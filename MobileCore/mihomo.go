@@ -31,8 +31,8 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// metacubexd 面板的 gh-pages 构建产物（已是打包好的静态站点）。
-const webUIURL = "https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip"
+// 配置文件未指定 external-ui-url 时，默认用 zashboard 面板（gh-pages 构建产物）。
+const defaultWebUIURL = "https://github.com/Zephyruso/zashboard/archive/refs/heads/gh-pages.zip"
 
 // ControllerAddr 是 NE 内 mihomo external-controller 的监听地址。
 // 主 App 经 sendProviderMessage IPC 在重签环境下不投递，改用本地回环 HTTP 直连——
@@ -179,25 +179,43 @@ func StartWithConfig(fd int, configYAML string, settingsJSON string) (err error)
 	addr := fmt.Sprintf("%s:%d", host, st.ControllerPort)
 
 	// webui：mihomo 在 /ui 同源提供面板（浏览器访问，无 CORS/混合内容问题）。
-	// SetUIPath 必须在 ReCreateServer 之前（注册路由时读取）。CORS 放开，方便外部仪表盘也能连 API。
-	uiPath := filepath.Join(homeDir, "ui")
+	// **优先用配置文件里指定的 external-ui / external-ui-url / external-ui-name**，
+	// 配置没指定时默认 zashboard。SetUIPath 必须在 ReCreateServer 之前（注册路由时读取）。
+	var uiCfg struct {
+		ExternalUI     string `yaml:"external-ui"`
+		ExternalUIURL  string `yaml:"external-ui-url"`
+		ExternalUIName string `yaml:"external-ui-name"`
+	}
+	_ = yaml.Unmarshal([]byte(configYAML), &uiCfg)
+	externalUI := uiCfg.ExternalUI
+	if externalUI == "" {
+		externalUI = "ui"
+	}
+	externalUIURL := uiCfg.ExternalUIURL
+	usingDefault := externalUIURL == ""
+	if usingDefault {
+		externalUIURL = defaultWebUIURL
+	}
+
+	uiPath := C.Path.Resolve(externalUI)
 	route.SetUIPath(uiPath)
 	route.ReCreateServer(&route.Config{
 		Addr:   addr,
 		Secret: st.ControllerSecret,
 		Cors:   route.Cors{AllowOrigins: []string{"*"}, AllowPrivateNetwork: true},
 	})
-	appendRunLog("external-controller 已启动: " + addr + " (UI: /ui)")
+	appendRunLog(fmt.Sprintf("external-controller 已启动: %s (UI: /ui, %s)", addr,
+		map[bool]string{true: "默认 zashboard", false: "配置指定"}[usingDefault]))
 
-	// 后台下载 metacubexd 面板到 ui 目录（空才下，已有则跳过）。best-effort，失败不影响代理。
+	// 后台下载面板到 ui 目录（空才下，已有则跳过）。best-effort，失败不影响代理。
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
 				appendRunLog(fmt.Sprintf("webui 下载 panic: %v", r))
 			}
 		}()
-		updater.NewUiUpdater("ui", webUIURL, "").AutoDownloadUI()
-		appendRunLog("webui 就绪: http://<本机/局域网IP>:" + fmt.Sprintf("%d", st.ControllerPort) + "/ui/")
+		updater.NewUiUpdater(externalUI, externalUIURL, uiCfg.ExternalUIName).AutoDownloadUI()
+		appendRunLog("webui 就绪: /ui/")
 	}()
 	return nil
 }
