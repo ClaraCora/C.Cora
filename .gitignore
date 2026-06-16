@@ -17,3 +17,6 @@ xcuserdata/
 # Go（Phase 1 起）
 MobileCore/*.a
 MobileCore/*.h
+
+# Claude Code 本地设置
+.claude/

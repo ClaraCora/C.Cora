@@ -54,3 +54,14 @@ targets:
         GENERATE_INFOPLIST_FILE: NO
         INFOPLIST_FILE: MiClashTunnel/Info.plist
         CODE_SIGN_ENTITLEMENTS: MiClashTunnel/MiClashTunnel.entitlements
+
+# 显式 scheme，确保 CI 里 `xcodebuild -scheme MiClash` 能找到（含嵌入的 NE 扩展）
+schemes:
+  MiClash:
+    build:
+      targets:
+        MiClash: all
+    run:
+      config: Release
+    archive:
+      config: Release
