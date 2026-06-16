@@ -48,7 +48,10 @@ jobs:
           go mod tidy
           # 交叉编译 mihomo 为 iOS 框架（含 device arm64 + simulator 切片）
           gomobile bind -target=ios -o ../Vendor/Mihomo.xcframework .
-          ls -la ../Vendor
+          echo "===== Mihomo.xcframework 切片 ====="
+          ls -R ../Vendor/Mihomo.xcframework | head -40
+          echo "===== Info.plist ====="
+          cat ../Vendor/Mihomo.xcframework/Info.plist
 
       # ───────────── 生成工程并构建 App ─────────────
       - name: Install XcodeGen
@@ -64,7 +67,7 @@ jobs:
             -project MiClash.xcodeproj \
             -scheme MiClash \
             -configuration Release \
-            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
