@@ -28,7 +28,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         ipv4.includedRoutes = []
         settings.ipv4Settings = ipv4
 
-        applyTunnelNetworkSettings(settings) { [weak self] error in
+        setTunnelNetworkSettings(settings) { [weak self] error in
             if let error {
                 self?.log.error("应用网络设置失败：\(error.localizedDescription, privacy: .public)")
             } else {
