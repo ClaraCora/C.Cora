@@ -38,13 +38,13 @@ final class TunnelManager {
         return mgr
     }
 
-    /// 启动隧道，并把订阅配置经 options 下发给 NE（不依赖 App Group）。
+    /// 启动隧道，并把订阅配置 + 设置经 options 下发给 NE（不依赖 App Group）。
     /// configYAML 为空串时 NE 会用缓存/DIRECT 兜底。
-    func start(configYAML: String) async throws {
+    func start(configYAML: String, settingsJSON: String) async throws {
         let mgr = try await loadOrCreateManager()
-        let options: [String: NSObject] = configYAML.isEmpty
-            ? [:]
-            : ["config": configYAML as NSString]
+        var options: [String: NSObject] = [:]
+        if !configYAML.isEmpty { options["config"] = configYAML as NSString }
+        if !settingsJSON.isEmpty { options["settings"] = settingsJSON as NSString }
         try mgr.connection.startVPNTunnel(options: options)
     }
 

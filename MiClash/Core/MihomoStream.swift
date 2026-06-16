@@ -44,7 +44,11 @@ final class MihomoStream: NSObject, @unchecked Sendable {
         var comps = URLComponents(url: MihomoAPI.base.appendingPathComponent(path),
                                   resolvingAgainstBaseURL: false)!
         comps.scheme = "ws"
-        let t = s.webSocketTask(with: comps.url!)
+        var req = URLRequest(url: comps.url!)
+        if !MihomoAPI.secret.isEmpty {
+            req.setValue("Bearer \(MihomoAPI.secret)", forHTTPHeaderField: "Authorization")
+        }
+        let t = s.webSocketTask(with: req)
         task = t
         t.resume()
 

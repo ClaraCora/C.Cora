@@ -26,9 +26,10 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         FileLog.write("startTunnel：开始配置网络设置")
         log.info("startTunnel：开始配置网络设置")
 
-        // 配置经 startVPNTunnel(options:) 下发（不依赖 App Group）。手动连接时主 App 会带 "config"。
+        // 配置经 startVPNTunnel(options:) 下发（不依赖 App Group）。手动连接时主 App 会带 "config" 和 "settings"。
         let incomingConfig = (options?["config"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-        FileLog.write("收到配置：\(incomingConfig != nil ? "来自 options(\(incomingConfig!.count) 字节)" : "无（将用缓存/DIRECT 兜底）")")
+        let settingsJSON = (options?["settings"] as? String) ?? ""
+        FileLog.write("收到配置：\(incomingConfig != nil ? "来自 options(\(incomingConfig!.count) 字节)" : "无（将用缓存/DIRECT 兜底）")，settings=\(settingsJSON.count)字节")
 
         let settings = makeNetworkSettings()
         setTunnelNetworkSettings(settings) { [weak self] error in
@@ -61,15 +62,18 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             FileLog.write("home dir = \(home)（\(usingShared ? "App Group 共享" : "NE 沙盒回退")），调用 MihomoSetup")
             MihomoSetup(home)
 
-            // 确定最终配置：options 配置 → 缓存文件 → 内置 DIRECT 兜底。
-            // 收到 options 配置时写入缓存，供系统重连（startTunnel 无 options）复用。
-            let configYAML = self.resolveConfig(incoming: incomingConfig, home: home)
+            // 确定最终配置/设置：options → 缓存文件 → 兜底。
+            // 收到 options 时写入缓存，供系统重连（startTunnel 无 options）复用。
+            let configYAML = self.resolveCached(incoming: incomingConfig, home: home,
+                                                file: "config.yaml") ?? MihomoConfig.directModeYAML()
+            let settings = self.resolveCached(incoming: settingsJSON.isEmpty ? nil : settingsJSON,
+                                              home: home, file: "settings.json") ?? ""
 
             // gomobile 把带 error 返回的 Go 函数生成为「返回 BOOL + NSError** 出参」的 C 函数，
             // 不会自动桥接成 Swift throws，所以用经典 NSError 指针写法：成功返回 true。
             FileLog.write("调用 MihomoStartWithConfig…")
             var startError: NSError?
-            let ok = MihomoStartWithConfig(Int(fd), configYAML, &startError)
+            let ok = MihomoStartWithConfig(Int(fd), configYAML, settings, &startError)
             if ok {
                 FileLog.write("MihomoStartWithConfig 返回成功")
                 self.log.info("mihomo 启动成功")
@@ -84,20 +88,19 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
-    /// 决定最终配置 YAML：options 配置（并缓存）→ 缓存文件 → 内置 DIRECT 兜底。
-    private func resolveConfig(incoming: String?, home: String) -> String {
-        let cachePath = (home as NSString).appendingPathComponent("config.yaml")
-        if let cfg = incoming {
-            try? cfg.write(toFile: cachePath, atomically: true, encoding: .utf8)
-            FileLog.write("使用 options 配置并写入缓存 config.yaml")
-            return cfg
+    /// 取值优先级：options 传入（并写缓存）→ 缓存文件 → nil。
+    private func resolveCached(incoming: String?, home: String, file: String) -> String? {
+        let cachePath = (home as NSString).appendingPathComponent(file)
+        if let value = incoming {
+            try? value.write(toFile: cachePath, atomically: true, encoding: .utf8)
+            FileLog.write("使用 options \(file)（\(value.count) 字节，已缓存）")
+            return value
         }
         if let cached = try? String(contentsOfFile: cachePath, encoding: .utf8), !cached.isEmpty {
-            FileLog.write("使用缓存 config.yaml（\(cached.count) 字节）")
+            FileLog.write("使用缓存 \(file)（\(cached.count) 字节）")
             return cached
         }
-        FileLog.write("无订阅配置，使用内置 DIRECT 兜底")
-        return MihomoConfig.directModeYAML()
+        return nil
     }
 
     override func stopTunnel(with reason: NEProviderStopReason,

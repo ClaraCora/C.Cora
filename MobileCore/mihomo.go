@@ -87,64 +87,39 @@ func startLogCapture() {
 	})
 }
 
-// StartWithFd 用系统 tun 的文件描述符 fd 与配置 YAML 启动内核。
-//
-// fd 来自 iOS NEPacketTunnelProvider 创建的 utun 接口——iOS 已经建好该接口并分配
-// 了地址/路由，我们把它的 fd 直接交给 mihomo 的 tun 监听器（sing-tun），由内核
-// 接管这块网卡的收发，避免再经 packetFlow 拷贝一层。
-//
-// 关键：fd 是运行期才知道的值，不能写死在 YAML 里，所以这里先把 YAML 反序列化成
-// RawConfig，再把 fd 注入 Tun.FileDescriptor，最后解析并下发给 executor。
-//
-// 用 recover 兜住内核启动期可能的 panic（如 gvisor/路由相关），把堆栈写进 run.log
-// 并以 error 返回，避免整个 NE 进程静默崩溃、只看到「连接中→已断开」却查不到原因。
-//
-// 对应 Swift 侧 `MihomoStartWithFd(_:_:error:)`。
-func StartWithFd(fd int, configYAML string) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			stack := fmt.Sprintf("panic: %v\n%s", r, debug.Stack())
-			appendRunLog("===== mihomo 启动 panic =====\n" + stack)
-			err = fmt.Errorf("mihomo panic: %v", r)
-		}
-	}()
-
-	appendRunLog(fmt.Sprintf("StartWithFd: fd=%d 开始解析配置", fd))
-
-	rawCfg, err := config.UnmarshalRawConfig([]byte(configYAML))
-	if err != nil {
-		appendRunLog("UnmarshalRawConfig 失败: " + err.Error())
-		return err
-	}
-
-	// 注入运行期信息：iOS 已创建好的 utun fd。
-	rawCfg.Tun.Enable = true
-	rawCfg.Tun.FileDescriptor = fd
-
-	cfg, err := config.ParseRawConfig(rawCfg)
-	if err != nil {
-		appendRunLog("ParseRawConfig 失败: " + err.Error())
-		return err
-	}
-
-	// force=true：强制应用配置、重启所有监听器（含 tun 入站）。
-	appendRunLog("ParseRawConfig 成功，开始 ApplyConfig")
-	executor.ApplyConfig(cfg, true)
-	appendRunLog("ApplyConfig 返回，内核已启动")
-
-	// executor.ApplyConfig 不会起 external-controller，需手动起（ReCreate 可重复调用）。
-	// 无 secret，仅绑 127.0.0.1，个人本机用。主 App 据此 HTTP 直连查/切策略组。
-	route.ReCreateServer(&route.Config{Addr: ControllerAddr})
-	appendRunLog("external-controller 已启动: " + ControllerAddr)
-	return nil
+// appSettings 是主 App 下发的设置（JSON）。零值即各项默认。
+type appSettings struct {
+	Stack            string `json:"stack"`
+	IPv6             bool   `json:"ipv6"`
+	StripGeo         bool   `json:"stripGeo"`
+	LogLevel         string `json:"logLevel"`
+	ControllerPort   int    `json:"controllerPort"`
+	ControllerSecret string `json:"controllerSecret"`
+	AllowLan         bool   `json:"allowLan"`
 }
 
-// StartWithConfig 用订阅/自定义 YAML 启动内核：先把订阅配置与「iOS 必需的安全设置」
-// 合并、并剔除 geo 规则，再注入 fd 启动。对应 Swift 侧 `MihomoStartWithConfig(_:_:error:)`。
-//
-// 为什么在 Go 侧统一覆盖：tun/dns/fake-ip/gvisor 这些 iOS NE 约束不能让订阅随意改写，
-// 否则 tun 不通或 OOM；集中在这里强制，订阅只贡献 proxies/proxy-groups/rules。
-func StartWithConfig(fd int, configYAML string) (err error) {
+// parseSettings 解析设置 JSON，缺省值兜底（与主 App SettingsStore 默认一致）。
+func parseSettings(settingsJSON string) appSettings {
+	s := appSettings{Stack: "gvisor", StripGeo: true, LogLevel: "info", ControllerPort: 9090}
+	if strings.TrimSpace(settingsJSON) != "" {
+		_ = json.Unmarshal([]byte(settingsJSON), &s)
+	}
+	if s.Stack == "" {
+		s.Stack = "gvisor"
+	}
+	if s.LogLevel == "" {
+		s.LogLevel = "info"
+	}
+	if s.ControllerPort == 0 {
+		s.ControllerPort = 9090
+	}
+	return s
+}
+
+// StartWithConfig 用订阅/自定义 YAML + 设置启动内核：先把订阅配置与「iOS 必需的安全设置」
+// 及用户设置合并、按需剔除 geo 规则，再注入 fd 启动，最后起 external-controller。
+// 对应 Swift 侧 `MihomoStartWithConfig(_:_:_:error:)`。
+func StartWithConfig(fd int, configYAML string, settingsJSON string) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			stack := fmt.Sprintf("panic: %v\n%s", r, debug.Stack())
@@ -153,9 +128,11 @@ func StartWithConfig(fd int, configYAML string) (err error) {
 		}
 	}()
 
-	appendRunLog(fmt.Sprintf("StartWithConfig: fd=%d 合并 iOS 安全设置并剔除 geo 规则", fd))
+	st := parseSettings(settingsJSON)
+	appendRunLog(fmt.Sprintf("StartWithConfig: fd=%d stack=%s ipv6=%v stripGeo=%v log=%s port=%d",
+		fd, st.Stack, st.IPv6, st.StripGeo, st.LogLevel, st.ControllerPort))
 
-	merged, err := mergeConfig(configYAML)
+	merged, err := mergeConfig(configYAML, st)
 	if err != nil {
 		appendRunLog("合并配置失败: " + err.Error())
 		return err
@@ -179,16 +156,21 @@ func StartWithConfig(fd int, configYAML string) (err error) {
 	executor.ApplyConfig(cfg, true)
 	appendRunLog("ApplyConfig 返回，内核已启动")
 
-	// executor.ApplyConfig 不会起 external-controller，需手动起（ReCreate 可重复调用）。
-	// 无 secret，仅绑 127.0.0.1，个人本机用。主 App 据此 HTTP 直连查/切策略组。
-	route.ReCreateServer(&route.Config{Addr: ControllerAddr})
-	appendRunLog("external-controller 已启动: " + ControllerAddr)
+	// 起 external-controller（executor.ApplyConfig 不会自动起，ReCreate 可重复调用）。
+	host := "127.0.0.1"
+	if st.AllowLan {
+		host = "0.0.0.0"
+	}
+	addr := fmt.Sprintf("%s:%d", host, st.ControllerPort)
+	route.ReCreateServer(&route.Config{Addr: addr, Secret: st.ControllerSecret})
+	appendRunLog("external-controller 已启动: " + addr)
 	return nil
 }
 
-// mergeConfig 把订阅 YAML 与 iOS 必需设置合并：强制 tun/dns、关 geo 下载、剔除 geo 规则。
+// mergeConfig 把订阅 YAML 与 iOS 必需设置 + 用户设置合并。
+// 强制 tun/dns（tun 必须 fake-ip 才通），其余按设置：栈、ipv6、日志等级、是否剔 geo。
 // fd 不在此写入（运行期值），由 StartWithConfig 解析后注入 Tun.FileDescriptor。
-func mergeConfig(subYAML string) ([]byte, error) {
+func mergeConfig(subYAML string, st appSettings) ([]byte, error) {
 	m := map[string]any{}
 	if strings.TrimSpace(subYAML) != "" {
 		if err := yaml.Unmarshal([]byte(subYAML), &m); err != nil {
@@ -196,10 +178,10 @@ func mergeConfig(subYAML string) ([]byte, error) {
 		}
 	}
 
-	// 强制 tun：gvisor 栈（iOS NE 里 system 栈 TCP 不通），dns 劫持，自动路由。
+	// 强制 tun：栈按设置（默认 gvisor；iOS NE 里 system 栈 TCP 常不通），dns 劫持，自动路由。
 	m["tun"] = map[string]any{
 		"enable":                true,
-		"stack":                 "gvisor",
+		"stack":                 st.Stack,
 		"dns-hijack":            []any{"any:53"},
 		"auto-route":            true,
 		"auto-detect-interface": true,
@@ -208,7 +190,7 @@ func mergeConfig(subYAML string) ([]byte, error) {
 	// 强制 dns：tun 必须 fake-ip + 纯 IP 的 DoH 上游（无需二次解析，杜绝死循环）。
 	m["dns"] = map[string]any{
 		"enable":        true,
-		"ipv6":          false,
+		"ipv6":          st.IPv6,
 		"enhanced-mode": "fake-ip",
 		"fake-ip-range": "198.18.0.1/16",
 		"nameserver": []any{
@@ -216,15 +198,19 @@ func mergeConfig(subYAML string) ([]byte, error) {
 			"https://1.1.1.1/dns-query",
 		},
 	}
+	m["ipv6"] = st.IPv6
+	m["log-level"] = st.LogLevel
 	// 关 geo 数据库下载/更新（NE 内会 OOM）。
 	m["geo-auto-update"] = false
 	m["geodata-mode"] = false
 	if _, ok := m["mode"]; !ok {
 		m["mode"] = "rule"
 	}
-	// 剔除 geo 规则（GEOIP/GEOSITE 需 geo 库，NE 50MB 限制下易 OOM）。
-	if rules, ok := m["rules"].([]any); ok {
-		m["rules"] = filterGeoRules(rules)
+	// 按设置剔除 geo 规则（GEOIP/GEOSITE 需 geo 库，NE 50MB 限制下易 OOM）。
+	if st.StripGeo {
+		if rules, ok := m["rules"].([]any); ok {
+			m["rules"] = filterGeoRules(rules)
+		}
 	}
 
 	return yaml.Marshal(m)

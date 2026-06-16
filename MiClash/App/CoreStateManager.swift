@@ -80,9 +80,10 @@ final class CoreStateManager: ObservableObject {
             case .connected, .connecting, .reasserting:
                 tunnel.stop()
             default:
-                // 连接时下发当前订阅配置；无订阅则传空串，NE 用缓存/DIRECT 兜底。
+                // 连接时下发当前订阅配置 + 设置；无订阅则传空串，NE 用缓存/DIRECT 兜底。
                 let yaml = SubscriptionStore.shared.activeYAML ?? ""
-                try await tunnel.start(configYAML: yaml)
+                let settings = SettingsStore.shared.asJSON()
+                try await tunnel.start(configYAML: yaml, settingsJSON: settings)
             }
         } catch {
             lastError = error.localizedDescription

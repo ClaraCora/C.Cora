@@ -53,15 +53,19 @@ final class KernelController: ObservableObject {
         trafficTask = Task { [weak self] in
             var prevDown: Int64?
             var prevUp: Int64?
+            var prevTime = Date()
             while !Task.isCancelled {
                 do {
                     let (d, u) = try await MihomoAPI.connectionsTotals()
+                    let now = Date()
                     if let pd = prevDown, let pu = prevUp {
-                        self?.down = max(0, d - pd)
-                        self?.up = max(0, u - pu)
+                        let dt = max(now.timeIntervalSince(prevTime), 0.001)
+                        self?.down = max(0, Int64(Double(d - pd) / dt))
+                        self?.up = max(0, Int64(Double(u - pu) / dt))
                     }
                     prevDown = d
                     prevUp = u
+                    prevTime = now
                     self?.reachable = true
                 } catch {
                     self?.reachable = false

@@ -2,12 +2,16 @@ import Foundation
 
 /// 主 App 访问 NE 内 mihomo external-controller 的 HTTP 客户端。
 ///
-/// 背景：sendProviderMessage IPC 在用户的重签环境下不投递，改走本地回环 HTTP。
-/// 127.0.0.1 是 loopback，不经 tun、跨进程可达；且是 IP 字面量，ATS 不拦截明文 HTTP，
-/// 无需 Info.plist 例外。地址与 Go 侧 ControllerAddr 一致（127.0.0.1:9090）。
+/// 127.0.0.1 是 loopback，不经 tun、跨进程可达；IP 字面量 ATS 不拦明文 HTTP。
+/// 端口/密钥由 SettingsStore 同步到这里的 `port`/`secret`（这里用普通静态量，
+/// 以便后台的 MihomoStream 也能无隔离地读取）。
 enum MihomoAPI {
 
-    static let base = URL(string: "http://127.0.0.1:9090")!
+    /// 由 SettingsStore 同步。默认 127.0.0.1:9090、无密钥。
+    static var port: Int = 9090
+    static var secret: String = ""
+
+    static var base: URL { URL(string: "http://127.0.0.1:\(port)")! }
 
     enum APIError: LocalizedError {
         case badStatus(Int)
@@ -20,7 +24,6 @@ enum MihomoAPI {
         }
     }
 
-    /// 普通请求用的短超时 session。
     private static let session: URLSession = {
         let cfg = URLSessionConfiguration.ephemeral
         cfg.timeoutIntervalForRequest = 8
@@ -28,27 +31,40 @@ enum MihomoAPI {
         return URLSession(configuration: cfg)
     }()
 
-    /// 流式请求（/traffic、/logs）用的长超时 session——每秒有数据，不应超时。
     private static let streamSession: URLSession = {
         let cfg = URLSessionConfiguration.ephemeral
-        cfg.timeoutIntervalForRequest = 3600
+        cfg.timeoutIntervalForRequest = 30
         cfg.waitsForConnectivity = false
         return URLSession(configuration: cfg)
     }()
 
+    /// 构建带鉴权头的请求。path 形如 "proxies/我的组"——URLComponents 会正确百分号编码
+    /// 路径里的中文/空格（保留 "/" 作分隔），避免 appendingPathComponent 误编码。
+    static func makeRequest(path: String, method: String = "GET",
+                            query: [URLQueryItem] = []) -> URLRequest {
+        var comps = URLComponents()
+        comps.scheme = "http"
+        comps.host = "127.0.0.1"
+        comps.port = port
+        comps.path = "/" + path
+        if !query.isEmpty { comps.queryItems = query }
+        var req = URLRequest(url: comps.url!)
+        req.httpMethod = method
+        if !secret.isEmpty { req.setValue("Bearer \(secret)", forHTTPHeaderField: "Authorization") }
+        return req
+    }
+
     // MARK: - 一次性请求
 
-    /// GET /version —— 连通性探测。
     static func version() async throws -> String {
-        let (data, resp) = try await session.data(from: base.appendingPathComponent("version"))
+        let (data, resp) = try await session.data(for: makeRequest(path: "version"))
         try check(resp)
         let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any]
         return (obj?["version"] as? String) ?? String(data: data, encoding: .utf8) ?? "?"
     }
 
-    /// GET /proxies —— 完整 proxies JSON（HTTP 无 IPC 体积限制）。
     static func proxiesJSON() async throws -> [String: Any] {
-        let (data, resp) = try await session.data(from: base.appendingPathComponent("proxies"))
+        let (data, resp) = try await session.data(for: makeRequest(path: "proxies"))
         try check(resp)
         guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw APIError.badResponse
@@ -56,19 +72,16 @@ enum MihomoAPI {
         return obj
     }
 
-    /// PUT /proxies/{group} body {"name": node} —— 在策略组里选定节点。
     static func select(group: String, node: String) async throws {
-        var req = URLRequest(url: base.appendingPathComponent("proxies").appendingPathComponent(group))
-        req.httpMethod = "PUT"
+        var req = makeRequest(path: "proxies/\(group)", method: "PUT")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try JSONSerialization.data(withJSONObject: ["name": node])
         let (_, resp) = try await session.data(for: req)
-        try check(resp)  // 成功为 204 No Content
+        try check(resp)
     }
 
-    /// GET /connections —— 取累计上下行字节（普通 GET 快照，可轮询算速率，比 WS 稳）。
     static func connectionsTotals() async throws -> (down: Int64, up: Int64) {
-        let (data, resp) = try await session.data(from: base.appendingPathComponent("connections"))
+        let (data, resp) = try await session.data(for: makeRequest(path: "connections"))
         try check(resp)
         let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
         let down = (obj?["downloadTotal"] as? NSNumber)?.int64Value ?? 0
@@ -76,43 +89,36 @@ enum MihomoAPI {
         return (down, up)
     }
 
-    /// GET /configs —— 取当前模式（rule/global/direct）。
     static func currentMode() async throws -> String {
-        let (data, resp) = try await session.data(from: base.appendingPathComponent("configs"))
+        let (data, resp) = try await session.data(for: makeRequest(path: "configs"))
         try check(resp)
         let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any]
         return (obj?["mode"] as? String) ?? "rule"
     }
 
-    /// PATCH /configs body {"mode": ...} —— 切换模式。
     static func setMode(_ mode: String) async throws {
-        var req = URLRequest(url: base.appendingPathComponent("configs"))
-        req.httpMethod = "PATCH"
+        var req = makeRequest(path: "configs", method: "PATCH")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try JSONSerialization.data(withJSONObject: ["mode": mode])
         let (_, resp) = try await session.data(for: req)
         try check(resp)
     }
 
-    /// GET /group/{name}/delay —— 测试策略组内所有节点延迟，返回 node→毫秒（不通的节点不在 map 里）。
+    /// GET /group/{name}/delay —— 测全组节点延迟，返回 node→毫秒。
     static func groupDelay(group: String,
                            testURL: String = "http://www.gstatic.com/generate_204",
                            timeout: Int = 5000) async throws -> [String: Int] {
-        let url = base.appendingPathComponent("group").appendingPathComponent(group).appendingPathComponent("delay")
-        var comps = URLComponents(url: url, resolvingAgainstBaseURL: false)!
-        comps.queryItems = [
+        var req = makeRequest(path: "group/\(group)/delay", query: [
             URLQueryItem(name: "url", value: testURL),
             URLQueryItem(name: "timeout", value: String(timeout)),
-        ]
-        // 测速可能数秒，用更宽松的超时
-        var req = URLRequest(url: comps.url!)
+        ])
         req.timeoutInterval = TimeInterval(timeout) / 1000 + 5
         let (data, resp) = try await streamSession.data(for: req)
         try check(resp)
         let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
         var result: [String: Int] = [:]
-        for (k, v) in obj {
-            if let n = (v as? NSNumber)?.intValue { result[k] = n }
+        for (k, v) in obj where (v as? NSNumber) != nil {
+            result[k] = (v as! NSNumber).intValue
         }
         return result
     }

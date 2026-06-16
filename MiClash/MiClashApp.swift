@@ -8,12 +8,15 @@ struct MiClashApp: App {
     @StateObject private var core = CoreStateManager.shared
     /// 订阅 Store：存取/拉取订阅，连接时提供当前配置。
     @StateObject private var subscriptions = SubscriptionStore.shared
+    /// 设置 Store：内核栈/日志/IPv6/geo/外部控制。
+    @StateObject private var settings = SettingsStore.shared
 
     var body: some Scene {
         WindowGroup {
             RootView()
                 .environmentObject(core)
                 .environmentObject(subscriptions)
+                .environmentObject(settings)
         }
     }
 }

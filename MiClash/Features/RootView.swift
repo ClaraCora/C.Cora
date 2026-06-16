@@ -16,6 +16,9 @@ struct RootView: View {
 
             LogsView()
                 .tabItem { Label("日志", systemImage: "list.bullet.rectangle") }
+
+            SettingsView()
+                .tabItem { Label("设置", systemImage: "gearshape") }
         }
     }
 }

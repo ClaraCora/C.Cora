@@ -102,9 +102,6 @@ private struct GroupCard: View {
                             delay: delays[node])
                         .padding(.horizontal, 14)
                         .frame(minHeight: 34)
-                        .background(
-                            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                .fill(node == group.now ? Color.accentColor.opacity(0.12) : Color.clear))
                         .contentShape(Rectangle())
                         .onTapGesture { onSelect(node) }
                     }
