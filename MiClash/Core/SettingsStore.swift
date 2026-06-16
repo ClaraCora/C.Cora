@@ -13,8 +13,14 @@ final class SettingsStore: ObservableObject {
     /// TCP/IP 栈：gvisor / system / mixed。iOS NE 强烈建议 gvisor（system 栈 TCP 常走不通）。
     @Published var stack: String { didSet { d.set(stack, forKey: K.stack) } }
     @Published var ipv6: Bool { didSet { d.set(ipv6, forKey: K.ipv6) } }
-    /// 剔除订阅里的 GEOIP/GEOSITE 规则（默认开，防 NE OOM）。关掉则保留（需 geo 库，自担风险）。
-    @Published var stripGeo: Bool { didSet { d.set(stripGeo, forKey: K.stripGeo) } }
+    /// 启用 geo 规则（默认关=剔除 GEOIP/GEOSITE 防 NE OOM）。开启则保留规则并按下列 geo 设置加载。
+    @Published var geoEnabled: Bool { didSet { d.set(geoEnabled, forKey: K.geoEnabled) } }
+    /// geo 加载器：standard / memconservative（小内存优化，NE 推荐）。
+    @Published var geoLoader: String { didSet { d.set(geoLoader, forKey: K.geoLoader) } }
+    /// 自动更新 geo 数据库。
+    @Published var geoAutoUpdate: Bool { didSet { d.set(geoAutoUpdate, forKey: K.geoAuto) } }
+    /// 自动更新间隔（小时）。
+    @Published var geoUpdateInterval: Int { didSet { d.set(geoUpdateInterval, forKey: K.geoInterval) } }
     /// 日志等级：silent / error / warning / info / debug。
     @Published var logLevel: String { didSet { d.set(logLevel, forKey: K.logLevel) } }
     /// external-controller 端口（主 App HTTP 客户端也用它）。
@@ -30,17 +36,24 @@ final class SettingsStore: ObservableObject {
 
     static let stackOptions = ["gvisor", "system", "mixed"]
     static let logLevelOptions = ["silent", "error", "warning", "info", "debug"]
+    static let geoLoaderOptions = ["memconservative", "standard"]
 
     private let d = UserDefaults.standard
     private enum K {
-        static let stack = "set.stack", ipv6 = "set.ipv6", stripGeo = "set.stripGeo"
+        static let stack = "set.stack", ipv6 = "set.ipv6"
+        static let geoEnabled = "set.geoEnabled", geoLoader = "set.geoLoader"
+        static let geoAuto = "set.geoAuto", geoInterval = "set.geoInterval"
         static let logLevel = "set.logLevel", port = "set.port", secret = "set.secret", allowLan = "set.allowLan"
     }
 
     private init() {
         stack = d.string(forKey: K.stack) ?? "gvisor"
         ipv6 = d.object(forKey: K.ipv6) as? Bool ?? false
-        stripGeo = d.object(forKey: K.stripGeo) as? Bool ?? true
+        geoEnabled = d.object(forKey: K.geoEnabled) as? Bool ?? false
+        geoLoader = d.string(forKey: K.geoLoader) ?? "memconservative"
+        geoAutoUpdate = d.object(forKey: K.geoAuto) as? Bool ?? false
+        let gi = d.integer(forKey: K.geoInterval)
+        geoUpdateInterval = gi == 0 ? 24 : gi
         logLevel = d.string(forKey: K.logLevel) ?? "info"
         let p = d.integer(forKey: K.port)
         controllerPort = p == 0 ? 9090 : p
@@ -57,7 +70,10 @@ final class SettingsStore: ObservableObject {
         let dict: [String: Any] = [
             "stack": stack,
             "ipv6": ipv6,
-            "stripGeo": stripGeo,
+            "geoEnabled": geoEnabled,
+            "geoLoader": geoLoader,
+            "geoAutoUpdate": geoAutoUpdate,
+            "geoUpdateInterval": geoUpdateInterval,
             "logLevel": logLevel,
             "controllerPort": controllerPort,
             "controllerSecret": controllerSecret,

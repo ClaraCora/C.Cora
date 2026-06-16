@@ -89,18 +89,22 @@ func startLogCapture() {
 
 // appSettings 是主 App 下发的设置（JSON）。零值即各项默认。
 type appSettings struct {
-	Stack            string `json:"stack"`
-	IPv6             bool   `json:"ipv6"`
-	StripGeo         bool   `json:"stripGeo"`
-	LogLevel         string `json:"logLevel"`
-	ControllerPort   int    `json:"controllerPort"`
-	ControllerSecret string `json:"controllerSecret"`
-	AllowLan         bool   `json:"allowLan"`
+	Stack             string `json:"stack"`
+	IPv6              bool   `json:"ipv6"`
+	GeoEnabled        bool   `json:"geoEnabled"`
+	GeoLoader         string `json:"geoLoader"`
+	GeoAutoUpdate     bool   `json:"geoAutoUpdate"`
+	GeoUpdateInterval int    `json:"geoUpdateInterval"`
+	LogLevel          string `json:"logLevel"`
+	ControllerPort    int    `json:"controllerPort"`
+	ControllerSecret  string `json:"controllerSecret"`
+	AllowLan          bool   `json:"allowLan"`
 }
 
 // parseSettings 解析设置 JSON，缺省值兜底（与主 App SettingsStore 默认一致）。
 func parseSettings(settingsJSON string) appSettings {
-	s := appSettings{Stack: "gvisor", StripGeo: true, LogLevel: "info", ControllerPort: 9090}
+	s := appSettings{Stack: "gvisor", LogLevel: "info", ControllerPort: 9090,
+		GeoLoader: "memconservative", GeoUpdateInterval: 24}
 	if strings.TrimSpace(settingsJSON) != "" {
 		_ = json.Unmarshal([]byte(settingsJSON), &s)
 	}
@@ -112,6 +116,12 @@ func parseSettings(settingsJSON string) appSettings {
 	}
 	if s.ControllerPort == 0 {
 		s.ControllerPort = 9090
+	}
+	if s.GeoLoader == "" {
+		s.GeoLoader = "memconservative"
+	}
+	if s.GeoUpdateInterval <= 0 {
+		s.GeoUpdateInterval = 24
 	}
 	return s
 }
@@ -129,8 +139,8 @@ func StartWithConfig(fd int, configYAML string, settingsJSON string) (err error)
 	}()
 
 	st := parseSettings(settingsJSON)
-	appendRunLog(fmt.Sprintf("StartWithConfig: fd=%d stack=%s ipv6=%v stripGeo=%v log=%s port=%d",
-		fd, st.Stack, st.IPv6, st.StripGeo, st.LogLevel, st.ControllerPort))
+	appendRunLog(fmt.Sprintf("StartWithConfig: fd=%d stack=%s ipv6=%v geo=%v(%s) log=%s port=%d",
+		fd, st.Stack, st.IPv6, st.GeoEnabled, st.GeoLoader, st.LogLevel, st.ControllerPort))
 
 	merged, err := mergeConfig(configYAML, st)
 	if err != nil {
@@ -200,14 +210,20 @@ func mergeConfig(subYAML string, st appSettings) ([]byte, error) {
 	}
 	m["ipv6"] = st.IPv6
 	m["log-level"] = st.LogLevel
-	// 关 geo 数据库下载/更新（NE 内会 OOM）。
-	m["geo-auto-update"] = false
-	m["geodata-mode"] = false
+
 	if _, ok := m["mode"]; !ok {
 		m["mode"] = "rule"
 	}
-	// 按设置剔除 geo 规则（GEOIP/GEOSITE 需 geo 库，NE 50MB 限制下易 OOM）。
-	if st.StripGeo {
+
+	// geo：默认关 → 剔除 GEOIP/GEOSITE 规则（省内存）。
+	// 开启 → 保留规则，按设置配置加载器/自动更新，内核按需下载/加载 geo 库（用 memconservative 省内存）。
+	m["geodata-mode"] = false // false=用 mmdb
+	if st.GeoEnabled {
+		m["geodata-loader"] = st.GeoLoader
+		m["geo-auto-update"] = st.GeoAutoUpdate
+		m["geo-update-interval"] = st.GeoUpdateInterval
+	} else {
+		m["geo-auto-update"] = false
 		if rules, ok := m["rules"].([]any); ok {
 			m["rules"] = filterGeoRules(rules)
 		}

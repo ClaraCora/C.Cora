@@ -1,9 +1,9 @@
 import SwiftUI
+import Charts
 
-/// 连接页：Form 风格（参考旧版 HomeView）——连接开关、实时流量、模式、当前订阅、内核状态。
+/// 连接页：Form 风格——连接开关、实时流量曲线、模式、内核状态。
 struct ConnectView: View {
     @EnvironmentObject private var core: CoreStateManager
-    @EnvironmentObject private var subscriptions: SubscriptionStore
     @StateObject private var kernel = KernelController()
 
     var body: some View {
@@ -29,14 +29,7 @@ struct ConnectView: View {
 
                 if core.isActive {
                     Section("实时流量") {
-                        HStack {
-                            Label(ByteFormat.rate(kernel.down), systemImage: "arrow.down")
-                                .foregroundStyle(.blue)
-                            Spacer()
-                            Label(ByteFormat.rate(kernel.up), systemImage: "arrow.up")
-                                .foregroundStyle(.orange)
-                        }
-                        .font(.callout.monospacedDigit())
+                        TrafficChart(samples: kernel.samples, up: kernel.up, down: kernel.down)
                     }
                 }
 
@@ -49,22 +42,6 @@ struct ConnectView: View {
                     }
                     .pickerStyle(.segmented)
                     .disabled(!core.isActive)
-                }
-
-                Section("当前订阅") {
-                    if let sub = subscriptions.selected {
-                        HStack {
-                            Text(sub.name)
-                            Spacer()
-                            if sub.hasUsage {
-                                Text("剩 \(ByteFormat.size(sub.remaining))")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                    } else {
-                        Text("未选择订阅（直连兜底）").foregroundStyle(.secondary)
-                    }
                 }
 
                 Section {
@@ -95,6 +72,52 @@ struct ConnectView: View {
             }
             .onDisappear { kernel.stopTraffic() }
         }
+    }
+}
+
+/// 实时流量曲线：上/下行速率折线 + 当前数值。
+private struct TrafficChart: View {
+    let samples: [KernelController.TrafficSample]
+    let up: Int64
+    let down: Int64
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 16) {
+                Label(ByteFormat.rate(down), systemImage: "arrow.down")
+                    .foregroundStyle(.blue)
+                Label(ByteFormat.rate(up), systemImage: "arrow.up")
+                    .foregroundStyle(.orange)
+            }
+            .font(.callout.monospacedDigit())
+
+            Chart {
+                ForEach(samples) { s in
+                    AreaMark(x: .value("t", s.id), y: .value("速率", Double(s.down)))
+                        .foregroundStyle(.blue.opacity(0.12))
+                        .interpolationMethod(.catmullRom)
+                    LineMark(x: .value("t", s.id), y: .value("速率", Double(s.down)),
+                             series: .value("方向", "下行"))
+                        .foregroundStyle(.blue)
+                        .interpolationMethod(.catmullRom)
+                    LineMark(x: .value("t", s.id), y: .value("速率", Double(s.up)),
+                             series: .value("方向", "上行"))
+                        .foregroundStyle(.orange)
+                        .interpolationMethod(.catmullRom)
+                }
+            }
+            .chartXAxis(.hidden)
+            .chartYAxis {
+                AxisMarks { value in
+                    AxisGridLine()
+                    if let v = value.as(Double.self) {
+                        AxisValueLabel { Text(ByteFormat.rate(Int64(v))).font(.caption2) }
+                    }
+                }
+            }
+            .frame(height: 120)
+        }
+        .padding(.vertical, 4)
     }
 }
 

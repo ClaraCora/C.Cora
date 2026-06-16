@@ -17,12 +17,23 @@ final class KernelController: ObservableObject {
         }
     }
 
+    /// 一条速率采样（用于曲线图）。
+    struct TrafficSample: Identifiable {
+        let id: Int        // 单调递增序号，作 x 轴
+        let up: Int64
+        let down: Int64
+    }
+
     @Published var mode: Mode = .rule
     @Published var up: Int64 = 0
     @Published var down: Int64 = 0
     @Published var reachable = false
+    /// 最近若干秒的速率采样（曲线图数据）。
+    @Published private(set) var samples: [TrafficSample] = []
 
     private var trafficTask: Task<Void, Never>?
+    private var sampleIndex = 0
+    private let maxSamples = 60
 
     /// 读取当前模式（连通即标记 reachable）。
     func loadMode() async {
@@ -60,8 +71,11 @@ final class KernelController: ObservableObject {
                     let now = Date()
                     if let pd = prevDown, let pu = prevUp {
                         let dt = max(now.timeIntervalSince(prevTime), 0.001)
-                        self?.down = max(0, Int64(Double(d - pd) / dt))
-                        self?.up = max(0, Int64(Double(u - pu) / dt))
+                        let downRate = max(0, Int64(Double(d - pd) / dt))
+                        let upRate = max(0, Int64(Double(u - pu) / dt))
+                        self?.down = downRate
+                        self?.up = upRate
+                        self?.pushSample(up: upRate, down: downRate)
                     }
                     prevDown = d
                     prevUp = u
@@ -81,5 +95,13 @@ final class KernelController: ObservableObject {
         trafficTask = nil
         up = 0
         down = 0
+        samples.removeAll()
+        sampleIndex = 0
+    }
+
+    private func pushSample(up: Int64, down: Int64) {
+        samples.append(TrafficSample(id: sampleIndex, up: up, down: down))
+        sampleIndex += 1
+        if samples.count > maxSamples { samples.removeFirst(samples.count - maxSamples) }
     }
 }

@@ -3,6 +3,8 @@ import SwiftUI
 /// 设置页：内核栈/日志/IPv6/geo + 外部控制。改后需重新连接生效。
 struct SettingsView: View {
     @EnvironmentObject private var settings: SettingsStore
+    @State private var geoUpdating = false
+    @State private var geoResult: String?
 
     var body: some View {
         NavigationStack {
@@ -22,11 +24,35 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    Toggle("剔除 geo 规则", isOn: $settings.stripGeo)
+                    Toggle("启用 geo 规则", isOn: $settings.geoEnabled)
+                    if settings.geoEnabled {
+                        Picker("加载器", selection: $settings.geoLoader) {
+                            ForEach(SettingsStore.geoLoaderOptions, id: \.self) { Text($0).tag($0) }
+                        }
+                        Toggle("自动更新", isOn: $settings.geoAutoUpdate)
+                        if settings.geoAutoUpdate {
+                            Stepper("更新间隔 \(settings.geoUpdateInterval) 小时",
+                                    value: $settings.geoUpdateInterval, in: 1...168)
+                        }
+                        Button {
+                            Task { await updateGeo() }
+                        } label: {
+                            HStack {
+                                Label("立即更新 geo", systemImage: "arrow.down.circle")
+                                Spacer()
+                                if geoUpdating { ProgressView() }
+                            }
+                        }
+                        .disabled(geoUpdating)
+                        if let r = geoResult {
+                            Text(r).font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
                 } header: {
-                    Text("规则")
+                    Text("geo 规则")
                 } footer: {
-                    Text("订阅里的 GEOIP/GEOSITE 规则需加载 geo 数据库，扩展内存有限易崩。默认剔除。")
+                    Text("关闭=剔除订阅里的 GEOIP/GEOSITE 规则（省内存）。开启则保留并由内核加载 geo 数据库；"
+                       + "扩展内存有限，建议用 memconservative 加载器。geo 库由内核按需下载/更新，不再随包编译。")
                 }
 
                 Section {
@@ -60,6 +86,18 @@ struct SettingsView: View {
                 }
             }
             .navigationTitle("设置")
+        }
+    }
+
+    private func updateGeo() async {
+        geoUpdating = true
+        geoResult = nil
+        defer { geoUpdating = false }
+        do {
+            try await MihomoAPI.updateGeo()
+            geoResult = "更新成功"
+        } catch {
+            geoResult = "更新失败：\(error.localizedDescription)（需先连接 VPN）"
         }
     }
 }
