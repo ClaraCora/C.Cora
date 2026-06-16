@@ -7,25 +7,29 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("内核") {
+                Section {
                     Picker("TUN 栈", selection: $settings.stack) {
-                        ForEach(SettingsStore.stackOptions, id: \.self) { Text($0) }
+                        ForEach(SettingsStore.stackOptions, id: \.self) { Text($0).tag($0) }
                     }
                     Picker("日志级别", selection: $settings.logLevel) {
-                        ForEach(SettingsStore.logLevelOptions, id: \.self) { Text($0) }
+                        ForEach(SettingsStore.logLevelOptions, id: \.self) { Text($0).tag($0) }
                     }
                     Toggle("启用 IPv6", isOn: $settings.ipv6)
+                } header: {
+                    Text("内核")
                 } footer: {
                     Text("iOS 隧道扩展里 system 栈 TCP 常走不通，建议保持 gvisor。")
                 }
 
-                Section("规则") {
+                Section {
                     Toggle("剔除 geo 规则", isOn: $settings.stripGeo)
+                } header: {
+                    Text("规则")
                 } footer: {
                     Text("订阅里的 GEOIP/GEOSITE 规则需加载 geo 数据库，扩展内存有限易崩。默认剔除。")
                 }
 
-                Section("外部控制") {
+                Section {
                     HStack {
                         Text("端口")
                         Spacer()
@@ -43,6 +47,8 @@ struct SettingsView: View {
                             .textInputAutocapitalization(.never)
                     }
                     Toggle("允许局域网访问", isOn: $settings.allowLan)
+                } header: {
+                    Text("外部控制")
                 } footer: {
                     Text("供主 App 访问内核 API。一般保持默认 9090、无密钥、仅本机。")
                 }
