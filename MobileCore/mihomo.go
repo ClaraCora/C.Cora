@@ -234,15 +234,40 @@ func filterGeoRules(rules []any) []any {
 	return out
 }
 
-// QueryProxies 返回所有代理与策略组的 JSON（等价 mihomo REST GET /proxies）。
-// 策略组会序列化出 type/now/all，主 App 据此渲染可切换的节点列表。
-// 对应 Swift 侧 `MihomoQueryProxies()`。
+// QueryProxies 返回**精简**的策略组 JSON：{"proxies":{<组名>:{type,now,all}}}。
+//
+// 为什么精简：完整 tunnel.Proxies() 含每个节点对象 + 测速 history + GLOBAL 列全部节点，
+// 多节点订阅可达数百 KB，超过 sendProviderMessage IPC 的响应体积上限会被丢成空响应。
+// UI 只需各策略组的 type/当前选中/成员名，这里只保留这三项，体积砍到几十分之一。
+// 实现：先按官方方式整体 Marshal（各代理用自身 MarshalJSON 吐出 all/now/type），
+// 再筛出带 "all" 的（即策略组），只取三字段重新打包。
 func QueryProxies() string {
-	data, err := json.Marshal(map[string]any{"proxies": tunnel.Proxies()})
+	raw, err := json.Marshal(tunnel.Proxies())
 	if err != nil {
-		return `{"proxies":{},"error":"` + err.Error() + `"}`
+		return `{"proxies":{},"error":"marshal: ` + err.Error() + `"}`
 	}
-	return string(data)
+	var full map[string]map[string]any
+	if err := json.Unmarshal(raw, &full); err != nil {
+		return `{"proxies":{},"error":"unmarshal: ` + err.Error() + `"}`
+	}
+
+	groups := map[string]any{}
+	for name, p := range full {
+		if _, isGroup := p["all"]; !isGroup {
+			continue // 只有策略组带 all
+		}
+		groups[name] = map[string]any{
+			"type": p["type"],
+			"now":  p["now"],
+			"all":  p["all"],
+		}
+	}
+
+	out, err := json.Marshal(map[string]any{"proxies": groups})
+	if err != nil {
+		return `{"proxies":{},"error":"repack: ` + err.Error() + `"}`
+	}
+	return string(out)
 }
 
 // SelectProxy 在指定策略组里选定某节点（等价 REST PUT /proxies/{name}）。

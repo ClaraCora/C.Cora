@@ -130,9 +130,17 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                                          : ["ok": false, "error": err?.localizedDescription ?? "未知错误"]
             completionHandler?((try? JSONSerialization.data(withJSONObject: resp)) ?? Data())
         default: // getLogs 及未知命令都回传日志，便于排查
+            // 日志可能很大，IPC 响应有体积上限 → 只回传末尾约 24KB，取最新内容。
             let body = "[cmd=\(cmd)]\n" + collectLogs()
-            completionHandler?(Data(body.utf8))
+            completionHandler?(Self.tailData(body, maxBytes: 24 * 1024))
         }
+    }
+
+    /// 取字符串末尾不超过 maxBytes 的 UTF-8 数据（避免 IPC 响应超限被丢成空响应）。
+    private static func tailData(_ s: String, maxBytes: Int) -> Data {
+        let data = Data(s.utf8)
+        guard data.count > maxBytes else { return data }
+        return Data("…（已截断，仅显示最新 \(maxBytes / 1024)KB）\n".utf8) + data.suffix(maxBytes)
     }
 
     /// 汇总 NE 步骤日志（内存）+ mihomo 内核 run.log（home 目录）。
