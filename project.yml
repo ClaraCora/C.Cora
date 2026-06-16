@@ -46,6 +46,9 @@ targets:
       # 把 NE 扩展嵌入到 App 的 PlugIns 里
       - target: MiClashTunnel
         embed: true
+      # 控制中心小组件扩展
+      - target: MiClashControl
+        embed: true
       # mihomo 内核框架（CI 由 gomobile bind 产出）。
       # gomobile 的 iOS 输出是静态框架 → 只链接、不嵌入（embed: false）。
       - framework: Vendor/Mihomo.xcframework
@@ -68,6 +71,21 @@ targets:
       # mihomo 内核必须在 NE 进程内运行（代理逻辑所在）。静态框架，只链接不嵌入。
       - framework: Vendor/Mihomo.xcframework
         embed: false
+
+  # ──────────────────── 控制中心小组件 ───────────────────
+  # iOS 18+ ControlWidget：控制中心里一个「代理开关」磁贴，点击启停 NE 隧道。
+  # 只用系统框架（WidgetKit/AppIntents/NetworkExtension，Swift 自动链接），不碰 mihomo。
+  MiClashControl:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: MiClashControl
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.miclash.app.control
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: MiClashControl/Info.plist
+        CODE_SIGN_ENTITLEMENTS: MiClashControl/MiClashControl.entitlements
 
 # 显式 scheme，确保 CI 里 `xcodebuild -scheme MiClash` 能找到（含嵌入的 NE 扩展）
 schemes:

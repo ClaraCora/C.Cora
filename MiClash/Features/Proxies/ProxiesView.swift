@@ -94,7 +94,7 @@ private struct GroupCard: View {
                 .onTapGesture(perform: onToggle)
 
             if isExpanded {
-                VStack(spacing: 4) {
+                VStack(spacing: 8) {
                     ForEach(group.all, id: \.self) { node in
                         ProxyNodeRow(
                             node: node,
@@ -102,13 +102,25 @@ private struct GroupCard: View {
                             selectable: group.selectable,
                             delay: delays[node])
                         .padding(.horizontal, 14)
-                        .frame(minHeight: 34)
-                        .contentShape(Rectangle())
+                        .padding(.vertical, 10)
+                        .background(
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .fill(Color(uiColor: .tertiarySystemGroupedBackground))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .strokeBorder(node == group.now
+                                              ? Color.accentColor.opacity(0.55)
+                                              : Color.clear,
+                                              lineWidth: 1.5)
+                        )
+                        .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                         .onTapGesture { onSelect(node) }
                     }
                 }
-                .padding(.horizontal, 8)
-                .padding(.bottom, 10)
+                .padding(.horizontal, 12)
+                .padding(.top, 4)
+                .padding(.bottom, 12)
             }
         }
         .background(
