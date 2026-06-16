@@ -23,10 +23,16 @@ import (
 	"github.com/metacubex/mihomo/config"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/hub/executor"
+	"github.com/metacubex/mihomo/hub/route"
 	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/tunnel"
 	"gopkg.in/yaml.v3"
 )
+
+// ControllerAddr 是 NE 内 mihomo external-controller 的监听地址。
+// 主 App 经 sendProviderMessage IPC 在重签环境下不投递，改用本地回环 HTTP 直连——
+// 127.0.0.1 是 loopback，不经 tun，跨进程可达，是 clash 类 iOS App 的通用做法。
+const ControllerAddr = "127.0.0.1:9090"
 
 // homeDir 是 mihomo 工作目录（= App Group 容器），run.log 也写在这里。
 var (
@@ -125,6 +131,11 @@ func StartWithFd(fd int, configYAML string) (err error) {
 	appendRunLog("ParseRawConfig 成功，开始 ApplyConfig")
 	executor.ApplyConfig(cfg, true)
 	appendRunLog("ApplyConfig 返回，内核已启动")
+
+	// executor.ApplyConfig 不会起 external-controller，需手动起（ReCreate 可重复调用）。
+	// 无 secret，仅绑 127.0.0.1，个人本机用。主 App 据此 HTTP 直连查/切策略组。
+	route.ReCreateServer(&route.Config{Addr: ControllerAddr})
+	appendRunLog("external-controller 已启动: " + ControllerAddr)
 	return nil
 }
 
@@ -167,6 +178,11 @@ func StartWithConfig(fd int, configYAML string) (err error) {
 	appendRunLog("ParseRawConfig 成功，开始 ApplyConfig")
 	executor.ApplyConfig(cfg, true)
 	appendRunLog("ApplyConfig 返回，内核已启动")
+
+	// executor.ApplyConfig 不会起 external-controller，需手动起（ReCreate 可重复调用）。
+	// 无 secret，仅绑 127.0.0.1，个人本机用。主 App 据此 HTTP 直连查/切策略组。
+	route.ReCreateServer(&route.Config{Addr: ControllerAddr})
+	appendRunLog("external-controller 已启动: " + ControllerAddr)
 	return nil
 }
 

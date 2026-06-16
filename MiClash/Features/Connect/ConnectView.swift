@@ -49,8 +49,8 @@ struct ConnectView: View {
                     .padding(.horizontal)
             }
 
-            // 排查入口：读取 NE/mihomo 落盘日志，定位 tun 启动失败在哪一步
-            Button("查看日志") { showLog = true }
+            // 排查入口：探测 NE 内 mihomo external-controller 是否可达
+            Button("内核状态") { showLog = true }
                 .font(.footnote)
 
             Spacer()
@@ -70,16 +70,16 @@ struct ConnectView: View {
             await core.refreshStatus()
         }
         .sheet(isPresented: $showLog) {
-            LogView().environmentObject(core)
+            LogView()
         }
     }
 }
 
-/// 日志查看页：经 sendProviderMessage 向运行中的 NE 索取日志（不依赖 App Group）。
+/// 内核状态页：探测 NE 内 mihomo external-controller 是否可达（GET /version + /proxies 计数）。
+/// 这条本地 HTTP 通道取代了已失效的 sendProviderMessage IPC。
 private struct LogView: View {
-    @EnvironmentObject private var core: CoreStateManager
     @Environment(\.dismiss) private var dismiss
-    @State private var text = "加载中…"
+    @State private var text = "探测中…"
 
     var body: some View {
         NavigationStack {
@@ -90,7 +90,7 @@ private struct LogView: View {
                     .textSelection(.enabled)
                     .padding()
             }
-            .navigationTitle("NE 运行日志")
+            .navigationTitle("内核状态")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
@@ -105,7 +105,25 @@ private struct LogView: View {
     }
 
     private func reload() async {
-        text = "拉取中…"
-        text = await core.fetchLogs()
+        text = "探测 http://127.0.0.1:9090 …"
+        do {
+            let version = try await MihomoAPI.version()
+            let obj = try await MihomoAPI.proxiesJSON()
+            let proxies = (obj["proxies"] as? [String: Any]) ?? [:]
+            let groupCount = proxies.values.compactMap { ($0 as? [String: Any])?["all"] }.count
+            text = """
+            ✅ external-controller 可达
+            版本：\(version)
+            代理/组总数：\(proxies.count)
+            策略组数：\(groupCount)
+            """
+        } catch {
+            text = """
+            ❌ 连不上内核 http://127.0.0.1:9090
+            \(error.localizedDescription)
+
+            请确认 VPN 已连接（状态「已连接」）后再探测。
+            """
+        }
     }
 }
