@@ -84,30 +84,27 @@ enum MihomoAPI {
         try check(resp)
     }
 
-    // MARK: - 流式请求
-
-    /// 打开一个 chunked 流（/traffic、/logs），按行返回 JSON。
-    /// 调用方在 for-await 里逐行解析；取消所在 Task 即断流。
-    static func lineStream(path: String) async throws -> AsyncThrowingStream<[String: Any], Error> {
-        let req = URLRequest(url: base.appendingPathComponent(path))
-        let (bytes, resp) = try await streamSession.bytes(for: req)
+    /// GET /group/{name}/delay —— 测试策略组内所有节点延迟，返回 node→毫秒（不通的节点不在 map 里）。
+    static func groupDelay(group: String,
+                           testURL: String = "http://www.gstatic.com/generate_204",
+                           timeout: Int = 5000) async throws -> [String: Int] {
+        let url = base.appendingPathComponent("group").appendingPathComponent(group).appendingPathComponent("delay")
+        var comps = URLComponents(url: url, resolvingAgainstBaseURL: false)!
+        comps.queryItems = [
+            URLQueryItem(name: "url", value: testURL),
+            URLQueryItem(name: "timeout", value: String(timeout)),
+        ]
+        // 测速可能数秒，用更宽松的超时
+        var req = URLRequest(url: comps.url!)
+        req.timeoutInterval = TimeInterval(timeout) / 1000 + 5
+        let (data, resp) = try await streamSession.data(for: req)
         try check(resp)
-        return AsyncThrowingStream { continuation in
-            let task = Task {
-                do {
-                    for try await line in bytes.lines {
-                        guard let d = line.data(using: .utf8),
-                              let obj = try JSONSerialization.jsonObject(with: d) as? [String: Any]
-                        else { continue }
-                        continuation.yield(obj)
-                    }
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
-            }
-            continuation.onTermination = { _ in task.cancel() }
+        let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        var result: [String: Int] = [:]
+        for (k, v) in obj {
+            if let n = (v as? NSNumber)?.intValue { result[k] = n }
         }
+        return result
     }
 
     private static func check(_ resp: URLResponse) throws {

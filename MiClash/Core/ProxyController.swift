@@ -24,6 +24,11 @@ final class ProxyController: ObservableObject {
     @Published var isLoading = false
     @Published var error: String?
 
+    /// 节点延迟（毫秒），node 名 → ms。0/缺失表示未测或超时。
+    @Published private(set) var delays: [String: Int] = [:]
+    /// 正在测速的策略组名。
+    @Published private(set) var testing: Set<String> = []
+
     func load() async {
         isLoading = true
         error = nil
@@ -86,6 +91,18 @@ final class ProxyController: ObservableObject {
             await load()
         } catch {
             self.error = "切换失败：\(error.localizedDescription)"
+        }
+    }
+
+    /// 对某策略组做延迟测试，结果并入 delays。
+    func testGroup(_ name: String) async {
+        testing.insert(name)
+        defer { testing.remove(name) }
+        do {
+            let result = try await MihomoAPI.groupDelay(group: name)
+            for (node, ms) in result { delays[node] = ms }
+        } catch {
+            self.error = "测速失败：\(error.localizedDescription)"
         }
     }
 }

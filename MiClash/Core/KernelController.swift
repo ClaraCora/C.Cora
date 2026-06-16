@@ -22,7 +22,7 @@ final class KernelController: ObservableObject {
     @Published var down: Int64 = 0
     @Published var reachable = false
 
-    private var trafficTask: Task<Void, Never>?
+    private let stream = MihomoStream()
 
     /// 读取当前模式（连通即标记 reachable）。
     func loadMode() async {
@@ -48,32 +48,21 @@ final class KernelController: ObservableObject {
 
     /// 开始订阅速率流（连接后调用）。
     func startTraffic() {
-        guard trafficTask == nil else { return }
-        trafficTask = Task { [weak self] in
-            while !Task.isCancelled {
-                do {
-                    let stream = try await MihomoAPI.lineStream(path: "traffic")
-                    self?.reachable = true
-                    for try await obj in stream {
-                        if Task.isCancelled { break }
-                        let up = (obj["up"] as? NSNumber)?.int64Value ?? 0
-                        let down = (obj["down"] as? NSNumber)?.int64Value ?? 0
-                        self?.up = up
-                        self?.down = down
-                    }
-                } catch {
-                    // 断流（如刚连上内核还没起）：稍后重试
-                    self?.reachable = false
-                    try? await Task.sleep(nanoseconds: 1_500_000_000)
-                }
+        stream.onObject = { [weak self] obj in
+            let up = (obj["up"] as? NSNumber)?.int64Value ?? 0
+            let down = (obj["down"] as? NSNumber)?.int64Value ?? 0
+            Task { @MainActor in
+                self?.up = up
+                self?.down = down
+                self?.reachable = true
             }
         }
+        stream.start(path: "traffic")
     }
 
     /// 停止速率流（断开/页面消失）。
     func stopTraffic() {
-        trafficTask?.cancel()
-        trafficTask = nil
+        stream.stop()
         up = 0
         down = 0
     }

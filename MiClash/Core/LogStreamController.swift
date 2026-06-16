@@ -15,36 +15,28 @@ final class LogStreamController: ObservableObject {
     @Published var isStreaming = false
     @Published var error: String?
 
-    private var task: Task<Void, Never>?
+    private let stream = MihomoStream()
     private let maxLines = 500
 
     func start() {
-        guard task == nil else { return }
         isStreaming = true
         error = nil
-        task = Task { [weak self] in
-            while !Task.isCancelled {
-                do {
-                    let stream = try await MihomoAPI.lineStream(path: "logs")
-                    self?.error = nil
-                    for try await obj in stream {
-                        if Task.isCancelled { break }
-                        let line = LogLine(
-                            type: obj["type"] as? String ?? "info",
-                            payload: obj["payload"] as? String ?? "")
-                        self?.append(line)
-                    }
-                } catch {
-                    self?.error = "未连接内核（请先连接 VPN）"
-                    try? await Task.sleep(nanoseconds: 1_500_000_000)
-                }
+        stream.onObject = { [weak self] obj in
+            let line = LogLine(
+                type: obj["type"] as? String ?? "info",
+                payload: obj["payload"] as? String ?? "")
+            Task { @MainActor in self?.append(line) }
+        }
+        stream.onClose = { [weak self] _ in
+            Task { @MainActor in
+                if self?.lines.isEmpty ?? true { self?.error = "未连接内核（请先连接 VPN）" }
             }
         }
+        stream.start(path: "logs")
     }
 
     func stop() {
-        task?.cancel()
-        task = nil
+        stream.stop()
         isStreaming = false
     }
 
