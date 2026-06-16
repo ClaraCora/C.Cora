@@ -38,10 +38,14 @@ final class TunnelManager {
         return mgr
     }
 
-    /// 启动隧道。Phase 0 不带参数；后续可通过 options 把配置路径等传给 NE。
-    func start() async throws {
+    /// 启动隧道，并把订阅配置经 options 下发给 NE（不依赖 App Group）。
+    /// configYAML 为空串时 NE 会用缓存/DIRECT 兜底。
+    func start(configYAML: String) async throws {
         let mgr = try await loadOrCreateManager()
-        try mgr.connection.startVPNTunnel()
+        let options: [String: NSObject] = configYAML.isEmpty
+            ? [:]
+            : ["config": configYAML as NSString]
+        try mgr.connection.startVPNTunnel(options: options)
     }
 
     /// 停止隧道。
@@ -55,34 +59,36 @@ final class TunnelManager {
         return mgr.connection.status
     }
 
-    /// 向运行中的 NE 索取日志（官方 sendProviderMessage IPC，不依赖 App Group）。
-    /// 仅在 VPN 已连接时可用——NE 已停止时无法通信。
-    func fetchLogs() async -> String {
-        // 直接从系统重新加载现有配置，拿正在运行的那个 session（不 saveToPreferences，避免扰动）。
+    /// 向运行中的 NE 发送一条 sendProviderMessage 请求并取回响应（不依赖 App Group）。
+    /// 仅 VPN 已连接时可用。失败/未连接返回 nil。
+    func sendMessage(_ payload: Data) async -> Data? {
+        // 重新加载现有配置，拿正在运行的 session（不 saveToPreferences，避免扰动）。
         guard let all = try? await NETunnelProviderManager.loadAllFromPreferences(),
-              let mgr = all.first else {
-            return "(未找到 VPN 配置——请先点连接)"
-        }
+              let mgr = all.first else { return nil }
         self.manager = mgr
 
-        guard let session = mgr.connection as? NETunnelProviderSession else {
-            return "(连接对象不是 NETunnelProviderSession)"
-        }
-        guard session.status == .connected else {
-            return "(VPN 当前未连接，状态 rawValue=\(session.status.rawValue)。\n"
-                 + "sendProviderMessage 需 NE 正在运行，请先点连接、待状态变为已连接后再取日志。\n"
-                 + "若一点就断、根本连不上，说明 mihomo 启动即失败，NE 还没来得及响应。)"
-        }
+        guard let session = mgr.connection as? NETunnelProviderSession,
+              session.status == .connected else { return nil }
 
         return await withCheckedContinuation { cont in
             do {
-                try session.sendProviderMessage(Data("getLogs".utf8)) { resp in
-                    let text = resp.flatMap { String(data: $0, encoding: .utf8) }
-                    cont.resume(returning: text ?? "(NE 无响应)")
+                try session.sendProviderMessage(payload) { resp in
+                    cont.resume(returning: resp)
                 }
             } catch {
-                cont.resume(returning: "(sendProviderMessage 失败：\(error.localizedDescription))")
+                cont.resume(returning: nil)
             }
         }
+    }
+
+    /// 取 NE/内核日志（getLogs 命令）。
+    func fetchLogs() async -> String {
+        let payload = (try? JSONSerialization.data(withJSONObject: ["cmd": "getLogs"]))
+            ?? Data("getLogs".utf8)
+        guard let resp = await sendMessage(payload),
+              let text = String(data: resp, encoding: .utf8) else {
+            return "(NE 无响应——请先点连接、待状态「已连接」后再取日志；若一点就断，说明 mihomo 启动即失败)"
+        }
+        return text
     }
 }

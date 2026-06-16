@@ -4,13 +4,16 @@ import SwiftUI
 /// 全局状态机 CoreStateManager 以 @StateObject 注入环境，供所有视图单向绑定。
 @main
 struct MiClashApp: App {
-    /// 全局单例状态机：Phase 0 只负责 VPN 启停与状态；后续接入 mihomo API。
+    /// 全局单例状态机：VPN 启停/状态、与 NE 的 IPC。
     @StateObject private var core = CoreStateManager.shared
+    /// 订阅 Store：存取/拉取订阅，连接时提供当前配置。
+    @StateObject private var subscriptions = SubscriptionStore.shared
 
     var body: some Scene {
         WindowGroup {
-            ConnectView()
+            RootView()
                 .environmentObject(core)
+                .environmentObject(subscriptions)
         }
     }
 }

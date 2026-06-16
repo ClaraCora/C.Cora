@@ -80,11 +80,19 @@ final class CoreStateManager: ObservableObject {
             case .connected, .connecting, .reasserting:
                 tunnel.stop()
             default:
-                try await tunnel.start()
+                // 连接时下发当前订阅配置；无订阅则传空串，NE 用缓存/DIRECT 兜底。
+                let yaml = SubscriptionStore.shared.activeYAML ?? ""
+                try await tunnel.start(configYAML: yaml)
             }
         } catch {
             lastError = error.localizedDescription
         }
+    }
+
+    /// 向运行中的 NE 发 JSON 命令并取回响应（策略组查询/切换、日志等共用）。
+    func sendMessage(_ object: [String: Any]) async -> Data? {
+        guard let payload = try? JSONSerialization.data(withJSONObject: object) else { return nil }
+        return await tunnel.sendMessage(payload)
     }
 
     /// 给 UI 用的友好状态文案。

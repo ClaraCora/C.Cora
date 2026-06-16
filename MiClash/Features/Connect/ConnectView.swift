@@ -6,6 +6,7 @@ import SwiftUI
 /// 这是后续四大页面（Dashboard/Proxies/Profiles/Settings）统一遵循的 MVVM 范式雏形。
 struct ConnectView: View {
     @EnvironmentObject private var core: CoreStateManager
+    @EnvironmentObject private var subscriptions: SubscriptionStore
     @State private var showLog = false
 
     var body: some View {
@@ -58,7 +59,7 @@ struct ConnectView: View {
                 Text(core.coreVersion)
                     .font(.caption.monospaced())
                     .foregroundStyle(.secondary)
-                Text("Phase 2 · DIRECT 模式 tun 接管流量")
+                Text(subscriptions.selected.map { "当前订阅：\($0.name)" } ?? "无订阅 · DIRECT 直连模式")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }

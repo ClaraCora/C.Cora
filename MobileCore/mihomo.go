@@ -9,18 +9,23 @@
 package mihomo
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/metacubex/mihomo/adapter/outboundgroup"
 	"github.com/metacubex/mihomo/config"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/hub/executor"
 	"github.com/metacubex/mihomo/log"
+	"github.com/metacubex/mihomo/tunnel"
+	"gopkg.in/yaml.v3"
 )
 
 // homeDir 是 mihomo 工作目录（= App Group 容器），run.log 也写在这里。
@@ -121,6 +126,139 @@ func StartWithFd(fd int, configYAML string) (err error) {
 	executor.ApplyConfig(cfg, true)
 	appendRunLog("ApplyConfig 返回，内核已启动")
 	return nil
+}
+
+// StartWithConfig 用订阅/自定义 YAML 启动内核：先把订阅配置与「iOS 必需的安全设置」
+// 合并、并剔除 geo 规则，再注入 fd 启动。对应 Swift 侧 `MihomoStartWithConfig(_:_:error:)`。
+//
+// 为什么在 Go 侧统一覆盖：tun/dns/fake-ip/gvisor 这些 iOS NE 约束不能让订阅随意改写，
+// 否则 tun 不通或 OOM；集中在这里强制，订阅只贡献 proxies/proxy-groups/rules。
+func StartWithConfig(fd int, configYAML string) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			stack := fmt.Sprintf("panic: %v\n%s", r, debug.Stack())
+			appendRunLog("===== mihomo 启动 panic =====\n" + stack)
+			err = fmt.Errorf("mihomo panic: %v", r)
+		}
+	}()
+
+	appendRunLog(fmt.Sprintf("StartWithConfig: fd=%d 合并 iOS 安全设置并剔除 geo 规则", fd))
+
+	merged, err := mergeConfig(configYAML)
+	if err != nil {
+		appendRunLog("合并配置失败: " + err.Error())
+		return err
+	}
+
+	rawCfg, err := config.UnmarshalRawConfig(merged)
+	if err != nil {
+		appendRunLog("UnmarshalRawConfig 失败: " + err.Error())
+		return err
+	}
+	rawCfg.Tun.Enable = true
+	rawCfg.Tun.FileDescriptor = fd
+
+	cfg, err := config.ParseRawConfig(rawCfg)
+	if err != nil {
+		appendRunLog("ParseRawConfig 失败: " + err.Error())
+		return err
+	}
+
+	appendRunLog("ParseRawConfig 成功，开始 ApplyConfig")
+	executor.ApplyConfig(cfg, true)
+	appendRunLog("ApplyConfig 返回，内核已启动")
+	return nil
+}
+
+// mergeConfig 把订阅 YAML 与 iOS 必需设置合并：强制 tun/dns、关 geo 下载、剔除 geo 规则。
+// fd 不在此写入（运行期值），由 StartWithConfig 解析后注入 Tun.FileDescriptor。
+func mergeConfig(subYAML string) ([]byte, error) {
+	m := map[string]any{}
+	if strings.TrimSpace(subYAML) != "" {
+		if err := yaml.Unmarshal([]byte(subYAML), &m); err != nil {
+			return nil, err
+		}
+	}
+
+	// 强制 tun：gvisor 栈（iOS NE 里 system 栈 TCP 不通），dns 劫持，自动路由。
+	m["tun"] = map[string]any{
+		"enable":                true,
+		"stack":                 "gvisor",
+		"dns-hijack":            []any{"any:53"},
+		"auto-route":            true,
+		"auto-detect-interface": true,
+		"mtu":                   1500,
+	}
+	// 强制 dns：tun 必须 fake-ip + 纯 IP 的 DoH 上游（无需二次解析，杜绝死循环）。
+	m["dns"] = map[string]any{
+		"enable":        true,
+		"ipv6":          false,
+		"enhanced-mode": "fake-ip",
+		"fake-ip-range": "198.18.0.1/16",
+		"nameserver": []any{
+			"https://223.5.5.5/dns-query",
+			"https://1.1.1.1/dns-query",
+		},
+	}
+	// 关 geo 数据库下载/更新（NE 内会 OOM）。
+	m["geo-auto-update"] = false
+	m["geodata-mode"] = false
+	if _, ok := m["mode"]; !ok {
+		m["mode"] = "rule"
+	}
+	// 剔除 geo 规则（GEOIP/GEOSITE 需 geo 库，NE 50MB 限制下易 OOM）。
+	if rules, ok := m["rules"].([]any); ok {
+		m["rules"] = filterGeoRules(rules)
+	}
+
+	return yaml.Marshal(m)
+}
+
+// filterGeoRules 删除以 GEOIP,/GEOSITE,/GEODATA, 开头的规则条目（不分大小写）。
+func filterGeoRules(rules []any) []any {
+	out := make([]any, 0, len(rules))
+	dropped := 0
+	for _, r := range rules {
+		if s, ok := r.(string); ok {
+			u := strings.ToUpper(strings.TrimSpace(s))
+			if strings.HasPrefix(u, "GEOIP,") || strings.HasPrefix(u, "GEOSITE,") || strings.HasPrefix(u, "GEODATA,") {
+				dropped++
+				continue
+			}
+		}
+		out = append(out, r)
+	}
+	if dropped > 0 {
+		appendRunLog(fmt.Sprintf("剔除 geo 规则 %d 条", dropped))
+	}
+	return out
+}
+
+// QueryProxies 返回所有代理与策略组的 JSON（等价 mihomo REST GET /proxies）。
+// 策略组会序列化出 type/now/all，主 App 据此渲染可切换的节点列表。
+// 对应 Swift 侧 `MihomoQueryProxies()`。
+func QueryProxies() string {
+	data, err := json.Marshal(map[string]any{"proxies": tunnel.Proxies()})
+	if err != nil {
+		return `{"proxies":{},"error":"` + err.Error() + `"}`
+	}
+	return string(data)
+}
+
+// SelectProxy 在指定策略组里选定某节点（等价 REST PUT /proxies/{name}）。
+// 仅 Selector 类策略组可选；URLTest/Fallback 等自动组不支持。
+// 对应 Swift 侧 `MihomoSelectProxy(_:_:error:)`。
+func SelectProxy(group, name string) error {
+	proxies := tunnel.Proxies()
+	p, exist := proxies[group]
+	if !exist {
+		return fmt.Errorf("策略组不存在: %s", group)
+	}
+	selector, ok := p.Adapter().(outboundgroup.SelectAble)
+	if !ok {
+		return fmt.Errorf("%s 不是可选择的策略组（Selector）", group)
+	}
+	return selector.Set(name)
 }
 
 // Stop 关闭内核与所有监听器。对应 Swift 侧 `MihomoStop()`。

@@ -26,6 +26,10 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         FileLog.write("startTunnel：开始配置网络设置")
         log.info("startTunnel：开始配置网络设置")
 
+        // 配置经 startVPNTunnel(options:) 下发（不依赖 App Group）。手动连接时主 App 会带 "config"。
+        let incomingConfig = (options?["config"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        FileLog.write("收到配置：\(incomingConfig != nil ? "来自 options(\(incomingConfig!.count) 字节)" : "无（将用缓存/DIRECT 兜底）")")
+
         let settings = makeNetworkSettings()
         setTunnelNetworkSettings(settings) { [weak self] error in
             guard let self else { return }
@@ -57,23 +61,43 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             FileLog.write("home dir = \(home)（\(usingShared ? "App Group 共享" : "NE 沙盒回退")），调用 MihomoSetup")
             MihomoSetup(home)
 
+            // 确定最终配置：options 配置 → 缓存文件 → 内置 DIRECT 兜底。
+            // 收到 options 配置时写入缓存，供系统重连（startTunnel 无 options）复用。
+            let configYAML = self.resolveConfig(incoming: incomingConfig, home: home)
+
             // gomobile 把带 error 返回的 Go 函数生成为「返回 BOOL + NSError** 出参」的 C 函数，
             // 不会自动桥接成 Swift throws，所以用经典 NSError 指针写法：成功返回 true。
-            FileLog.write("调用 MihomoStartWithFd…")
+            FileLog.write("调用 MihomoStartWithConfig…")
             var startError: NSError?
-            let ok = MihomoStartWithFd(Int(fd), MihomoConfig.directModeYAML(), &startError)
+            let ok = MihomoStartWithConfig(Int(fd), configYAML, &startError)
             if ok {
-                FileLog.write("MihomoStartWithFd 返回成功（DIRECT 模式）")
-                self.log.info("mihomo 启动成功（DIRECT 模式）")
+                FileLog.write("MihomoStartWithConfig 返回成功")
+                self.log.info("mihomo 启动成功")
                 completionHandler(nil)
             } else {
                 let err = startError ?? NSError(domain: "MiClashTunnel", code: -3,
                     userInfo: [NSLocalizedDescriptionKey: "mihomo 启动失败（未知错误）"])
-                FileLog.write("MihomoStartWithFd 失败：\(err.localizedDescription)")
+                FileLog.write("MihomoStartWithConfig 失败：\(err.localizedDescription)")
                 self.log.error("mihomo 启动失败：\(err.localizedDescription, privacy: .public)")
                 completionHandler(err)
             }
         }
+    }
+
+    /// 决定最终配置 YAML：options 配置（并缓存）→ 缓存文件 → 内置 DIRECT 兜底。
+    private func resolveConfig(incoming: String?, home: String) -> String {
+        let cachePath = (home as NSString).appendingPathComponent("config.yaml")
+        if let cfg = incoming {
+            try? cfg.write(toFile: cachePath, atomically: true, encoding: .utf8)
+            FileLog.write("使用 options 配置并写入缓存 config.yaml")
+            return cfg
+        }
+        if let cached = try? String(contentsOfFile: cachePath, encoding: .utf8), !cached.isEmpty {
+            FileLog.write("使用缓存 config.yaml（\(cached.count) 字节）")
+            return cached
+        }
+        FileLog.write("无订阅配置，使用内置 DIRECT 兜底")
+        return MihomoConfig.directModeYAML()
     }
 
     override func stopTunnel(with reason: NEProviderStopReason,
@@ -85,15 +109,30 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     /// 主 App 经 sendProviderMessage 发来的请求（不依赖 App Group 的官方 IPC）。
-    /// 当前不管收到什么命令都回传日志，并在开头标注「已被调用 + 收到的命令」，
-    /// 用于确认 handleAppMessage 是否真被触发、命令是否如期到达（排查「NE 无响应」）。
+    /// JSON 命令协议：{"cmd":"getLogs"|"queryProxies"|"selectProxy","group":..,"name":..}。
     /// 关键：completionHandler 必须**非 nil 回调**，否则主 App 侧 resp 为 nil。
     override func handleAppMessage(_ messageData: Data,
                                   completionHandler: ((Data?) -> Void)?) {
-        let cmd = String(data: messageData, encoding: .utf8) ?? "(非UTF8)"
-        FileLog.write("handleAppMessage 被调用，cmd=\(cmd)")
-        let body = "[handleAppMessage 命中，cmd=\(cmd)]\n" + collectLogs()
-        completionHandler?(Data(body.utf8))
+        let obj = (try? JSONSerialization.jsonObject(with: messageData)) as? [String: Any]
+        let cmd = (obj?["cmd"] as? String) ?? String(data: messageData, encoding: .utf8) ?? ""
+        FileLog.write("handleAppMessage：cmd=\(cmd)")
+
+        switch cmd {
+        case "queryProxies":
+            // 直接回传 mihomo 的 proxies JSON
+            completionHandler?(Data(MihomoQueryProxies().utf8))
+        case "selectProxy":
+            let group = (obj?["group"] as? String) ?? ""
+            let name = (obj?["name"] as? String) ?? ""
+            var err: NSError?
+            let ok = MihomoSelectProxy(group, name, &err)
+            let resp: [String: Any] = ok ? ["ok": true]
+                                         : ["ok": false, "error": err?.localizedDescription ?? "未知错误"]
+            completionHandler?((try? JSONSerialization.data(withJSONObject: resp)) ?? Data())
+        default: // getLogs 及未知命令都回传日志，便于排查
+            let body = "[cmd=\(cmd)]\n" + collectLogs()
+            completionHandler?(Data(body.utf8))
+        }
     }
 
     /// 汇总 NE 步骤日志（内存）+ mihomo 内核 run.log（home 目录）。
