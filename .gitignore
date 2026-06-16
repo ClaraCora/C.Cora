@@ -1,0 +1,19 @@
+# XcodeGen 生成物，不入库
+*.xcodeproj
+*.xcworkspace
+
+# 构建产物
+build/
+DerivedData/
+Payload/
+*.ipa
+*.xcframework
+
+# macOS / Xcode
+.DS_Store
+xcuserdata/
+*.xcuserstate
+
+# Go（Phase 1 起）
+MobileCore/*.a
+MobileCore/*.h

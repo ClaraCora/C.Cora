@@ -1,0 +1,57 @@
+name: Build unsigned IPA
+
+# 在 macos-15（Xcode 16）上构建未签名 ipa。签名由用户用自有开发者证书自理。
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 16
+        run: sudo xcode-select -s /Applications/Xcode_16.app
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build (unsigned)
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project MiClash.xcodeproj \
+            -scheme MiClash \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            clean build
+
+      - name: Package into .ipa (unsigned)
+        run: |
+          set -euo pipefail
+          APP_PATH="build/Build/Products/Release-iphoneos/MiClash.app"
+          if [ ! -d "$APP_PATH" ]; then
+            echo "未找到 $APP_PATH"; exit 1
+          fi
+          rm -rf Payload
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+          zip -qr MiClash-unsigned.ipa Payload
+          echo "已生成 MiClash-unsigned.ipa"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MiClash-unsigned-ipa
+          path: MiClash-unsigned.ipa
+          if-no-files-found: error

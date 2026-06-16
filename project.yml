@@ -1,0 +1,56 @@
+# XcodeGen 工程定义。由 CI 执行 `xcodegen generate` 生成 MiClash.xcodeproj（不入库）。
+# 双 target：主 App + Network Extension（Packet Tunnel）。部署目标 iOS 18.0。
+name: MiClash
+
+options:
+  bundleIdPrefix: com.miclash
+  deploymentTarget:
+    iOS: "18.0"
+  createIntermediateGroups: true
+  # CI 不签名，签名由用户自理
+  defaultConfig: Release
+
+# 全 target 共享的基础构建设置
+settings:
+  base:
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    SWIFT_VERSION: "5.0"
+    # 手动签名占位；CI 用 CODE_SIGNING_ALLOWED=NO 跳过，用户本地用自有证书签
+    CODE_SIGN_STYLE: Manual
+    DEVELOPMENT_TEAM: ""
+    TARGETED_DEVICE_FAMILY: "1"   # 1=iPhone
+
+targets:
+  # ───────────────────────── 主 App ─────────────────────────
+  MiClash:
+    type: application
+    platform: iOS
+    sources:
+      - path: MiClash
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.miclash.app
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: MiClash
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait"
+        CODE_SIGN_ENTITLEMENTS: MiClash/MiClash.entitlements
+    dependencies:
+      # 把 NE 扩展嵌入到 App 的 PlugIns 里
+      - target: MiClashTunnel
+        embed: true
+
+  # ──────────────────── Network Extension ───────────────────
+  MiClashTunnel:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: MiClashTunnel
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.miclash.app.tunnel
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: MiClashTunnel/Info.plist
+        CODE_SIGN_ENTITLEMENTS: MiClashTunnel/MiClashTunnel.entitlements

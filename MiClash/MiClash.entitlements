@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- App Group：与 NE 扩展共享配置文件、日志、状态 -->
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.com.miclash.app</string>
+	</array>
+	<!-- 允许使用 Packet Tunnel 类型的 Network Extension -->
+	<key>com.apple.developer.networking.networkextension</key>
+	<array>
+		<string>packet-tunnel-provider</string>
+	</array>
+</dict>
+</plist>
