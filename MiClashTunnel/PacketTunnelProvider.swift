@@ -85,16 +85,15 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     /// 主 App 经 sendProviderMessage 发来的请求（不依赖 App Group 的官方 IPC）。
-    /// "getLogs" → 回传 NE 内存日志 + mihomo run.log，用于无 Mac 环境下排查。
+    /// 当前不管收到什么命令都回传日志，并在开头标注「已被调用 + 收到的命令」，
+    /// 用于确认 handleAppMessage 是否真被触发、命令是否如期到达（排查「NE 无响应」）。
+    /// 关键：completionHandler 必须**非 nil 回调**，否则主 App 侧 resp 为 nil。
     override func handleAppMessage(_ messageData: Data,
                                   completionHandler: ((Data?) -> Void)?) {
-        let cmd = String(data: messageData, encoding: .utf8) ?? ""
-        switch cmd {
-        case "getLogs":
-            completionHandler?(collectLogs().data(using: .utf8))
-        default:
-            completionHandler?(nil)
-        }
+        let cmd = String(data: messageData, encoding: .utf8) ?? "(非UTF8)"
+        FileLog.write("handleAppMessage 被调用，cmd=\(cmd)")
+        let body = "[handleAppMessage 命中，cmd=\(cmd)]\n" + collectLogs()
+        completionHandler?(Data(body.utf8))
     }
 
     /// 汇总 NE 步骤日志（内存）+ mihomo 内核 run.log（home 目录）。

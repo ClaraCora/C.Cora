@@ -58,14 +58,12 @@ final class TunnelManager {
     /// 向运行中的 NE 索取日志（官方 sendProviderMessage IPC，不依赖 App Group）。
     /// 仅在 VPN 已连接时可用——NE 已停止时无法通信。
     func fetchLogs() async -> String {
-        let mgr: NETunnelProviderManager
-        if let m = manager {
-            mgr = m
-        } else if let m = try? await loadOrCreateManager() {
-            mgr = m
-        } else {
-            return "(无法加载 VPN 配置)"
+        // 直接从系统重新加载现有配置，拿正在运行的那个 session（不 saveToPreferences，避免扰动）。
+        guard let all = try? await NETunnelProviderManager.loadAllFromPreferences(),
+              let mgr = all.first else {
+            return "(未找到 VPN 配置——请先点连接)"
         }
+        self.manager = mgr
 
         guard let session = mgr.connection as? NETunnelProviderSession else {
             return "(连接对象不是 NETunnelProviderSession)"
