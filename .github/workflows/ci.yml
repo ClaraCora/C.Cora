@@ -41,7 +41,10 @@ jobs:
           cd MobileCore
           # 解析依赖版本（首次构建用 @latest，成功后再 pin）
           go get github.com/metacubex/mihomo@latest
-          go get golang.org/x/mobile/bind@latest
+          # 用 tool 指令把 golang.org/x/mobile 钉进模块依赖图，
+          # 否则 go mod tidy 会因源码未直接 import 而剪掉它，导致 gomobile bind 报
+          # "requires golang.org/x/mobile in the current module"
+          go get -tool golang.org/x/mobile/cmd/gobind
           go mod tidy
           # 交叉编译 mihomo 为 iOS 框架（含 device arm64 + simulator 切片）
           gomobile bind -target=ios -o ../Vendor/Mihomo.xcframework .
