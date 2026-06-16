@@ -48,10 +48,16 @@ struct ConnectView: View {
             }
 
             Spacer()
-            Text("Phase 0 · 仅验证 NE 隧道链路")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-                .padding(.bottom, 8)
+            VStack(spacing: 2) {
+                // Phase 1：显示 mihomo 内核版本，证明核心已加载
+                Text(core.coreVersion)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                Text("Phase 1 · 验证 mihomo 内核加载")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.bottom, 8)
         }
         .task {
             // 视图出现时同步一次真实状态（冷启动场景）

@@ -1,6 +1,7 @@
 name: Build unsigned IPA
 
-# 在 macos-15（Xcode 16）上构建未签名 ipa。签名由用户用自有开发者证书自理。
+# 在 macos-15（Xcode 16）上：先用 gomobile 把 mihomo 编成 Mihomo.xcframework，
+# 再生成 Xcode 工程并构建未签名 ipa。签名由用户用自有开发者证书自理。
 on:
   push:
     branches: [ main ]
@@ -16,6 +17,37 @@ jobs:
       - name: Select Xcode 16
         run: sudo xcode-select -s /Applications/Xcode_16.app
 
+      # ───────────── Phase 1：gomobile 编 mihomo 内核 ─────────────
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/Library/Caches/go-build
+          key: ${{ runner.os }}-go-${{ hashFiles('MobileCore/go.sum') }}
+          restore-keys: ${{ runner.os }}-go-
+
+      - name: Build Mihomo.xcframework (gomobile bind)
+        run: |
+          set -euxo pipefail
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          go install golang.org/x/mobile/cmd/gobind@latest
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          cd MobileCore
+          # 解析依赖版本（首次构建用 @latest，成功后再 pin）
+          go get github.com/metacubex/mihomo@latest
+          go get golang.org/x/mobile/bind@latest
+          go mod tidy
+          # 交叉编译 mihomo 为 iOS 框架（含 device arm64 + simulator 切片）
+          gomobile bind -target=ios -o ../Vendor/Mihomo.xcframework .
+          ls -la ../Vendor
+
+      # ───────────── 生成工程并构建 App ─────────────
       - name: Install XcodeGen
         run: brew install xcodegen
 

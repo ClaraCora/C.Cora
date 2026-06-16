@@ -41,6 +41,10 @@ targets:
       # 把 NE 扩展嵌入到 App 的 PlugIns 里
       - target: MiClashTunnel
         embed: true
+      # mihomo 内核框架（CI 由 gomobile bind 产出）。
+      # gomobile 的 iOS 输出是静态框架 → 只链接、不嵌入（embed: false）。
+      - framework: Vendor/Mihomo.xcframework
+        embed: false
 
   # ──────────────────── Network Extension ───────────────────
   MiClashTunnel:

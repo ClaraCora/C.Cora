@@ -24,11 +24,16 @@ final class CoreStateManager: ObservableObject {
     /// 最近一次错误信息（用于 UI 提示）。
     @Published var lastError: String?
 
+    /// mihomo 内核版本号（Phase 1 用于验证核心加载）。
+    @Published private(set) var coreVersion: String = "加载中…"
+
     private let tunnel = TunnelManager()
     private var statusObserver: NSObjectProtocol?
 
     private init() {
         observeVPNStatus()
+        // 调用内核取版本号：能返回即证明 mihomo 已正确链接进 App
+        coreVersion = MihomoCore.version()
         Task { await refreshStatus() }
     }
 
