@@ -20,3 +20,4 @@ MobileCore/*.h
 
 # Claude Code 本地设置
 .claude/
+miclash_old/
