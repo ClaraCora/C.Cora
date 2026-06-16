@@ -47,14 +47,18 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             }
             MihomoSetup(home)
 
-            do {
-                // gomobile：Go 的 error 返回映射为 Swift throws
-                try MihomoStartWithFd(Int(fd), MihomoConfig.directModeYAML())
+            // gomobile 把带 error 返回的 Go 函数生成为「返回 BOOL + NSError** 出参」的 C 函数，
+            // 不会自动桥接成 Swift throws，所以用经典 NSError 指针写法：成功返回 true。
+            var startError: NSError?
+            let ok = MihomoStartWithFd(Int(fd), MihomoConfig.directModeYAML(), &startError)
+            if ok {
                 self.log.info("mihomo 启动成功（DIRECT 模式）")
                 completionHandler(nil)
-            } catch {
-                self.log.error("mihomo 启动失败：\(error.localizedDescription, privacy: .public)")
-                completionHandler(error)
+            } else {
+                let err = startError ?? NSError(domain: "MiClashTunnel", code: -3,
+                    userInfo: [NSLocalizedDescriptionKey: "mihomo 启动失败（未知错误）"])
+                self.log.error("mihomo 启动失败：\(err.localizedDescription, privacy: .public)")
+                completionHandler(err)
             }
         }
     }
