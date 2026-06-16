@@ -70,18 +70,18 @@ final class MihomoStream: NSObject, @unchecked Sendable {
         }
     }
 
-    /// 断流后延迟重连（页面仍可见、未 stop 时）。
+    /// 断流后快速重连（页面仍可见、未 stop 时）；间隙短到几乎无感。
     private func scheduleReconnect() {
         guard active else { return }
-        DispatchQueue.global().asyncAfter(deadline: .now() + 1.5) { [weak self] in
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.5) { [weak self] in
             guard let self, self.active else { return }
             self.connect()
         }
     }
 
-    /// 定时 ping 保活，避免连接被中途回收。
+    /// 频繁 ping 保活，避免连接被中途回收（5s，远小于常见读超时）。
     private func schedulePing(_ gen: Int) {
-        DispatchQueue.global().asyncAfter(deadline: .now() + 15) { [weak self] in
+        DispatchQueue.global().asyncAfter(deadline: .now() + 5) { [weak self] in
             guard let self, self.active, gen == self.generation, let t = self.task else { return }
             t.sendPing { _ in }
             self.schedulePing(gen)

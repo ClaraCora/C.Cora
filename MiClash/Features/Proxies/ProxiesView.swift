@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// 节点页：扁平可折叠列表（默认收起），支持延迟测速，手动切换（仅 Selector 组）。
+/// 节点页：卡片式可折叠列表（每组一张圆角卡片，左右留白、组间留白、无分割线）。
 struct ProxiesView: View {
     @EnvironmentObject private var core: CoreStateManager
     @StateObject private var controller = ProxyController()
@@ -46,33 +46,27 @@ struct ProxiesView: View {
     }
 
     private var groupList: some View {
-        List {
-            ForEach(controller.groups) { group in
-                GroupHeaderRow(
-                    group: group,
-                    isExpanded: expanded.contains(group.name),
-                    isTesting: controller.testing.contains(group.name),
-                    onToggle: { toggle(group.name) },
-                    onTest: { Task { await controller.testGroup(group.name) } })
-
-                if expanded.contains(group.name) {
-                    ForEach(group.all, id: \.self) { node in
-                        ProxyNodeRow(
-                            node: node,
-                            isCurrent: node == group.now,
-                            selectable: group.selectable,
-                            delay: controller.delays[node])
-                        .listRowInsets(EdgeInsets(top: 4, leading: 34, bottom: 4, trailing: 16))
-                        .contentShape(Rectangle())
-                        .onTapGesture {
+        ScrollView {
+            LazyVStack(spacing: 14) {
+                ForEach(controller.groups) { group in
+                    GroupCard(
+                        group: group,
+                        isExpanded: expanded.contains(group.name),
+                        isTesting: controller.testing.contains(group.name),
+                        delays: controller.delays,
+                        onToggle: { toggle(group.name) },
+                        onTest: { Task { await controller.testGroup(group.name) } },
+                        onSelect: { node in
                             guard group.selectable, node != group.now else { return }
                             Task { await controller.select(group: group.name, name: node) }
-                        }
-                    }
+                        })
                 }
             }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 14)
         }
-        .listStyle(.plain)
+        .background(Color(uiColor: .systemGroupedBackground))
+        .scrollIndicators(.hidden)
     }
 
     private func toggle(_ name: String) {
@@ -82,14 +76,44 @@ struct ProxiesView: View {
     }
 }
 
-private struct GroupHeaderRow: View {
+/// 单个策略组卡片：组头 +（展开时）节点列表，整体一张圆角矩形。
+private struct GroupCard: View {
     let group: ProxyGroup
     let isExpanded: Bool
     let isTesting: Bool
+    let delays: [String: Int]
     let onToggle: () -> Void
     let onTest: () -> Void
+    let onSelect: (String) -> Void
 
     var body: some View {
+        VStack(spacing: 0) {
+            header
+                .contentShape(Rectangle())
+                .onTapGesture(perform: onToggle)
+
+            if isExpanded {
+                ForEach(group.all, id: \.self) { node in
+                    ProxyNodeRow(
+                        node: node,
+                        isCurrent: node == group.now,
+                        selectable: group.selectable,
+                        delay: delays[node])
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 9)
+                    .background(node == group.now ? Color.accentColor.opacity(0.08) : .clear)
+                    .contentShape(Rectangle())
+                    .onTapGesture { onSelect(node) }
+                }
+            }
+        }
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(Color(uiColor: .secondarySystemGroupedBackground))
+        )
+    }
+
+    private var header: some View {
         HStack(spacing: 10) {
             Image(systemName: "chevron.right")
                 .font(.caption.weight(.bold))
@@ -119,9 +143,8 @@ private struct GroupHeaderRow: View {
             .buttonStyle(.borderless)
             .disabled(isTesting)
         }
-        .padding(.vertical, 4)
-        .contentShape(Rectangle())
-        .onTapGesture(perform: onToggle)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
     }
 }
 
