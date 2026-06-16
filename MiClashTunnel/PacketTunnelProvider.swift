@@ -45,15 +45,12 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             FileLog.write("拿到 utun fd = \(fd)")
             self.log.info("拿到 utun fd = \(fd, privacy: .public)，启动 mihomo 内核")
 
-            // mihomo 工作目录设为 App Group 容器（可写，且与主 App 共享）
-            guard let home = self.appGroupContainerPath() else {
-                FileLog.write("App Group 容器不可用")
-                self.log.error("无法获取 App Group 容器路径")
-                completionHandler(NSError(domain: "MiClashTunnel", code: -2,
-                    userInfo: [NSLocalizedDescriptionKey: "App Group 容器不可用"]))
-                return
-            }
-            FileLog.write("home dir = \(home)，调用 MihomoSetup")
+            // mihomo 工作目录：优先 App Group 容器（与主 App 共享，日志可被读取）；
+            // App Group 不可用时回退到 NE 自己的沙盒目录——保证代理仍能跑起来，
+            // App Group 只影响“日志/配置共享”，不该卡死整个 VPN。
+            let home = self.appGroupContainerPath() ?? self.fallbackHomePath()
+            let usingShared = self.appGroupContainerPath() != nil
+            FileLog.write("home dir = \(home)（\(usingShared ? "App Group 共享" : "NE 沙盒回退")），调用 MihomoSetup")
             MihomoSetup(home)
 
             // gomobile 把带 error 返回的 Go 函数生成为「返回 BOOL + NSError** 出参」的 C 函数，
@@ -187,5 +184,14 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     /// 用 AppGroup 动态解析实际被授予的 group（兼容重签工具改写 group id 的情况）。
     private func appGroupContainerPath() -> String? {
         AppGroup.containerURL?.path
+    }
+
+    /// 回退 home：NE 进程自己的 Library 目录，永远可写、无需任何 entitlement。
+    /// 仅在 App Group 不可用时用，确保 mihomo 仍有可写工作目录、代理能跑。
+    private func fallbackHomePath() -> String {
+        let dir = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("mihomo", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.path
     }
 }
