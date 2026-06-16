@@ -55,32 +55,54 @@ private struct SubscriptionRow: View {
     let isSelected: Bool
 
     var body: some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                    .foregroundStyle(isSelected ? .green : .secondary)
                 Text(sub.name).font(.headline)
-                Text(sub.url)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                HStack(spacing: 8) {
-                    if sub.nodeCount > 0 {
-                        Text("\(sub.nodeCount) 节点").font(.caption2)
-                    }
-                    if let t = sub.updatedAt {
-                        Text(t.formatted(date: .abbreviated, time: .shortened))
-                            .font(.caption2)
-                    } else {
-                        Text("未拉取").font(.caption2).foregroundStyle(.orange)
-                    }
+                Spacer()
+                if sub.nodeCount > 0 {
+                    Text("\(sub.nodeCount) 节点")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
                 }
-                .foregroundStyle(.tertiary)
             }
-            Spacer()
-            if isSelected {
-                Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+
+            // 流量进度
+            if sub.hasUsage {
+                VStack(alignment: .leading, spacing: 4) {
+                    ProgressView(value: Double(sub.used), total: Double(max(sub.total, 1)))
+                        .tint(usageTint)
+                    HStack {
+                        Text("已用 \(ByteFormat.size(sub.used)) / \(ByteFormat.size(sub.total))")
+                        Spacer()
+                        Text("剩 \(ByteFormat.size(sub.remaining))")
+                    }
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                }
             }
+
+            HStack(spacing: 12) {
+                if let exp = sub.expire {
+                    Label(exp.formatted(date: .numeric, time: .omitted), systemImage: "calendar")
+                        .foregroundStyle(exp < Date() ? .red : .secondary)
+                }
+                if let t = sub.updatedAt {
+                    Label(t.formatted(date: .omitted, time: .shortened), systemImage: "arrow.clockwise")
+                } else {
+                    Text("未拉取").foregroundStyle(.orange)
+                }
+            }
+            .font(.caption2)
+            .foregroundStyle(.tertiary)
         }
-        .padding(.vertical, 2)
+        .padding(.vertical, 4)
+    }
+
+    private var usageTint: Color {
+        let ratio = sub.total > 0 ? Double(sub.used) / Double(sub.total) : 0
+        return ratio > 0.9 ? .red : (ratio > 0.7 ? .orange : .green)
     }
 }
 

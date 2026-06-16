@@ -20,14 +20,25 @@ enum MihomoAPI {
         }
     }
 
-    private static var session: URLSession = {
+    /// 普通请求用的短超时 session。
+    private static let session: URLSession = {
         let cfg = URLSessionConfiguration.ephemeral
         cfg.timeoutIntervalForRequest = 8
         cfg.waitsForConnectivity = false
         return URLSession(configuration: cfg)
     }()
 
-    /// GET /version —— 连通性探测，返回版本串。
+    /// 流式请求（/traffic、/logs）用的长超时 session——每秒有数据，不应超时。
+    private static let streamSession: URLSession = {
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.timeoutIntervalForRequest = 3600
+        cfg.waitsForConnectivity = false
+        return URLSession(configuration: cfg)
+    }()
+
+    // MARK: - 一次性请求
+
+    /// GET /version —— 连通性探测。
     static func version() async throws -> String {
         let (data, resp) = try await session.data(from: base.appendingPathComponent("version"))
         try check(resp)
@@ -35,7 +46,7 @@ enum MihomoAPI {
         return (obj?["version"] as? String) ?? String(data: data, encoding: .utf8) ?? "?"
     }
 
-    /// GET /proxies —— 返回完整 proxies JSON（HTTP 无 IPC 体积限制）。
+    /// GET /proxies —— 完整 proxies JSON（HTTP 无 IPC 体积限制）。
     static func proxiesJSON() async throws -> [String: Any] {
         let (data, resp) = try await session.data(from: base.appendingPathComponent("proxies"))
         try check(resp)
@@ -55,8 +66,63 @@ enum MihomoAPI {
         try check(resp)  // 成功为 204 No Content
     }
 
+    /// GET /configs —— 取当前模式（rule/global/direct）。
+    static func currentMode() async throws -> String {
+        let (data, resp) = try await session.data(from: base.appendingPathComponent("configs"))
+        try check(resp)
+        let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        return (obj?["mode"] as? String) ?? "rule"
+    }
+
+    /// PATCH /configs body {"mode": ...} —— 切换模式。
+    static func setMode(_ mode: String) async throws {
+        var req = URLRequest(url: base.appendingPathComponent("configs"))
+        req.httpMethod = "PATCH"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONSerialization.data(withJSONObject: ["mode": mode])
+        let (_, resp) = try await session.data(for: req)
+        try check(resp)
+    }
+
+    // MARK: - 流式请求
+
+    /// 打开一个 chunked 流（/traffic、/logs），按行返回 JSON。
+    /// 调用方在 for-await 里逐行解析；取消所在 Task 即断流。
+    static func lineStream(path: String) async throws -> AsyncThrowingStream<[String: Any], Error> {
+        let req = URLRequest(url: base.appendingPathComponent(path))
+        let (bytes, resp) = try await streamSession.bytes(for: req)
+        try check(resp)
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    for try await line in bytes.lines {
+                        guard let d = line.data(using: .utf8),
+                              let obj = try JSONSerialization.jsonObject(with: d) as? [String: Any]
+                        else { continue }
+                        continuation.yield(obj)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
     private static func check(_ resp: URLResponse) throws {
         guard let http = resp as? HTTPURLResponse else { throw APIError.badResponse }
         guard (200..<300).contains(http.statusCode) else { throw APIError.badStatus(http.statusCode) }
     }
+}
+
+/// 字节数/速率的人类可读格式化。
+enum ByteFormat {
+    static func size(_ bytes: Int64) -> String {
+        let units = ["B", "KB", "MB", "GB", "TB"]
+        var v = Double(bytes); var i = 0
+        while v >= 1024 && i < units.count - 1 { v /= 1024; i += 1 }
+        return i == 0 ? "\(Int(v)) \(units[i])" : String(format: "%.2f %@", v, units[i])
+    }
+    static func rate(_ bytesPerSec: Int64) -> String { size(bytesPerSec) + "/s" }
 }

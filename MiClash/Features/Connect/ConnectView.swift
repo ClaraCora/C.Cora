@@ -1,83 +1,146 @@
 import SwiftUI
 
-/// Phase 0 的唯一界面：一个连接开关 + 状态显示。
-///
-/// 它只读 CoreStateManager 的状态、调它的方法，自身不持有业务逻辑——
-/// 这是后续四大页面（Dashboard/Proxies/Profiles/Settings）统一遵循的 MVVM 范式雏形。
+/// 连接页：连接开关 + 模式选择（规则/全局/直连）+ 实时速率。
 struct ConnectView: View {
     @EnvironmentObject private var core: CoreStateManager
     @EnvironmentObject private var subscriptions: SubscriptionStore
-    @State private var showLog = false
+    @StateObject private var kernel = KernelController()
+    @State private var showStatus = false
 
     var body: some View {
-        VStack(spacing: 32) {
-            Spacer()
+        NavigationStack {
+            VStack(spacing: 28) {
+                Spacer(minLength: 8)
 
-            Text("MiClash")
-                .font(.largeTitle.bold())
+                statusBadge
 
-            Text(core.statusText)
-                .font(.title3)
-                .foregroundStyle(core.isActive ? .green : .secondary)
+                toggleButton
 
-            // 连接按钮：圆形大开关，状态驱动颜色
-            Button {
-                Task { await core.toggleConnection() }
-            } label: {
-                ZStack {
-                    Circle()
-                        .fill(core.isActive ? Color.green.opacity(0.15) : Color.gray.opacity(0.12))
-                        .frame(width: 160, height: 160)
-                    if core.isBusy {
-                        ProgressView()
-                            .scaleEffect(1.4)
-                    } else {
-                        Image(systemName: "power")
-                            .font(.system(size: 56, weight: .bold))
-                            .foregroundStyle(core.isActive ? .green : .secondary)
-                    }
+                if core.isActive {
+                    rateRow
+                        .transition(.opacity)
+                }
+
+                modePicker
+                    .padding(.horizontal)
+                    .disabled(!core.isActive)
+                    .opacity(core.isActive ? 1 : 0.4)
+
+                if let err = core.lastError {
+                    Text(err)
+                        .font(.footnote)
+                        .foregroundStyle(.red)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal)
+                }
+
+                Spacer()
+
+                footer
+            }
+            .padding(.top, 12)
+            .navigationTitle("MiClash")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("内核状态") { showStatus = true }.font(.footnote)
                 }
             }
-            .buttonStyle(.plain)
-            .disabled(core.isBusy)
-
-            if let err = core.lastError {
-                Text(err)
-                    .font(.footnote)
-                    .foregroundStyle(.red)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal)
+            .animation(.default, value: core.isActive)
+            .task { await core.refreshStatus() }
+            .onChange(of: core.isActive) { _, active in
+                if active {
+                    Task { await kernel.loadMode() }
+                    kernel.startTraffic()
+                } else {
+                    kernel.stopTraffic()
+                }
             }
-
-            // 排查入口：探测 NE 内 mihomo external-controller 是否可达
-            Button("内核状态") { showLog = true }
-                .font(.footnote)
-
-            Spacer()
-            VStack(spacing: 2) {
-                // Phase 1：显示 mihomo 内核版本，证明核心已加载
-                Text(core.coreVersion)
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
-                Text(subscriptions.selected.map { "当前订阅：\($0.name)" } ?? "无订阅 · DIRECT 直连模式")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
+            .onAppear {
+                if core.isActive {
+                    Task { await kernel.loadMode() }
+                    kernel.startTraffic()
+                }
             }
-            .padding(.bottom, 8)
+            .onDisappear { kernel.stopTraffic() }
+            .sheet(isPresented: $showStatus) { KernelStatusView() }
         }
-        .task {
-            // 视图出现时同步一次真实状态（冷启动场景）
-            await core.refreshStatus()
+    }
+
+    // MARK: - 子视图
+
+    private var statusBadge: some View {
+        Text(core.statusText)
+            .font(.subheadline.weight(.medium))
+            .foregroundStyle(core.isActive ? .green : .secondary)
+    }
+
+    private var toggleButton: some View {
+        Button {
+            Task { await core.toggleConnection() }
+        } label: {
+            ZStack {
+                Circle()
+                    .fill(core.isActive ? Color.green.opacity(0.15) : Color.gray.opacity(0.12))
+                    .frame(width: 110, height: 110)
+                Circle()
+                    .stroke(core.isActive ? Color.green : Color.gray.opacity(0.4), lineWidth: 2)
+                    .frame(width: 110, height: 110)
+                if core.isBusy {
+                    ProgressView().scaleEffect(1.2)
+                } else {
+                    Image(systemName: "power")
+                        .font(.system(size: 40, weight: .bold))
+                        .foregroundStyle(core.isActive ? .green : .secondary)
+                }
+            }
         }
-        .sheet(isPresented: $showLog) {
-            LogView()
+        .buttonStyle(.plain)
+        .disabled(core.isBusy)
+    }
+
+    private var rateRow: some View {
+        HStack(spacing: 24) {
+            rateItem(icon: "arrow.down", color: .blue, value: kernel.down)
+            rateItem(icon: "arrow.up", color: .orange, value: kernel.up)
         }
+        .font(.callout.monospacedDigit())
+    }
+
+    private func rateItem(icon: String, color: Color, value: Int64) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: icon).foregroundStyle(color)
+            Text(ByteFormat.rate(value)).foregroundStyle(.primary)
+        }
+    }
+
+    private var modePicker: some View {
+        Picker("模式", selection: Binding(
+            get: { kernel.mode },
+            set: { newMode in Task { await kernel.setMode(newMode) } }
+        )) {
+            ForEach(KernelController.Mode.allCases) { m in
+                Text(m.label).tag(m)
+            }
+        }
+        .pickerStyle(.segmented)
+    }
+
+    private var footer: some View {
+        VStack(spacing: 2) {
+            Text(core.coreVersion)
+                .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
+            Text(subscriptions.selected.map { "当前订阅：\($0.name)" } ?? "无订阅 · DIRECT 直连")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        }
+        .padding(.bottom, 8)
     }
 }
 
-/// 内核状态页：探测 NE 内 mihomo external-controller 是否可达（GET /version + /proxies 计数）。
-/// 这条本地 HTTP 通道取代了已失效的 sendProviderMessage IPC。
-private struct LogView: View {
+/// 内核状态页：探测 external-controller 是否可达（GET /version + /proxies 计数）。
+private struct KernelStatusView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var text = "探测中…"
 
@@ -85,7 +148,7 @@ private struct LogView: View {
         NavigationStack {
             ScrollView {
                 Text(text)
-                    .font(.system(.caption2, design: .monospaced))
+                    .font(.system(.footnote, design: .monospaced))
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .textSelection(.enabled)
                     .padding()
@@ -93,12 +156,8 @@ private struct LogView: View {
             .navigationTitle("内核状态")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button("关闭") { dismiss() }
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("刷新") { Task { await reload() } }
-                }
+                ToolbarItem(placement: .topBarLeading) { Button("关闭") { dismiss() } }
+                ToolbarItem(placement: .topBarTrailing) { Button("刷新") { Task { await reload() } } }
             }
             .task { await reload() }
         }
@@ -122,7 +181,7 @@ private struct LogView: View {
             ❌ 连不上内核 http://127.0.0.1:9090
             \(error.localizedDescription)
 
-            请确认 VPN 已连接（状态「已连接」）后再探测。
+            请确认 VPN 已连接后再探测。
             """
         }
     }

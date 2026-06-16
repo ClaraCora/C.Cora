@@ -7,16 +7,53 @@ struct Subscription: Identifiable, Codable, Equatable {
     var url: String
     var yaml: String          // 拉取到的 Clash/mihomo 配置原文
     var updatedAt: Date?      // 最近一次成功拉取时间
-    var nodeCount: Int        // 粗略统计 proxies 条目数，给 UI 展示
+    var nodeCount: Int        // 粗略统计 proxies 条目数
+
+    // 来自机场返回的 subscription-userinfo 响应头（字节）
+    var upload: Int64
+    var download: Int64
+    var total: Int64
+    var expire: Date?
+    var autoNamed: Bool       // 名称是否自动获取（用户没手填时才自动覆盖）
 
     init(id: UUID = UUID(), name: String, url: String, yaml: String = "",
-         updatedAt: Date? = nil, nodeCount: Int = 0) {
+         updatedAt: Date? = nil, nodeCount: Int = 0,
+         upload: Int64 = 0, download: Int64 = 0, total: Int64 = 0,
+         expire: Date? = nil, autoNamed: Bool = false) {
         self.id = id
         self.name = name
         self.url = url
         self.yaml = yaml
         self.updatedAt = updatedAt
         self.nodeCount = nodeCount
+        self.upload = upload
+        self.download = download
+        self.total = total
+        self.expire = expire
+        self.autoNamed = autoNamed
+    }
+
+    var used: Int64 { upload + download }
+    var remaining: Int64 { max(0, total - used) }
+    var hasUsage: Bool { total > 0 }
+
+    // 容错解码：旧版 subscriptions.json 没有新字段，缺失时给默认值，避免整体解码失败丢订阅。
+    enum CodingKeys: String, CodingKey {
+        case id, name, url, yaml, updatedAt, nodeCount, upload, download, total, expire, autoNamed
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        url = try c.decode(String.self, forKey: .url)
+        yaml = try c.decodeIfPresent(String.self, forKey: .yaml) ?? ""
+        updatedAt = try c.decodeIfPresent(Date.self, forKey: .updatedAt)
+        nodeCount = try c.decodeIfPresent(Int.self, forKey: .nodeCount) ?? 0
+        upload = try c.decodeIfPresent(Int64.self, forKey: .upload) ?? 0
+        download = try c.decodeIfPresent(Int64.self, forKey: .download) ?? 0
+        total = try c.decodeIfPresent(Int64.self, forKey: .total) ?? 0
+        expire = try c.decodeIfPresent(Date.self, forKey: .expire)
+        autoNamed = try c.decodeIfPresent(Bool.self, forKey: .autoNamed) ?? false
     }
 }
 
@@ -62,7 +99,8 @@ final class SubscriptionStore: ObservableObject {
         let trimmedURL = url.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedURL.isEmpty else { lastError = "订阅地址为空"; return }
 
-        let sub = Subscription(name: trimmedName.isEmpty ? "未命名订阅" : trimmedName, url: trimmedURL)
+        let auto = trimmedName.isEmpty
+        let sub = Subscription(name: auto ? "拉取中…" : trimmedName, url: trimmedURL, autoNamed: auto)
         subscriptions.append(sub)
         if selectedID == nil { selectedID = sub.id }
         save()
@@ -113,6 +151,22 @@ final class SubscriptionStore: ObservableObject {
             subscriptions[i].yaml = text
             subscriptions[i].updatedAt = Date()
             subscriptions[i].nodeCount = countProxies(text)
+
+            // 解析机场返回的流量/到期（subscription-userinfo 头）
+            if let info = headerValue(http, "subscription-userinfo") {
+                let kv = parseUserInfo(info)
+                subscriptions[i].upload = kv["upload"] ?? 0
+                subscriptions[i].download = kv["download"] ?? 0
+                subscriptions[i].total = kv["total"] ?? 0
+                if let exp = kv["expire"], exp > 0 {
+                    subscriptions[i].expire = Date(timeIntervalSince1970: TimeInterval(exp))
+                }
+            }
+            // 自动名称（用户没手填时）
+            if subscriptions[i].autoNamed,
+               let title = subscriptionTitle(http, fallbackHost: url.host) {
+                subscriptions[i].name = title
+            }
             save()
         } catch {
             lastError = "拉取失败：\(error.localizedDescription)"
@@ -120,6 +174,61 @@ final class SubscriptionStore: ObservableObject {
     }
 
     // MARK: - 校验/统计
+
+    /// 大小写不敏感地取响应头。
+    private func headerValue(_ http: HTTPURLResponse, _ key: String) -> String? {
+        if #available(iOS 13.0, *) {
+            return http.value(forHTTPHeaderField: key)
+        }
+        return http.allHeaderFields[key] as? String
+    }
+
+    /// 解析 subscription-userinfo: "upload=..; download=..; total=..; expire=.."
+    private func parseUserInfo(_ s: String) -> [String: Int64] {
+        var result: [String: Int64] = [:]
+        for part in s.split(separator: ";") {
+            let kv = part.split(separator: "=", maxSplits: 1)
+            guard kv.count == 2 else { continue }
+            let k = kv[0].trimmingCharacters(in: .whitespaces).lowercased()
+            let v = Int64(kv[1].trimmingCharacters(in: .whitespaces)) ?? 0
+            result[k] = v
+        }
+        return result
+    }
+
+    /// 从响应头推断订阅名称：优先 profile-title（可能 base64），其次 content-disposition 文件名，最后主机名。
+    private func subscriptionTitle(_ http: HTTPURLResponse, fallbackHost: String?) -> String? {
+        if let raw = headerValue(http, "profile-title") {
+            if raw.lowercased().hasPrefix("base64:"),
+               let data = Data(base64Encoded: String(raw.dropFirst(7))),
+               let decoded = String(data: data, encoding: .utf8), !decoded.isEmpty {
+                return decoded
+            }
+            if !raw.isEmpty { return raw }
+        }
+        if let cd = headerValue(http, "content-disposition"),
+           let name = filename(fromContentDisposition: cd) {
+            return name
+        }
+        return fallbackHost
+    }
+
+    private func filename(fromContentDisposition cd: String) -> String? {
+        // filename*=UTF-8''xxx 优先
+        if let range = cd.range(of: "filename*=") {
+            var v = String(cd[range.upperBound...])
+            if let semi = v.firstIndex(of: ";") { v = String(v[..<semi]) }
+            if let tick = v.range(of: "''") { v = String(v[tick.upperBound...]) }
+            if let decoded = v.removingPercentEncoding, !decoded.isEmpty { return decoded }
+        }
+        if let range = cd.range(of: "filename=") {
+            var v = String(cd[range.upperBound...])
+            if let semi = v.firstIndex(of: ";") { v = String(v[..<semi]) }
+            v = v.trimmingCharacters(in: CharacterSet(charactersIn: "\" "))
+            if !v.isEmpty { return v }
+        }
+        return nil
+    }
 
     private func looksLikeClashYAML(_ text: String) -> Bool {
         text.contains("proxies:") || text.contains("proxy-groups:") || text.contains("proxy-providers:")

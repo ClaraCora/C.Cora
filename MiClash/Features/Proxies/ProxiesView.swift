@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// 节点/策略组页：连接后查看各策略组并手动切换节点（仅 Selector 组可点）。
+/// 节点页：按配置顺序展示策略组，按模式决定显示哪些组，可手动切换（仅 Selector 组）。
 struct ProxiesView: View {
     @EnvironmentObject private var core: CoreStateManager
     @StateObject private var controller = ProxyController()
@@ -12,6 +12,10 @@ struct ProxiesView: View {
                     ContentUnavailableView("未连接",
                         systemImage: "bolt.horizontal.circle",
                         description: Text("先在「连接」页连上 VPN，再查看策略组"))
+                } else if controller.mode == "direct" {
+                    ContentUnavailableView("直连模式",
+                        systemImage: "arrow.up.forward",
+                        description: Text("当前为直连模式，不经过代理节点"))
                 } else if let err = controller.error, controller.groups.isEmpty {
                     ContentUnavailableView("拿不到节点",
                         systemImage: "exclamationmark.triangle",
@@ -27,7 +31,11 @@ struct ProxiesView: View {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         Task { await controller.load() }
-                    } label: { Image(systemName: "arrow.clockwise") }
+                    } label: {
+                        if controller.isLoading { ProgressView() }
+                        else { Image(systemName: "arrow.clockwise") }
+                    }
+                    .disabled(controller.isLoading)
                 }
             }
             .task(id: core.isActive) {
@@ -41,30 +49,59 @@ struct ProxiesView: View {
             ForEach(controller.groups) { group in
                 Section {
                     ForEach(group.all, id: \.self) { node in
-                        Button {
+                        ProxyNodeRow(
+                            node: node,
+                            isCurrent: node == group.now,
+                            selectable: group.selectable)
+                        .contentShape(Rectangle())
+                        .onTapGesture {
                             guard group.selectable, node != group.now else { return }
                             Task { await controller.select(group: group.name, name: node) }
-                        } label: {
-                            HStack {
-                                Text(node)
-                                    .foregroundStyle(group.selectable ? .primary : .secondary)
-                                Spacer()
-                                if node == group.now {
-                                    Image(systemName: "checkmark").foregroundStyle(.green)
-                                }
-                            }
                         }
-                        .disabled(!group.selectable)
                     }
                 } header: {
-                    HStack {
-                        Text(group.name)
-                        Text(group.type).font(.caption2).foregroundStyle(.tertiary)
+                    HStack(spacing: 6) {
+                        Text(group.name).font(.subheadline.weight(.semibold))
+                        TypeBadge(type: group.type)
                         Spacer()
-                        Text(group.now).font(.caption2).foregroundStyle(.secondary)
+                        Text(group.now)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
                     }
+                    .textCase(nil)
                 }
             }
         }
+        .listStyle(.insetGrouped)
+    }
+}
+
+private struct ProxyNodeRow: View {
+    let node: String
+    let isCurrent: Bool
+    let selectable: Bool
+
+    var body: some View {
+        HStack {
+            Image(systemName: isCurrent ? "checkmark.circle.fill" : "circle")
+                .foregroundStyle(isCurrent ? Color.accentColor : Color.secondary.opacity(0.4))
+            Text(node)
+                .foregroundStyle(selectable ? .primary : .secondary)
+            Spacer()
+        }
+        .padding(.vertical, 2)
+    }
+}
+
+private struct TypeBadge: View {
+    let type: String
+    var body: some View {
+        Text(type)
+            .font(.system(size: 9, weight: .bold))
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(Capsule().fill(Color.secondary.opacity(0.15)))
+            .foregroundStyle(.secondary)
     }
 }

@@ -13,6 +13,9 @@ struct RootView: View {
 
             ProxiesView()
                 .tabItem { Label("节点", systemImage: "point.3.connected.trianglepath.dotted") }
+
+            LogsView()
+                .tabItem { Label("日志", systemImage: "list.bullet.rectangle") }
         }
     }
 }
