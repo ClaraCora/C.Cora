@@ -54,6 +54,7 @@ struct ConnectView: View {
                     Text("内核：\(core.coreVersion)")
                 }
             }
+            .floatingTabBarInset()
             .navigationTitle("MiClash")
             .task { await core.refreshStatus() }
         }

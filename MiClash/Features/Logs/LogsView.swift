@@ -19,6 +19,7 @@ struct LogsView: View {
                     logList
                 }
             }
+            .floatingTabBarInset()
             .navigationTitle("日志")
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {

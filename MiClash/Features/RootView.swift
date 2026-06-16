@@ -34,7 +34,10 @@ struct RootView: View {
 
     var body: some View {
         content
-            .safeAreaInset(edge: .bottom) {
+            // 底栏用 overlay 悬浮在内容之上（不占布局），各页自行在底部预留 TabBarMetrics.reserve
+            // 的安全高度。早先用 safeAreaInset 包在每页 NavigationStack 外层，预留量无法传进内部的
+            // 滚动视图，导致末尾内容被底栏遮住——改成「overlay 画 + 内部 inset 让位」即可。
+            .overlay(alignment: .bottom) {
                 FloatingTabBar(selection: $tab)
                     .padding(.horizontal, 18)
                     .padding(.bottom, 6)
@@ -63,6 +66,19 @@ struct RootView: View {
             kernel.stop()
             logs.stop()
         }
+    }
+}
+
+/// 悬浮底栏尺寸：胶囊高度(~61) + 底部留白(6) + 余量，供各页底部预留安全高度。
+enum TabBarMetrics {
+    static let reserve: CGFloat = 72
+}
+
+extension View {
+    /// 在页面（NavigationStack 内的滚动内容）底部预留悬浮底栏的高度，避免末尾内容被遮挡。
+    /// 必须作用在 Form / List / ScrollView 等可滚动视图上，inset 才能转成滚动内容的底部留白。
+    func floatingTabBarInset() -> some View {
+        safeAreaInset(edge: .bottom) { Color.clear.frame(height: TabBarMetrics.reserve) }
     }
 }
 

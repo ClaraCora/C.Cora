@@ -27,6 +27,7 @@ struct ProxiesView: View {
                     groupList
                 }
             }
+            .floatingTabBarInset()
             .navigationTitle("节点")
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
