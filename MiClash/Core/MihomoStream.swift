@@ -49,7 +49,6 @@ final class MihomoStream: NSObject, @unchecked Sendable {
         t.resume()
 
         receive(gen)
-        schedulePing(gen)
     }
 
     private func receive(_ gen: Int) {
@@ -76,15 +75,6 @@ final class MihomoStream: NSObject, @unchecked Sendable {
         DispatchQueue.global().asyncAfter(deadline: .now() + 0.5) { [weak self] in
             guard let self, self.active else { return }
             self.connect()
-        }
-    }
-
-    /// 频繁 ping 保活，避免连接被中途回收（5s，远小于常见读超时）。
-    private func schedulePing(_ gen: Int) {
-        DispatchQueue.global().asyncAfter(deadline: .now() + 5) { [weak self] in
-            guard let self, self.active, gen == self.generation, let t = self.task else { return }
-            t.sendPing { _ in }
-            self.schedulePing(gen)
         }
     }
 

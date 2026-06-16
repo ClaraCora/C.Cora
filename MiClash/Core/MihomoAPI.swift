@@ -66,6 +66,16 @@ enum MihomoAPI {
         try check(resp)  // 成功为 204 No Content
     }
 
+    /// GET /connections —— 取累计上下行字节（普通 GET 快照，可轮询算速率，比 WS 稳）。
+    static func connectionsTotals() async throws -> (down: Int64, up: Int64) {
+        let (data, resp) = try await session.data(from: base.appendingPathComponent("connections"))
+        try check(resp)
+        let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        let down = (obj?["downloadTotal"] as? NSNumber)?.int64Value ?? 0
+        let up = (obj?["uploadTotal"] as? NSNumber)?.int64Value ?? 0
+        return (down, up)
+    }
+
     /// GET /configs —— 取当前模式（rule/global/direct）。
     static func currentMode() async throws -> String {
         let (data, resp) = try await session.data(from: base.appendingPathComponent("configs"))

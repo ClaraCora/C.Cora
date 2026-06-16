@@ -93,18 +93,24 @@ private struct GroupCard: View {
                 .onTapGesture(perform: onToggle)
 
             if isExpanded {
-                ForEach(group.all, id: \.self) { node in
-                    ProxyNodeRow(
-                        node: node,
-                        isCurrent: node == group.now,
-                        selectable: group.selectable,
-                        delay: delays[node])
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 9)
-                    .background(node == group.now ? Color.accentColor.opacity(0.08) : .clear)
-                    .contentShape(Rectangle())
-                    .onTapGesture { onSelect(node) }
+                VStack(spacing: 4) {
+                    ForEach(group.all, id: \.self) { node in
+                        ProxyNodeRow(
+                            node: node,
+                            isCurrent: node == group.now,
+                            selectable: group.selectable,
+                            delay: delays[node])
+                        .padding(.horizontal, 14)
+                        .frame(minHeight: 34)
+                        .background(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .fill(node == group.now ? Color.accentColor.opacity(0.12) : Color.clear))
+                        .contentShape(Rectangle())
+                        .onTapGesture { onSelect(node) }
+                    }
                 }
+                .padding(.horizontal, 8)
+                .padding(.bottom, 10)
             }
         }
         .background(

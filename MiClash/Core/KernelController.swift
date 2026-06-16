@@ -22,7 +22,7 @@ final class KernelController: ObservableObject {
     @Published var down: Int64 = 0
     @Published var reachable = false
 
-    private let stream = MihomoStream()
+    private var trafficTask: Task<Void, Never>?
 
     /// 读取当前模式（连通即标记 reachable）。
     func loadMode() async {
@@ -46,23 +46,35 @@ final class KernelController: ObservableObject {
         }
     }
 
-    /// 开始订阅速率流（连接后调用）。
+    /// 开始速率轮询（连接后调用）。每秒 GET /connections，用累计字节差值算速率。
+    /// 走普通 GET 而非 WebSocket——后者在重签环境下几秒就断，轮询稳定可靠。
     func startTraffic() {
-        stream.onObject = { [weak self] obj in
-            let up = (obj["up"] as? NSNumber)?.int64Value ?? 0
-            let down = (obj["down"] as? NSNumber)?.int64Value ?? 0
-            Task { @MainActor in
-                self?.up = up
-                self?.down = down
-                self?.reachable = true
+        stopTraffic()
+        trafficTask = Task { [weak self] in
+            var prevDown: Int64?
+            var prevUp: Int64?
+            while !Task.isCancelled {
+                do {
+                    let (d, u) = try await MihomoAPI.connectionsTotals()
+                    if let pd = prevDown, let pu = prevUp {
+                        self?.down = max(0, d - pd)
+                        self?.up = max(0, u - pu)
+                    }
+                    prevDown = d
+                    prevUp = u
+                    self?.reachable = true
+                } catch {
+                    self?.reachable = false
+                }
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
             }
         }
-        stream.start(path: "traffic")
     }
 
-    /// 停止速率流（断开/页面消失）。
+    /// 停止速率轮询（断开/页面消失）。
     func stopTraffic() {
-        stream.stop()
+        trafficTask?.cancel()
+        trafficTask = nil
         up = 0
         down = 0
     }
