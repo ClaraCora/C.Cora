@@ -6,6 +6,7 @@ import SwiftUI
 /// 这是后续四大页面（Dashboard/Proxies/Profiles/Settings）统一遵循的 MVVM 范式雏形。
 struct ConnectView: View {
     @EnvironmentObject private var core: CoreStateManager
+    @State private var showLog = false
 
     var body: some View {
         VStack(spacing: 32) {
@@ -47,6 +48,10 @@ struct ConnectView: View {
                     .padding(.horizontal)
             }
 
+            // 排查入口：读取 NE/mihomo 落盘日志，定位 tun 启动失败在哪一步
+            Button("查看日志") { showLog = true }
+                .font(.footnote)
+
             Spacer()
             VStack(spacing: 2) {
                 // Phase 1：显示 mihomo 内核版本，证明核心已加载
@@ -62,6 +67,38 @@ struct ConnectView: View {
         .task {
             // 视图出现时同步一次真实状态（冷启动场景）
             await core.refreshStatus()
+        }
+        .sheet(isPresented: $showLog) {
+            LogView()
+        }
+    }
+}
+
+/// 日志查看页：展示 App Group 里的 ne.log + run.log，可刷新、可复制。
+private struct LogView: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var text = "加载中…"
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                Text(text)
+                    .font(.system(.caption2, design: .monospaced))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+                    .padding()
+            }
+            .navigationTitle("启动日志")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("关闭") { dismiss() }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("刷新") { text = SharedLogReader.combined() }
+                }
+            }
+            .onAppear { text = SharedLogReader.combined() }
         }
     }
 }

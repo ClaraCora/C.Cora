@@ -18,45 +18,57 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
     override func startTunnel(options: [String: NSObject]?,
                               completionHandler: @escaping (Error?) -> Void) {
+        // 每次启动清空 ne.log，避免历史残留干扰排查
+        FileLog.reset()
+        FileLog.write("startTunnel：开始配置网络设置")
         log.info("startTunnel：开始配置网络设置")
 
         let settings = makeNetworkSettings()
         setTunnelNetworkSettings(settings) { [weak self] error in
             guard let self else { return }
             if let error {
+                FileLog.write("应用网络设置失败：\(error.localizedDescription)")
                 self.log.error("应用网络设置失败：\(error.localizedDescription, privacy: .public)")
                 completionHandler(error)
                 return
             }
+            FileLog.write("网络设置已生效")
 
-            // 网络设置生效后，iOS 才创建好 utun 接口，此时扫描 fd
+            // 网络设置生效后，iOS 才创建好 utun 接口，此时定位 fd
             guard let fd = self.findTunnelFileDescriptor() else {
+                FileLog.write("未找到 utun fd（getifaddrs/getsockopt 都没命中网关 IP）")
                 self.log.error("未找到 utun 文件描述符")
                 completionHandler(NSError(domain: "MiClashTunnel", code: -1,
                     userInfo: [NSLocalizedDescriptionKey: "未找到 utun fd"]))
                 return
             }
+            FileLog.write("拿到 utun fd = \(fd)")
             self.log.info("拿到 utun fd = \(fd, privacy: .public)，启动 mihomo 内核")
 
             // mihomo 工作目录设为 App Group 容器（可写，且与主 App 共享）
             guard let home = self.appGroupContainerPath() else {
+                FileLog.write("App Group 容器不可用")
                 self.log.error("无法获取 App Group 容器路径")
                 completionHandler(NSError(domain: "MiClashTunnel", code: -2,
                     userInfo: [NSLocalizedDescriptionKey: "App Group 容器不可用"]))
                 return
             }
+            FileLog.write("home dir = \(home)，调用 MihomoSetup")
             MihomoSetup(home)
 
             // gomobile 把带 error 返回的 Go 函数生成为「返回 BOOL + NSError** 出参」的 C 函数，
             // 不会自动桥接成 Swift throws，所以用经典 NSError 指针写法：成功返回 true。
+            FileLog.write("调用 MihomoStartWithFd…")
             var startError: NSError?
             let ok = MihomoStartWithFd(Int(fd), MihomoConfig.directModeYAML(), &startError)
             if ok {
+                FileLog.write("MihomoStartWithFd 返回成功（DIRECT 模式）")
                 self.log.info("mihomo 启动成功（DIRECT 模式）")
                 completionHandler(nil)
             } else {
                 let err = startError ?? NSError(domain: "MiClashTunnel", code: -3,
                     userInfo: [NSLocalizedDescriptionKey: "mihomo 启动失败（未知错误）"])
+                FileLog.write("MihomoStartWithFd 失败：\(err.localizedDescription)")
                 self.log.error("mihomo 启动失败：\(err.localizedDescription, privacy: .public)")
                 completionHandler(err)
             }
@@ -65,6 +77,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
     override func stopTunnel(with reason: NEProviderStopReason,
                             completionHandler: @escaping () -> Void) {
+        FileLog.write("stopTunnel，原因 rawValue=\(reason.rawValue)")
         log.info("stopTunnel，原因：\(reason.rawValue, privacy: .public)")
         MihomoStop()
         completionHandler()
