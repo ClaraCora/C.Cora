@@ -1,40 +1,18 @@
 import Foundation
-import Security
 
-/// 动态解析「当前二进制实际被授予的 App Group」，主 App 与 NE 共用同一套逻辑。
+/// App Group 容器访问，主 App 与 NE 共用。
 ///
-/// 为什么不直接用硬编码的 "group.com.miclash.app"：
-/// 用户在 Windows 用重签工具（Sideloadly / 在线签名等）自签，这类工具常把
-/// bundle id / app group 改写成带团队前缀或随机后缀的新值。若代码仍按硬编码字符串
-/// 取容器，`containerURL(forSecurityApplicationGroupIdentifier:)` 会因「该 group
-/// 未被授权」而返回 nil → 共享容器失效（日志全空、VPN 数据共享废掉）。
+/// 说明：用户证书来自他人、无法控制开发者账号 → 注册不了 App Group，容器多半取不到。
+/// 因此 App Group **不是关键路径**：
+///   - 日志走官方 `sendProviderMessage`/`handleAppMessage` IPC（不需共享容器）；
+///   - mihomo 工作目录在容器不可用时回退到 NE 自己的沙盒目录。
+/// 这里只做最简封装：容器可用就用（顺带 best-effort 落日志文件），不可用返回 nil 由调用方回退。
 ///
-/// 解法（依据 Security 框架公开 API）：
-///   SecTaskCreateFromSelf + SecTaskCopyValueForEntitlement
-///   读取本进程 entitlements 里真正生效的 `com.apple.security.application-groups`，取第一个。
-/// 只要重签工具对主 App 和 NE 两端改写一致，两边解析出的就是同一个 group，
-/// 共享容器即可打通——与具体字符串无关。若 entitlements 里压根没有 app group
-/// （签名时没启用该能力），则回退到 fallback，并在诊断里暴露出来。
+/// 注：iOS SDK 不公开 SecTask 系列 API（那是 macOS 的），无法在运行时读 entitlements
+/// 动态解析被授予的 group，故直接用约定的固定标识。
 enum AppGroup {
+    static let identifier = "group.com.miclash.app"
 
-    /// 兜底值：与源码 entitlements 一致。签名未被改写时即用它。
-    static let fallback = "group.com.miclash.app"
-
-    /// 本进程实际被授予的所有 App Group（来自运行期 entitlements）。
-    static let granted: [String] = {
-        guard let task = SecTaskCreateFromSelf(nil),
-              let value = SecTaskCopyValueForEntitlement(
-                task, "com.apple.security.application-groups" as CFString, nil),
-              let groups = value as? [String] else {
-            return []
-        }
-        return groups
-    }()
-
-    /// 选用的 App Group identifier：优先用实际被授予的第一个，否则回退 fallback。
-    static var identifier: String { granted.first ?? fallback }
-
-    /// 共享容器 URL（解析失败 / 未授权时为 nil）。
     static var containerURL: URL? {
         FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: identifier)
     }
