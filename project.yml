@@ -20,6 +20,9 @@ settings:
     CODE_SIGN_STYLE: Manual
     DEVELOPMENT_TEAM: ""
     TARGETED_DEVICE_FAMILY: "1"   # 1=iPhone
+    # mihomo（Go 运行时）的 net 包在 Darwin 上引用 libresolv 的 res_9_* 符号，
+    # 精简的 NE 扩展不会隐式链接它，需显式补链，否则报 undefined symbols。
+    OTHER_LDFLAGS: -lresolv
 
 targets:
   # ───────────────────────── 主 App ─────────────────────────
