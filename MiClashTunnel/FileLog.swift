@@ -9,9 +9,7 @@ enum FileLog {
     static let fileName = "ne.log"
 
     private static var fileURL: URL? {
-        FileManager.default
-            .containerURL(forSecurityApplicationGroupIdentifier: "group.com.miclash.app")?
-            .appendingPathComponent(fileName)
+        AppGroup.containerURL?.appendingPathComponent(fileName)
     }
 
     private static let formatter: DateFormatter = {

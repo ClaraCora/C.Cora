@@ -31,6 +31,7 @@ targets:
     platform: iOS
     sources:
       - path: MiClash
+      - path: Shared
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.miclash.app
@@ -55,6 +56,7 @@ targets:
     platform: iOS
     sources:
       - path: MiClashTunnel
+      - path: Shared
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.miclash.app.tunnel

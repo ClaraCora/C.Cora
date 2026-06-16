@@ -9,23 +9,22 @@ import Foundation
 /// 或描述文件没注册该 group），日志必然全空——所以先诊断容器，再读日志，避免误判。
 enum SharedLogReader {
 
-    private static var containerURL: URL? {
-        FileManager.default
-            .containerURL(forSecurityApplicationGroupIdentifier: AppConstants.appGroupID)
-    }
-
     /// 诊断 + 日志合并报告，一屏看清问题。
     static func combined() -> String {
         var out = "===== App Group 诊断 =====\n"
-        out += "group id: \(AppConstants.appGroupID)\n"
+        out += "源码 fallback: \(AppGroup.fallback)\n"
+        out += "实际被授予: \(AppGroup.granted.isEmpty ? "(无 —— 签名未启用 App Groups 能力)" : AppGroup.granted.joined(separator: ", "))\n"
+        out += "选用 id: \(AppGroup.identifier)\n"
 
-        guard let dir = containerURL else {
-            // 容器为 nil = 致命：主 App 这一侧就没拿到 App Group 容器。
-            // 多半是签名时没勾选 App Groups 能力 / 描述文件没含此 group。
+        guard let dir = AppGroup.containerURL else {
+            // 容器为 nil = 主 App 这侧没拿到共享容器。
             out += "❌ 容器为 nil —— App Group 未生效！\n"
-            out += "   原因通常是：签名时未启用 App Groups 能力，或描述文件未注册 "
-            out += "\(AppConstants.appGroupID)。\n"
-            out += "   此时 NE 也写不进共享文件，VPN 数据共享同样不可用，需先修签名/能力。\n"
+            if AppGroup.granted.isEmpty {
+                out += "   原因：签名时未启用 App Groups 能力（entitlements 里没有 application-groups）。\n"
+                out += "   修法：重签时勾选/注入 App Groups 能力，主 App 与 NE 用同一个 group。\n"
+            } else {
+                out += "   entitlements 里有 group 但容器仍取不到，可能是描述文件未真正注册该 group。\n"
+            }
             return out
         }
         out += "✅ 容器路径: \(dir.path)\n"

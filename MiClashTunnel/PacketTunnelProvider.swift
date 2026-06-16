@@ -184,9 +184,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     // MARK: - App Group
 
     /// App Group 共享容器路径，作为 mihomo 的 home dir。
+    /// 用 AppGroup 动态解析实际被授予的 group（兼容重签工具改写 group id 的情况）。
     private func appGroupContainerPath() -> String? {
-        FileManager.default
-            .containerURL(forSecurityApplicationGroupIdentifier: "group.com.miclash.app")?
-            .path
+        AppGroup.containerURL?.path
     }
 }
