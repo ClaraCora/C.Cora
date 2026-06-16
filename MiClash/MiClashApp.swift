@@ -10,6 +10,9 @@ struct MiClashApp: App {
     @StateObject private var subscriptions = SubscriptionStore.shared
     /// 设置 Store：内核栈/日志/IPv6/geo/外部控制。
     @StateObject private var settings = SettingsStore.shared
+    /// 全局内核运行态（模式+速率）与日志流——跨页面常驻。
+    @StateObject private var kernel = KernelController.shared
+    @StateObject private var logs = LogStreamController.shared
 
     var body: some Scene {
         WindowGroup {
@@ -17,6 +20,8 @@ struct MiClashApp: App {
                 .environmentObject(core)
                 .environmentObject(subscriptions)
                 .environmentObject(settings)
+                .environmentObject(kernel)
+                .environmentObject(logs)
         }
     }
 }

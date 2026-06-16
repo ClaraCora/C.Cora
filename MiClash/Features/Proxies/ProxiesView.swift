@@ -123,13 +123,13 @@ private struct GroupCard: View {
                 .foregroundStyle(.secondary)
                 .rotationEffect(.degrees(isExpanded ? 90 : 0))
 
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
-                    Text(group.name).font(.subheadline.weight(.semibold))
+                    Text(group.name).font(.headline)
                     TypeBadge(type: group.type)
                 }
                 Text(group.now)
-                    .font(.caption2)
+                    .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
@@ -160,10 +160,10 @@ private struct ProxyNodeRow: View {
     var body: some View {
         HStack(spacing: 10) {
             Image(systemName: isCurrent ? "checkmark.circle.fill" : "circle")
-                .font(.footnote)
+                .font(.body)
                 .foregroundStyle(isCurrent ? Color.accentColor : Color.secondary.opacity(0.35))
             Text(node)
-                .font(.callout)
+                .font(.body)
                 .foregroundStyle(selectable ? .primary : .secondary)
                 .lineLimit(1)
             Spacer(minLength: 8)
@@ -177,10 +177,10 @@ private struct DelayBadge: View {
     var body: some View {
         if let d = delay, d > 0 {
             Text("\(d) ms")
-                .font(.caption2.monospacedDigit())
+                .font(.subheadline.monospacedDigit())
                 .foregroundStyle(color(d))
         } else if delay == 0 {
-            Text("超时").font(.caption2).foregroundStyle(.red)
+            Text("超时").font(.subheadline).foregroundStyle(.red)
         }
     }
     private func color(_ ms: Int) -> Color {

@@ -3,7 +3,7 @@ import SwiftUI
 /// 日志页：实时显示 mihomo 内核日志（经 external-controller /logs 流）。
 struct LogsView: View {
     @EnvironmentObject private var core: CoreStateManager
-    @StateObject private var controller = LogStreamController()
+    @EnvironmentObject private var controller: LogStreamController
 
     var body: some View {
         NavigationStack {
@@ -26,11 +26,7 @@ struct LogsView: View {
                         .disabled(controller.lines.isEmpty)
                 }
             }
-            .onAppear { if core.isActive { controller.start() } }
-            .onDisappear { controller.stop() }
-            .onChange(of: core.isActive) { _, active in
-                if active { controller.start() } else { controller.stop() }
-            }
+            // 启停由 RootView 按连接状态统一驱动，这里只展示，切走再回来日志不清空。
         }
     }
 

@@ -11,6 +11,9 @@ struct LogLine: Identifiable {
 @MainActor
 final class LogStreamController: ObservableObject {
 
+    /// 全局共享：由 RootView 按连接状态驱动启停，切 tab 后日志缓冲不清空。
+    static let shared = LogStreamController()
+
     @Published private(set) var lines: [LogLine] = []
     @Published var isStreaming = false
     @Published var error: String?

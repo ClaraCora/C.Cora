@@ -4,7 +4,7 @@ import Charts
 /// 连接页：Form 风格——连接开关、实时流量曲线、模式、内核状态。
 struct ConnectView: View {
     @EnvironmentObject private var core: CoreStateManager
-    @StateObject private var kernel = KernelController()
+    @EnvironmentObject private var kernel: KernelController
 
     var body: some View {
         NavigationStack {
@@ -27,12 +27,6 @@ struct ConnectView: View {
                     }
                 }
 
-                if core.isActive {
-                    Section("实时流量") {
-                        TrafficChart(samples: kernel.samples, up: kernel.up, down: kernel.down)
-                    }
-                }
-
                 Section("模式") {
                     Picker("代理模式", selection: Binding(
                         get: { kernel.mode },
@@ -42,6 +36,12 @@ struct ConnectView: View {
                     }
                     .pickerStyle(.segmented)
                     .disabled(!core.isActive)
+                }
+
+                if core.isActive {
+                    Section("实时流量") {
+                        TrafficChart(samples: kernel.samples, up: kernel.up, down: kernel.down)
+                    }
                 }
 
                 Section {
@@ -56,21 +56,6 @@ struct ConnectView: View {
             }
             .navigationTitle("MiClash")
             .task { await core.refreshStatus() }
-            .onChange(of: core.isActive) { _, active in
-                if active {
-                    Task { await kernel.loadMode() }
-                    kernel.startTraffic()
-                } else {
-                    kernel.stopTraffic()
-                }
-            }
-            .onAppear {
-                if core.isActive {
-                    Task { await kernel.loadMode() }
-                    kernel.startTraffic()
-                }
-            }
-            .onDisappear { kernel.stopTraffic() }
         }
     }
 }

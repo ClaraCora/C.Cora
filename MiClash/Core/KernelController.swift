@@ -5,6 +5,9 @@ import Foundation
 @MainActor
 final class KernelController: ObservableObject {
 
+    /// 全局共享：由 RootView 按连接状态驱动启停，不随页面出现/消失，切 tab 后数据不清零。
+    static let shared = KernelController()
+
     enum Mode: String, CaseIterable, Identifiable {
         case rule, global, direct
         var id: String { rawValue }
@@ -34,6 +37,15 @@ final class KernelController: ObservableObject {
     private var trafficTask: Task<Void, Never>?
     private var sampleIndex = 0
     private let maxSamples = 60
+
+    /// 连接建立后调用：读模式 + 开始速率采样。
+    func start() {
+        Task { await loadMode() }
+        startTraffic()
+    }
+
+    /// 断开后调用：停止采样。
+    func stop() { stopTraffic() }
 
     /// 读取当前模式（连通即标记 reachable）。
     func loadMode() async {
