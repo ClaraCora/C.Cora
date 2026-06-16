@@ -21,6 +21,7 @@ import (
 
 	"github.com/metacubex/mihomo/adapter/outboundgroup"
 	"github.com/metacubex/mihomo/component/dialer"
+	"github.com/metacubex/mihomo/component/updater"
 	"github.com/metacubex/mihomo/config"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/hub/executor"
@@ -29,6 +30,9 @@ import (
 	"github.com/metacubex/mihomo/tunnel"
 	"gopkg.in/yaml.v3"
 )
+
+// metacubexd 面板的 gh-pages 构建产物（已是打包好的静态站点）。
+const webUIURL = "https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip"
 
 // ControllerAddr 是 NE 内 mihomo external-controller 的监听地址。
 // 主 App 经 sendProviderMessage IPC 在重签环境下不投递，改用本地回环 HTTP 直连——
@@ -173,8 +177,28 @@ func StartWithConfig(fd int, configYAML string, settingsJSON string) (err error)
 		host = "0.0.0.0"
 	}
 	addr := fmt.Sprintf("%s:%d", host, st.ControllerPort)
-	route.ReCreateServer(&route.Config{Addr: addr, Secret: st.ControllerSecret})
-	appendRunLog("external-controller 已启动: " + addr)
+
+	// webui：mihomo 在 /ui 同源提供面板（浏览器访问，无 CORS/混合内容问题）。
+	// SetUIPath 必须在 ReCreateServer 之前（注册路由时读取）。CORS 放开，方便外部仪表盘也能连 API。
+	uiPath := filepath.Join(homeDir, "ui")
+	route.SetUIPath(uiPath)
+	route.ReCreateServer(&route.Config{
+		Addr:   addr,
+		Secret: st.ControllerSecret,
+		Cors:   route.Cors{AllowOrigins: []string{"*"}, AllowPrivateNetwork: true},
+	})
+	appendRunLog("external-controller 已启动: " + addr + " (UI: /ui)")
+
+	// 后台下载 metacubexd 面板到 ui 目录（空才下，已有则跳过）。best-effort，失败不影响代理。
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				appendRunLog(fmt.Sprintf("webui 下载 panic: %v", r))
+			}
+		}()
+		updater.NewUiUpdater("ui", webUIURL, "").AutoDownloadUI()
+		appendRunLog("webui 就绪: http://<本机/局域网IP>:" + fmt.Sprintf("%d", st.ControllerPort) + "/ui/")
+	}()
 	return nil
 }
 

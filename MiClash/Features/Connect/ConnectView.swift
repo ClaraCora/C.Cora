@@ -77,20 +77,21 @@ private struct TrafficChart: View {
             .font(.callout.monospacedDigit())
 
             Chart {
-                ForEach(samples) { s in
-                    AreaMark(x: .value("t", s.id), y: .value("速率", Double(s.down)))
+                ForEach(Array(samples.enumerated()), id: \.element.id) { idx, s in
+                    AreaMark(x: .value("t", idx), y: .value("速率", Double(s.down)))
                         .foregroundStyle(.blue.opacity(0.12))
                         .interpolationMethod(.catmullRom)
-                    LineMark(x: .value("t", s.id), y: .value("速率", Double(s.down)),
+                    LineMark(x: .value("t", idx), y: .value("速率", Double(s.down)),
                              series: .value("方向", "下行"))
                         .foregroundStyle(.blue)
                         .interpolationMethod(.catmullRom)
-                    LineMark(x: .value("t", s.id), y: .value("速率", Double(s.up)),
+                    LineMark(x: .value("t", idx), y: .value("速率", Double(s.up)),
                              series: .value("方向", "上行"))
                         .foregroundStyle(.orange)
                         .interpolationMethod(.catmullRom)
                 }
             }
+            .chartXScale(domain: 0...Double(max(samples.count - 1, 1)))
             .chartXAxis(.hidden)
             .chartYAxis {
                 AxisMarks { value in
