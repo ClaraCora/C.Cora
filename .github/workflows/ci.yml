@@ -14,8 +14,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Select Xcode 16
-        run: sudo xcode-select -s /Applications/Xcode_16.app
+      # 不写死某个 Xcode（镜像里 Xcode_16.app 可能没装 iOS 平台）；
+      # 用 runner 默认 Xcode（GitHub 保证其 iOS SDK 可用），并打印实际可用 SDK 便于排查。
+      - name: Show Xcode & iOS SDK
+        run: |
+          xcodebuild -version
+          echo "--- installed iphoneos SDKs ---"
+          xcodebuild -showsdks | grep -i iphoneos || true
+          echo "--- available Xcodes ---"
+          ls -d /Applications/Xcode*.app
 
       # ───────────── Phase 1：gomobile 编 mihomo 内核 ─────────────
       - name: Set up Go
