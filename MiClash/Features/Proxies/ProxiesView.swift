@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// 节点页：策略组可折叠，支持延迟测速，手动切换（仅 Selector 组）。
+/// 节点页：策略组可折叠（默认收起），支持延迟测速，手动切换（仅 Selector 组）。
 struct ProxiesView: View {
     @EnvironmentObject private var core: CoreStateManager
     @StateObject private var controller = ProxyController()
@@ -40,11 +40,7 @@ struct ProxiesView: View {
                 }
             }
             .task(id: core.isActive) {
-                if core.isActive {
-                    await controller.load()
-                    // 默认展开第一个策略组
-                    if let first = controller.groups.first { expanded = [first.name] }
-                }
+                if core.isActive { await controller.load() }
             }
         }
     }
@@ -52,23 +48,27 @@ struct ProxiesView: View {
     private var groupList: some View {
         List {
             ForEach(controller.groups) { group in
-                DisclosureGroup(isExpanded: bindingFor(group.name)) {
-                    ForEach(group.all, id: \.self) { node in
-                        ProxyNodeRow(
-                            node: node,
-                            isCurrent: node == group.now,
-                            selectable: group.selectable,
-                            delay: controller.delays[node])
-                        .contentShape(Rectangle())
-                        .onTapGesture {
-                            guard group.selectable, node != group.now else { return }
-                            Task { await controller.select(group: group.name, name: node) }
+                Section {
+                    if expanded.contains(group.name) {
+                        ForEach(group.all, id: \.self) { node in
+                            ProxyNodeRow(
+                                node: node,
+                                isCurrent: node == group.now,
+                                selectable: group.selectable,
+                                delay: controller.delays[node])
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                guard group.selectable, node != group.now else { return }
+                                Task { await controller.select(group: group.name, name: node) }
+                            }
                         }
                     }
-                } label: {
+                } header: {
                     GroupHeader(
                         group: group,
+                        isExpanded: expanded.contains(group.name),
                         isTesting: controller.testing.contains(group.name),
+                        onToggle: { toggle(group.name) },
                         onTest: { Task { await controller.testGroup(group.name) } })
                 }
             }
@@ -76,43 +76,59 @@ struct ProxiesView: View {
         .listStyle(.insetGrouped)
     }
 
-    private func bindingFor(_ name: String) -> Binding<Bool> {
-        Binding(
-            get: { expanded.contains(name) },
-            set: { isOn in
-                if isOn { expanded.insert(name) } else { expanded.remove(name) }
-            })
+    private func toggle(_ name: String) {
+        if expanded.contains(name) { expanded.remove(name) } else { expanded.insert(name) }
     }
 }
 
 private struct GroupHeader: View {
     let group: ProxyGroup
+    let isExpanded: Bool
     let isTesting: Bool
+    let onToggle: () -> Void
     let onTest: () -> Void
 
     var body: some View {
-        HStack(spacing: 6) {
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
-                    Text(group.name).font(.subheadline.weight(.semibold))
-                    TypeBadge(type: group.type)
+        HStack(spacing: 10) {
+            // 标题区：点击折叠/展开
+            Button(action: onToggle) {
+                HStack(spacing: 8) {
+                    Image(systemName: "chevron.right")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 6) {
+                            Text(group.name)
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(.primary)
+                            TypeBadge(type: group.type)
+                        }
+                        Text(group.now)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: 0)
                 }
-                Text(group.now)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                .contentShape(Rectangle())
             }
-            Spacer()
+            .buttonStyle(.plain)
+
+            // 测速
             Button(action: onTest) {
                 if isTesting {
                     ProgressView()
                 } else {
-                    Image(systemName: "bolt.fill").foregroundStyle(.yellow)
+                    Image(systemName: "bolt.fill")
+                        .foregroundStyle(.yellow)
                 }
             }
             .buttonStyle(.borderless)
             .disabled(isTesting)
         }
+        .textCase(nil)
+        .padding(.vertical, 2)
     }
 }
 
@@ -125,14 +141,14 @@ private struct ProxyNodeRow: View {
     var body: some View {
         HStack(spacing: 10) {
             Image(systemName: isCurrent ? "checkmark.circle.fill" : "circle")
-                .foregroundStyle(isCurrent ? Color.accentColor : Color.secondary.opacity(0.4))
+                .foregroundStyle(isCurrent ? Color.accentColor : Color.secondary.opacity(0.35))
             Text(node)
                 .foregroundStyle(selectable ? .primary : .secondary)
                 .lineLimit(1)
-            Spacer()
+            Spacer(minLength: 8)
             DelayBadge(delay: delay)
         }
-        .padding(.vertical, 2)
+        .padding(.vertical, 3)
     }
 }
 
