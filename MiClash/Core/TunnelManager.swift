@@ -59,24 +59,42 @@ final class TunnelManager {
         return mgr.connection.status
     }
 
-    /// 向运行中的 NE 发送一条 sendProviderMessage 请求并取回响应（不依赖 App Group）。
-    /// 仅 VPN 已连接时可用。失败/未连接返回 nil。
-    func sendMessage(_ payload: Data) async -> Data? {
-        // 重新加载现有配置，拿正在运行的 session（不 saveToPreferences，避免扰动）。
-        guard let all = try? await NETunnelProviderManager.loadAllFromPreferences(),
-              let mgr = all.first else { return nil }
-        self.manager = mgr
+    /// IPC 结果：成功带数据，失败带可显示的原因（便于无 Mac 排查）。
+    enum IPCResult {
+        case ok(Data)
+        case failure(String)
+    }
 
-        guard let session = mgr.connection as? NETunnelProviderSession,
-              session.status == .connected else { return nil }
+    /// 向运行中的 NE 发送一条 sendProviderMessage 请求并取回响应（不依赖 App Group）。
+    /// 优先复用连接时那个 manager（其 connection 状态可靠）；不强行卡 .connected，
+    /// 直接尝试发送，失败/空响应都回传具体原因。
+    func sendMessage(_ payload: Data) async -> IPCResult {
+        let mgr: NETunnelProviderManager
+        if let m = manager {
+            mgr = m
+        } else if let all = try? await NETunnelProviderManager.loadAllFromPreferences(), let m = all.first {
+            self.manager = m
+            mgr = m
+        } else {
+            return .failure("未找到 VPN 配置（请先连接）")
+        }
+
+        guard let session = mgr.connection as? NETunnelProviderSession else {
+            return .failure("连接对象不是 NETunnelProviderSession（status=\(mgr.connection.status.rawValue)）")
+        }
+        let st = session.status.rawValue
 
         return await withCheckedContinuation { cont in
             do {
                 try session.sendProviderMessage(payload) { resp in
-                    cont.resume(returning: resp)
+                    if let resp {
+                        cont.resume(returning: .ok(resp))
+                    } else {
+                        cont.resume(returning: .failure("NE 回传空响应（status=\(st)）"))
+                    }
                 }
             } catch {
-                cont.resume(returning: nil)
+                cont.resume(returning: .failure("sendProviderMessage 抛错：\(error.localizedDescription)（status=\(st)）"))
             }
         }
     }
@@ -85,10 +103,11 @@ final class TunnelManager {
     func fetchLogs() async -> String {
         let payload = (try? JSONSerialization.data(withJSONObject: ["cmd": "getLogs"]))
             ?? Data("getLogs".utf8)
-        guard let resp = await sendMessage(payload),
-              let text = String(data: resp, encoding: .utf8) else {
-            return "(NE 无响应——请先点连接、待状态「已连接」后再取日志；若一点就断，说明 mihomo 启动即失败)"
+        switch await sendMessage(payload) {
+        case .ok(let data):
+            return String(data: data, encoding: .utf8) ?? "(响应非文本)"
+        case .failure(let reason):
+            return "(取日志失败：\(reason))"
         }
-        return text
     }
 }

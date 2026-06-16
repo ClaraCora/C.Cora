@@ -90,8 +90,11 @@ final class CoreStateManager: ObservableObject {
     }
 
     /// 向运行中的 NE 发 JSON 命令并取回响应（策略组查询/切换、日志等共用）。
-    func sendMessage(_ object: [String: Any]) async -> Data? {
-        guard let payload = try? JSONSerialization.data(withJSONObject: object) else { return nil }
+    /// 返回成功数据或可显示的失败原因。
+    func sendMessage(_ object: [String: Any]) async -> TunnelManager.IPCResult {
+        guard let payload = try? JSONSerialization.data(withJSONObject: object) else {
+            return .failure("命令编码失败")
+        }
         return await tunnel.sendMessage(payload)
     }
 

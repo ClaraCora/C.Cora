@@ -33,8 +33,12 @@ final class ProxyController: ObservableObject {
         error = nil
         defer { isLoading = false }
 
-        guard let data = await core.sendMessage(["cmd": "queryProxies"]) else {
-            error = "未连接或 NE 无响应——请先连接 VPN 再查看节点"
+        let data: Data
+        switch await core.sendMessage(["cmd": "queryProxies"]) {
+        case .ok(let d):
+            data = d
+        case .failure(let reason):
+            error = reason
             groups = []
             return
         }
@@ -63,8 +67,12 @@ final class ProxyController: ObservableObject {
 
     /// 在某策略组选定节点。
     func select(group: String, name: String) async {
-        guard let data = await core.sendMessage(["cmd": "selectProxy", "group": group, "name": name]) else {
-            error = "切换失败：NE 无响应"
+        let data: Data
+        switch await core.sendMessage(["cmd": "selectProxy", "group": group, "name": name]) {
+        case .ok(let d):
+            data = d
+        case .failure(let reason):
+            error = "切换失败：\(reason)"
             return
         }
         let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
