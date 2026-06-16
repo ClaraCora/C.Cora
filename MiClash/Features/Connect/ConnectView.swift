@@ -53,7 +53,7 @@ struct ConnectView: View {
                 Text(core.coreVersion)
                     .font(.caption.monospaced())
                     .foregroundStyle(.secondary)
-                Text("Phase 1 · 验证 mihomo 内核加载")
+                Text("Phase 2 · DIRECT 模式 tun 接管流量")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }

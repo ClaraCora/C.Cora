@@ -58,6 +58,10 @@ targets:
         GENERATE_INFOPLIST_FILE: NO
         INFOPLIST_FILE: MiClashTunnel/Info.plist
         CODE_SIGN_ENTITLEMENTS: MiClashTunnel/MiClashTunnel.entitlements
+    dependencies:
+      # mihomo 内核必须在 NE 进程内运行（代理逻辑所在）。静态框架，只链接不嵌入。
+      - framework: Vendor/Mihomo.xcframework
+        embed: false
 
 # 显式 scheme，确保 CI 里 `xcodebuild -scheme MiClash` 能找到（含嵌入的 NE 扩展）
 schemes:
