@@ -100,13 +100,28 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     // MARK: - utun fd 获取
+    //
+    // ⚠️ 设计依据与取舍（已查 Apple 官方文档确认）：
+    // Apple 对 NEPacketTunnelProvider 文档化的唯一数据通道是 `packetFlow`
+    // （NEPacketTunnelFlow，read/writePackets 收发 Data 包），**官方不暴露 utun 的 fd**。
+    // 但 mihomo（底层 sing-tun）原生按「给我一个 fd，我接管这块网卡」设计，要的是 fd。
+    // 经与用户确认，本项目走「A. fd 直喂」：性能最好、Go 胶水最少，是 clash/sing-box
+    // iOS 的事实标准做法；自签/个人用无 App Store 审核风险。fd 获取属文档外技巧，
+    // 故下面用「网关 IP 锁定接口名」把它做成确定性的，避免盲扫选错 utun。
 
-    /// 扫描本进程的文件描述符，找出 iOS 为本隧道创建的 utun 接口的 fd。
+    /// 找出 iOS 为本隧道创建的 utun 接口的 fd（确定性版本）。
     ///
-    /// 原理：utun 接口底层是 SYSPROTO_CONTROL 类型的 socket，对其用
-    /// getsockopt(UTUN_OPT_IFNAME) 能取到接口名（utunN）。遍历 fd 命中即得。
-    /// 这是 sing-box / clashmi 等在 iOS 上的通用做法，比 KVC 取私有属性更稳。
+    /// 两步：
+    /// 1. getifaddrs 找出「IPv4 地址 == 我们网关 198.18.0.1」的那块 utun 接口名——
+    ///    网络设置生效后该 IP 已绑到我们自己的 utun 上，能唯一区分于别的 VPN 的 utun；
+    /// 2. 遍历 fd，用 getsockopt(UTUN_OPT_IFNAME) 取名，精确匹配第 1 步的接口名。
     private func findTunnelFileDescriptor() -> Int32? {
+        guard let wantName = tunnelInterfaceName() else {
+            log.error("getifaddrs 未找到 IP=\(MihomoConfig.tunGatewayIP, privacy: .public) 的 utun 接口")
+            return nil
+        }
+        log.info("目标 utun 接口名：\(wantName, privacy: .public)")
+
         let SYSPROTO_CONTROL: Int32 = 2 // <sys/sys_domain.h>
         let UTUN_OPT_IFNAME: Int32 = 2  // <net/if_utun.h>
 
@@ -119,9 +134,35 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 let name = nameBuffer.withUnsafeBufferPointer { ptr in
                     String(cString: ptr.baseAddress!)
                 }
-                if name.hasPrefix("utun") {
+                if name == wantName {
                     return fd
                 }
+            }
+        }
+        return nil
+    }
+
+    /// 用 getifaddrs 找到绑定了我们网关 IP 的 utun 接口名。
+    private func tunnelInterfaceName() -> String? {
+        var ifaddrPtr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddrPtr) == 0 else { return nil }
+        defer { freeifaddrs(ifaddrPtr) }
+
+        var cursor = ifaddrPtr
+        while let cur = cursor {
+            defer { cursor = cur.pointee.ifa_next }
+            let ifa = cur.pointee
+            guard let sa = ifa.ifa_addr, sa.pointee.sa_family == sa_family_t(AF_INET) else {
+                continue
+            }
+            let ifName = String(cString: ifa.ifa_name)
+            guard ifName.hasPrefix("utun") else { continue }
+
+            var sin = sockaddr_in()
+            memcpy(&sin, sa, Int(MemoryLayout<sockaddr_in>.size))
+            let ip = String(cString: inet_ntoa(sin.sin_addr))
+            if ip == MihomoConfig.tunGatewayIP {
+                return ifName
             }
         }
         return nil
