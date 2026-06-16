@@ -39,15 +39,20 @@ jobs:
           go install golang.org/x/mobile/cmd/gobind@latest
           export PATH="$PATH:$(go env GOPATH)/bin"
           cd MobileCore
-          # 解析依赖版本（首次构建用 @latest，成功后再 pin）
-          go get github.com/metacubex/mihomo@latest
           # 用 tool 指令把 golang.org/x/mobile 钉进模块依赖图，
           # 否则 go mod tidy 会因源码未直接 import 而剪掉它，导致 gomobile bind 报
           # "requires golang.org/x/mobile in the current module"
           go get -tool golang.org/x/mobile/cmd/gobind
+          # go.mod 已 pin mihomo 版本；tidy 补齐间接依赖与 go.sum
           go mod tidy
+          # 取出真实 mihomo 版本，用 ldflags 注入 constant.Version
+          # （源码默认值是陈旧占位串，官方靠 ldflags 注入真实版本，这里照做）
+          MIHOMO_VERSION=$(go list -m -f '{{.Version}}' github.com/metacubex/mihomo)
+          echo "注入 mihomo 版本：${MIHOMO_VERSION}"
           # 交叉编译 mihomo 为 iOS 框架（含 device arm64 + simulator 切片）
-          gomobile bind -target=ios -o ../Vendor/Mihomo.xcframework .
+          gomobile bind \
+            -ldflags="-X github.com/metacubex/mihomo/constant.Version=${MIHOMO_VERSION}" \
+            -target=ios -o ../Vendor/Mihomo.xcframework .
           echo "===== Mihomo.xcframework 切片 ====="
           ls -R ../Vendor/Mihomo.xcframework | head -40
           echo "===== Info.plist ====="
