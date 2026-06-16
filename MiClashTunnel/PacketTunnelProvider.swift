@@ -16,6 +16,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private let log = Logger(subsystem: "com.miclash.app.tunnel", category: "PacketTunnel")
 
+    /// 当前 mihomo 工作目录（含 run.log）。供 handleAppMessage 回传内核日志用。
+    private var homeDir: String?
+
     override func startTunnel(options: [String: NSObject]?,
                               completionHandler: @escaping (Error?) -> Void) {
         // 每次启动清空 ne.log，避免历史残留干扰排查
@@ -50,6 +53,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             // App Group 只影响“日志/配置共享”，不该卡死整个 VPN。
             let home = self.appGroupContainerPath() ?? self.fallbackHomePath()
             let usingShared = self.appGroupContainerPath() != nil
+            self.homeDir = home
             FileLog.write("home dir = \(home)（\(usingShared ? "App Group 共享" : "NE 沙盒回退")），调用 MihomoSetup")
             MihomoSetup(home)
 
@@ -80,9 +84,30 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         completionHandler()
     }
 
+    /// 主 App 经 sendProviderMessage 发来的请求（不依赖 App Group 的官方 IPC）。
+    /// "getLogs" → 回传 NE 内存日志 + mihomo run.log，用于无 Mac 环境下排查。
     override func handleAppMessage(_ messageData: Data,
                                   completionHandler: ((Data?) -> Void)?) {
-        completionHandler?(messageData)
+        let cmd = String(data: messageData, encoding: .utf8) ?? ""
+        switch cmd {
+        case "getLogs":
+            completionHandler?(collectLogs().data(using: .utf8))
+        default:
+            completionHandler?(nil)
+        }
+    }
+
+    /// 汇总 NE 步骤日志（内存）+ mihomo 内核 run.log（home 目录）。
+    private func collectLogs() -> String {
+        var out = "===== ne（NE 启动步骤，内存）=====\n" + FileLog.dump()
+        if let home = homeDir {
+            let runPath = (home as NSString).appendingPathComponent("run.log")
+            let run = (try? String(contentsOfFile: runPath, encoding: .utf8)) ?? "(run.log 不存在)"
+            out += "\n\n===== run.log（mihomo 内核）=====\n" + (run.isEmpty ? "(空)" : run)
+        } else {
+            out += "\n\n(home 未设置，mihomo 尚未启动)"
+        }
+        return out
     }
 
     // MARK: - 网络设置

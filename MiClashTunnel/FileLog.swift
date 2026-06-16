@@ -1,16 +1,17 @@
 import Foundation
 
-/// NE 扩展的落盘日志。
+/// NE 扩展的运行日志。
 ///
-/// 用户在 Windows、无 Mac/Console，看不到 NE 的 os.log。这里把启动各步骤写进
-/// App Group 共享容器的 `ne.log`，主 App 直接读该文件显示，使 NE 内部过程可见、可排查。
-/// mihomo 内核自身的日志由 Go 侧写到同目录的 `run.log`（见 MobileCore/mihomo.go）。
+/// 用户证书来自他人、无法控制开发者账号 → 注册不了 App Group。因此日志**不依赖
+/// App Group 共享文件**，改为：进程内内存缓冲 + 经 `sendProviderMessage`/`handleAppMessage`
+/// 官方 IPC 回传给主 App（见 PacketTunnelProvider.handleAppMessage）。
+/// 这条通道不需要任何共享容器，只要 NE 在运行即可读取。
+///
+/// 若 App Group 恰好可用，也会顺带写一份 ne.log 文件（best-effort），但不作为主路径。
 enum FileLog {
-    static let fileName = "ne.log"
 
-    private static var fileURL: URL? {
-        AppGroup.containerURL?.appendingPathComponent(fileName)
-    }
+    private static let queue = DispatchQueue(label: "com.miclash.tunnel.filelog")
+    private static var buffer: [String] = []
 
     private static let formatter: DateFormatter = {
         let f = DateFormatter()
@@ -18,24 +19,31 @@ enum FileLog {
         return f
     }()
 
-    /// 清空日志（每次 startTunnel 调用，避免历史残留）。
+    /// 清空（每次 startTunnel 调用）。
     static func reset() {
-        guard let url = fileURL else { return }
-        try? "".write(to: url, atomically: true, encoding: .utf8)
+        queue.sync { buffer.removeAll() }
     }
 
     /// 追加一行（带时间戳）。
     static func write(_ message: String) {
-        guard let url = fileURL else { return }
-        let line = "\(formatter.string(from: Date())) [NE] \(message)\n"
-        guard let data = line.data(using: .utf8) else { return }
-        if let handle = try? FileHandle(forWritingTo: url) {
-            defer { try? handle.close() }
-            handle.seekToEndOfFile()
-            handle.write(data)
-        } else {
-            // 文件还不存在，直接创建
-            try? line.write(to: url, atomically: true, encoding: .utf8)
+        let line = "\(formatter.string(from: Date())) [NE] \(message)"
+        queue.sync { buffer.append(line) }
+
+        // best-effort：App Group 可用时也落一份文件，便于将来排查
+        if let url = AppGroup.containerURL?.appendingPathComponent("ne.log") {
+            let data = (line + "\n").data(using: .utf8) ?? Data()
+            if let h = try? FileHandle(forWritingTo: url) {
+                defer { try? h.close() }
+                h.seekToEndOfFile()
+                h.write(data)
+            } else {
+                try? (line + "\n").write(to: url, atomically: true, encoding: .utf8)
+            }
         }
+    }
+
+    /// 导出当前缓冲全部内容（供 handleAppMessage 回传主 App）。
+    static func dump() -> String {
+        queue.sync { buffer.joined(separator: "\n") }
     }
 }

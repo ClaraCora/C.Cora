@@ -54,4 +54,37 @@ final class TunnelManager {
         guard let mgr = try? await loadOrCreateManager() else { return .invalid }
         return mgr.connection.status
     }
+
+    /// 向运行中的 NE 索取日志（官方 sendProviderMessage IPC，不依赖 App Group）。
+    /// 仅在 VPN 已连接时可用——NE 已停止时无法通信。
+    func fetchLogs() async -> String {
+        let mgr: NETunnelProviderManager
+        if let m = manager {
+            mgr = m
+        } else if let m = try? await loadOrCreateManager() {
+            mgr = m
+        } else {
+            return "(无法加载 VPN 配置)"
+        }
+
+        guard let session = mgr.connection as? NETunnelProviderSession else {
+            return "(连接对象不是 NETunnelProviderSession)"
+        }
+        guard session.status == .connected else {
+            return "(VPN 当前未连接，状态 rawValue=\(session.status.rawValue)。\n"
+                 + "sendProviderMessage 需 NE 正在运行，请先点连接、待状态变为已连接后再取日志。\n"
+                 + "若一点就断、根本连不上，说明 mihomo 启动即失败，NE 还没来得及响应。)"
+        }
+
+        return await withCheckedContinuation { cont in
+            do {
+                try session.sendProviderMessage(Data("getLogs".utf8)) { resp in
+                    let text = resp.flatMap { String(data: $0, encoding: .utf8) }
+                    cont.resume(returning: text ?? "(NE 无响应)")
+                }
+            } catch {
+                cont.resume(returning: "(sendProviderMessage 失败：\(error.localizedDescription))")
+            }
+        }
+    }
 }

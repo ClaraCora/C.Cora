@@ -63,6 +63,11 @@ final class CoreStateManager: ObservableObject {
         status = await tunnel.currentStatus()
     }
 
+    /// 向运行中的 NE 索取日志（sendProviderMessage，不依赖 App Group）。
+    func fetchLogs() async -> String {
+        await tunnel.fetchLogs()
+    }
+
     /// 用户点连接按钮：根据当前状态决定启停（toggle 语义）。
     func toggleConnection() async {
         guard !isBusy else { return }

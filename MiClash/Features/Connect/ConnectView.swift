@@ -69,13 +69,14 @@ struct ConnectView: View {
             await core.refreshStatus()
         }
         .sheet(isPresented: $showLog) {
-            LogView()
+            LogView().environmentObject(core)
         }
     }
 }
 
-/// 日志查看页：展示 App Group 里的 ne.log + run.log，可刷新、可复制。
+/// 日志查看页：经 sendProviderMessage 向运行中的 NE 索取日志（不依赖 App Group）。
 private struct LogView: View {
+    @EnvironmentObject private var core: CoreStateManager
     @Environment(\.dismiss) private var dismiss
     @State private var text = "加载中…"
 
@@ -88,17 +89,22 @@ private struct LogView: View {
                     .textSelection(.enabled)
                     .padding()
             }
-            .navigationTitle("启动日志")
+            .navigationTitle("NE 运行日志")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     Button("关闭") { dismiss() }
                 }
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button("刷新") { text = SharedLogReader.combined() }
+                    Button("刷新") { Task { await reload() } }
                 }
             }
-            .onAppear { text = SharedLogReader.combined() }
+            .task { await reload() }
         }
+    }
+
+    private func reload() async {
+        text = "拉取中…"
+        text = await core.fetchLogs()
     }
 }
