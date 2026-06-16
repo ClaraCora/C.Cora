@@ -188,21 +188,28 @@ func mergeConfig(subYAML string, st appSettings) ([]byte, error) {
 		}
 	}
 
-	// 强制 tun：栈按设置（默认 gvisor；iOS NE 里 system 栈 TCP 常不通），dns 劫持，自动路由。
+	// 强制 tun：gvisor 栈（iOS NE 里 system 栈 TCP 不通），dns 劫持，自动路由。
+	// mtu=9000：sing-tun 默认值。设成 1500 会让 gvisor 处理的包数翻几倍、吞吐大降——这是限速主因。
 	m["tun"] = map[string]any{
 		"enable":                true,
 		"stack":                 st.Stack,
 		"dns-hijack":            []any{"any:53"},
 		"auto-route":            true,
 		"auto-detect-interface": true,
-		"mtu":                   1500,
+		"mtu":                   9000,
 	}
-	// 强制 dns：tun 必须 fake-ip + 纯 IP 的 DoH 上游（无需二次解析，杜绝死循环）。
+	// 并发建连，降低连接建立延迟。
+	m["tcp-concurrent"] = true
+	// 强制 dns：tun 必须 fake-ip。
+	// nameserver 用纯 IP DoH（安全）；default/proxy-server-nameserver 用快速 UDP DNS
+	// 专门解析代理服务器域名——否则代理服务器也走慢速 DoH，每次建连都多一次 TLS 握手，延迟翻倍。
 	m["dns"] = map[string]any{
-		"enable":        true,
-		"ipv6":          st.IPv6,
-		"enhanced-mode": "fake-ip",
-		"fake-ip-range": "198.18.0.1/16",
+		"enable":                  true,
+		"ipv6":                    st.IPv6,
+		"enhanced-mode":           "fake-ip",
+		"fake-ip-range":           "198.18.0.1/16",
+		"default-nameserver":      []any{"223.5.5.5", "8.8.8.8"},
+		"proxy-server-nameserver": []any{"223.5.5.5", "8.8.8.8"},
 		"nameserver": []any{
 			"https://223.5.5.5/dns-query",
 			"https://1.1.1.1/dns-query",

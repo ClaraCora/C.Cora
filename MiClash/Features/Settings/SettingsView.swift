@@ -10,9 +10,6 @@ struct SettingsView: View {
         NavigationStack {
             Form {
                 Section {
-                    Picker("TUN 栈", selection: $settings.stack) {
-                        ForEach(SettingsStore.stackOptions, id: \.self) { Text($0).tag($0) }
-                    }
                     Picker("日志级别", selection: $settings.logLevel) {
                         ForEach(SettingsStore.logLevelOptions, id: \.self) { Text($0).tag($0) }
                     }
@@ -20,7 +17,7 @@ struct SettingsView: View {
                 } header: {
                     Text("内核")
                 } footer: {
-                    Text("iOS 隧道扩展里 system 栈 TCP 常走不通，建议保持 gvisor。")
+                    Text("TCP/IP 栈固定 gvisor（iOS 隧道扩展里 system 栈 TCP 走不通）。")
                 }
 
                 Section {
