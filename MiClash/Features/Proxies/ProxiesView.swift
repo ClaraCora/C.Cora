@@ -125,7 +125,7 @@ private struct GroupCard: View {
 
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
-                    Text(group.name).font(.headline)
+                    Text(group.name).font(.title3.weight(.semibold))
                     TypeBadge(type: group.type)
                 }
                 Text(group.now)
@@ -163,7 +163,7 @@ private struct ProxyNodeRow: View {
                 .font(.body)
                 .foregroundStyle(isCurrent ? Color.accentColor : Color.secondary.opacity(0.35))
             Text(node)
-                .font(.body)
+                .font(.headline.weight(.regular))
                 .foregroundStyle(selectable ? .primary : .secondary)
                 .lineLimit(1)
             Spacer(minLength: 8)
