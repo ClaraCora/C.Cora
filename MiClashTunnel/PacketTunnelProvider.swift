@@ -1,5 +1,6 @@
 import NetworkExtension
 import Mihomo // gomobile 生成的 mihomo 内核框架（含 with_gvisor）
+import Network
 import Darwin
 import os.log
 
@@ -18,6 +19,12 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
     /// 当前 mihomo 工作目录（含 run.log）。供 handleAppMessage 回传内核日志用。
     private var homeDir: String?
+
+    // 物理接口监控：把真实出站接口（en0/pdp_ip0）显式喂给内核，取代 mihomo 自带的不可靠监控。
+    private var pathMonitor: NWPathMonitor?
+    private let pathMonitorQueue = DispatchQueue(label: "com.miclash.tunnel.pathmonitor", qos: .utility)
+    private var pendingPathUpdate: DispatchWorkItem?
+    private var lastInterfaceName: String?
 
     override func startTunnel(options: [String: NSObject]?,
                               completionHandler: @escaping (Error?) -> Void) {
@@ -77,6 +84,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             if ok {
                 FileLog.write("MihomoStartWithConfig 返回成功")
                 self.log.info("mihomo 启动成功")
+                self.startPathMonitor() // 开始把真实出站接口喂给内核
                 completionHandler(nil)
             } else {
                 let err = startError ?? NSError(domain: "MiClashTunnel", code: -3,
@@ -107,8 +115,55 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                             completionHandler: @escaping () -> Void) {
         FileLog.write("stopTunnel，原因 rawValue=\(reason.rawValue)")
         log.info("stopTunnel，原因：\(reason.rawValue, privacy: .public)")
+        stopPathMonitor()
         MihomoStop()
         completionHandler()
+    }
+
+    // MARK: - 物理接口监控
+
+    /// 监控网络路径，把真实出站接口名喂给 mihomo（取代其自带的 iOS 下不可靠的接口监控）。
+    /// 出站绑对物理网卡才不会被默认路由兜回 tun → 这是吞吐能跑满的关键。
+    private func startPathMonitor() {
+        stopPathMonitor()
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] path in
+            self?.schedulePathUpdate(path)
+        }
+        monitor.start(queue: pathMonitorQueue)
+        pathMonitor = monitor
+    }
+
+    private func stopPathMonitor() {
+        pendingPathUpdate?.cancel()
+        pendingPathUpdate = nil
+        pathMonitor?.cancel()
+        pathMonitor = nil
+    }
+
+    /// 首次立即应用（缩短启动时「出站未绑接口」的窗口）；之后变化用防抖。
+    private func schedulePathUpdate(_ path: Network.NWPath) {
+        pendingPathUpdate?.cancel()
+        if lastInterfaceName == nil {
+            applyInterface(from: path)
+            return
+        }
+        let work = DispatchWorkItem { [weak self] in
+            self?.applyInterface(from: path)
+        }
+        pendingPathUpdate = work
+        pathMonitorQueue.asyncAfter(deadline: .now() + .milliseconds(800), execute: work)
+    }
+
+    private func applyInterface(from path: Network.NWPath) {
+        guard path.status == .satisfied,
+              let iface = path.availableInterfaces.first(where: { $0.type != .other }) ?? path.availableInterfaces.first else {
+            return
+        }
+        guard iface.name != lastInterfaceName else { return }
+        lastInterfaceName = iface.name
+        FileLog.write("出站接口切到 \(iface.name)")
+        MihomoSetDefaultInterface(iface.name)
     }
 
     /// 主 App 经 sendProviderMessage 发来的请求（不依赖 App Group 的官方 IPC）。

@@ -16,8 +16,7 @@ enum MihomoConfig {
     static let tunGatewayIP = "198.18.0.1"
     static let tunSubnetMask = "255.255.0.0"
     static let dnsServerIP = "198.18.0.2"
-    /// 9000 = sing-tun 默认。NE 隧道接口与 mihomo tun 都用 9000，提升 gvisor 吞吐。
-    static let mtu = 9000
+    static let mtu = 1500
 
     /// 生成 DIRECT 直连模式的最小配置 YAML。
     /// 注意：tun.file-descriptor 不在此处填写——它是运行期值，由 Go 侧

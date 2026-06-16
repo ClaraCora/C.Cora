@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/adapter/outboundgroup"
+	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/config"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/hub/executor"
@@ -188,28 +189,27 @@ func mergeConfig(subYAML string, st appSettings) ([]byte, error) {
 		}
 	}
 
-	// 强制 tun：gvisor 栈（iOS NE 里 system 栈 TCP 不通），dns 劫持，自动路由。
-	// mtu=9000：sing-tun 默认值。设成 1500 会让 gvisor 处理的包数翻几倍、吞吐大降——这是限速主因。
-	m["tun"] = map[string]any{
-		"enable":                true,
-		"stack":                 st.Stack,
-		"dns-hijack":            []any{"any:53"},
-		"auto-route":            true,
-		"auto-detect-interface": true,
-		"mtu":                   9000,
+	// 强制 tun（参考能跑满速的 Everywhere）：只设 enable/stack/mtu/dns-hijack/地址。
+	// **关键：不设 auto-detect-interface / auto-route**——mihomo 自带接口监控在 iOS NE 不可靠，
+	// 会把出站接口错切，导致流量被默认路由兜回 tun 而限速。出站接口改由 NE 的 NWPathMonitor
+	// 经 SetDefaultInterface 显式喂入；iOS 路由由 NEPacketTunnelNetworkSettings 负责，无需 auto-route。
+	tunCfg := map[string]any{
+		"enable":        true,
+		"stack":         st.Stack,
+		"mtu":           1500,
+		"dns-hijack":    []any{"any:53"},
+		"inet4-address": []any{"198.18.0.1/16"},
 	}
-	// 并发建连，降低连接建立延迟。
-	m["tcp-concurrent"] = true
-	// 强制 dns：tun 必须 fake-ip。
-	// nameserver 用纯 IP DoH（安全）；default/proxy-server-nameserver 用快速 UDP DNS
-	// 专门解析代理服务器域名——否则代理服务器也走慢速 DoH，每次建连都多一次 TLS 握手，延迟翻倍。
+	if st.IPv6 {
+		tunCfg["inet6-address"] = []any{"fdfe:dcba:9876::1/126"}
+	}
+	m["tun"] = tunCfg
+	// 强制 dns：tun 必须 fake-ip + 纯 IP 的 DoH 上游（无需二次解析，杜绝死循环）。
 	m["dns"] = map[string]any{
-		"enable":                  true,
-		"ipv6":                    st.IPv6,
-		"enhanced-mode":           "fake-ip",
-		"fake-ip-range":           "198.18.0.1/16",
-		"default-nameserver":      []any{"223.5.5.5", "8.8.8.8"},
-		"proxy-server-nameserver": []any{"223.5.5.5", "8.8.8.8"},
+		"enable":        true,
+		"ipv6":          st.IPv6,
+		"enhanced-mode": "fake-ip",
+		"fake-ip-range": "198.18.0.1/16",
 		"nameserver": []any{
 			"https://223.5.5.5/dns-query",
 			"https://1.1.1.1/dns-query",
@@ -309,6 +309,14 @@ func SelectProxy(group, name string) error {
 		return fmt.Errorf("%s 不是可选择的策略组（Selector）", group)
 	}
 	return selector.Set(name)
+}
+
+// SetDefaultInterface 把所有出站绑定到指定物理接口（en0/pdp_ip0…）。
+// 由 NE 的 NWPathMonitor 在网络路径变化时调用，取代 mihomo 自带的（iOS 下不可靠的）接口监控。
+// 对应 Swift 侧 `MihomoSetDefaultInterface(_:)`。
+func SetDefaultInterface(name string) {
+	dialer.DefaultInterface.Store(name)
+	appendRunLog("默认出站接口 = " + name)
 }
 
 // Stop 关闭内核与所有监听器。对应 Swift 侧 `MihomoStop()`。
