@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// 节点页：策略组可折叠（默认收起），支持延迟测速，手动切换（仅 Selector 组）。
+/// 节点页：扁平可折叠列表（默认收起），支持延迟测速，手动切换（仅 Selector 组）。
 struct ProxiesView: View {
     @EnvironmentObject private var core: CoreStateManager
     @StateObject private var controller = ProxyController()
@@ -48,40 +48,41 @@ struct ProxiesView: View {
     private var groupList: some View {
         List {
             ForEach(controller.groups) { group in
-                Section {
-                    if expanded.contains(group.name) {
-                        ForEach(group.all, id: \.self) { node in
-                            ProxyNodeRow(
-                                node: node,
-                                isCurrent: node == group.now,
-                                selectable: group.selectable,
-                                delay: controller.delays[node])
-                            .contentShape(Rectangle())
-                            .onTapGesture {
-                                guard group.selectable, node != group.now else { return }
-                                Task { await controller.select(group: group.name, name: node) }
-                            }
+                GroupHeaderRow(
+                    group: group,
+                    isExpanded: expanded.contains(group.name),
+                    isTesting: controller.testing.contains(group.name),
+                    onToggle: { toggle(group.name) },
+                    onTest: { Task { await controller.testGroup(group.name) } })
+
+                if expanded.contains(group.name) {
+                    ForEach(group.all, id: \.self) { node in
+                        ProxyNodeRow(
+                            node: node,
+                            isCurrent: node == group.now,
+                            selectable: group.selectable,
+                            delay: controller.delays[node])
+                        .listRowInsets(EdgeInsets(top: 4, leading: 34, bottom: 4, trailing: 16))
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            guard group.selectable, node != group.now else { return }
+                            Task { await controller.select(group: group.name, name: node) }
                         }
                     }
-                } header: {
-                    GroupHeader(
-                        group: group,
-                        isExpanded: expanded.contains(group.name),
-                        isTesting: controller.testing.contains(group.name),
-                        onToggle: { toggle(group.name) },
-                        onTest: { Task { await controller.testGroup(group.name) } })
                 }
             }
         }
-        .listStyle(.insetGrouped)
+        .listStyle(.plain)
     }
 
     private func toggle(_ name: String) {
-        if expanded.contains(name) { expanded.remove(name) } else { expanded.insert(name) }
+        withAnimation(.easeInOut(duration: 0.18)) {
+            if expanded.contains(name) { expanded.remove(name) } else { expanded.insert(name) }
+        }
     }
 }
 
-private struct GroupHeader: View {
+private struct GroupHeaderRow: View {
     let group: ProxyGroup
     let isExpanded: Bool
     let isTesting: Bool
@@ -90,45 +91,37 @@ private struct GroupHeader: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            // 标题区：点击折叠/展开
-            Button(action: onToggle) {
-                HStack(spacing: 8) {
-                    Image(systemName: "chevron.right")
-                        .font(.caption2.weight(.bold))
-                        .foregroundStyle(.secondary)
-                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
-                    VStack(alignment: .leading, spacing: 2) {
-                        HStack(spacing: 6) {
-                            Text(group.name)
-                                .font(.subheadline.weight(.semibold))
-                                .foregroundStyle(.primary)
-                            TypeBadge(type: group.type)
-                        }
-                        Text(group.now)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                    Spacer(minLength: 0)
-                }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
+            Image(systemName: "chevron.right")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(.secondary)
+                .rotationEffect(.degrees(isExpanded ? 90 : 0))
 
-            // 测速
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(group.name).font(.subheadline.weight(.semibold))
+                    TypeBadge(type: group.type)
+                }
+                Text(group.now)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            Spacer(minLength: 8)
+
             Button(action: onTest) {
                 if isTesting {
                     ProgressView()
                 } else {
-                    Image(systemName: "bolt.fill")
-                        .foregroundStyle(.yellow)
+                    Image(systemName: "bolt.fill").foregroundStyle(.yellow)
                 }
             }
             .buttonStyle(.borderless)
             .disabled(isTesting)
         }
-        .textCase(nil)
-        .padding(.vertical, 2)
+        .padding(.vertical, 4)
+        .contentShape(Rectangle())
+        .onTapGesture(perform: onToggle)
     }
 }
 
@@ -141,14 +134,15 @@ private struct ProxyNodeRow: View {
     var body: some View {
         HStack(spacing: 10) {
             Image(systemName: isCurrent ? "checkmark.circle.fill" : "circle")
+                .font(.footnote)
                 .foregroundStyle(isCurrent ? Color.accentColor : Color.secondary.opacity(0.35))
             Text(node)
+                .font(.callout)
                 .foregroundStyle(selectable ? .primary : .secondary)
                 .lineLimit(1)
             Spacer(minLength: 8)
             DelayBadge(delay: delay)
         }
-        .padding(.vertical, 3)
     }
 }
 
