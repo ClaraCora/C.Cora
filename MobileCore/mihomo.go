@@ -92,6 +92,11 @@ func startLogCapture() {
 			}
 			defer f.Close()
 			for elm := range sub {
+				// 总线收所有级别（mihomo 的 logCh 无条件推送），这里按配置级别过滤，
+				// 让 run.log 以「设置里的日志级别」为天花板——复刻 print 的 `< Level()` 逻辑。
+				if elm.LogLevel < log.Level() {
+					continue
+				}
 				_, _ = f.WriteString(fmt.Sprintf("%s [%s] %s\n",
 					time.Now().Format("15:04:05.000"), elm.Type(), elm.Payload))
 				_ = f.Sync()
@@ -279,6 +284,15 @@ func mergeConfig(subYAML string, st appSettings) ([]byte, error) {
 	if _, ok := m["mode"]; !ok {
 		m["mode"] = "rule"
 	}
+
+	// 持久化策略组选择：store-selected=true → 选中的节点写入 <home>/.cache（App Group 容器，
+	// 跨重启保留），下次启动恢复，不再回默认。保留配置里已有的 profile 其它键。
+	profile, _ := m["profile"].(map[string]any)
+	if profile == nil {
+		profile = map[string]any{}
+	}
+	profile["store-selected"] = true
+	m["profile"] = profile
 
 	// 收集本次合并的「不适用内容」提示。
 	configNotices = nil

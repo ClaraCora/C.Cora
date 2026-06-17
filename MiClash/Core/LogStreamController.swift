@@ -9,10 +9,10 @@ struct LogLine: Identifiable {
 
 /// 日志页数据源：**优先读 App Group 共享的 run.log（文件 tail），否则退回 /logs WebSocket**。
 ///
-/// 级别过滤与搜索一律**客户端做**：原始日志全存 rawLines，展示用的 lines = rawLines 按
-/// level + 搜索词过滤。切级别/改搜索只是重过滤，**绝不清空、绝不重连**——这修了「切级别再切
-/// 回来日志就没了」的问题（旧实现 WS 切级别会清空 lines 并重连流）。
-/// WS 源以最宽的 debug 订阅一次（mihomo 日志总线本就推送所有级别），拿全后客户端再筛。
+/// 天花板是「设置里的日志级别」：文件源(run.log)由内核按该级别过滤后落盘，WS 源以该级别订阅。
+/// 视图里的级别只在这个天花板内**客户端再筛**：原始日志全存 rawLines，展示用的 lines = rawLines
+/// 按 level + 搜索词过滤。切级别/改搜索只是重过滤，**绝不清空、绝不重连**——修了「切级别再切回来
+/// 日志就没了」。所以设 info 时最多到 info；想看 debug 要把设置里的日志级别调到 debug。
 @MainActor
 final class LogStreamController: ObservableObject {
 
@@ -133,6 +133,8 @@ final class LogStreamController: ObservableObject {
                 if self?.rawLines.isEmpty ?? true { self?.error = "未连接内核（请先连接 VPN）" }
             }
         }
-        stream.start(path: "logs", query: [URLQueryItem(name: "level", value: "debug")])
+        // 以「设置里的日志级别」为天花板订阅（不再固定 debug），与文件源/设置语义一致；
+        // 视图里切级别只在此天花板内客户端再筛。
+        stream.start(path: "logs", query: [URLQueryItem(name: "level", value: SettingsStore.shared.logLevel)])
     }
 }
