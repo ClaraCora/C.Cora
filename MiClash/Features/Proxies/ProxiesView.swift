@@ -136,6 +136,8 @@ private struct GroupCard: View {
                 .foregroundStyle(.secondary)
                 .rotationEffect(.degrees(isExpanded ? 90 : 0))
 
+            GroupIcon(url: group.icon)
+
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
                     Text(group.name).font(.title3.weight(.semibold))
@@ -161,6 +163,30 @@ private struct GroupCard: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 12)
+    }
+}
+
+/// 策略组图标：配置里的 icon URL（内核经 /proxies 回传）。无图标时不占位。
+private struct GroupIcon: View {
+    let url: URL?
+
+    var body: some View {
+        if let url {
+            AsyncImage(url: url) { phase in
+                switch phase {
+                case .success(let image):
+                    image.resizable().scaledToFit()
+                case .empty:
+                    ProgressView().controlSize(.mini)
+                case .failure:
+                    Image(systemName: "globe").foregroundStyle(.secondary)
+                @unknown default:
+                    Color.clear
+                }
+            }
+            .frame(width: 26, height: 26)
+            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        }
     }
 }
 

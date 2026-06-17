@@ -7,6 +7,7 @@ struct ProxyGroup: Identifiable {
     let type: String      // Selector / URLTest / Fallback / LoadBalance / Relay ...
     let now: String       // 当前选中/生效的节点
     let all: [String]     // 成员节点名（按配置顺序）
+    let icon: URL?        // 配置里 proxy-groups[].icon，内核经 /proxies 原样回传
 
     /// 只有 Selector 可手动点选；URLTest/Fallback 等是自动组。
     var selectable: Bool { type == "Selector" }
@@ -51,10 +52,12 @@ final class ProxyController: ObservableObject {
             func makeGroup(_ name: String) -> ProxyGroup? {
                 guard let d = proxies[name] as? [String: Any],
                       let all = d["all"] as? [String] else { return nil }
+                let iconStr = (d["icon"] as? String)?.trimmingCharacters(in: .whitespaces) ?? ""
                 return ProxyGroup(name: name,
                                   type: d["type"] as? String ?? "",
                                   now: d["now"] as? String ?? "",
-                                  all: all)
+                                  all: all,
+                                  icon: iconStr.isEmpty ? nil : URL(string: iconStr))
             }
 
             switch mode {
