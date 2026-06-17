@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// 节点页：卡片式可折叠列表（每组一张圆角卡片，左右留白、组间留白、无分割线）。
 struct ProxiesView: View {
@@ -166,27 +167,36 @@ private struct GroupCard: View {
     }
 }
 
-/// 策略组图标：配置里的 icon URL（内核经 /proxies 回传）。无图标时不占位。
+/// 策略组图标：配置里的 icon URL（内核经 /proxies 回传），带内存+磁盘缓存。无图标时不占位。
 private struct GroupIcon: View {
     let url: URL?
+    @State private var image: UIImage?
+    @State private var failed = false
 
     var body: some View {
         if let url {
-            AsyncImage(url: url) { phase in
-                switch phase {
-                case .success(let image):
-                    image.resizable().scaledToFit()
-                case .empty:
-                    ProgressView().controlSize(.mini)
-                case .failure:
-                    Image(systemName: "globe").foregroundStyle(.secondary)
-                @unknown default:
-                    Color.clear
-                }
-            }
-            .frame(width: 26, height: 26)
-            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+            content
+                .frame(width: 26, height: 26)
+                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                .task(id: url) { await load(url) }
         }
+    }
+
+    @ViewBuilder private var content: some View {
+        if let image {
+            Image(uiImage: image).resizable().scaledToFit()
+        } else if failed {
+            Image(systemName: "globe").foregroundStyle(.secondary)
+        } else {
+            ProgressView().controlSize(.mini)
+        }
+    }
+
+    private func load(_ url: URL) async {
+        // 缓存命中直接显示，避免闪 loading
+        if let hit = IconCache.shared.cached(url) { image = hit; return }
+        if let img = await IconCache.shared.load(url) { image = img }
+        else { failed = true }
     }
 }
 

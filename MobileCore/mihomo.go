@@ -30,6 +30,7 @@ import (
 	"github.com/metacubex/mihomo/hub/route"
 	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/tunnel"
+	"github.com/metacubex/mihomo/tunnel/statistic"
 	"gopkg.in/yaml.v3"
 )
 
@@ -389,6 +390,35 @@ func GroupDelay(group, url string, timeoutMs int) string {
 	out, err := json.Marshal(dm)
 	if err != nil {
 		return `{"error":"marshal: ` + err.Error() + `"}`
+	}
+	return string(out)
+}
+
+// Mode 返回当前模式字符串（rule/global/direct）。对应 Swift 侧 `MihomoMode()`。
+func Mode() string {
+	return tunnel.Mode().String()
+}
+
+// SetMode 设置模式（rule/global/direct，大小写不敏感，未知按 rule）。
+// 对应 Swift 侧 `MihomoSetMode(_:)`。
+func SetMode(mode string) {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "global":
+		tunnel.SetMode(tunnel.Global)
+	case "direct":
+		tunnel.SetMode(tunnel.Direct)
+	default:
+		tunnel.SetMode(tunnel.Rule)
+	}
+}
+
+// TrafficNow 返回当前每秒上下行速率（字节）：{"up":..,"down":..}。
+// 取自 mihomo 统计管理器（与 REST /traffic 同源），对应 Swift 侧 `MihomoTrafficNow()`。
+func TrafficNow() string {
+	up, down := statistic.DefaultManager.Now()
+	out, err := json.Marshal(map[string]int64{"up": up, "down": down})
+	if err != nil {
+		return `{"up":0,"down":0}`
 	}
 	return string(out)
 }

@@ -197,6 +197,13 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             let url = (obj?["url"] as? String) ?? ""
             let timeout = (obj?["timeout"] as? Int) ?? 5000
             completionHandler?(Data(MihomoGroupDelay(group, url, timeout).utf8))
+        case "traffic":
+            completionHandler?(Data(MihomoTrafficNow().utf8))
+        case "getMode":
+            completionHandler?(Data(MihomoMode().utf8))
+        case "setMode":
+            MihomoSetMode((obj?["mode"] as? String) ?? "rule")
+            completionHandler?(Data(#"{"ok":true}"#.utf8))
         default: // getLogs 及未知命令都回传日志，便于排查
             // 日志可能很大，IPC 响应有体积上限 → 只回传末尾约 24KB，取最新内容。
             let body = "[cmd=\(cmd)]\n" + collectLogs()

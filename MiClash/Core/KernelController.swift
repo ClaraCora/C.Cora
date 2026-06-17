@@ -1,7 +1,7 @@
 import Foundation
 
 /// 连接页用的内核运行态：当前模式 + 实时上下行速率。
-/// 经 external-controller：模式 GET/PATCH /configs，速率订阅 /traffic 流。
+/// 经 **sendProviderMessage IPC**：模式 getMode/setMode，速率 traffic（内核每秒速率直给）。
 @MainActor
 final class KernelController: ObservableObject {
 
@@ -47,53 +47,42 @@ final class KernelController: ObservableObject {
     /// 断开后调用：停止采样。
     func stop() { stopTraffic() }
 
-    /// 读取当前模式（连通即标记 reachable）。
+    /// 读取当前模式（IPC getMode，连通即标记 reachable）。
     func loadMode() async {
-        do {
-            let m = try await MihomoAPI.currentMode()
+        let result = await CoreStateManager.shared.sendMessage(["cmd": "getMode"])
+        switch result {
+        case .ok(let data):
+            let m = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             mode = Mode(rawValue: m) ?? .rule
             reachable = true
-        } catch {
+        case .failure:
             reachable = false
         }
     }
 
-    /// 切换模式（乐观更新 + 回读确认）。
+    /// 切换模式（IPC setMode，乐观更新 + 失败回滚）。
     func setMode(_ newMode: Mode) async {
         let old = mode
         mode = newMode
-        do {
-            try await MihomoAPI.setMode(newMode.rawValue)
-        } catch {
-            mode = old // 失败回滚
-        }
+        let result = await CoreStateManager.shared.sendMessage(["cmd": "setMode", "mode": newMode.rawValue])
+        if case .failure = result { mode = old }
     }
 
-    /// 开始速率轮询（连接后调用）。每秒 GET /connections，用累计字节差值算速率。
-    /// 走普通 GET 而非 WebSocket——后者在重签环境下几秒就断，轮询稳定可靠。
+    /// 开始速率轮询（连接后调用）。每秒 IPC traffic，内核直接给每秒速率，无需差值计算。
     func startTraffic() {
         stopTraffic()
         trafficTask = Task { [weak self] in
-            var prevDown: Int64?
-            var prevUp: Int64?
-            var prevTime = Date()
             while !Task.isCancelled {
-                do {
-                    let (d, u) = try await MihomoAPI.connectionsTotals()
-                    let now = Date()
-                    if let pd = prevDown, let pu = prevUp {
-                        let dt = max(now.timeIntervalSince(prevTime), 0.001)
-                        let downRate = max(0, Int64(Double(d - pd) / dt))
-                        let upRate = max(0, Int64(Double(u - pu) / dt))
-                        self?.down = downRate
-                        self?.up = upRate
-                        self?.pushSample(up: upRate, down: downRate)
-                    }
-                    prevDown = d
-                    prevUp = u
-                    prevTime = now
+                let result = await CoreStateManager.shared.sendMessage(["cmd": "traffic"])
+                if case .ok(let data) = result,
+                   let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+                    let u = (obj["up"] as? NSNumber)?.int64Value ?? 0
+                    let d = (obj["down"] as? NSNumber)?.int64Value ?? 0
+                    self?.up = u
+                    self?.down = d
+                    self?.pushSample(up: u, down: d)
                     self?.reachable = true
-                } catch {
+                } else {
                     self?.reachable = false
                 }
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
