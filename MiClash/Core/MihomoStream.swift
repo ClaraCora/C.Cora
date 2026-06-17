@@ -13,12 +13,14 @@ final class MihomoStream: NSObject, @unchecked Sendable {
     private var session: URLSession?
     private var task: URLSessionWebSocketTask?
     private var path = ""
+    private var query: [URLQueryItem] = []
     private var active = false
     private var generation = 0   // 每次 connect 自增，旧的接收/ping/重连循环据此失效
 
-    func start(path: String) {
+    func start(path: String, query: [URLQueryItem] = []) {
         stop()
         self.path = path
+        self.query = query
         active = true
         connect()
     }
@@ -44,6 +46,7 @@ final class MihomoStream: NSObject, @unchecked Sendable {
         var comps = URLComponents(url: MihomoAPI.base.appendingPathComponent(path),
                                   resolvingAgainstBaseURL: false)!
         comps.scheme = "ws"
+        if !query.isEmpty { comps.queryItems = query }
         var req = URLRequest(url: comps.url!)
         if !MihomoAPI.secret.isEmpty {
             req.setValue("Bearer \(MihomoAPI.secret)", forHTTPHeaderField: "Authorization")
