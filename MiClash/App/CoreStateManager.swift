@@ -89,31 +89,44 @@ final class CoreStateManager: ObservableObject {
 
     /// 用户点连接按钮：根据当前状态决定启停（toggle 语义）。
     func toggleConnection() async {
-        guard !isBusy else { return }
+        if isActive { disconnect() } else { await connect() }
+    }
+
+    /// 显式连接（UI / 快捷指令共用）。连接后同步磁贴状态。
+    func connect() async {
+        guard !isBusy, !isActive else { return }
         isBusy = true
         defer { isBusy = false }
         lastError = nil
-
         do {
-            switch status {
-            case .connected, .connecting, .reasserting:
-                tunnel.stop()
-            default:
-                // 连接时下发当前订阅配置 + 设置；无订阅则传空串，NE 用缓存/DIRECT 兜底。
-                let yaml = SubscriptionStore.shared.activeYAML ?? ""
-                let settings = SettingsStore.shared.asJSON()
-                let s = SettingsStore.shared
-                let opts = TunnelManager.ProtocolOptions(
-                    includeAllNetworks: s.includeAllNetworks,
-                    excludeCellularServices: s.excludeCellularServices,
-                    excludeAPNs: s.excludeAPNs,
-                    excludeDeviceCommunication: s.excludeDeviceCommunication,
-                    enforceRoutes: s.enforceRoutes)
-                try await tunnel.start(configYAML: yaml, settingsJSON: settings, protocolOptions: opts)
-            }
+            // 连接时下发当前订阅配置 + 设置；无订阅则传空串，NE 用缓存/DIRECT 兜底。
+            let yaml = SubscriptionStore.shared.activeYAML ?? ""
+            let settings = SettingsStore.shared.asJSON()
+            let s = SettingsStore.shared
+            let opts = TunnelManager.ProtocolOptions(
+                includeAllNetworks: s.includeAllNetworks,
+                excludeCellularServices: s.excludeCellularServices,
+                excludeAPNs: s.excludeAPNs,
+                excludeDeviceCommunication: s.excludeDeviceCommunication,
+                enforceRoutes: s.enforceRoutes)
+            try await tunnel.start(configYAML: yaml, settingsJSON: settings, protocolOptions: opts)
+            syncWidget(true)
         } catch {
             lastError = error.localizedDescription
         }
+    }
+
+    /// 显式断开（UI / 快捷指令共用）。断开后同步磁贴状态。
+    func disconnect() {
+        guard isActive else { return }
+        tunnel.stop()
+        syncWidget(false)
+    }
+
+    /// 写共享状态 + 请求刷新控制中心磁贴（乐观，NE 启停后还会再写一次确认）。
+    private func syncWidget(_ connected: Bool) {
+        AppGroupState.vpnConnected = connected
+        ControlCenter.shared.reloadControls(ofKind: ControlWidgetKind.vpn)
     }
 
     /// 向运行中的 NE 发 JSON 命令并取回响应（策略组查询/切换、日志等共用）。
