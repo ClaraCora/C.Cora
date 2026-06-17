@@ -192,6 +192,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             let resp: [String: Any] = ok ? ["ok": true]
                                          : ["ok": false, "error": err?.localizedDescription ?? "未知错误"]
             completionHandler?((try? JSONSerialization.data(withJSONObject: resp)) ?? Data())
+        case "groupDelay":
+            let group = (obj?["group"] as? String) ?? ""
+            let url = (obj?["url"] as? String) ?? ""
+            let timeout = (obj?["timeout"] as? Int) ?? 5000
+            completionHandler?(Data(MihomoGroupDelay(group, url, timeout).utf8))
         default: // getLogs 及未知命令都回传日志，便于排查
             // 日志可能很大，IPC 响应有体积上限 → 只回传末尾约 24KB，取最新内容。
             let body = "[cmd=\(cmd)]\n" + collectLogs()

@@ -13,7 +13,8 @@ struct ProxyGroup: Identifiable {
     var selectable: Bool { type == "Selector" }
 }
 
-/// 策略组查询与节点切换：经 mihomo external-controller HTTP（GET /proxies、PUT /proxies/{group}）。
+/// 策略组查询与节点切换：经 **sendProviderMessage IPC** 直连 NE 内核
+/// （queryProxies / selectProxy / groupDelay），不走 HTTP API。
 ///
 /// 排序：用 GLOBAL 组的 all 顺序（即配置里 proxy-groups 的定义顺序），不再按字母乱排。
 /// 模式感知：global 只显示 GLOBAL 组；rule 显示其余策略组；direct 不涉及节点选择。
@@ -35,11 +36,18 @@ final class ProxyController: ObservableObject {
         error = nil
         defer { isLoading = false }
 
-        do {
-            async let modeStr = MihomoAPI.currentMode()
-            async let proxiesObj = MihomoAPI.proxiesJSON()
-            let (m, obj) = try await (modeStr, proxiesObj)
-            mode = m
+        let result = await CoreStateManager.shared.sendMessage(["cmd": "queryProxies"])
+        switch result {
+        case .failure(let reason):
+            self.error = "拿不到节点：\(reason)"
+            groups = []
+            return
+        case .ok(let data):
+            guard let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+                error = "解析失败（IPC 响应非 JSON）"
+                return
+            }
+            mode = (obj["mode"] as? String) ?? "rule"
 
             guard let proxies = obj["proxies"] as? [String: Any] else {
                 error = "解析代理列表失败"
@@ -81,31 +89,47 @@ final class ProxyController: ObservableObject {
                 }
                 groups = ordered
             }
-        } catch {
-            self.error = "连不上内核：\(error.localizedDescription)\n（请确认 VPN 已连接）"
-            groups = []
         }
     }
 
-    /// 在某策略组选定节点。
+    /// 在某策略组选定节点（IPC selectProxy）。
     func select(group: String, name: String) async {
-        do {
-            try await MihomoAPI.select(group: group, node: name)
-            await load()
-        } catch {
-            self.error = "切换失败：\(error.localizedDescription)"
+        let result = await CoreStateManager.shared.sendMessage(
+            ["cmd": "selectProxy", "group": group, "name": name])
+        switch result {
+        case .ok(let data):
+            let resp = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            if (resp?["ok"] as? Bool) == true {
+                await load()
+            } else {
+                self.error = "切换失败：\((resp?["error"] as? String) ?? "未知错误")"
+            }
+        case .failure(let reason):
+            self.error = "切换失败：\(reason)"
         }
     }
 
-    /// 对某策略组做延迟测试，结果并入 delays。
+    /// 对某策略组做延迟测试（IPC groupDelay），结果并入 delays。
     func testGroup(_ name: String) async {
         testing.insert(name)
         defer { testing.remove(name) }
-        do {
-            let result = try await MihomoAPI.groupDelay(group: name)
-            for (node, ms) in result { delays[node] = ms }
-        } catch {
-            self.error = "测速失败：\(error.localizedDescription)"
+        let result = await CoreStateManager.shared.sendMessage(
+            ["cmd": "groupDelay", "group": name, "timeout": 5000])
+        switch result {
+        case .ok(let data):
+            guard let dict = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+                self.error = "测速失败：响应非 JSON"
+                return
+            }
+            if let err = dict["error"] as? String {
+                self.error = "测速失败：\(err)"
+                return
+            }
+            for (node, ms) in dict {
+                if let v = (ms as? NSNumber)?.intValue { delays[node] = v }
+            }
+        case .failure(let reason):
+            self.error = "测速失败：\(reason)"
         }
     }
 }

@@ -9,6 +9,7 @@
 package mihomo
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -20,6 +21,7 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/adapter/outboundgroup"
+	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/updater"
 	"github.com/metacubex/mihomo/config"
@@ -327,10 +329,15 @@ func QueryProxies() string {
 			"type": p["type"],
 			"now":  p["now"],
 			"all":  p["all"],
+			"icon": p["icon"], // 策略组图标 URL（配置里的）
 		}
 	}
 
-	out, err := json.Marshal(map[string]any{"proxies": groups})
+	// 顺带带上当前模式，UI 一次 IPC 即可拿到「组 + 模式」，省一次往返。
+	out, err := json.Marshal(map[string]any{
+		"proxies": groups,
+		"mode":    tunnel.Mode().String(),
+	})
 	if err != nil {
 		return `{"proxies":{},"error":"repack: ` + err.Error() + `"}`
 	}
@@ -351,6 +358,39 @@ func SelectProxy(group, name string) error {
 		return fmt.Errorf("%s 不是可选择的策略组（Selector）", group)
 	}
 	return selector.Set(name)
+}
+
+// GroupDelay 对策略组里所有节点做延迟测试（等价 REST GET /group/{name}/delay），
+// 返回 {<节点名>: 毫秒} 的 JSON；失败返回 {"error":...}。
+// 对应 Swift 侧 `MihomoGroupDelay(_:_:_:)`。
+func GroupDelay(group, url string, timeoutMs int) string {
+	p, exist := tunnel.Proxies()[group]
+	if !exist {
+		return `{"error":"策略组不存在"}`
+	}
+	g, ok := p.Adapter().(outboundgroup.ProxyGroup)
+	if !ok {
+		return `{"error":"不是策略组"}`
+	}
+	if url == "" {
+		url = "https://www.gstatic.com/generate_204"
+	}
+	if timeoutMs <= 0 {
+		timeoutMs = 5000
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(timeoutMs))
+	defer cancel()
+
+	var expectedStatus utils.IntRanges[uint16] // 零值=不限定状态码，与不带 expected 的 REST 行为一致
+	dm, err := g.URLTest(ctx, url, expectedStatus)
+	if err != nil {
+		return `{"error":"` + err.Error() + `"}`
+	}
+	out, err := json.Marshal(dm)
+	if err != nil {
+		return `{"error":"marshal: ` + err.Error() + `"}`
+	}
+	return string(out)
 }
 
 // SetDefaultInterface 把所有出站绑定到指定物理接口（en0/pdp_ip0…）。
