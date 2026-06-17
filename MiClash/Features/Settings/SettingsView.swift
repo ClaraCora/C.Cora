@@ -116,7 +116,8 @@ struct SettingsView: View {
     }
 }
 
-/// 内核状态页：探测 external-controller 是否可达。
+/// 内核状态页：同时探测 external-controller API 与 sendProviderMessage IPC，并排对比可用性。
+/// 用于在自有账号 + App Group 就绪后，验证 IPC 是否已恢复可靠（决定能否把控制从 HTTP 切到 IPC）。
 private struct KernelStatusView: View {
     @State private var text = "探测中…"
 
@@ -135,25 +136,34 @@ private struct KernelStatusView: View {
     }
 
     private func reload() async {
-        text = "探测 \(MihomoAPI.base.absoluteString) …"
+        text = "探测中…"
+        var out = "目标：\(MihomoAPI.base.absoluteString)\n（请在 VPN 已连接时探测）\n"
+
+        // 1) external-controller API（loopback HTTP）
+        out += "\n【external-controller API】\n"
         do {
             let version = try await MihomoAPI.version()
             let obj = try await MihomoAPI.proxiesJSON()
             let proxies = (obj["proxies"] as? [String: Any]) ?? [:]
             let groupCount = proxies.values.compactMap { ($0 as? [String: Any])?["all"] }.count
-            text = """
-            ✅ external-controller 可达
-            版本：\(version)
-            代理/组总数：\(proxies.count)
-            策略组数：\(groupCount)
-            """
+            out += "✅ 可达，版本 \(version)，代理/组 \(proxies.count)，策略组 \(groupCount)\n"
         } catch {
-            text = """
-            ❌ 连不上内核 \(MihomoAPI.base.absoluteString)
-            \(error.localizedDescription)
-
-            请确认 VPN 已连接后再探测。
-            """
+            out += "❌ \(error.localizedDescription)\n"
         }
+
+        // 2) sendProviderMessage IPC（App↔NE 官方通道）
+        out += "\n【sendProviderMessage IPC】\n"
+        let ipc = await CoreStateManager.shared.sendMessage(["cmd": "queryProxies"])
+        switch ipc {
+        case .ok(let data):
+            let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            let proxies = (obj?["proxies"] as? [String: Any]) ?? [:]
+            let groupCount = proxies.values.compactMap { ($0 as? [String: Any])?["all"] }.count
+            out += "✅ 可用，queryProxies 回 \(data.count) 字节，策略组 \(groupCount)\n"
+        case .failure(let reason):
+            out += "❌ \(reason)\n"
+        }
+
+        text = out
     }
 }
