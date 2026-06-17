@@ -3,6 +3,7 @@ import SwiftUI
 /// 设置页：内核栈/日志/IPv6/geo + 外部控制。改后需重新连接生效。
 struct SettingsView: View {
     @EnvironmentObject private var settings: SettingsStore
+    @EnvironmentObject private var core: CoreStateManager
     @State private var geoUpdating = false
     @State private var geoResult: String?
 
@@ -77,6 +78,21 @@ struct SettingsView: View {
                 }
 
                 Section {
+                    NavigationLink {
+                        KernelStatusView()
+                    } label: {
+                        Label("内核状态", systemImage: "stethoscope")
+                    }
+                    HStack {
+                        Text("内核版本")
+                        Spacer()
+                        Text(core.coreVersion).foregroundStyle(.secondary)
+                    }
+                } header: {
+                    Text("诊断")
+                }
+
+                Section {
                     Text("修改设置后需重新连接 VPN 生效。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
@@ -96,6 +112,48 @@ struct SettingsView: View {
             geoResult = "更新成功"
         } catch {
             geoResult = "更新失败：\(error.localizedDescription)（需先连接 VPN）"
+        }
+    }
+}
+
+/// 内核状态页：探测 external-controller 是否可达。
+private struct KernelStatusView: View {
+    @State private var text = "探测中…"
+
+    var body: some View {
+        ScrollView {
+            Text(text)
+                .font(.system(.footnote, design: .monospaced))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .textSelection(.enabled)
+                .padding()
+        }
+        .navigationTitle("内核状态")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar { Button("刷新") { Task { await reload() } } }
+        .task { await reload() }
+    }
+
+    private func reload() async {
+        text = "探测 \(MihomoAPI.base.absoluteString) …"
+        do {
+            let version = try await MihomoAPI.version()
+            let obj = try await MihomoAPI.proxiesJSON()
+            let proxies = (obj["proxies"] as? [String: Any]) ?? [:]
+            let groupCount = proxies.values.compactMap { ($0 as? [String: Any])?["all"] }.count
+            text = """
+            ✅ external-controller 可达
+            版本：\(version)
+            代理/组总数：\(proxies.count)
+            策略组数：\(groupCount)
+            """
+        } catch {
+            text = """
+            ❌ 连不上内核 \(MihomoAPI.base.absoluteString)
+            \(error.localizedDescription)
+
+            请确认 VPN 已连接后再探测。
+            """
         }
     }
 }

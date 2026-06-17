@@ -36,6 +36,8 @@ struct Subscription: Identifiable, Codable, Equatable {
     var used: Int64 { upload + download }
     var remaining: Int64 { max(0, total - used) }
     var hasUsage: Bool { total > 0 }
+    /// 本地配置：没有订阅链接，内容由用户手写/粘贴，不可远程刷新。
+    var isLocal: Bool { url.isEmpty }
 
     // 容错解码：旧版 subscriptions.json 没有新字段，缺失时给默认值，避免整体解码失败丢订阅。
     enum CodingKeys: String, CodingKey {
@@ -107,6 +109,32 @@ final class SubscriptionStore: ObservableObject {
         await refresh(sub.id)
     }
 
+    /// 新建一个本地配置文件（用户手写/粘贴 YAML，无订阅链接）。
+    func addLocal(name: String, yaml: String) {
+        let n = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        var sub = Subscription(name: n.isEmpty ? "本地配置" : n, url: "", yaml: yaml)
+        sub.nodeCount = countProxies(yaml)
+        sub.updatedAt = Date()
+        subscriptions.append(sub)
+        if selectedID == nil { selectedID = sub.id }
+        lastError = looksLikeClashYAML(yaml) ? nil
+            : "已保存，但内容里没找到 proxies/proxy-groups，连接时可能无效"
+        save()
+    }
+
+    /// 编辑本地配置（名称 + YAML）。
+    func updateLocal(_ id: UUID, name: String, yaml: String) {
+        guard let i = subscriptions.firstIndex(where: { $0.id == id }) else { return }
+        let n = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !n.isEmpty { subscriptions[i].name = n }
+        subscriptions[i].yaml = yaml
+        subscriptions[i].nodeCount = countProxies(yaml)
+        subscriptions[i].updatedAt = Date()
+        lastError = looksLikeClashYAML(yaml) ? nil
+            : "已保存，但内容里没找到 proxies/proxy-groups，连接时可能无效"
+        save()
+    }
+
     func remove(_ id: UUID) {
         subscriptions.removeAll { $0.id == id }
         if selectedID == id { selectedID = subscriptions.first?.id }
@@ -122,6 +150,7 @@ final class SubscriptionStore: ObservableObject {
     func refresh(_ id: UUID) async {
         guard let idx = subscriptions.firstIndex(where: { $0.id == id }) else { return }
         let urlString = subscriptions[idx].url
+        guard !urlString.isEmpty else { lastError = "本地配置无需刷新"; return }
         guard let url = URL(string: urlString) else { lastError = "无效的订阅地址"; return }
 
         isBusy = true

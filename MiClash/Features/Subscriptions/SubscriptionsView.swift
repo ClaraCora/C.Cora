@@ -1,46 +1,71 @@
 import SwiftUI
 
-/// 订阅管理页：添加/刷新/删除订阅，选择当前生效订阅。
+/// 订阅管理页：添加订阅链接 / 新建本地配置、查看详情、刷新、删除、选择当前生效。
 struct SubscriptionsView: View {
     @EnvironmentObject private var store: SubscriptionStore
-    @State private var showAdd = false
+    @State private var showAddRemote = false
+    @State private var showAddLocal = false
 
     var body: some View {
         NavigationStack {
             List {
                 if store.subscriptions.isEmpty {
-                    ContentUnavailableView("还没有订阅",
+                    ContentUnavailableView("还没有配置",
                         systemImage: "tray",
-                        description: Text("点右上角 + 粘贴 Clash/mihomo 订阅链接"))
+                        description: Text("点右上角 + 添加订阅链接，或新建一个本地配置"))
                 }
 
                 ForEach(store.subscriptions) { sub in
-                    SubscriptionRow(sub: sub, isSelected: sub.id == store.selectedID)
-                        .contentShape(Rectangle())
-                        .onTapGesture { store.select(sub.id) }
-                        .swipeActions(edge: .trailing) {
-                            Button(role: .destructive) {
-                                store.remove(sub.id)
-                            } label: { Label("删除", systemImage: "trash") }
+                    NavigationLink {
+                        SubscriptionDetailView(subID: sub.id)
+                    } label: {
+                        SubscriptionRow(sub: sub, isSelected: sub.id == store.selectedID)
+                    }
+                    .swipeActions(edge: .trailing) {
+                        Button(role: .destructive) {
+                            store.remove(sub.id)
+                        } label: { Label("删除", systemImage: "trash") }
+                        if !sub.isLocal {
                             Button {
                                 Task { await store.refresh(sub.id) }
                             } label: { Label("刷新", systemImage: "arrow.clockwise") }
                             .tint(.blue)
                         }
+                    }
+                    .swipeActions(edge: .leading) {
+                        if sub.id != store.selectedID {
+                            Button {
+                                store.select(sub.id)
+                            } label: { Label("设为当前", systemImage: "checkmark.circle") }
+                            .tint(.green)
+                        }
+                    }
                 }
             }
             .floatingTabBarInset()
-            .navigationTitle("订阅")
+            .navigationTitle("配置")
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button { showAdd = true } label: { Image(systemName: "plus") }
+                    Menu {
+                        Button { showAddRemote = true } label: {
+                            Label("添加订阅链接", systemImage: "link")
+                        }
+                        Button { showAddLocal = true } label: {
+                            Label("新建本地配置", systemImage: "doc.badge.plus")
+                        }
+                    } label: {
+                        Image(systemName: "plus")
+                    }
                 }
             }
             .overlay {
                 if store.isBusy { ProgressView().controlSize(.large) }
             }
-            .sheet(isPresented: $showAdd) {
+            .sheet(isPresented: $showAddRemote) {
                 AddSubscriptionView().environmentObject(store)
+            }
+            .sheet(isPresented: $showAddLocal) {
+                LocalConfigEditorView(editing: nil).environmentObject(store)
             }
             .alert("出错了", isPresented: .constant(store.lastError != nil)) {
                 Button("好") { store.lastError = nil }
@@ -51,7 +76,7 @@ struct SubscriptionsView: View {
     }
 }
 
-private struct SubscriptionRow: View {
+struct SubscriptionRow: View {
     let sub: Subscription
     let isSelected: Bool
 
@@ -61,6 +86,13 @@ private struct SubscriptionRow: View {
                 Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
                     .foregroundStyle(isSelected ? .green : .secondary)
                 Text(sub.name).font(.headline)
+                if sub.isLocal {
+                    Text("本地")
+                        .font(.system(size: 10, weight: .bold))
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(Capsule().fill(Color.orange.opacity(0.18)))
+                        .foregroundStyle(.orange)
+                }
                 Spacer()
                 if sub.nodeCount > 0 {
                     Text("\(sub.nodeCount) 节点")
@@ -69,7 +101,7 @@ private struct SubscriptionRow: View {
                 }
             }
 
-            // 流量进度
+            // 流量进度（仅远程订阅有）
             if sub.hasUsage {
                 VStack(alignment: .leading, spacing: 4) {
                     ProgressView(value: Double(sub.used), total: Double(max(sub.total, 1)))
@@ -90,7 +122,7 @@ private struct SubscriptionRow: View {
                         .foregroundStyle(exp < Date() ? .red : .secondary)
                 }
                 if let t = sub.updatedAt {
-                    Label(t.formatted(date: .omitted, time: .shortened), systemImage: "arrow.clockwise")
+                    Label(t.formatted(date: .omitted, time: .shortened), systemImage: "clock")
                 } else {
                     Text("未拉取").foregroundStyle(.orange)
                 }
@@ -107,7 +139,7 @@ private struct SubscriptionRow: View {
     }
 }
 
-/// 添加订阅弹窗。
+/// 添加订阅链接弹窗。
 private struct AddSubscriptionView: View {
     @EnvironmentObject private var store: SubscriptionStore
     @Environment(\.dismiss) private var dismiss

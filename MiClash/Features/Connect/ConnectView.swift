@@ -1,59 +1,26 @@
 import SwiftUI
 import Charts
 
-/// 连接页：Form 风格——连接开关、实时流量曲线、模式、内核状态。
+/// 连接页：一张「连接卡片」（大圆形开关 + 状态 + 模式三合一）+ 实时流量卡片。
+/// 内核状态等诊断信息移到设置页，这里只保留最常用的连接与模式。
 struct ConnectView: View {
     @EnvironmentObject private var core: CoreStateManager
     @EnvironmentObject private var kernel: KernelController
 
     var body: some View {
         NavigationStack {
-            Form {
-                Section {
-                    Toggle(isOn: Binding(
-                        get: { core.isActive },
-                        set: { _ in Task { await core.toggleConnection() } }
-                    )) {
-                        HStack {
-                            Image(systemName: core.isActive ? "shield.fill" : "shield.slash")
-                                .foregroundStyle(core.isActive ? .green : .secondary)
-                            Text(core.statusText)
-                        }
-                    }
-                    .disabled(core.isBusy)
-                } footer: {
-                    if let err = core.lastError {
-                        Text(err).foregroundStyle(.red)
+            ScrollView {
+                VStack(spacing: 16) {
+                    ConnectionCard()
+                    if core.isActive {
+                        TrafficCard(samples: kernel.samples, up: kernel.up, down: kernel.down)
                     }
                 }
-
-                Section("模式") {
-                    Picker("代理模式", selection: Binding(
-                        get: { kernel.mode },
-                        set: { m in Task { await kernel.setMode(m) } }
-                    )) {
-                        ForEach(KernelController.Mode.allCases) { Text($0.label).tag($0) }
-                    }
-                    .pickerStyle(.segmented)
-                    .disabled(!core.isActive)
-                }
-
-                if core.isActive {
-                    Section("实时流量") {
-                        TrafficChart(samples: kernel.samples, up: kernel.up, down: kernel.down)
-                    }
-                }
-
-                Section {
-                    NavigationLink {
-                        KernelStatusView()
-                    } label: {
-                        Label("内核状态", systemImage: "stethoscope")
-                    }
-                } footer: {
-                    Text("内核：\(core.coreVersion)")
-                }
+                .padding(.horizontal, 16)
+                .padding(.top, 8)
             }
+            .scrollIndicators(.hidden)
+            .background(Color(uiColor: .systemGroupedBackground))
             .floatingTabBarInset()
             .navigationTitle("MiClash")
             .task { await core.refreshStatus() }
@@ -61,21 +28,111 @@ struct ConnectView: View {
     }
 }
 
-/// 实时流量曲线：上/下行速率折线 + 当前数值。
-private struct TrafficChart: View {
+/// 连接卡片：大圆形电源开关 + 状态文案 + 代理模式，集中在一张卡里。
+private struct ConnectionCard: View {
+    @EnvironmentObject private var core: CoreStateManager
+    @EnvironmentObject private var kernel: KernelController
+
+    var body: some View {
+        VStack(spacing: 20) {
+            // 大圆形电源按钮
+            Button {
+                Task { await core.toggleConnection() }
+            } label: {
+                ZStack {
+                    Circle()
+                        .fill(buttonGradient)
+                        .frame(width: 150, height: 150)
+                        .shadow(color: glowColor.opacity(0.45), radius: 20, x: 0, y: 8)
+                    if core.isBusy {
+                        ProgressView()
+                            .controlSize(.large)
+                            .tint(.white)
+                    } else {
+                        Image(systemName: "power")
+                            .font(.system(size: 52, weight: .bold))
+                            .foregroundStyle(.white)
+                    }
+                }
+            }
+            .buttonStyle(.plain)
+            .disabled(core.isBusy)
+
+            VStack(spacing: 4) {
+                Text(core.statusText)
+                    .font(.title3.weight(.semibold))
+                Text(core.isActive ? "点按断开" : "点按连接")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+
+            if let err = core.lastError {
+                Text(err)
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+                    .multilineTextAlignment(.center)
+            }
+
+            Divider()
+
+            // 代理模式
+            HStack {
+                Text("模式")
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            Picker("代理模式", selection: Binding(
+                get: { kernel.mode },
+                set: { m in Task { await kernel.setMode(m) } }
+            )) {
+                ForEach(KernelController.Mode.allCases) { Text($0.label).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .disabled(!core.isActive)
+        }
+        .padding(20)
+        .background(
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .fill(Color(uiColor: .secondarySystemGroupedBackground))
+        )
+    }
+
+    private var glowColor: Color {
+        switch core.status {
+        case .connected:               return .green
+        case .connecting, .reasserting: return .orange
+        default:                        return .gray
+        }
+    }
+
+    private var buttonGradient: LinearGradient {
+        let c: [Color]
+        switch core.status {
+        case .connected:                c = [.green, .green.opacity(0.7)]
+        case .connecting, .reasserting: c = [.orange, .orange.opacity(0.7)]
+        default:                        c = [Color(uiColor: .systemGray3), Color(uiColor: .systemGray2)]
+        }
+        return LinearGradient(colors: c, startPoint: .topLeading, endPoint: .bottomTrailing)
+    }
+}
+
+/// 实时流量卡片：上/下行速率折线 + 当前数值。
+private struct TrafficCard: View {
     let samples: [KernelController.TrafficSample]
     let up: Int64
     let down: Int64
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 16) {
                 Label(ByteFormat.rate(down), systemImage: "arrow.down")
                     .foregroundStyle(.blue)
                 Label(ByteFormat.rate(up), systemImage: "arrow.up")
                     .foregroundStyle(.orange)
+                Spacer()
             }
-            .font(.callout.monospacedDigit())
+            .font(.callout.monospacedDigit().weight(.medium))
 
             Chart {
                 ForEach(Array(samples.enumerated()), id: \.element.id) { idx, s in
@@ -102,50 +159,12 @@ private struct TrafficChart: View {
                     }
                 }
             }
-            .frame(height: 120)
+            .frame(height: 140)
         }
-        .padding(.vertical, 4)
-    }
-}
-
-/// 内核状态页：探测 external-controller 是否可达。
-private struct KernelStatusView: View {
-    @State private var text = "探测中…"
-
-    var body: some View {
-        ScrollView {
-            Text(text)
-                .font(.system(.footnote, design: .monospaced))
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .textSelection(.enabled)
-                .padding()
-        }
-        .navigationTitle("内核状态")
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar { Button("刷新") { Task { await reload() } } }
-        .task { await reload() }
-    }
-
-    private func reload() async {
-        text = "探测 \(MihomoAPI.base.absoluteString) …"
-        do {
-            let version = try await MihomoAPI.version()
-            let obj = try await MihomoAPI.proxiesJSON()
-            let proxies = (obj["proxies"] as? [String: Any]) ?? [:]
-            let groupCount = proxies.values.compactMap { ($0 as? [String: Any])?["all"] }.count
-            text = """
-            ✅ external-controller 可达
-            版本：\(version)
-            代理/组总数：\(proxies.count)
-            策略组数：\(groupCount)
-            """
-        } catch {
-            text = """
-            ❌ 连不上内核 \(MihomoAPI.base.absoluteString)
-            \(error.localizedDescription)
-
-            请确认 VPN 已连接后再探测。
-            """
-        }
+        .padding(20)
+        .background(
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .fill(Color(uiColor: .secondarySystemGroupedBackground))
+        )
     }
 }

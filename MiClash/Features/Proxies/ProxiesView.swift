@@ -94,33 +94,33 @@ private struct GroupCard: View {
                 .onTapGesture(perform: onToggle)
 
             if isExpanded {
-                VStack(spacing: 8) {
+                VStack(spacing: 10) {
                     ForEach(group.all, id: \.self) { node in
                         ProxyNodeRow(
                             node: node,
                             isCurrent: node == group.now,
                             selectable: group.selectable,
                             delay: delays[node])
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 10)
+                        .padding(.horizontal, 16)
+                        .frame(minHeight: 56)
                         .background(
-                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            RoundedRectangle(cornerRadius: 14, style: .continuous)
                                 .fill(Color(uiColor: .tertiarySystemGroupedBackground))
                         )
                         .overlay(
-                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            RoundedRectangle(cornerRadius: 14, style: .continuous)
                                 .strokeBorder(node == group.now
-                                              ? Color.accentColor.opacity(0.55)
+                                              ? Color.accentColor.opacity(0.6)
                                               : Color.clear,
-                                              lineWidth: 1.5)
+                                              lineWidth: 2)
                         )
-                        .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                         .onTapGesture { onSelect(node) }
                     }
                 }
                 .padding(.horizontal, 12)
-                .padding(.top, 4)
-                .padding(.bottom, 12)
+                .padding(.top, 6)
+                .padding(.bottom, 14)
             }
         }
         .background(
@@ -197,12 +197,12 @@ private struct ProxyNodeRow: View {
     let delay: Int?
 
     var body: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 12) {
             Image(systemName: isCurrent ? "checkmark.circle.fill" : "circle")
-                .font(.body)
+                .font(.title3)
                 .foregroundStyle(isCurrent ? Color.accentColor : Color.secondary.opacity(0.35))
             Text(node)
-                .font(.headline.weight(.regular))
+                .font(.body.weight(isCurrent ? .semibold : .regular))
                 .foregroundStyle(selectable ? .primary : .secondary)
                 .lineLimit(1)
             Spacer(minLength: 8)
