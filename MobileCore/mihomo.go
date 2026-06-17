@@ -288,13 +288,18 @@ func mergeConfig(subYAML string, st appSettings) ([]byte, error) {
 		m["rules"] = filterUnsupportedRules(rules)
 	}
 
-	// geo：默认关 → 剔除 GEOIP/GEOSITE 规则（省内存）。
-	// 开启 → 保留规则，按设置配置加载器/自动更新，内核按需下载/加载 geo 库（用 memconservative 省内存）。
+	// geo 规则处理：
+	//   开 → 保留普通 geo 规则，**只剔「取反」的**（geolocation-!cn / NOT,((GEOIP,CN)) 等，
+	//        这类在 NE 里易出问题），并配置加载器/自动更新；
+	//   关 → 剔除**所有** GEOIP/GEOSITE/GEODATA 规则（含逻辑规则里嵌的），省内存。
 	m["geodata-mode"] = false // false=用 mmdb
 	if st.GeoEnabled {
 		m["geodata-loader"] = st.GeoLoader
 		m["geo-auto-update"] = st.GeoAutoUpdate
 		m["geo-update-interval"] = st.GeoUpdateInterval
+		if rules, ok := m["rules"].([]any); ok {
+			m["rules"] = filterGeoNegationRules(rules)
+		}
 	} else {
 		m["geo-auto-update"] = false
 		if rules, ok := m["rules"].([]any); ok {
@@ -401,6 +406,35 @@ func ProxyDetails() string {
 		return "{}"
 	}
 	return string(out)
+}
+
+// filterGeoNegationRules 仅在 geo **开启**时用：保留普通 geo 规则，只剔除「取反」的——
+// 即既引用 geo（含 GEOIP,/GEOSITE,/GEODATA,）又带否定语义的：
+//   - 类目取反：GEOSITE,geolocation-!cn,…  / GEOIP,!cn,…（含 "!"）
+//   - 逻辑取反：NOT,((GEOIP,CN)),…  / AND,((NOT,(GEOSITE,cn)),…),…（含 "NOT,"）
+//
+// 这类在 50MB 的 NE 里加载/求值「非某地区」易出问题，普通 GEOIP,CN / GEOSITE,cn 仍保留。
+func filterGeoNegationRules(rules []any) []any {
+	out := make([]any, 0, len(rules))
+	dropped := 0
+	for _, r := range rules {
+		if s, ok := r.(string); ok {
+			u := strings.ToUpper(strings.TrimSpace(s))
+			hasGeo := strings.Contains(u, "GEOIP,") || strings.Contains(u, "GEOSITE,") || strings.Contains(u, "GEODATA,")
+			negated := strings.Contains(u, "!") || strings.Contains(u, "NOT,")
+			if hasGeo && negated {
+				dropped++
+				continue
+			}
+		}
+		out = append(out, r)
+	}
+	if dropped > 0 {
+		appendRunLog(fmt.Sprintf("剔除 geo 取反规则 %d 条", dropped))
+		configNotices = append(configNotices,
+			fmt.Sprintf("已忽略 %d 条 geo 取反规则（geolocation-!cn / NOT(GEOIP) 等，NE 内易出问题）", dropped))
+	}
+	return out
 }
 
 // filterGeoRules 删除任何**包含** GEOIP,/GEOSITE,/GEODATA, 的规则条目（不分大小写）。
