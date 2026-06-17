@@ -7,6 +7,8 @@ struct SubscriptionDetailView: View {
     let subID: UUID
 
     @State private var showEditor = false
+    @State private var refreshing = false
+    @State private var refreshOK = false
 
     private var sub: Subscription? {
         store.subscriptions.first(where: { $0.id == subID })
@@ -78,10 +80,25 @@ struct SubscriptionDetailView: View {
                 }
             } else {
                 Button {
-                    Task { await store.refresh(sub.id) }
+                    Task {
+                        refreshing = true
+                        refreshOK = false
+                        await store.refresh(sub.id)
+                        refreshing = false
+                        refreshOK = (store.lastError == nil)
+                    }
                 } label: {
-                    Label("刷新订阅", systemImage: "arrow.clockwise")
+                    HStack {
+                        Label("刷新订阅", systemImage: "arrow.clockwise")
+                        Spacer()
+                        if refreshing {
+                            ProgressView()
+                        } else if refreshOK {
+                            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                        }
+                    }
                 }
+                .disabled(refreshing)
             }
         }
     }

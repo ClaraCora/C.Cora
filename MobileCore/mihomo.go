@@ -403,14 +403,18 @@ func ProxyDetails() string {
 	return string(out)
 }
 
-// filterGeoRules 删除以 GEOIP,/GEOSITE,/GEODATA, 开头的规则条目（不分大小写）。
+// filterGeoRules 删除任何**包含** GEOIP,/GEOSITE,/GEODATA, 的规则条目（不分大小写）。
+// 用 Contains 而非 HasPrefix：除了 `GEOSITE,geolocation-!cn,…` `GEOIP,CN,…` 这种直接形式，
+// 还要抓住**逻辑规则里嵌的 geo**，如 `NOT,((GEOIP,CN)),节点`、`AND,((GEOSITE,cn),(…)),节点`
+// （即用户说的「geo 取反/组合」）——这些 geo 关闭时也必须剔除，否则内核仍会去加载 geo 库，
+// 在 50MB 的 NE 里 OOM/下载失败导致连不上。非 geo 规则正文几乎不可能含 "GEOIP," 子串，误伤可忽略。
 func filterGeoRules(rules []any) []any {
 	out := make([]any, 0, len(rules))
 	dropped := 0
 	for _, r := range rules {
 		if s, ok := r.(string); ok {
 			u := strings.ToUpper(strings.TrimSpace(s))
-			if strings.HasPrefix(u, "GEOIP,") || strings.HasPrefix(u, "GEOSITE,") || strings.HasPrefix(u, "GEODATA,") {
+			if strings.Contains(u, "GEOIP,") || strings.Contains(u, "GEOSITE,") || strings.Contains(u, "GEODATA,") {
 				dropped++
 				continue
 			}
