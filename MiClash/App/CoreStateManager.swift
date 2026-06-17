@@ -68,9 +68,12 @@ final class CoreStateManager: ObservableObject {
         }
     }
 
-    /// 初始化或前台回来时主动拉一次当前状态。
+    /// 初始化或前台回来时主动拉一次当前状态，并把状态同步给磁贴
+    /// （兜底：在系统设置里关了 VPN 后，回到 App 即可修正磁贴）。
     func refreshStatus() async {
         status = await tunnel.currentStatus()
+        AppGroupState.vpnConnected = isActive
+        ControlCenter.shared.reloadControls(ofKind: ControlWidgetKind.vpn)
     }
 
     /// 向运行中的 NE 索取日志（sendProviderMessage，不依赖 App Group）。
