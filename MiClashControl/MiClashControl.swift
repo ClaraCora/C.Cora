@@ -49,18 +49,12 @@ struct VPNControlWidget: ControlWidget {
     }
 }
 
-/// 提供磁贴当前状态：VPN 已连接/连接中 → 开。
+/// 提供磁贴当前状态：直接读 App Group 共享存储（NE 启停时写入，最准最快）。
 struct VPNStatusProvider: ControlValueProvider {
     var previewValue: Bool { false }
 
     func currentValue() async throws -> Bool {
-        guard let mgr = try await miclashManager() else { return false }
-        switch mgr.connection.status {
-        case .connected, .connecting, .reasserting:
-            return true
-        default:
-            return false
-        }
+        AppGroupState.vpnConnected
     }
 }
 
@@ -86,6 +80,9 @@ struct ToggleVPNIntent: SetValueIntent {
         } else {
             mgr.connection.stopVPNTunnel()
         }
+        // 乐观写入共享状态并刷新磁贴，让开关立刻翻到目标态（NE 启停后会再写一次确认）。
+        AppGroupState.vpnConnected = value
+        ControlCenter.shared.reloadControls(ofKind: VPNControlWidget.kind)
         return .result()
     }
 }

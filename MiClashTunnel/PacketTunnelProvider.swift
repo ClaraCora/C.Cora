@@ -84,6 +84,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             if ok {
                 FileLog.write("MihomoStartWithConfig 返回成功")
                 self.log.info("mihomo 启动成功")
+                AppGroupState.vpnConnected = true // 共享给控制中心磁贴显示
                 self.startPathMonitor() // 开始把真实出站接口喂给内核
                 completionHandler(nil)
             } else {
@@ -115,6 +116,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                             completionHandler: @escaping () -> Void) {
         FileLog.write("stopTunnel，原因 rawValue=\(reason.rawValue)")
         log.info("stopTunnel，原因：\(reason.rawValue, privacy: .public)")
+        AppGroupState.vpnConnected = false // 同步给控制中心磁贴
         stopPathMonitor()
         MihomoStop()
         completionHandler()

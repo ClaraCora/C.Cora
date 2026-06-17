@@ -54,6 +54,8 @@ final class CoreStateManager: ObservableObject {
             // 通知在主线程队列回调；用 Task 切到 actor 上下文更新隔离状态
             Task { @MainActor in
                 self?.status = connection.status
+                // 同步给控制中心磁贴（App 在前台时覆盖各种来源的状态变化）
+                AppGroupState.vpnConnected = self?.isActive ?? false
             }
         }
     }

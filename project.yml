@@ -80,6 +80,7 @@ targets:
     platform: iOS
     sources:
       - path: MiClashControl
+      - path: Shared
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.miclash.app.control
