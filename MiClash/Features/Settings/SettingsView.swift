@@ -126,7 +126,6 @@ struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            .floatingTabBarInset()
             .navigationTitle("设置")
         }
     }

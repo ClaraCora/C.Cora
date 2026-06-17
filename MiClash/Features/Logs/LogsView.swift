@@ -22,7 +22,6 @@ struct LogsView: View {
                     logList
                 }
             }
-            .floatingTabBarInset()
             .navigationTitle("日志")
             .searchable(text: $controller.searchText, placement: .navigationBarDrawer(displayMode: .always), prompt: "搜索日志")
             .toolbar {

@@ -24,7 +24,6 @@ struct ConnectView: View {
             }
             .scrollIndicators(.hidden)
             .background(Color(uiColor: .systemGroupedBackground))
-            .floatingTabBarInset()
             .navigationTitle("MiClash")
             .task { await core.refreshStatus() }
         }

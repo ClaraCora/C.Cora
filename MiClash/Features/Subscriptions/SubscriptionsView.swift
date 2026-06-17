@@ -42,7 +42,6 @@ struct SubscriptionsView: View {
                     }
                 }
             }
-            .floatingTabBarInset()
             .navigationTitle("配置")
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
