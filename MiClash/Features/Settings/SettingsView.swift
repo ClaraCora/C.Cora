@@ -55,6 +55,21 @@ struct SettingsView: View {
 
                 Section {
                     HStack {
+                        Text("User-Agent")
+                        Spacer()
+                        TextField("clash-meta", text: $settings.subscriptionUA)
+                            .multilineTextAlignment(.trailing)
+                            .autocorrectionDisabled()
+                            .textInputAutocapitalization(.never)
+                    }
+                } header: {
+                    Text("订阅")
+                } footer: {
+                    Text("拉取订阅时发送的 User-Agent。机场常按 UA 返回不同格式（clash / clash-meta / mihomo / stash 等），默认 clash-meta。改后重新拉取订阅生效。")
+                }
+
+                Section {
+                    HStack {
                         Text("端口")
                         Spacer()
                         TextField("9090", value: $settings.controllerPort, format: .number)

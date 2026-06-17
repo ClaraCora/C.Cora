@@ -159,8 +159,9 @@ final class SubscriptionStore: ObservableObject {
 
         do {
             var req = URLRequest(url: url)
-            // 多数订阅服务按 UA 返回 clash 配置
-            req.setValue("clash-meta", forHTTPHeaderField: "User-Agent")
+            // 机场常按 UA 返回不同格式；UA 可在设置里改，默认 clash-meta。
+            let ua = SettingsStore.shared.subscriptionUA.trimmingCharacters(in: .whitespaces)
+            req.setValue(ua.isEmpty ? "clash-meta" : ua, forHTTPHeaderField: "User-Agent")
             req.timeoutInterval = 30
             let (data, resp) = try await URLSession.shared.data(for: req)
             guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {

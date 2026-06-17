@@ -35,6 +35,9 @@ final class SettingsStore: ObservableObject {
     @Published var allowLan: Bool { didSet { d.set(allowLan, forKey: K.allowLan) } }
     /// 混合代理端口（HTTP+SOCKS，本机回环）。0=不开。下发给内核 mixed-port。
     @Published var mixedPort: Int { didSet { d.set(mixedPort, forKey: K.mixedPort) } }
+    /// 拉取订阅时用的 User-Agent（机场常按 UA 返回不同格式）。默认 clash-meta。
+    /// 仅主 App 下载订阅用，不经内核。
+    @Published var subscriptionUA: String { didSet { d.set(subscriptionUA, forKey: K.subUA) } }
 
     // 以下 5 项是 NETunnelProviderProtocol(NEVPNProtocol) 开关，连接时由主 App 设到隧道协议上，
     // 不经内核（与 mihomo 配置无关）。
@@ -62,6 +65,7 @@ final class SettingsStore: ObservableObject {
         static let mixedPort = "set.mixedPort"
         static let inclAll = "set.inclAll", exCell = "set.exCell", exAPNs = "set.exAPNs"
         static let exDev = "set.exDev", enforce = "set.enforce"
+        static let subUA = "set.subUA"
     }
 
     private init() {
@@ -83,6 +87,7 @@ final class SettingsStore: ObservableObject {
         excludeAPNs = d.object(forKey: K.exAPNs) as? Bool ?? true
         excludeDeviceCommunication = d.object(forKey: K.exDev) as? Bool ?? true
         enforceRoutes = d.object(forKey: K.enforce) as? Bool ?? false
+        subscriptionUA = d.string(forKey: K.subUA) ?? "clash-meta"
 
         // 同步给 HTTP 客户端
         MihomoAPI.port = controllerPort
