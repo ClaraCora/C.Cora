@@ -114,7 +114,7 @@ private struct FloatingTabBar: View {
 }
 
 /// 底栏背景：iOS 26 用原生液态玻璃（Liquid Glass），更低版本回退毛玻璃。
-/// 注意：glassEffect 需用 iOS 26 SDK（Xcode 26）编译；CI 若用旧 SDK 会报错，届时退回 else 分支即可。
+/// 需 Xcode 26 / iOS 26 SDK 编译（CI 已切到带 iOS SDK 的最新 Xcode）。
 private struct GlassBarBackground: ViewModifier {
     func body(content: Content) -> some View {
         if #available(iOS 26.0, *) {

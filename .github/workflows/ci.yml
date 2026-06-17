@@ -14,10 +14,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 不写死某个 Xcode（镜像里 Xcode_16.app 可能没装 iOS 平台）；
-      # 用 runner 默认 Xcode（GitHub 保证其 iOS SDK 可用），并打印实际可用 SDK 便于排查。
-      - name: Show Xcode & iOS SDK
+      # 选「带 iOS SDK 的最新 Xcode」：底栏液态玻璃(glassEffect)需 iOS 26 SDK(Xcode 26)。
+      # 默认 Xcode 可能是 16（无 iOS 26 SDK）。这里从高到低挑第一个含 iphoneos SDK 的 Xcode，
+      # 既拿到最新 SDK，又避开「某个 Xcode 没装 iOS 平台」的坑。
+      - name: Select newest Xcode with iOS SDK
         run: |
+          for x in $(ls -d /Applications/Xcode_*.app | sort -Vr); do
+            if "$x/Contents/Developer/usr/bin/xcodebuild" -showsdks 2>/dev/null | grep -qi iphoneos; then
+              echo "Selecting $x"
+              sudo xcode-select -s "$x/Contents/Developer"
+              break
+            fi
+          done
           xcodebuild -version
           echo "--- installed iphoneos SDKs ---"
           xcodebuild -showsdks | grep -i iphoneos || true
