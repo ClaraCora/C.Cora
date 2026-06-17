@@ -23,6 +23,7 @@ import (
 	"github.com/metacubex/mihomo/adapter/outboundgroup"
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/component/dialer"
+	"github.com/metacubex/mihomo/component/profile/cachefile"
 	"github.com/metacubex/mihomo/component/updater"
 	"github.com/metacubex/mihomo/config"
 	C "github.com/metacubex/mihomo/constant"
@@ -531,7 +532,13 @@ func SelectProxy(group, name string) error {
 	if !ok {
 		return fmt.Errorf("%s 不是可选择的策略组（Selector）", group)
 	}
-	return selector.Set(name)
+	if err := selector.Set(name); err != nil {
+		return err
+	}
+	// 关键：Set() 只改运行态，**持久化要显式写 cache**（mihomo 的 REST 也是这么做的），
+	// 否则 store-selected 启动时没东西可恢复 → 重连回默认。
+	cachefile.Cache().SetSelected(group, name)
+	return nil
 }
 
 // GroupDelay 对策略组里所有节点做延迟测试（等价 REST GET /group/{name}/delay），
