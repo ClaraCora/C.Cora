@@ -30,7 +30,7 @@ private func miclashManager() async throws -> NETunnelProviderManager? {
 
 /// 控制中心「代理开关」磁贴。
 struct VPNControlWidget: ControlWidget {
-    static let kind = "com.miclash.app.control.vpn"
+    static let kind = ControlWidgetKind.vpn
 
     var body: some ControlWidgetConfiguration {
         StaticControlConfiguration(kind: Self.kind, provider: VPNStatusProvider()) { isOn in
@@ -49,12 +49,23 @@ struct VPNControlWidget: ControlWidget {
     }
 }
 
-/// 提供磁贴当前状态：直接读 App Group 共享存储（NE 启停时写入，最准最快）。
+/// 提供磁贴当前状态：优先读 NETunnelProviderManager 的真实连接状态（不依赖 App Group，
+/// 反映 App 内/系统设置里的任何来源），读不到再退回 App Group 共享值。
 struct VPNStatusProvider: ControlValueProvider {
     var previewValue: Bool { false }
 
     func currentValue() async throws -> Bool {
-        AppGroupState.vpnConnected
+        if let mgr = try? await miclashManager() {
+            switch mgr.connection.status {
+            case .connected, .connecting, .reasserting:
+                return true
+            case .disconnected, .disconnecting, .invalid:
+                return false
+            @unknown default:
+                break
+            }
+        }
+        return AppGroupState.vpnConnected
     }
 }
 

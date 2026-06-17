@@ -3,6 +3,7 @@ import Mihomo // gomobile 生成的 mihomo 内核框架（含 with_gvisor）
 import Network
 import Darwin
 import os.log
+import WidgetKit
 
 /// Network Extension 的 Packet Tunnel 实现（Phase 2：真正接管流量）。
 ///
@@ -85,6 +86,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 FileLog.write("MihomoStartWithConfig 返回成功")
                 self.log.info("mihomo 启动成功")
                 AppGroupState.vpnConnected = true // 共享给控制中心磁贴显示
+                ControlCenter.shared.reloadControls(ofKind: ControlWidgetKind.vpn)
                 self.startPathMonitor() // 开始把真实出站接口喂给内核
                 completionHandler(nil)
             } else {
@@ -117,6 +119,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         FileLog.write("stopTunnel，原因 rawValue=\(reason.rawValue)")
         log.info("stopTunnel，原因：\(reason.rawValue, privacy: .public)")
         AppGroupState.vpnConnected = false // 同步给控制中心磁贴
+        ControlCenter.shared.reloadControls(ofKind: ControlWidgetKind.vpn)
         stopPathMonitor()
         MihomoStop()
         completionHandler()

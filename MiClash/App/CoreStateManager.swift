@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import NetworkExtension
+import WidgetKit
 
 /// 全局状态机（MVVM 中的「全局 Model/Store」）。
 ///
@@ -56,6 +57,8 @@ final class CoreStateManager: ObservableObject {
                 self?.status = connection.status
                 // 同步给控制中心磁贴（App 在前台时覆盖各种来源的状态变化）
                 AppGroupState.vpnConnected = self?.isActive ?? false
+                // 主动请求系统刷新磁贴，否则 App 内启停不会同步到控制中心
+                ControlCenter.shared.reloadControls(ofKind: ControlWidgetKind.vpn)
             }
         }
     }
