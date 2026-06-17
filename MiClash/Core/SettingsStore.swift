@@ -33,6 +33,21 @@ final class SettingsStore: ObservableObject {
     }
     /// 允许局域网访问控制接口（绑 0.0.0.0 而非仅 127.0.0.1）。
     @Published var allowLan: Bool { didSet { d.set(allowLan, forKey: K.allowLan) } }
+    /// 混合代理端口（HTTP+SOCKS，本机回环）。0=不开。下发给内核 mixed-port。
+    @Published var mixedPort: Int { didSet { d.set(mixedPort, forKey: K.mixedPort) } }
+
+    // 以下 5 项是 NETunnelProviderProtocol(NEVPNProtocol) 开关，连接时由主 App 设到隧道协议上，
+    // 不经内核（与 mihomo 配置无关）。
+    /// 接管所有网络（含系统默认会排除的流量）。
+    @Published var includeAllNetworks: Bool { didSet { d.set(includeAllNetworks, forKey: K.inclAll) } }
+    /// 排除蜂窝服务（VoLTE 等），默认 true（Apple 建议）。
+    @Published var excludeCellularServices: Bool { didSet { d.set(excludeCellularServices, forKey: K.exCell) } }
+    /// 排除 APNs（推送），默认 true。
+    @Published var excludeAPNs: Bool { didSet { d.set(excludeAPNs, forKey: K.exAPNs) } }
+    /// 排除设备间通信（隔空投送/接力等），默认 true。
+    @Published var excludeDeviceCommunication: Bool { didSet { d.set(excludeDeviceCommunication, forKey: K.exDev) } }
+    /// 强制路由（即使 includeAllNetworks 关，也强制按规则路由）。
+    @Published var enforceRoutes: Bool { didSet { d.set(enforceRoutes, forKey: K.enforce) } }
 
     static let stackOptions = ["gvisor", "system", "mixed"]
     static let logLevelOptions = ["silent", "error", "warning", "info", "debug"]
@@ -44,6 +59,9 @@ final class SettingsStore: ObservableObject {
         static let geoEnabled = "set.geoEnabled", geoLoader = "set.geoLoader"
         static let geoAuto = "set.geoAuto", geoInterval = "set.geoInterval"
         static let logLevel = "set.logLevel", port = "set.port", secret = "set.secret", allowLan = "set.allowLan"
+        static let mixedPort = "set.mixedPort"
+        static let inclAll = "set.inclAll", exCell = "set.exCell", exAPNs = "set.exAPNs"
+        static let exDev = "set.exDev", enforce = "set.enforce"
     }
 
     private init() {
@@ -59,6 +77,12 @@ final class SettingsStore: ObservableObject {
         controllerPort = p == 0 ? 9090 : p
         controllerSecret = d.string(forKey: K.secret) ?? ""
         allowLan = d.object(forKey: K.allowLan) as? Bool ?? false
+        mixedPort = d.integer(forKey: K.mixedPort) // 默认 0 = 不开
+        includeAllNetworks = d.object(forKey: K.inclAll) as? Bool ?? false
+        excludeCellularServices = d.object(forKey: K.exCell) as? Bool ?? true
+        excludeAPNs = d.object(forKey: K.exAPNs) as? Bool ?? true
+        excludeDeviceCommunication = d.object(forKey: K.exDev) as? Bool ?? true
+        enforceRoutes = d.object(forKey: K.enforce) as? Bool ?? false
 
         // 同步给 HTTP 客户端
         MihomoAPI.port = controllerPort
@@ -78,6 +102,7 @@ final class SettingsStore: ObservableObject {
             "controllerPort": controllerPort,
             "controllerSecret": controllerSecret,
             "allowLan": allowLan,
+            "mixedPort": mixedPort,
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: dict),
               let s = String(data: data, encoding: .utf8) else { return "" }

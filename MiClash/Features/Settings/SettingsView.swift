@@ -78,6 +78,34 @@ struct SettingsView: View {
                 }
 
                 Section {
+                    HStack {
+                        Text("混合代理端口")
+                        Spacer()
+                        TextField("0=不开", value: $settings.mixedPort, format: .number)
+                            .keyboardType(.numberPad)
+                            .multilineTextAlignment(.trailing)
+                            .frame(width: 90)
+                    }
+                } header: {
+                    Text("代理端口")
+                } footer: {
+                    Text("开启后内核在本机回环监听 HTTP+SOCKS 混合代理端口（0=不开）。")
+                }
+
+                Section {
+                    Toggle("接管所有网络", isOn: $settings.includeAllNetworks)
+                    Toggle("强制路由", isOn: $settings.enforceRoutes)
+                    Toggle("排除蜂窝服务", isOn: $settings.excludeCellularServices)
+                    Toggle("排除 APNs 推送", isOn: $settings.excludeAPNs)
+                    Toggle("排除设备间通信", isOn: $settings.excludeDeviceCommunication)
+                } header: {
+                    Text("隧道路由")
+                } footer: {
+                    Text("系统隧道(NETunnelProvider)开关。「接管所有网络」会连系统默认排除的流量也走隧道；"
+                       + "排除项默认开启（蜂窝服务/推送/隔空投送等不走代理，避免异常）。改后需重连。")
+                }
+
+                Section {
                     NavigationLink {
                         KernelStatusView()
                     } label: {

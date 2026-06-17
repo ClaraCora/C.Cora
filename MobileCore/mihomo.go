@@ -46,6 +46,10 @@ const ControllerAddr = "127.0.0.1:9090"
 var (
 	homeDir      string
 	logCaptureMu sync.Once
+
+	// 最近一次合并配置时收集的：不适用内容提示 + 各节点协议摘要（供主 App 经 IPC 取用）。
+	configNotices   []string
+	proxyDetailsMap = map[string]string{}
 )
 
 // Version 返回「mihomo 内核版本 / Go 运行时版本」。
@@ -73,9 +77,10 @@ func Setup(home string) {
 // 才能看到内核内部输出（如出站接口选择、bind 失败、DNS 等），不靠猜。
 //
 // 依据：metacubex/mihomo v1.19.27 log/log.go ——
-//   func Subscribe() observable.Subscription[Event]（即 <-chan Event）
-//   type Event struct { LogLevel LogLevel; Payload string }
-//   func (e *Event) Type() string  // 级别字符串
+//
+//	func Subscribe() observable.Subscription[Event]（即 <-chan Event）
+//	type Event struct { LogLevel LogLevel; Payload string }
+//	func (e *Event) Type() string  // 级别字符串
 func startLogCapture() {
 	logCaptureMu.Do(func() {
 		sub := log.Subscribe()
@@ -107,6 +112,7 @@ type appSettings struct {
 	ControllerPort    int    `json:"controllerPort"`
 	ControllerSecret  string `json:"controllerSecret"`
 	AllowLan          bool   `json:"allowLan"`
+	MixedPort         int    `json:"mixedPort"`
 }
 
 // parseSettings 解析设置 JSON，缺省值兜底（与主 App SettingsStore 默认一致）。
@@ -263,8 +269,23 @@ func mergeConfig(subYAML string, st appSettings) ([]byte, error) {
 	m["ipv6"] = st.IPv6
 	m["log-level"] = st.LogLevel
 
+	// 混合代理端口（HTTP+SOCKS，本机回环）。0=不开。
+	if st.MixedPort > 0 {
+		m["mixed-port"] = st.MixedPort
+	} else {
+		delete(m, "mixed-port")
+	}
+
 	if _, ok := m["mode"]; !ok {
 		m["mode"] = "rule"
+	}
+
+	// 收集本次合并的「不适用内容」提示。
+	configNotices = nil
+
+	// iOS 沙盒拿不到其它进程信息 → PROCESS-NAME/PROCESS-PATH 规则无效，剔除并提示。
+	if rules, ok := m["rules"].([]any); ok {
+		m["rules"] = filterUnsupportedRules(rules)
 	}
 
 	// geo：默认关 → 剔除 GEOIP/GEOSITE 规则（省内存）。
@@ -281,7 +302,105 @@ func mergeConfig(subYAML string, st appSettings) ([]byte, error) {
 		}
 	}
 
+	// 解析各节点协议摘要（如 "VLESS · TCP · Reality · Vision"），供节点页副标题。
+	buildProxyDetails(m)
+
 	return yaml.Marshal(m)
+}
+
+// filterUnsupportedRules 剔除 iOS 上无效的规则类型（按进程匹配），并登记提示。
+func filterUnsupportedRules(rules []any) []any {
+	out := make([]any, 0, len(rules))
+	dropped := 0
+	for _, r := range rules {
+		if s, ok := r.(string); ok {
+			u := strings.ToUpper(strings.TrimSpace(s))
+			if strings.HasPrefix(u, "PROCESS-NAME,") || strings.HasPrefix(u, "PROCESS-PATH,") {
+				dropped++
+				continue
+			}
+		}
+		out = append(out, r)
+	}
+	if dropped > 0 {
+		configNotices = append(configNotices,
+			fmt.Sprintf("已忽略 %d 条按进程分流规则（PROCESS-NAME/PATH，iOS 无法获取其它 App 进程）", dropped))
+	}
+	return out
+}
+
+// buildProxyDetails 从 proxies 段解析每个节点的协议摘要。
+func buildProxyDetails(m map[string]any) {
+	proxyDetailsMap = map[string]string{}
+	list, ok := m["proxies"].([]any)
+	if !ok {
+		return
+	}
+	for _, item := range list {
+		p, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		name, _ := p["name"].(string)
+		if name == "" {
+			continue
+		}
+		proxyDetailsMap[name] = summarizeProxy(p)
+	}
+}
+
+// summarizeProxy 拼出 "VLESS · TCP · Reality · Vision" 这类协议摘要。
+func summarizeProxy(p map[string]any) string {
+	parts := []string{}
+	typ, _ := p["type"].(string)
+	if typ != "" {
+		parts = append(parts, strings.ToUpper(typ))
+	}
+	// 传输层 network；vless/vmess/trojan 缺省即 tcp。
+	network, _ := p["network"].(string)
+	if network == "" {
+		switch strings.ToLower(typ) {
+		case "vless", "vmess", "trojan":
+			network = "tcp"
+		}
+	}
+	if network != "" {
+		parts = append(parts, strings.ToUpper(network))
+	}
+	// 安全层：reality > tls。
+	if _, hasReality := p["reality-opts"]; hasReality {
+		parts = append(parts, "Reality")
+	} else if tls, _ := p["tls"].(bool); tls {
+		parts = append(parts, "TLS")
+	}
+	// flow：xtls-rprx-vision → Vision。
+	if flow, _ := p["flow"].(string); flow != "" {
+		if strings.Contains(strings.ToLower(flow), "vision") {
+			parts = append(parts, "Vision")
+		} else {
+			parts = append(parts, flow)
+		}
+	}
+	return strings.Join(parts, " · ")
+}
+
+// ConfigNotices 返回最近一次合并配置时的不适用内容提示（JSON 字符串数组）。
+// 对应 Swift 侧 `MihomoConfigNotices()`。
+func ConfigNotices() string {
+	out, err := json.Marshal(configNotices)
+	if err != nil {
+		return "[]"
+	}
+	return string(out)
+}
+
+// ProxyDetails 返回 {节点名: 协议摘要} 的 JSON。对应 Swift 侧 `MihomoProxyDetails()`。
+func ProxyDetails() string {
+	out, err := json.Marshal(proxyDetailsMap)
+	if err != nil {
+		return "{}"
+	}
+	return string(out)
 }
 
 // filterGeoRules 删除以 GEOIP,/GEOSITE,/GEODATA, 开头的规则条目（不分大小写）。
@@ -300,6 +419,8 @@ func filterGeoRules(rules []any) []any {
 	}
 	if dropped > 0 {
 		appendRunLog(fmt.Sprintf("剔除 geo 规则 %d 条", dropped))
+		configNotices = append(configNotices,
+			fmt.Sprintf("已忽略 %d 条 GEOIP/GEOSITE 规则（geo 未启用，可在设置里开启）", dropped))
 	}
 	return out
 }

@@ -15,6 +15,9 @@ struct ConnectView: View {
                     if core.isActive {
                         TrafficCard(samples: kernel.samples, up: kernel.up, down: kernel.down)
                     }
+                    if !core.configNotices.isEmpty {
+                        NoticesCard(notices: core.configNotices)
+                    }
                 }
                 .padding(.horizontal, 16)
                 .padding(.top, 8)
@@ -114,6 +117,30 @@ private struct ConnectionCard: View {
         default:                        c = [Color(uiColor: .systemGray3), Color(uiColor: .systemGray2)]
         }
         return LinearGradient(colors: c, startPoint: .topLeading, endPoint: .bottomTrailing)
+    }
+}
+
+/// 配置提示卡片：列出被忽略的不适用内容（geo 剔除、进程规则等）。
+private struct NoticesCard: View {
+    let notices: [String]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("配置提示", systemImage: "exclamationmark.triangle.fill")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.orange)
+            ForEach(notices, id: \.self) { n in
+                Text("• \(n)")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .padding(16)
+        .background(
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .fill(Color(uiColor: .secondarySystemGroupedBackground))
+        )
     }
 }
 

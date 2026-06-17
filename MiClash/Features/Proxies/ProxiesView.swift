@@ -56,6 +56,7 @@ struct ProxiesView: View {
                         isExpanded: expanded.contains(group.name),
                         isTesting: controller.testing.contains(group.name),
                         delays: controller.delays,
+                        details: controller.details,
                         onToggle: { toggle(group.name) },
                         onTest: { Task { await controller.testGroup(group.name) } },
                         onSelect: { node in
@@ -84,6 +85,7 @@ private struct GroupCard: View {
     let isExpanded: Bool
     let isTesting: Bool
     let delays: [String: Int]
+    let details: [String: String]
     let onToggle: () -> Void
     let onTest: () -> Void
     let onSelect: (String) -> Void
@@ -101,7 +103,8 @@ private struct GroupCard: View {
                             node: node,
                             isCurrent: node == group.now,
                             selectable: group.selectable,
-                            delay: delays[node])
+                            delay: delays[node],
+                            detail: details[node])
                         .padding(.horizontal, 16)
                         .frame(minHeight: 56)
                         .background(
@@ -205,16 +208,25 @@ private struct ProxyNodeRow: View {
     let isCurrent: Bool
     let selectable: Bool
     let delay: Int?
+    let detail: String?
 
     var body: some View {
         HStack(spacing: 12) {
             Image(systemName: isCurrent ? "checkmark.circle.fill" : "circle")
                 .font(.title3)
                 .foregroundStyle(isCurrent ? Color.accentColor : Color.secondary.opacity(0.35))
-            Text(node)
-                .font(.body.weight(isCurrent ? .semibold : .regular))
-                .foregroundStyle(selectable ? .primary : .secondary)
-                .lineLimit(1)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(node)
+                    .font(.body.weight(isCurrent ? .semibold : .regular))
+                    .foregroundStyle(selectable ? .primary : .secondary)
+                    .lineLimit(1)
+                if let detail, !detail.isEmpty {
+                    Text(detail)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
             Spacer(minLength: 8)
             DelayBadge(delay: delay)
         }

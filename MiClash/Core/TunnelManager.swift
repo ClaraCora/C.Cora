@@ -9,12 +9,22 @@ import NetworkExtension
 /// 设计上它是「控制面」的底层，不持有 UI 状态；UI 状态由 CoreStateManager 聚合。
 final class TunnelManager {
 
+    /// NETunnelProviderProtocol(NEVPNProtocol) 上的隧道开关（连接时设置）。
+    struct ProtocolOptions {
+        var includeAllNetworks = false
+        var excludeCellularServices = true
+        var excludeAPNs = true
+        var excludeDeviceCommunication = true
+        var enforceRoutes = false
+    }
+
     /// 当前使用的 provider 管理对象。懒加载/复用，避免重复创建系统描述文件。
     private var manager: NETunnelProviderManager?
 
     /// 加载（或创建）唯一的 VPN 描述文件。
     /// iOS 要求 VPN 配置先 saveToPreferences 落到「设置 > VPN」里，用户授权一次后方可启动。
-    func loadOrCreateManager() async throws -> NETunnelProviderManager {
+    /// 传入 options 时一并设置隧道协议开关；nil（仅查状态）时保留已有协议配置不动。
+    func loadOrCreateManager(options: ProtocolOptions? = nil) async throws -> NETunnelProviderManager {
         // 先尝试读取已有配置，避免每次新建导致系统里堆叠多个 VPN 条目
         let existing = try await NETunnelProviderManager.loadAllFromPreferences()
         let mgr = existing.first ?? NETunnelProviderManager()
@@ -24,6 +34,14 @@ final class TunnelManager {
         proto.providerBundleIdentifier = AppConstants.tunnelBundleID
         // serverAddress 仅用于系统 UI 展示，Phase 0 用占位串即可
         proto.serverAddress = "MiClash"
+
+        if let o = options {
+            proto.includeAllNetworks = o.includeAllNetworks
+            proto.enforceRoutes = o.enforceRoutes
+            proto.excludeCellularServices = o.excludeCellularServices
+            proto.excludeAPNs = o.excludeAPNs
+            proto.excludeDeviceCommunication = o.excludeDeviceCommunication
+        }
 
         mgr.protocolConfiguration = proto
         mgr.localizedDescription = AppConstants.vpnProfileName
@@ -40,8 +58,8 @@ final class TunnelManager {
 
     /// 启动隧道，并把订阅配置 + 设置经 options 下发给 NE（不依赖 App Group）。
     /// configYAML 为空串时 NE 会用缓存/DIRECT 兜底。
-    func start(configYAML: String, settingsJSON: String) async throws {
-        let mgr = try await loadOrCreateManager()
+    func start(configYAML: String, settingsJSON: String, protocolOptions: ProtocolOptions) async throws {
+        let mgr = try await loadOrCreateManager(options: protocolOptions)
         var options: [String: NSObject] = [:]
         if !configYAML.isEmpty { options["config"] = configYAML as NSString }
         if !settingsJSON.isEmpty { options["settings"] = settingsJSON as NSString }

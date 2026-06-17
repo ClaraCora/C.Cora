@@ -40,7 +40,7 @@ struct RootView: View {
             .overlay(alignment: .bottom) {
                 FloatingTabBar(selection: $tab)
                     .padding(.horizontal, 18)
-                    .padding(.bottom, 6)
+                    .padding(.bottom, 0)
             }
             .onChange(of: core.isActive) { _, active in
                 syncStreams(active)
@@ -69,9 +69,9 @@ struct RootView: View {
     }
 }
 
-/// 悬浮底栏尺寸：胶囊高度(~61) + 底部留白(6) + 余量，供各页底部预留安全高度。
+/// 悬浮底栏尺寸：胶囊高度(~61) + 余量，供各页底部预留安全高度。
 enum TabBarMetrics {
-    static let reserve: CGFloat = 72
+    static let reserve: CGFloat = 66
 }
 
 extension View {
@@ -108,11 +108,24 @@ private struct FloatingTabBar: View {
         }
         .padding(.vertical, 10)
         .padding(.horizontal, 10)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 26, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.06))
-        )
+        .modifier(GlassBarBackground())
         .shadow(color: .black.opacity(0.12), radius: 12, x: 0, y: 4)
+    }
+}
+
+/// 底栏背景：iOS 26 用原生液态玻璃（Liquid Glass），更低版本回退毛玻璃。
+/// 注意：glassEffect 需用 iOS 26 SDK（Xcode 26）编译；CI 若用旧 SDK 会报错，届时退回 else 分支即可。
+private struct GlassBarBackground: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(iOS 26.0, *) {
+            content.glassEffect(.regular, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
+        } else {
+            content
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 28, style: .continuous)
+                        .strokeBorder(Color.primary.opacity(0.06))
+                )
+        }
     }
 }

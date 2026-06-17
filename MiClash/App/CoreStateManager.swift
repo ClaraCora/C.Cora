@@ -28,6 +28,9 @@ final class CoreStateManager: ObservableObject {
     /// mihomo 内核版本号（Phase 1 用于验证核心加载）。
     @Published private(set) var coreVersion: String = "加载中…"
 
+    /// 合并配置时被忽略的不适用内容提示（geo 剔除、进程规则等），连接后从 NE 取。
+    @Published var configNotices: [String] = []
+
     private let tunnel = TunnelManager()
     private var statusObserver: NSObjectProtocol?
 
@@ -59,6 +62,8 @@ final class CoreStateManager: ObservableObject {
                 AppGroupState.vpnConnected = self?.isActive ?? false
                 // 主动请求系统刷新磁贴，否则 App 内启停不会同步到控制中心
                 ControlCenter.shared.reloadControls(ofKind: ControlWidgetKind.vpn)
+                if connection.status == .connected { await self?.fetchNotices() }
+                else if connection.status == .disconnected { self?.configNotices = [] }
             }
         }
     }
@@ -71,6 +76,15 @@ final class CoreStateManager: ObservableObject {
     /// 向运行中的 NE 索取日志（sendProviderMessage，不依赖 App Group）。
     func fetchLogs() async -> String {
         await tunnel.fetchLogs()
+    }
+
+    /// 取配置「不适用内容」提示（连接后调用）。
+    func fetchNotices() async {
+        let r = await sendMessage(["cmd": "configNotices"])
+        if case .ok(let d) = r,
+           let arr = (try? JSONSerialization.jsonObject(with: d)) as? [String] {
+            configNotices = arr
+        }
     }
 
     /// 用户点连接按钮：根据当前状态决定启停（toggle 语义）。
@@ -88,7 +102,14 @@ final class CoreStateManager: ObservableObject {
                 // 连接时下发当前订阅配置 + 设置；无订阅则传空串，NE 用缓存/DIRECT 兜底。
                 let yaml = SubscriptionStore.shared.activeYAML ?? ""
                 let settings = SettingsStore.shared.asJSON()
-                try await tunnel.start(configYAML: yaml, settingsJSON: settings)
+                let s = SettingsStore.shared
+                let opts = TunnelManager.ProtocolOptions(
+                    includeAllNetworks: s.includeAllNetworks,
+                    excludeCellularServices: s.excludeCellularServices,
+                    excludeAPNs: s.excludeAPNs,
+                    excludeDeviceCommunication: s.excludeDeviceCommunication,
+                    enforceRoutes: s.enforceRoutes)
+                try await tunnel.start(configYAML: yaml, settingsJSON: settings, protocolOptions: opts)
             }
         } catch {
             lastError = error.localizedDescription

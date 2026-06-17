@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// 订阅/配置详情：查看元信息与配置原文（YAML），并可设为当前、刷新（远程）或编辑（本地）。
 struct SubscriptionDetailView: View {
@@ -91,11 +92,47 @@ struct SubscriptionDetailView: View {
                 Text(sub.isLocal ? "（空，点上方编辑添加内容）" : "（未拉取，下拉刷新）")
                     .foregroundStyle(.secondary)
             } else {
-                Text(sub.yaml)
-                    .font(.system(.caption2, design: .monospaced))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                // 整份 YAML 放进 List 的单个 Text 会让滑动很卡（SwiftUI 要测量整段超长文本）。
+                // 改为跳转到 UITextView 承载的只读页，原生虚拟化滚动，丝滑。
+                NavigationLink {
+                    ConfigTextReader(title: sub.name, text: sub.yaml)
+                } label: {
+                    Label("查看配置内容（\(sub.yaml.count) 字符）", systemImage: "doc.plaintext")
+                }
             }
         }
+    }
+}
+
+/// 只读配置阅读器：用 UITextView 承载超长 YAML，避免 SwiftUI Text 的卡顿。
+private struct ConfigTextReader: View {
+    let title: String
+    let text: String
+
+    var body: some View {
+        MonospacedTextView(text: text)
+            .ignoresSafeArea(edges: .bottom)
+            .navigationTitle(title)
+            .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+/// UITextView 包装：只读、可选中、等宽。大文本滚动平滑（自带虚拟化）。
+private struct MonospacedTextView: UIViewRepresentable {
+    let text: String
+
+    func makeUIView(context: Context) -> UITextView {
+        let tv = UITextView()
+        tv.isEditable = false
+        tv.isSelectable = true
+        tv.alwaysBounceVertical = true
+        tv.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        tv.textContainerInset = UIEdgeInsets(top: 12, left: 12, bottom: 24, right: 12)
+        tv.backgroundColor = .systemBackground
+        return tv
+    }
+
+    func updateUIView(_ tv: UITextView, context: Context) {
+        if tv.text != text { tv.text = text }
     }
 }

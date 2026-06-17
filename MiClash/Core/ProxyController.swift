@@ -28,6 +28,8 @@ final class ProxyController: ObservableObject {
 
     /// 节点延迟（毫秒），node 名 → ms。0/缺失表示未测或超时。
     @Published private(set) var delays: [String: Int] = [:]
+    /// 节点协议摘要，node 名 → "VLESS · TCP · Reality · Vision"。
+    @Published private(set) var details: [String: String] = [:]
     /// 正在测速的策略组名。
     @Published private(set) var testing: Set<String> = []
 
@@ -52,6 +54,13 @@ final class ProxyController: ObservableObject {
             guard let proxies = obj["proxies"] as? [String: Any] else {
                 error = "解析代理列表失败"
                 return
+            }
+
+            // 协议摘要（按配置走，随列表一起刷新）。
+            let det = await CoreStateManager.shared.sendMessage(["cmd": "proxyDetails"])
+            if case .ok(let d) = det,
+               let map = (try? JSONSerialization.jsonObject(with: d)) as? [String: String] {
+                details = map
             }
 
             // 用 GLOBAL.all 的顺序还原配置定义顺序
