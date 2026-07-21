@@ -22,3 +22,8 @@ MobileCore/*.h
 .claude/
 miclash_old/
 Everywhere/
+
+# 本地参考源码（不入库）
+REALITY/
+Xray-core/
+utls/
