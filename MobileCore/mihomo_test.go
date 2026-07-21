@@ -28,7 +28,7 @@ func nestedMap(t *testing.T, m map[string]any, key string) map[string]any {
 	return v
 }
 
-func TestMergeConfigLowMemoryOverrides(t *testing.T) {
+func TestMergeConfigLowMemoryOverridesAndWebUI(t *testing.T) {
 	m := mergedMap(t, `
 external-ui: ui
 external-ui-url: https://example.com/ui.zip
@@ -40,9 +40,14 @@ dns:
   cache-max-size: 4096
 `)
 
-	for _, key := range []string{"external-ui", "external-ui-url", "external-ui-name"} {
-		if _, exists := m[key]; exists {
-			t.Errorf("%s was not removed", key)
+	wantUI := map[string]any{
+		"external-ui":      "ui",
+		"external-ui-url":  "https://example.com/ui.zip",
+		"external-ui-name": "panel",
+	}
+	for key, want := range wantUI {
+		if got := m[key]; got != want {
+			t.Errorf("%s = %v, want preserved %v", key, got, want)
 		}
 	}
 	profile := nestedMap(t, m, "profile")
