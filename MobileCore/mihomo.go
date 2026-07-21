@@ -603,6 +603,17 @@ func TrafficNow() string {
 	return string(out)
 }
 
+// MemoryUsage 返回 NE 进程当前驻留内存（RSS，字节）：{"rss":..}。
+// Memory() 会主动刷新 Darwin proc_pidinfo；不要改用 Snapshot().Memory（它只读缓存，且会枚举连接）。
+func MemoryUsage() string {
+	rss := statistic.DefaultManager.Memory()
+	out, err := json.Marshal(map[string]uint64{"rss": rss})
+	if err != nil {
+		return `{"rss":0}`
+	}
+	return string(out)
+}
+
 // SetDefaultInterface 把所有出站绑定到指定物理接口（en0/pdp_ip0…）。
 // 由 NE 的 NWPathMonitor 在网络路径变化时调用，取代 mihomo 自带的（iOS 下不可靠的）接口监控。
 // 对应 Swift 侧 `MihomoSetDefaultInterface(_:)`。

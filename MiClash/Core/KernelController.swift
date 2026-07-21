@@ -1,7 +1,7 @@
 import Foundation
 
-/// 连接页用的内核运行态：当前模式 + 实时上下行速率。
-/// 经 **sendProviderMessage IPC**：模式 getMode/setMode，速率 traffic（内核每秒速率直给）。
+/// 连接页用的内核运行态：当前模式 + 实时上下行速率 + NE 进程 RSS。
+/// 经 **sendProviderMessage IPC**：模式 getMode/setMode、速率 traffic、内存 memory。
 @MainActor
 final class KernelController: ObservableObject {
 
@@ -31,21 +31,28 @@ final class KernelController: ObservableObject {
     @Published var up: Int64 = 0
     @Published var down: Int64 = 0
     @Published var reachable = false
+    /// Packet Tunnel Extension 进程的驻留内存（RSS，字节）；nil 表示尚未取到。
+    @Published private(set) var memoryRSS: Int64?
     /// 最近若干秒的速率采样（曲线图数据）。
     @Published private(set) var samples: [TrafficSample] = []
 
     private var trafficTask: Task<Void, Never>?
+    private var memoryTask: Task<Void, Never>?
     private var sampleIndex = 0
     private let maxSamples = 60
 
-    /// 连接建立后调用：读模式 + 开始速率采样。
+    /// 连接建立后调用：读模式 + 开始速率/内存采样。
     func start() {
         Task { await loadMode() }
         startTraffic()
+        startMemoryPolling()
     }
 
     /// 断开后调用：停止采样。
-    func stop() { stopTraffic() }
+    func stop() {
+        stopTraffic()
+        stopMemoryPolling()
+    }
 
     /// 读取当前模式（IPC getMode，连通即标记 reachable）。
     func loadMode() async {
@@ -98,6 +105,34 @@ final class KernelController: ObservableObject {
         down = 0
         samples.removeAll()
         sampleIndex = 0
+    }
+
+    /// NE RSS 变化较慢，每 5 秒查询一次，避免每秒调用 Darwin proc_pidinfo。
+    private func startMemoryPolling() {
+        stopMemoryPolling()
+        memoryTask = Task { [weak self] in
+            // 让隧道启动初期的模式/流量 IPC 先完成。
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            while !Task.isCancelled {
+                let result = await CoreStateManager.shared.sendMessage(["cmd": "memory"])
+                guard !Task.isCancelled else { return }
+                if case .ok(let data) = result,
+                   let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                   let rss = (obj["rss"] as? NSNumber)?.int64Value,
+                   rss > 0 {
+                    self?.memoryRSS = rss
+                } else {
+                    self?.memoryRSS = nil
+                }
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+            }
+        }
+    }
+
+    private func stopMemoryPolling() {
+        memoryTask?.cancel()
+        memoryTask = nil
+        memoryRSS = nil
     }
 
     private func pushSample(up: Int64, down: Int64) {

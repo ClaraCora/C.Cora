@@ -172,7 +172,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     /// 主 App 经 sendProviderMessage 发来的请求（不依赖 App Group 的官方 IPC）。
-    /// JSON 命令协议：{"cmd":"getLogs"|"queryProxies"|"selectProxy","group":..,"name":..}。
+    /// JSON 命令协议：{"cmd":"getLogs"|"queryProxies"|"selectProxy"|"traffic"|"memory",...}。
     /// 关键：completionHandler 必须**非 nil 回调**，否则主 App 侧 resp 为 nil。
     override func handleAppMessage(_ messageData: Data,
                                   completionHandler: ((Data?) -> Void)?) {
@@ -199,6 +199,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             completionHandler?(Data(MihomoGroupDelay(group, url, timeout).utf8))
         case "traffic":
             completionHandler?(Data(MihomoTrafficNow().utf8))
+        case "memory":
+            completionHandler?(Data(MihomoMemoryUsage().utf8))
         case "proxyDetails":
             completionHandler?(Data(MihomoProxyDetails().utf8))
         case "configNotices":

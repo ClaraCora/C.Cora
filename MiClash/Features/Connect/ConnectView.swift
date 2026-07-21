@@ -13,7 +13,8 @@ struct ConnectView: View {
                 VStack(spacing: 16) {
                     ConnectionCard()
                     if core.isActive {
-                        TrafficCard(samples: kernel.samples, up: kernel.up, down: kernel.down)
+                        TrafficCard(samples: kernel.samples, up: kernel.up, down: kernel.down,
+                                    memoryRSS: kernel.memoryRSS)
                     }
                     if !core.configNotices.isEmpty {
                         NoticesCard(notices: core.configNotices)
@@ -148,6 +149,7 @@ private struct TrafficCard: View {
     let samples: [KernelController.TrafficSample]
     let up: Int64
     let down: Int64
+    let memoryRSS: Int64?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -159,6 +161,15 @@ private struct TrafficCard: View {
                 Spacer()
             }
             .font(.callout.monospacedDigit().weight(.medium))
+
+            HStack(spacing: 6) {
+                Label("NE RSS", systemImage: "memorychip")
+                Spacer()
+                Text(memoryRSS.map(ByteFormat.size) ?? "—")
+                    .monospacedDigit()
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
 
             Chart {
                 ForEach(Array(samples.enumerated()), id: \.element.id) { idx, s in
