@@ -14,29 +14,29 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 选「带 iOS SDK 的最新 Xcode」：底栏液态玻璃(glassEffect)需 iOS 26 SDK(Xcode 26)。
-      # 默认 Xcode 可能是 16（无 iOS 26 SDK）。这里从高到低挑第一个含 iphoneos SDK 的 Xcode，
-      # 既拿到最新 SDK，又避开「某个 Xcode 没装 iOS 平台」的坑。
-      - name: Select newest Xcode with iOS SDK
+      # 固定 Xcode，避免 GitHub runner 更新后「同一 commit 重新构建」产出不同。
+      # 14b9b97 的源码今天重构也不可用，说明问题在浮动构建环境而不是业务代码。
+      # 先回到稳定的 Xcode 16.4 / iOS 18 SDK；功能优先，iOS 26 液态玻璃外观暂不作为构建约束。
+      - name: Select pinned Xcode
         run: |
-          for x in $(ls -d /Applications/Xcode_*.app | sort -Vr); do
-            if "$x/Contents/Developer/usr/bin/xcodebuild" -showsdks 2>/dev/null | grep -qi iphoneos; then
-              echo "Selecting $x"
-              sudo xcode-select -s "$x/Contents/Developer"
-              break
-            fi
-          done
+          set -euo pipefail
+          XCODE_APP="/Applications/Xcode_16.4.app"
+          if [ ! -d "$XCODE_APP" ]; then
+            echo "$XCODE_APP 不存在，当前 runner 可用 Xcode："
+            ls -d /Applications/Xcode*.app
+            exit 1
+          fi
+          echo "Selecting $XCODE_APP"
+          sudo xcode-select -s "$XCODE_APP/Contents/Developer"
           xcodebuild -version
           echo "--- installed iphoneos SDKs ---"
           xcodebuild -showsdks | grep -i iphoneos || true
-          echo "--- available Xcodes ---"
-          ls -d /Applications/Xcode*.app
 
       # ───────────── Phase 1：gomobile 编 mihomo 内核 ─────────────
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: 'stable'
+          go-version: '1.25.4'
 
       - name: Cache Go modules
         uses: actions/cache@v4
@@ -50,14 +50,15 @@ jobs:
       - name: Build Mihomo.xcframework (gomobile bind)
         run: |
           set -euxo pipefail
-          go install golang.org/x/mobile/cmd/gomobile@latest
-          go install golang.org/x/mobile/cmd/gobind@latest
+          MOBILE_VERSION="v0.0.0-20260611195102-4dd8f1dbf5d2"
+          go install golang.org/x/mobile/cmd/gomobile@${MOBILE_VERSION}
+          go install golang.org/x/mobile/cmd/gobind@${MOBILE_VERSION}
           export PATH="$PATH:$(go env GOPATH)/bin"
           cd MobileCore
           # 用 tool 指令把 golang.org/x/mobile 钉进模块依赖图，
           # 否则 go mod tidy 会因源码未直接 import 而剪掉它，导致 gomobile bind 报
           # "requires golang.org/x/mobile in the current module"
-          go get -tool golang.org/x/mobile/cmd/gobind
+          go get -tool golang.org/x/mobile/cmd/gobind@${MOBILE_VERSION}
           # go.mod 已 pin mihomo 版本；tidy 补齐间接依赖与 go.sum
           go mod tidy
           # 取出真实 mihomo 版本，用 ldflags 注入 constant.Version
