@@ -603,25 +603,6 @@ func TrafficNow() string {
 	return string(out)
 }
 
-// RuntimeStats 返回连接页展示用的运行态：当前速率、累计流量、连接数、内存。
-// 对应 Swift 侧 `MihomoRuntimeStats()`。
-func RuntimeStats() string {
-	up, down := statistic.DefaultManager.Now()
-	s := statistic.DefaultManager.Snapshot()
-	out, err := json.Marshal(map[string]any{
-		"up":            up,
-		"down":          down,
-		"uploadTotal":   s.UploadTotal,
-		"downloadTotal": s.DownloadTotal,
-		"connections":   len(s.Connections),
-		"memory":        s.Memory,
-	})
-	if err != nil {
-		return `{"up":0,"down":0,"uploadTotal":0,"downloadTotal":0,"connections":0,"memory":0}`
-	}
-	return string(out)
-}
-
 // SetDefaultInterface 把所有出站绑定到指定物理接口（en0/pdp_ip0…）。
 // 由 NE 的 NWPathMonitor 在网络路径变化时调用，取代 mihomo 自带的（iOS 下不可靠的）接口监控。
 // 对应 Swift 侧 `MihomoSetDefaultInterface(_:)`。

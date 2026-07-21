@@ -199,8 +199,6 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             completionHandler?(Data(MihomoGroupDelay(group, url, timeout).utf8))
         case "traffic":
             completionHandler?(Data(MihomoTrafficNow().utf8))
-        case "runtimeStats":
-            completionHandler?(Data(MihomoRuntimeStats().utf8))
         case "proxyDetails":
             completionHandler?(Data(MihomoProxyDetails().utf8))
         case "configNotices":
