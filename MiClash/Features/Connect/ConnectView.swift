@@ -13,7 +13,13 @@ struct ConnectView: View {
                 VStack(spacing: 16) {
                     ConnectionCard()
                     if core.isActive {
-                        TrafficCard(samples: kernel.samples, up: kernel.up, down: kernel.down)
+                        TrafficCard(samples: kernel.samples,
+                                    up: kernel.up,
+                                    down: kernel.down,
+                                    memory: kernel.memory,
+                                    connectionCount: kernel.connectionCount,
+                                    uploadTotal: kernel.uploadTotal,
+                                    downloadTotal: kernel.downloadTotal)
                     }
                     if !core.configNotices.isEmpty {
                         NoticesCard(notices: core.configNotices)
@@ -148,6 +154,10 @@ private struct TrafficCard: View {
     let samples: [KernelController.TrafficSample]
     let up: Int64
     let down: Int64
+    let memory: UInt64
+    let connectionCount: Int
+    let uploadTotal: Int64
+    let downloadTotal: Int64
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -159,6 +169,15 @@ private struct TrafficCard: View {
                 Spacer()
             }
             .font(.callout.monospacedDigit().weight(.medium))
+
+            HStack(spacing: 14) {
+                Label(ByteFormat.size(Int64(memory)), systemImage: "memorychip")
+                Label("\(connectionCount)", systemImage: "link")
+                Label(ByteFormat.size(downloadTotal + uploadTotal), systemImage: "sum")
+                Spacer()
+            }
+            .font(.caption.monospacedDigit())
+            .foregroundStyle(.secondary)
 
             Chart {
                 ForEach(Array(samples.enumerated()), id: \.element.id) { idx, s in

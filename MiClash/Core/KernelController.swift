@@ -30,6 +30,10 @@ final class KernelController: ObservableObject {
     @Published var mode: Mode = .rule
     @Published var up: Int64 = 0
     @Published var down: Int64 = 0
+    @Published var uploadTotal: Int64 = 0
+    @Published var downloadTotal: Int64 = 0
+    @Published var memory: UInt64 = 0
+    @Published var connectionCount: Int = 0
     @Published var reachable = false
     /// 最近若干秒的速率采样（曲线图数据）。
     @Published private(set) var samples: [TrafficSample] = []
@@ -73,13 +77,17 @@ final class KernelController: ObservableObject {
         stopTraffic()
         trafficTask = Task { [weak self] in
             while !Task.isCancelled {
-                let result = await CoreStateManager.shared.sendMessage(["cmd": "traffic"])
+                let result = await CoreStateManager.shared.sendMessage(["cmd": "runtimeStats"])
                 if case .ok(let data) = result,
                    let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
                     let u = (obj["up"] as? NSNumber)?.int64Value ?? 0
                     let d = (obj["down"] as? NSNumber)?.int64Value ?? 0
                     self?.up = u
                     self?.down = d
+                    self?.uploadTotal = (obj["uploadTotal"] as? NSNumber)?.int64Value ?? 0
+                    self?.downloadTotal = (obj["downloadTotal"] as? NSNumber)?.int64Value ?? 0
+                    self?.memory = (obj["memory"] as? NSNumber)?.uint64Value ?? 0
+                    self?.connectionCount = (obj["connections"] as? NSNumber)?.intValue ?? 0
                     self?.pushSample(up: u, down: d)
                     self?.reachable = true
                 } else {
@@ -96,6 +104,10 @@ final class KernelController: ObservableObject {
         trafficTask = nil
         up = 0
         down = 0
+        uploadTotal = 0
+        downloadTotal = 0
+        memory = 0
+        connectionCount = 0
         samples.removeAll()
         sampleIndex = 0
     }
