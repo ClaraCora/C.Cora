@@ -57,11 +57,10 @@ final class TunnelManager {
     }
 
     /// 启动隧道，并把订阅配置 + 设置经 options 下发给 NE（不依赖 App Group）。
-    /// configYAML 为空串时 NE 会用缓存/DIRECT 兜底。
-    func start(configYAML: String, settingsJSON: String, protocolOptions: ProtocolOptions) async throws {
+    /// App 启动始终携带 config：非空=订阅，空串=明确 DIRECT；系统无 options 重连才复用缓存。
+    func start(configYAML: String?, settingsJSON: String, protocolOptions: ProtocolOptions) async throws {
         let mgr = try await loadOrCreateManager(options: protocolOptions)
-        var options: [String: NSObject] = [:]
-        if !configYAML.isEmpty { options["config"] = configYAML as NSString }
+        var options: [String: NSObject] = ["config": (configYAML ?? "") as NSString]
         if !settingsJSON.isEmpty { options["settings"] = settingsJSON as NSString }
         try mgr.connection.startVPNTunnel(options: options)
     }

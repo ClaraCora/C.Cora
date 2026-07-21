@@ -23,7 +23,7 @@ enum MihomoConfig {
     /// StartWithFd 注入到 Tun.FileDescriptor。
     static func directModeYAML() -> String {
         """
-        mode: rule
+        mode: direct
         log-level: info
         ipv6: false
         # iOS 上进程匹配不可用，关掉省开销
@@ -45,12 +45,20 @@ enum MihomoConfig {
           ipv6: false
           enhanced-mode: fake-ip
           fake-ip-range: 198.18.0.1/16
+          cache-max-size: 512
           # 纯 IP 的 DoH：上游本身就是 IP，无需再解析，避免死循环
           nameserver:
             - https://223.5.5.5/dns-query
             - https://1.1.1.1/dns-query
 
+        profile:
+          store-selected: false
+
         proxies: []
+        proxy-groups: []
+        proxy-providers: {}
+        rule-providers: {}
+        sub-rules: {}
 
         # DIRECT 测试：全部直连，零 geo 规则（geo 在 NE 里会 OOM）
         rules:

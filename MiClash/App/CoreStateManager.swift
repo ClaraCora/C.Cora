@@ -99,8 +99,8 @@ final class CoreStateManager: ObservableObject {
         defer { isBusy = false }
         lastError = nil
         do {
-            // 连接时下发当前订阅配置 + 设置；无订阅则传空串，NE 用缓存/DIRECT 兜底。
-            let yaml = SubscriptionStore.shared.activeYAML ?? ""
+            // App 主动连接时明确下发配置意图：nil=使用内建 DIRECT，不复活旧订阅缓存。
+            let yaml = SubscriptionStore.shared.activeYAML
             let settings = SettingsStore.shared.asJSON()
             let s = SettingsStore.shared
             let opts = TunnelManager.ProtocolOptions(

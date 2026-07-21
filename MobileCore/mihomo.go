@@ -24,7 +24,6 @@ import (
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/profile/cachefile"
-	"github.com/metacubex/mihomo/component/updater"
 	"github.com/metacubex/mihomo/config"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/hub/executor"
@@ -34,9 +33,6 @@ import (
 	"github.com/metacubex/mihomo/tunnel/statistic"
 	"gopkg.in/yaml.v3"
 )
-
-// 配置文件未指定 external-ui-url 时，默认用 zashboard 面板（gh-pages 构建产物）。
-const defaultWebUIURL = "https://github.com/Zephyruso/zashboard/archive/refs/heads/gh-pages.zip"
 
 // ControllerAddr 是 NE 内 mihomo external-controller 的监听地址。
 // 主 App 经 sendProviderMessage IPC 在重签环境下不投递，改用本地回环 HTTP 直连——
@@ -193,45 +189,13 @@ func StartWithConfig(fd int, configYAML string, settingsJSON string) (err error)
 	}
 	addr := fmt.Sprintf("%s:%d", host, st.ControllerPort)
 
-	// webui：mihomo 在 /ui 同源提供面板（浏览器访问，无 CORS/混合内容问题）。
-	// **优先用配置文件里指定的 external-ui / external-ui-url / external-ui-name**，
-	// 配置没指定时默认 zashboard。SetUIPath 必须在 ReCreateServer 之前（注册路由时读取）。
-	var uiCfg struct {
-		ExternalUI     string `yaml:"external-ui"`
-		ExternalUIURL  string `yaml:"external-ui-url"`
-		ExternalUIName string `yaml:"external-ui-name"`
-	}
-	_ = yaml.Unmarshal([]byte(configYAML), &uiCfg)
-	externalUI := uiCfg.ExternalUI
-	if externalUI == "" {
-		externalUI = "ui"
-	}
-	externalUIURL := uiCfg.ExternalUIURL
-	usingDefault := externalUIURL == ""
-	if usingDefault {
-		externalUIURL = defaultWebUIURL
-	}
-
-	uiPath := C.Path.Resolve(externalUI)
-	route.SetUIPath(uiPath)
+	// 只保留原生 UI/诊断需要的 controller API；NE 内不注册、不下载 WebUI，避免启动峰值。
 	route.ReCreateServer(&route.Config{
 		Addr:   addr,
 		Secret: st.ControllerSecret,
 		Cors:   route.Cors{AllowOrigins: []string{"*"}, AllowPrivateNetwork: true},
 	})
-	appendRunLog(fmt.Sprintf("external-controller 已启动: %s (UI: /ui, %s)", addr,
-		map[bool]string{true: "默认 zashboard", false: "配置指定"}[usingDefault]))
-
-	// 后台下载面板到 ui 目录（空才下，已有则跳过）。best-effort，失败不影响代理。
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				appendRunLog(fmt.Sprintf("webui 下载 panic: %v", r))
-			}
-		}()
-		updater.NewUiUpdater(externalUI, externalUIURL, uiCfg.ExternalUIName).AutoDownloadUI()
-		appendRunLog("webui 就绪: /ui/")
-	}()
+	appendRunLog(fmt.Sprintf("external-controller 已启动: %s（WebUI 已禁用）", addr))
 	return nil
 }
 
@@ -263,10 +227,11 @@ func mergeConfig(subYAML string, st appSettings) ([]byte, error) {
 	m["tun"] = tunCfg
 	// 强制 dns：tun 必须 fake-ip + 纯 IP 的 DoH 上游（无需二次解析，杜绝死循环）。
 	m["dns"] = map[string]any{
-		"enable":        true,
-		"ipv6":          st.IPv6,
-		"enhanced-mode": "fake-ip",
-		"fake-ip-range": "198.18.0.1/16",
+		"enable":         true,
+		"ipv6":           st.IPv6,
+		"enhanced-mode":  "fake-ip",
+		"fake-ip-range":  "198.18.0.1/16",
+		"cache-max-size": 512,
 		"nameserver": []any{
 			"https://223.5.5.5/dns-query",
 			"https://1.1.1.1/dns-query",
@@ -286,13 +251,19 @@ func mergeConfig(subYAML string, st appSettings) ([]byte, error) {
 		m["mode"] = "rule"
 	}
 
-	// 持久化策略组选择：store-selected=true → 选中的节点写入 <home>/.cache（App Group 容器，
-	// 跨重启保留），下次启动恢复，不再回默认。保留配置里已有的 profile 其它键。
+	// iOS NE 不提供 WebUI；剔除字段也阻止 upstream ApplyConfig 自动下载/解压面板。
+	delete(m, "external-ui")
+	delete(m, "external-ui-url")
+	delete(m, "external-ui-name")
+
+	// 普通订阅默认持久化策略组选择；DIRECT 明确传 false 时保留，避免无意义打开 cache。
 	profile, _ := m["profile"].(map[string]any)
 	if profile == nil {
 		profile = map[string]any{}
 	}
-	profile["store-selected"] = true
+	if _, specified := profile["store-selected"]; !specified {
+		profile["store-selected"] = true
+	}
 	m["profile"] = profile
 
 	// 收集本次合并的「不适用内容」提示。
