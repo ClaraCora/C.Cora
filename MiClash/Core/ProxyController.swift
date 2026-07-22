@@ -32,6 +32,8 @@ final class ProxyController: ObservableObject {
     @Published private(set) var details: [String: String] = [:]
     /// 正在测速的策略组名。
     @Published private(set) var testing: Set<String> = []
+    /// 正在切换的策略组与目标节点，避免重复点击并给节点行显示进度。
+    @Published private(set) var selecting: [String: String] = [:]
 
     func load() async {
         isLoading = true
@@ -103,6 +105,11 @@ final class ProxyController: ObservableObject {
 
     /// 在某策略组选定节点（IPC selectProxy）。
     func select(group: String, name: String) async {
+        guard selecting[group] == nil else { return }
+        error = nil
+        selecting[group] = name
+        defer { selecting[group] = nil }
+
         let result = await CoreStateManager.shared.sendMessage(
             ["cmd": "selectProxy", "group": group, "name": name])
         switch result {
@@ -120,6 +127,8 @@ final class ProxyController: ObservableObject {
 
     /// 对某策略组做延迟测试（IPC groupDelay），结果并入 delays。
     func testGroup(_ name: String) async {
+        guard !testing.contains(name) else { return }
+        error = nil
         testing.insert(name)
         defer { testing.remove(name) }
         let result = await CoreStateManager.shared.sendMessage(
