@@ -119,6 +119,7 @@ struct ProxiesView: View {
                                 .buttonStyle(.plain)
                                 .disabled(!group.selectable || selectingNode != nil)
                                 .listRowInsets(EdgeInsets(top: 7, leading: 18, bottom: 7, trailing: 14))
+                                .listRowSeparator(.hidden)
                                 .listRowBackground(
                                     node == group.now
                                         ? Color.accentColor.opacity(0.08)
@@ -130,6 +131,7 @@ struct ProxiesView: View {
             }
         }
         .listStyle(.insetGrouped)
+        .listSectionSpacing(6)
         .refreshable { await reload(expandFirstGroup: false) }
         .animation(.easeInOut(duration: 0.18), value: expanded)
     }
