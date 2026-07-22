@@ -126,6 +126,30 @@ sub-rules:
     - GEOSITE,cn,DIRECT
     - SRC-IP-ASN,4134,DIRECT
     - DOMAIN,example.com,DIRECT
+dns:
+  nameserver-policy:
+    "geosite:cn":
+      - https://dns.alidns.com/dns-query
+    "rule-set:Ai":
+      - https://dns.google/dns-query#Ai
+    "+.qpic.cn":
+      - system
+  proxy-server-nameserver-policy:
+    "GEOSITE:geolocation-!cn":
+      - https://dns.google/dns-query
+    "+.example.com":
+      - system
+  fallback-filter:
+    geoip: true
+    geoip-code: CN
+    geosite:
+      - cn
+    domain:
+      - +.example.org
+  fake-ip-filter:
+    - geosite:cn
+    - rule-set:Ai
+    - +.lan
 `
 	m := mergedMapWithSettings(t, input, appSettings{
 		Stack: "gvisor", LogLevel: "info", GeoEnabled: false,
@@ -151,6 +175,36 @@ sub-rules:
 	nested, ok := subRules["nested"].([]any)
 	if !ok || len(nested) != 2 || nested[0] != "SRC-IP-ASN,4134,DIRECT" || nested[1] != "DOMAIN,example.com,DIRECT" {
 		t.Errorf("sub-rules.nested = %v, want ASN and DOMAIN rules retained", subRules["nested"])
+	}
+	dns := nestedMap(t, m, "dns")
+	policy := nestedMap(t, dns, "nameserver-policy")
+	if _, exists := policy["geosite:cn"]; exists {
+		t.Errorf("dns.nameserver-policy should not retain geosite entry: %v", policy)
+	}
+	for _, key := range []string{"rule-set:Ai", "+.qpic.cn"} {
+		if _, exists := policy[key]; !exists {
+			t.Errorf("dns.nameserver-policy should preserve %s: %v", key, policy)
+		}
+	}
+	proxyPolicy := nestedMap(t, dns, "proxy-server-nameserver-policy")
+	if _, exists := proxyPolicy["GEOSITE:geolocation-!cn"]; exists {
+		t.Errorf("dns.proxy-server-nameserver-policy should not retain geosite entry: %v", proxyPolicy)
+	}
+	if _, exists := proxyPolicy["+.example.com"]; !exists {
+		t.Errorf("dns.proxy-server-nameserver-policy lost normal domain: %v", proxyPolicy)
+	}
+	fallback := nestedMap(t, dns, "fallback-filter")
+	for _, key := range []string{"geoip", "geoip-code", "geosite"} {
+		if _, exists := fallback[key]; exists {
+			t.Errorf("dns.fallback-filter.%s should be absent while GEO is disabled: %v", key, fallback)
+		}
+	}
+	if _, exists := fallback["domain"]; !exists {
+		t.Errorf("dns.fallback-filter.domain should be preserved: %v", fallback)
+	}
+	fakeIPFilter, ok := dns["fake-ip-filter"].([]any)
+	if !ok || len(fakeIPFilter) != 2 || fakeIPFilter[0] != "rule-set:Ai" || fakeIPFilter[1] != "+.lan" {
+		t.Errorf("dns.fake-ip-filter = %v, want non-GEO filters preserved", dns["fake-ip-filter"])
 	}
 
 	m = mergedMapWithSettings(t, `geox-url: {geoip: https://example.com/geoip.dat}`, appSettings{
@@ -269,6 +323,8 @@ profile:
 dns:
   enhanced-mode: redir-host
   cache-max-size: 4096
+  nameserver:
+    - https://dns.google/dns-query#Proxy
   default-nameserver:
     - 223.5.5.5
   nameserver-policy:
@@ -302,6 +358,10 @@ dns:
 	if got := dns["enhanced-mode"]; got != "fake-ip" {
 		t.Errorf("dns.enhanced-mode = %v, want forced fake-ip", got)
 	}
+	nameserver, ok := dns["nameserver"].([]any)
+	if !ok || len(nameserver) != 1 || nameserver[0] != "https://dns.google/dns-query#Proxy" {
+		t.Errorf("dns.nameserver = %v, want subscription value preserved", dns["nameserver"])
+	}
 	defaultNameserver, ok := dns["default-nameserver"].([]any)
 	if !ok || len(defaultNameserver) != 1 || defaultNameserver[0] != "223.5.5.5" {
 		t.Errorf("dns.default-nameserver = %v, want subscription value preserved", dns["default-nameserver"])
@@ -326,6 +386,12 @@ func TestMergeConfigSubscriptionDefaults(t *testing.T) {
 	if got := profile["store-selected"]; got != true {
 		t.Errorf("profile.store-selected = %v, want true", got)
 	}
+	dns := nestedMap(t, m, "dns")
+	nameserver, ok := dns["nameserver"].([]any)
+	if !ok || len(nameserver) != 2 || nameserver[0] != "https://223.5.5.5/dns-query" ||
+		nameserver[1] != "https://1.1.1.1/dns-query" {
+		t.Errorf("dns.nameserver = %v, want built-in fallback", dns["nameserver"])
+	}
 
 	m = mergedMap(t, "mode: global\n")
 	if got := m["mode"]; got != "global" {
@@ -333,8 +399,31 @@ func TestMergeConfigSubscriptionDefaults(t *testing.T) {
 	}
 }
 
+func TestMergeConfigPreservesDisabledTunRouteOptions(t *testing.T) {
+	m := mergedMap(t, `
+tun:
+  auto-route: false
+  auto-redirect: false
+  strict-route: false
+`)
+	tun := nestedMap(t, m, "tun")
+	for _, key := range []string{"auto-route", "auto-redirect", "strict-route"} {
+		if got := tun[key]; got != false {
+			t.Errorf("tun.%s = %v, want subscription false preserved", key, got)
+		}
+	}
+}
+
 func TestMergeConfigKeepsIOSConstraints(t *testing.T) {
-	m := mergedMap(t, "geo-auto-update: true\nmixed-port: 7890\n")
+	m := mergedMap(t, `
+geo-auto-update: true
+mixed-port: 7890
+tun:
+  auto-route: true
+  auto-redirect: true
+  strict-route: true
+  device: desktop-tun
+`)
 	if got := m["geo-auto-update"]; got != false {
 		t.Errorf("geo-auto-update = %v, want false", got)
 	}
@@ -344,6 +433,14 @@ func TestMergeConfigKeepsIOSConstraints(t *testing.T) {
 	}
 	if got := tun["enable"]; got != true {
 		t.Errorf("tun.enable = %v, want true", got)
+	}
+	for _, key := range []string{"auto-route", "auto-redirect", "strict-route"} {
+		if got := tun[key]; got != true {
+			t.Errorf("tun.%s = %v, want subscription value preserved", key, got)
+		}
+	}
+	if _, exists := tun["device"]; exists {
+		t.Errorf("tun.device should be replaced in iOS FD mode: %v", tun["device"])
 	}
 	if _, exists := m["mixed-port"]; exists {
 		t.Error("mixed-port should be absent when the App setting is zero")

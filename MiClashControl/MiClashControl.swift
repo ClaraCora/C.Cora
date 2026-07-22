@@ -28,33 +28,8 @@ private func miclashManager() async throws -> NETunnelProviderManager? {
     }
 }
 
-/// 覆盖安装后系统可能吞掉第一次启动请求；只在未进入运行态时刷新配置并补试一次。
+/// 启动前只加载一次系统保存的配置；失败直接上报，不刷新配置或自动重试。
 private func startVPN(_ manager: NETunnelProviderManager) async throws {
-    try await manager.loadFromPreferences()
-    do {
-        try manager.connection.startVPNTunnel()
-    } catch {
-        try await manager.loadFromPreferences()
-        try manager.connection.startVPNTunnel()
-        return
-    }
-
-    for _ in 0..<6 {
-        switch manager.connection.status {
-        case .connected, .connecting, .reasserting:
-            return
-        case .invalid, .disconnected, .disconnecting:
-            break
-        @unknown default:
-            break
-        }
-        try? await Task.sleep(nanoseconds: 250_000_000)
-    }
-
-    for _ in 0..<8 {
-        guard manager.connection.status == .disconnecting else { break }
-        try? await Task.sleep(nanoseconds: 250_000_000)
-    }
     try await manager.loadFromPreferences()
     try manager.connection.startVPNTunnel()
 }

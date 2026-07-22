@@ -395,10 +395,10 @@ func mergeConfig(subYAML string, st appSettings) ([]byte, error) {
 		}
 	}
 
-	// 强制 tun（参考能跑满速的 Everywhere）：只设 enable/stack/mtu/dns-hijack/地址。
-	// **关键：不设 auto-detect-interface / auto-route**——mihomo 自带接口监控在 iOS NE 不可靠，
-	// 会把出站接口错切，导致流量被默认路由兜回 tun 而限速。出站接口改由 NE 的 NWPathMonitor
-	// 经 SetDefaultInterface 显式喂入；iOS 路由由 NEPacketTunnelNetworkSettings 负责，无需 auto-route。
+	// 重建 iOS tun 的核心参数；保留订阅显式声明的路由开关，方便配置审计并尊重
+	// auto-route=false。auto-redirect 在非 Linux 平台会由 sing-tun 强制关闭，strict-route
+	// 在 iOS FD 模式下也不负责系统路由；实际路由仍由 NEPacketTunnelNetworkSettings 下发。
+	sourceTun, _ := m["tun"].(map[string]any)
 	tunCfg := map[string]any{
 		"enable":        true,
 		"stack":         st.Stack,
@@ -409,9 +409,14 @@ func mergeConfig(subYAML string, st appSettings) ([]byte, error) {
 	if st.IPv6 {
 		tunCfg["inet6-address"] = []any{"fdfe:dcba:9876::1/126"}
 	}
+	for _, key := range []string{"auto-route", "auto-redirect", "strict-route"} {
+		if value, exists := sourceTun[key]; exists {
+			tunCfg[key] = value
+		}
+	}
 	m["tun"] = tunCfg
-	// 保留订阅中的 nameserver-policy 等 DNS 分流配置，只覆盖 iOS tun 必须固定的参数。
-	// 主 nameserver 使用纯 IP 的 DoH 上游，无需二次解析，可避免启动阶段的 DNS 死循环。
+	// 保留订阅中的 nameserver、nameserver-policy 等 DNS 配置，只覆盖 iOS tun
+	// 必须固定的工作模式。配置未提供 nameserver 时才使用纯 IP DoH 兜底。
 	dnsCfg, _ := m["dns"].(map[string]any)
 	if dnsCfg == nil {
 		dnsCfg = map[string]any{}
@@ -421,9 +426,13 @@ func mergeConfig(subYAML string, st appSettings) ([]byte, error) {
 	dnsCfg["enhanced-mode"] = "fake-ip"
 	dnsCfg["fake-ip-range"] = "198.18.0.1/16"
 	dnsCfg["cache-max-size"] = 512
-	dnsCfg["nameserver"] = []any{
-		"https://223.5.5.5/dns-query",
-		"https://1.1.1.1/dns-query",
+	rawNameservers, hasNameservers := dnsCfg["nameserver"]
+	nameservers, isList := rawNameservers.([]any)
+	if !hasNameservers || rawNameservers == nil || (isList && len(nameservers) == 0) {
+		dnsCfg["nameserver"] = []any{
+			"https://223.5.5.5/dns-query",
+			"https://1.1.1.1/dns-query",
+		}
 	}
 	m["dns"] = dnsCfg
 	m["ipv6"] = st.IPv6
@@ -630,8 +639,9 @@ func filterGeoNegationRules(rules []any) []any {
 	return out
 }
 
-// filterGeoRulesFromConfig 删除 rules 与 sub-rules 中任何包含 GEOIP,/GEOSITE,/GEODATA,
-// 的条目。用 Contains 抓住逻辑规则内嵌的 geo，避免 geo 关闭后内核仍触发数据库下载。
+// filterGeoRulesFromConfig 删除 rules、sub-rules 与 DNS 配置中所有依赖 GEO 数据库的条目。
+// DNS 也能通过 nameserver-policy/fallback-filter/fake-ip-filter 引用 GeoSite/GeoIP；
+// 若只过滤分流规则，geo 关闭后仍会在 DNS 初始化阶段加载数据库并导致 NE 内存冲高。
 func filterGeoRulesFromConfig(m map[string]any) {
 	dropped := 0
 	if rules, ok := m["rules"].([]any); ok {
@@ -649,11 +659,68 @@ func filterGeoRulesFromConfig(m map[string]any) {
 		}
 		m["sub-rules"] = subRules
 	}
+	dropped += filterGeoDNSConfig(m)
 	if dropped > 0 {
-		appendRunLog(fmt.Sprintf("剔除 geo 规则 %d 条", dropped))
+		appendRunLog(fmt.Sprintf("剔除 geo 规则/DNS 策略 %d 条", dropped))
 		configNotices = append(configNotices,
-			fmt.Sprintf("已忽略 %d 条 GEOIP/GEOSITE 规则（geo 未启用，可在设置里开启）", dropped))
+			fmt.Sprintf("已忽略 %d 条 GEOIP/GEOSITE 规则或 DNS 策略（geo 未启用，可在设置里开启）", dropped))
 	}
+}
+
+func filterGeoDNSConfig(m map[string]any) int {
+	dnsCfg, ok := m["dns"].(map[string]any)
+	if !ok {
+		return 0
+	}
+
+	dropped := 0
+	for _, name := range []string{"nameserver-policy", "proxy-server-nameserver-policy"} {
+		policy, ok := dnsCfg[name].(map[string]any)
+		if !ok {
+			continue
+		}
+		for key := range policy {
+			if strings.HasPrefix(strings.ToLower(strings.TrimSpace(key)), "geosite:") {
+				delete(policy, key)
+				dropped++
+			}
+		}
+		if len(policy) == 0 {
+			delete(dnsCfg, name)
+		} else {
+			dnsCfg[name] = policy
+		}
+	}
+
+	if fallback, ok := dnsCfg["fallback-filter"].(map[string]any); ok {
+		if enabled, _ := fallback["geoip"].(bool); enabled {
+			dropped++
+		}
+		delete(fallback, "geoip")
+		delete(fallback, "geoip-code")
+		if geosite, ok := fallback["geosite"].([]any); ok {
+			dropped += len(geosite)
+			delete(fallback, "geosite")
+		}
+		dnsCfg["fallback-filter"] = fallback
+	}
+
+	if filters, ok := dnsCfg["fake-ip-filter"].([]any); ok {
+		kept := make([]any, 0, len(filters))
+		for _, raw := range filters {
+			value, isString := raw.(string)
+			upper := strings.ToUpper(strings.TrimSpace(value))
+			if isString && (strings.Contains(upper, "GEOSITE:") || strings.Contains(upper, "GEOSITE,")) {
+				dropped++
+				continue
+			}
+			kept = append(kept, raw)
+		}
+		dnsCfg["fake-ip-filter"] = kept
+	}
+
+	m["dns"] = dnsCfg
+	return dropped
 }
 
 func filterGeoRules(rules []any) ([]any, int) {
