@@ -22,7 +22,7 @@ struct ProxiesView: View {
                 }
                 .task(id: core.isActive) {
                     guard core.isActive else { return }
-                    await reload(expandFirstGroup: true)
+                    await reload()
                 }
                 .onChange(of: core.isActive) { _, active in
                     guard !active else { return }
@@ -47,7 +47,7 @@ struct ProxiesView: View {
             } description: {
                 Text(err)
             } actions: {
-                Button("重试") { Task { await reload(expandFirstGroup: true) } }
+                Button("重试") { Task { await reload() } }
             }
         } else if controller.groups.isEmpty {
             ProgressView("加载策略组…")
@@ -63,7 +63,7 @@ struct ProxiesView: View {
                     .controlSize(.small)
             } else {
                 Button {
-                    Task { await reload(expandFirstGroup: false) }
+                    Task { await reload() }
                 } label: {
                     Image(systemName: "arrow.clockwise")
                 }
@@ -132,7 +132,7 @@ struct ProxiesView: View {
         }
         .listStyle(.insetGrouped)
         .listSectionSpacing(6)
-        .refreshable { await reload(expandFirstGroup: false) }
+        .refreshable { await reload() }
         .animation(.easeInOut(duration: 0.18), value: expanded)
     }
 
@@ -179,11 +179,8 @@ struct ProxiesView: View {
         }
     }
 
-    private func reload(expandFirstGroup: Bool) async {
+    private func reload() async {
         await controller.load()
-        if expandFirstGroup, expanded.isEmpty, let first = controller.groups.first {
-            expanded.insert(first.name)
-        }
     }
 }
 
