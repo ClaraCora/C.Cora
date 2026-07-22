@@ -70,6 +70,8 @@ final class SettingsStore: ObservableObject {
         "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb"
     static let defaultGeoSiteURL =
         "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat"
+    static let defaultASNURL =
+        "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/GeoLite2-ASN.mmdb"
 
     private let d = UserDefaults.standard
     private enum K {

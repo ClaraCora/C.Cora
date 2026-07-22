@@ -29,11 +29,11 @@ struct SettingsView: View {
                         Toggle("Geodata 模式（GeoIP.dat）", isOn: $settings.geodataMode)
                         Toggle("忽略 GEO 取反规则", isOn: $settings.ignoreGeoNegation)
                         if settings.geodataMode {
-                            GeoURLField(title: "GeoIP.dat 地址", text: $settings.geoIPDatURL)
+                            GeoURLField(title: "备用 GeoIP.dat 地址", text: $settings.geoIPDatURL)
                         } else {
-                            GeoURLField(title: "MMDB 地址", text: $settings.geoMMDBURL)
+                            GeoURLField(title: "备用 MMDB 地址", text: $settings.geoMMDBURL)
                         }
-                        GeoURLField(title: "GeoSite.dat 地址", text: $settings.geoSiteURL)
+                        GeoURLField(title: "备用 GeoSite.dat 地址", text: $settings.geoSiteURL)
                         Toggle("自动更新", isOn: $settings.geoAutoUpdate)
                         if settings.geoAutoUpdate {
                             Stepper("更新间隔 \(settings.geoUpdateInterval) 小时",
@@ -43,7 +43,7 @@ struct SettingsView: View {
                             Task { await updateGeo() }
                         } label: {
                             HStack {
-                                Label("下载 / 更新 GEO 数据", systemImage: "arrow.down.circle")
+                                Label("下载 / 更新 GEO 与 ASN 数据", systemImage: "arrow.down.circle")
                                 Spacer()
                                 if geoDatabase.isUpdating { ProgressView() }
                             }
@@ -68,11 +68,13 @@ struct SettingsView: View {
                         }
                     }
                 } header: {
-                    Text("geo 规则")
+                    Text("GEO 与 ASN")
                 } footer: {
                     Text("关闭 GEO=剔除订阅里的 GEOIP/GEOSITE 规则。Geodata 模式关闭时使用 MMDB，开启时使用 GeoIP.dat；"
                        + "“忽略 GEO 取反规则”可单独控制 geolocation-!cn / NOT(GEOIP) 等规则。"
-                       + "数据库由主 App 下载到共享目录，自动更新会在打开 App 或连接前按间隔检查，更新后需重新连接。")
+                       + "主 App 优先读取当前配置的 geox-url 下载数据库，设置中的地址仅在配置缺少对应地址时使用。"
+                       + "IP-ASN/SRC-IP-ASN 规则会保留；ASN 优先使用配置中的 geox-url.asn，缺少时使用内置备用地址。"
+                       + "更新后需重新连接。")
                 }
 
                 Section {

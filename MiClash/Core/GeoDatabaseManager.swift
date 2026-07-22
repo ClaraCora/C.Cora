@@ -1,7 +1,7 @@
 import Foundation
 import Mihomo
 
-/// 主 App 负责下载 GEO 数据到 App Group；NE 只读取已安装文件。
+/// 主 App 负责下载 GEO / ASN 数据到 App Group；NE 只读取已安装文件。
 @MainActor
 final class GeoDatabaseManager: ObservableObject {
     static let shared = GeoDatabaseManager()
@@ -18,29 +18,43 @@ final class GeoDatabaseManager: ObservableObject {
     /// App 启动时只执行用户开启的定时更新；缺文件会在连接前强制补齐。
     func updateOnLaunch() async {
         let settings = SettingsStore.shared
-        guard settings.geoEnabled, settings.geoAutoUpdate else { return }
+        guard settings.geoAutoUpdate else { return }
+        let configYAML = SubscriptionStore.shared.activeYAML ?? ""
+        let resolved = resolveURLs(configYAML: configYAML, settingsJSON: settings.asJSON())
+        guard settings.geoEnabled || resolved.asnRequired else { return }
         do {
-            try await updateIfNeeded(force: false)
+            try await updateIfNeeded(force: false, configYAML: configYAML)
         } catch {
             publish(error: error)
         }
     }
 
-    /// 连接前确保当前模式所需的两个文件存在，并按自动更新间隔刷新。
-    func prepareForConnection() async throws {
-        guard SettingsStore.shared.geoEnabled else { return }
-        try await updateIfNeeded(force: false)
-        try validateInstalledAssets(geodataMode: SettingsStore.shared.geodataMode)
+    /// 连接前确保当前配置需要的 GEO / ASN 文件存在，并按自动更新间隔刷新。
+    func prepareForConnection(configYAML: String?) async throws {
+        let yaml = configYAML ?? ""
+        let settings = SettingsStore.shared
+        let resolved = resolveURLs(configYAML: yaml, settingsJSON: settings.asJSON())
+        guard settings.geoEnabled || resolved.asnRequired else { return }
+        try await updateIfNeeded(force: false, configYAML: yaml)
+        do {
+            try validateInstalledAssets(configYAML: yaml)
+        } catch {
+            try await updateIfNeeded(force: true, configYAML: yaml)
+            try validateInstalledAssets(configYAML: yaml)
+        }
     }
 
-    /// 设置页手动下载/更新当前模式的 GEOIP 数据与 GeoSite.dat。
+    /// 设置页手动下载/更新当前配置需要的 GEO / ASN 数据。
     func updateManually() async throws {
-        try await updateIfNeeded(force: true)
+        try await updateIfNeeded(force: true,
+                                 configYAML: SubscriptionStore.shared.activeYAML ?? "")
     }
 
     func lastUpdatedAt(geodataMode: Bool) -> Date? {
         guard let home = AppGroup.containerURL else { return nil }
-        let names = [geodataMode ? "GeoIP.dat" : "geoip.metadb", "GeoSite.dat"]
+        let names = requiredAssets(configYAML: SubscriptionStore.shared.activeYAML ?? "",
+                                   geodataMode: geodataMode).map(\.fileName)
+        guard !names.isEmpty else { return nil }
         let dates = names.compactMap { modificationDate(home.appendingPathComponent($0)) }
         guard dates.count == names.count else { return nil }
         return dates.min()
@@ -48,36 +62,34 @@ final class GeoDatabaseManager: ObservableObject {
 
     func installedSize(geodataMode: Bool) -> Int64? {
         guard let home = AppGroup.containerURL else { return nil }
-        let names = [geodataMode ? "GeoIP.dat" : "geoip.metadb", "GeoSite.dat"]
+        let names = requiredAssets(configYAML: SubscriptionStore.shared.activeYAML ?? "",
+                                   geodataMode: geodataMode).map(\.fileName)
+        guard !names.isEmpty else { return nil }
         let sizes = names.compactMap { fileSize(home.appendingPathComponent($0)) }
         guard sizes.count == names.count else { return nil }
         return sizes.reduce(0, +)
     }
 
-    private func updateIfNeeded(force: Bool) async throws {
+    private func updateIfNeeded(force: Bool, configYAML: String) async throws {
         if let activeUpdate {
             try await activeUpdate.value
             return
         }
 
         let settings = SettingsStore.shared
-        guard settings.geoEnabled else { return }
         guard let home = AppGroup.containerURL else { throw GeoError.appGroupUnavailable }
         let geodataMode = settings.geodataMode
         let autoUpdate = settings.geoAutoUpdate
         let updateInterval = settings.geoUpdateInterval
-        let geoIPURL = geodataMode ? settings.geoIPDatURL : settings.geoMMDBURL
-        let geoSiteURL = settings.geoSiteURL
+        let assets = requiredAssets(configYAML: configYAML, geodataMode: geodataMode)
+        guard !assets.isEmpty else { return }
         let config = DownloadConfiguration(
             home: home,
-            geodataMode: geodataMode,
-            geoIPURL: geoIPURL,
-            geoIPFileName: geodataMode ? "GeoIP.dat" : "geoip.metadb",
-            geoSiteURL: geoSiteURL
+            assets: assets
         )
-        let filesMissing = !assetsAvailable(home: config.home, geodataMode: config.geodataMode)
+        let filesMissing = !assetsAvailable(home: config.home, assets: config.assets)
         let stale = assetsAreStale(home: config.home,
-                                   geodataMode: config.geodataMode,
+                                   assets: config.assets,
                                    intervalHours: updateInterval)
         guard force || filesMissing || (autoUpdate && stale) else { return }
 
@@ -97,30 +109,73 @@ final class GeoDatabaseManager: ObservableObject {
             try await task.value
             revision += 1
             statusIsError = false
-            statusText = "GEO 数据已更新"
+            statusText = "GEO / ASN 数据已更新"
         } catch {
             publish(error: error)
             throw error
         }
     }
 
-    private func validateInstalledAssets(geodataMode: Bool) throws {
+    private func validateInstalledAssets(configYAML: String) throws {
         guard let home = AppGroup.containerURL else { throw GeoError.appGroupUnavailable }
-        let names = [geodataMode ? "GeoIP.dat" : "geoip.metadb", "GeoSite.dat"]
-        let missing = names.filter { (fileSize(home.appendingPathComponent($0)) ?? 0) < 1_024 }
+        let assets = requiredAssets(configYAML: configYAML,
+                                    geodataMode: SettingsStore.shared.geodataMode)
+        let missing = assets.map(\.fileName).filter {
+            (fileSize(home.appendingPathComponent($0)) ?? 0) < 1_024
+        }
         if !missing.isEmpty { throw GeoError.missingFiles(missing) }
+        for asset in assets {
+            let path = home.appendingPathComponent(asset.fileName).path
+            var validationError: NSError?
+            guard MihomoValidateGeoDatabase(path, asset.kind, &validationError) else {
+                throw GeoError.validationFailed(asset.fileName,
+                                                validationError?.localizedDescription)
+            }
+        }
     }
 
-    private func assetsAvailable(home: URL, geodataMode: Bool) -> Bool {
-        let names = [geodataMode ? "GeoIP.dat" : "geoip.metadb", "GeoSite.dat"]
-        return names.allSatisfy { (fileSize(home.appendingPathComponent($0)) ?? 0) >= 1_024 }
+    private func assetsAvailable(home: URL, assets: [AssetDownload]) -> Bool {
+        assets.allSatisfy { (fileSize(home.appendingPathComponent($0.fileName)) ?? 0) >= 1_024 }
     }
 
-    private func assetsAreStale(home: URL, geodataMode: Bool, intervalHours: Int) -> Bool {
-        let names = [geodataMode ? "GeoIP.dat" : "geoip.metadb", "GeoSite.dat"]
-        let dates = names.compactMap { modificationDate(home.appendingPathComponent($0)) }
-        guard dates.count == names.count, let oldest = dates.min() else { return true }
+    private func assetsAreStale(home: URL, assets: [AssetDownload], intervalHours: Int) -> Bool {
+        let dates = assets.compactMap { modificationDate(home.appendingPathComponent($0.fileName)) }
+        guard dates.count == assets.count, let oldest = dates.min() else { return true }
         return Date().timeIntervalSince(oldest) >= TimeInterval(max(intervalHours, 1) * 3_600)
+    }
+
+    private func requiredAssets(configYAML: String, geodataMode: Bool) -> [AssetDownload] {
+        let settings = SettingsStore.shared
+        let resolved = resolveURLs(configYAML: configYAML, settingsJSON: settings.asJSON())
+        var assets: [AssetDownload] = []
+        if settings.geoEnabled {
+            assets.append(AssetDownload(
+                label: geodataMode ? "GeoIP.dat" : "geoip.metadb",
+                url: geodataMode ? resolved.geoip : resolved.mmdb,
+                fileName: geodataMode ? "GeoIP.dat" : "geoip.metadb",
+                kind: geodataMode ? "geoip" : "mmdb"))
+            assets.append(AssetDownload(label: "GeoSite.dat", url: resolved.geosite,
+                                        fileName: "GeoSite.dat", kind: "geosite"))
+        }
+        if resolved.asnRequired {
+            assets.append(AssetDownload(label: "ASN.mmdb", url: resolved.asn,
+                                        fileName: "ASN.mmdb", kind: "asn"))
+        }
+        return assets
+    }
+
+    private func resolveURLs(configYAML: String, settingsJSON: String) -> ResolvedURLs {
+        let json = MihomoResolveGeoDownloadURLs(configYAML, settingsJSON)
+        guard let data = json.data(using: .utf8),
+              let resolved = try? JSONDecoder().decode(ResolvedURLs.self, from: data) else {
+            return ResolvedURLs(
+                geoip: SettingsStore.defaultGeoIPDatURL,
+                mmdb: SettingsStore.defaultGeoMMDBURL,
+                geosite: SettingsStore.defaultGeoSiteURL,
+                asn: SettingsStore.defaultASNURL,
+                asnRequired: false)
+        }
+        return resolved
     }
 
     private func modificationDate(_ url: URL) -> Date? {
@@ -140,10 +195,22 @@ final class GeoDatabaseManager: ObservableObject {
 
     private struct DownloadConfiguration: Sendable {
         let home: URL
-        let geodataMode: Bool
-        let geoIPURL: String
-        let geoIPFileName: String
-        let geoSiteURL: String
+        let assets: [AssetDownload]
+    }
+
+    private struct AssetDownload: Sendable {
+        let label: String
+        let url: String
+        let fileName: String
+        let kind: String
+    }
+
+    private struct ResolvedURLs: Decodable, Sendable {
+        let geoip: String
+        let mmdb: String
+        let geosite: String
+        let asn: String
+        let asnRequired: Bool
     }
 
     private struct StagedAsset: Sendable {
@@ -160,25 +227,23 @@ final class GeoDatabaseManager: ObservableObject {
         let session = URLSession(configuration: sessionConfig)
         defer { session.invalidateAndCancel() }
 
-        let geoIP = try await stageAsset(label: config.geoIPFileName,
-                                         urlString: config.geoIPURL,
-                                         fileName: config.geoIPFileName,
-                                         home: config.home,
-                                         session: session)
+        var staged: [StagedAsset] = []
         do {
-            let geoSite = try await stageAsset(label: "GeoSite.dat",
-                                               urlString: config.geoSiteURL,
-                                               fileName: "GeoSite.dat",
-                                               home: config.home,
-                                               session: session)
-            defer {
-                try? FileManager.default.removeItem(at: geoIP.url)
-                try? FileManager.default.removeItem(at: geoSite.url)
+            for asset in config.assets {
+                staged.append(try await stageAsset(label: asset.label,
+                                                   urlString: asset.url,
+                                                   fileName: asset.fileName,
+                                                   kind: asset.kind,
+                                                   home: config.home,
+                                                   session: session))
             }
-            try install(geoIP, home: config.home)
-            try install(geoSite, home: config.home)
+            for asset in staged {
+                try install(asset, home: config.home)
+            }
         } catch {
-            try? FileManager.default.removeItem(at: geoIP.url)
+            for asset in staged {
+                try? FileManager.default.removeItem(at: asset.url)
+            }
             throw error
         }
     }
@@ -186,6 +251,7 @@ final class GeoDatabaseManager: ObservableObject {
     nonisolated private static func stageAsset(label: String,
                                               urlString: String,
                                               fileName: String,
+                                              kind: String,
                                               home: URL,
                                               session: URLSession) async throws -> StagedAsset {
         let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -220,8 +286,6 @@ final class GeoDatabaseManager: ObservableObject {
             throw GeoError.invalidContent(label)
         }
 
-        let kind = fileName == "geoip.metadb" ? "mmdb" :
-            (fileName == "GeoIP.dat" ? "geoip" : "geosite")
         var validationError: NSError?
         guard MihomoValidateGeoDatabase(temporaryURL.path, kind, &validationError) else {
             throw GeoError.validationFailed(label, validationError?.localizedDescription)
@@ -256,7 +320,7 @@ private enum GeoError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .appGroupUnavailable:
-            return "App Group 不可用，主 App 无法把 GEO 数据共享给隧道扩展"
+            return "App Group 不可用，主 App 无法把 GEO / ASN 数据共享给隧道扩展"
         case .invalidURL(let name):
             return "\(name) 下载地址无效"
         case .httpStatus(let name, let code):
@@ -268,7 +332,7 @@ private enum GeoError: LocalizedError {
         case .validationFailed(let name, let reason):
             return "\(name) 数据库校验失败" + (reason.map { "：\($0)" } ?? "")
         case .missingFiles(let names):
-            return "缺少 GEO 数据文件：\(names.joined(separator: "、"))"
+            return "缺少 GEO / ASN 数据文件：\(names.joined(separator: "、"))"
         }
     }
 }

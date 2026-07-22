@@ -34,11 +34,14 @@ import (
 	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/tunnel"
 	"github.com/metacubex/mihomo/tunnel/statistic"
+	"github.com/oschwald/maxminddb-golang"
 	"gopkg.in/yaml.v3"
 )
 
 // 配置文件未指定 external-ui-url 时，默认用 zashboard 面板（gh-pages 构建产物）。
 const defaultWebUIURL = "https://github.com/Zephyruso/zashboard/archive/refs/heads/gh-pages.zip"
+
+const defaultASNURL = "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/GeoLite2-ASN.mmdb"
 
 // ControllerAddr 是 NE 内 mihomo external-controller 的监听地址。
 // 主 App 经 sendProviderMessage IPC 在重签环境下不投递，改用本地回环 HTTP 直连——
@@ -76,6 +79,18 @@ func ValidateGeoDatabase(path string, kind string) error {
 			return fmt.Errorf("invalid MMDB database")
 		}
 		return nil
+	case "asn":
+		reader, err := maxminddb.Open(path)
+		if err != nil {
+			return fmt.Errorf("invalid ASN database: %w", err)
+		}
+		defer reader.Close()
+		switch reader.Metadata.DatabaseType {
+		case "GeoLite2-ASN", "DBIP-ASN-Lite (compat=GeoLite2-ASN)", "ipinfo generic_asn_free.mmdb":
+			return nil
+		default:
+			return fmt.Errorf("unsupported ASN database type: %s", reader.Metadata.DatabaseType)
+		}
 	case "geoip", "geosite":
 		data, err := os.ReadFile(path)
 		if err != nil {
@@ -199,6 +214,81 @@ func parseSettings(settingsJSON string) appSettings {
 	return s
 }
 
+type geoDownloadURLs struct {
+	GeoIP       string `json:"geoip"`
+	MMDB        string `json:"mmdb"`
+	GeoSite     string `json:"geosite"`
+	ASN         string `json:"asn"`
+	ASNRequired bool   `json:"asnRequired"`
+}
+
+// ResolveGeoDownloadURLs returns the database URLs that the main App should use.
+// Values declared by the active YAML's geox-url take priority over App fallbacks.
+func ResolveGeoDownloadURLs(configYAML string, settingsJSON string) string {
+	resolved := resolveGeoDownloadURLs(configYAML, parseSettings(settingsJSON))
+	out, err := json.Marshal(resolved)
+	if err != nil {
+		return "{}"
+	}
+	return string(out)
+}
+
+func resolveGeoDownloadURLs(configYAML string, st appSettings) geoDownloadURLs {
+	resolved := geoDownloadURLs{
+		GeoIP:   st.GeoIPDatURL,
+		MMDB:    st.GeoMMDBURL,
+		GeoSite: st.GeoSiteURL,
+		ASN:     defaultASNURL,
+	}
+	m := map[string]any{}
+	if strings.TrimSpace(configYAML) != "" {
+		_ = yaml.Unmarshal([]byte(configYAML), &m)
+	}
+	if urls, ok := m["geox-url"].(map[string]any); ok {
+		if value := stringValue(urls["geoip"]); value != "" {
+			resolved.GeoIP = value
+		}
+		if value := stringValue(urls["mmdb"]); value != "" {
+			resolved.MMDB = value
+		}
+		if value := stringValue(urls["geosite"]); value != "" {
+			resolved.GeoSite = value
+		}
+		if value := stringValue(urls["asn"]); value != "" {
+			resolved.ASN = value
+			resolved.ASNRequired = true
+		}
+	}
+	resolved.ASNRequired = resolved.ASNRequired || rulesUseASN(m["rules"]) || rulesUseASN(m["sub-rules"])
+	return resolved
+}
+
+func stringValue(value any) string {
+	s, _ := value.(string)
+	return strings.TrimSpace(s)
+}
+
+func rulesUseASN(value any) bool {
+	switch typed := value.(type) {
+	case string:
+		u := strings.ToUpper(strings.TrimSpace(typed))
+		return strings.Contains(u, "IP-ASN,") || strings.Contains(u, "SRC-IP-ASN,")
+	case []any:
+		for _, item := range typed {
+			if rulesUseASN(item) {
+				return true
+			}
+		}
+	case map[string]any:
+		for _, item := range typed {
+			if rulesUseASN(item) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // StartWithConfig 用订阅/自定义 YAML + 设置启动内核：先把订阅配置与「iOS 必需的安全设置」
 // 及用户设置合并、按需剔除 geo 规则，再注入 fd 启动，最后起 external-controller。
 // 对应 Swift 侧 `MihomoStartWithConfig(_:_:_:error:)`。
@@ -320,18 +410,22 @@ func mergeConfig(subYAML string, st appSettings) ([]byte, error) {
 		tunCfg["inet6-address"] = []any{"fdfe:dcba:9876::1/126"}
 	}
 	m["tun"] = tunCfg
-	// 强制 dns：tun 必须 fake-ip + 纯 IP 的 DoH 上游（无需二次解析，杜绝死循环）。
-	m["dns"] = map[string]any{
-		"enable":         true,
-		"ipv6":           st.IPv6,
-		"enhanced-mode":  "fake-ip",
-		"fake-ip-range":  "198.18.0.1/16",
-		"cache-max-size": 512,
-		"nameserver": []any{
-			"https://223.5.5.5/dns-query",
-			"https://1.1.1.1/dns-query",
-		},
+	// 保留订阅中的 nameserver-policy 等 DNS 分流配置，只覆盖 iOS tun 必须固定的参数。
+	// 主 nameserver 使用纯 IP 的 DoH 上游，无需二次解析，可避免启动阶段的 DNS 死循环。
+	dnsCfg, _ := m["dns"].(map[string]any)
+	if dnsCfg == nil {
+		dnsCfg = map[string]any{}
 	}
+	dnsCfg["enable"] = true
+	dnsCfg["ipv6"] = st.IPv6
+	dnsCfg["enhanced-mode"] = "fake-ip"
+	dnsCfg["fake-ip-range"] = "198.18.0.1/16"
+	dnsCfg["cache-max-size"] = 512
+	dnsCfg["nameserver"] = []any{
+		"https://223.5.5.5/dns-query",
+		"https://1.1.1.1/dns-query",
+	}
+	m["dns"] = dnsCfg
 	m["ipv6"] = st.IPv6
 	m["log-level"] = st.LogLevel
 
@@ -371,6 +465,7 @@ func mergeConfig(subYAML string, st appSettings) ([]byte, error) {
 	// 自动下载始终关闭，GEO 文件只允许主 App 管理。
 	m["geo-auto-update"] = false
 	if st.GeoEnabled {
+		resolvedURLs := resolveGeoDownloadURLs(subYAML, st)
 		m["geodata-mode"] = st.GeodataMode
 		m["geodata-loader"] = st.GeoLoader
 		m["geo-update-interval"] = st.GeoUpdateInterval
@@ -378,9 +473,10 @@ func mergeConfig(subYAML string, st appSettings) ([]byte, error) {
 		if geoXURL == nil {
 			geoXURL = map[string]any{}
 		}
-		geoXURL["geoip"] = st.GeoIPDatURL
-		geoXURL["mmdb"] = st.GeoMMDBURL
-		geoXURL["geosite"] = st.GeoSiteURL
+		geoXURL["geoip"] = resolvedURLs.GeoIP
+		geoXURL["mmdb"] = resolvedURLs.MMDB
+		geoXURL["geosite"] = resolvedURLs.GeoSite
+		geoXURL["asn"] = resolvedURLs.ASN
 		m["geox-url"] = geoXURL
 		if st.IgnoreGeoNegation {
 			if rules, ok := m["rules"].([]any); ok {

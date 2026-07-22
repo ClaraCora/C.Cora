@@ -80,9 +80,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             let settings = self.resolveCached(incoming: settingsJSON.isEmpty ? nil : settingsJSON,
                                               home: home, file: "settings.json") ?? ""
 
-            // GEO 文件必须由主 App 预先写入共享 home；NE 启动阶段不再联网下载。
-            if let geoError = Self.validateGeoAssets(settingsJSON: settings, home: home) {
-                FileLog.write("GEO 数据检查失败：\(geoError.localizedDescription)")
+            // GEO / ASN 文件必须由主 App 预先写入共享 home；NE 启动阶段不再联网下载。
+            if let geoError = Self.validateGeoAssets(configYAML: configYAML,
+                                                      settingsJSON: settings,
+                                                      home: home) {
+                FileLog.write("GEO / ASN 数据检查失败：\(geoError.localizedDescription)")
                 completionHandler(geoError)
                 return
             }
@@ -377,15 +379,23 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         return nil
     }
 
-    private static func validateGeoAssets(settingsJSON: String, home: String) -> NSError? {
-        guard let data = settingsJSON.data(using: .utf8),
-              let settings = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              (settings["geoEnabled"] as? Bool) == true else {
-            return nil
-        }
-
+    private static func validateGeoAssets(configYAML: String,
+                                          settingsJSON: String,
+                                          home: String) -> NSError? {
+        let data = settingsJSON.data(using: .utf8) ?? Data()
+        let settings = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        let geoEnabled = (settings["geoEnabled"] as? Bool) == true
         let geodataMode = (settings["geodataMode"] as? Bool) ?? false
-        let required = [geodataMode ? "GeoIP.dat" : "geoip.metadb", "GeoSite.dat"]
+        var required = geoEnabled
+            ? [geodataMode ? "GeoIP.dat" : "geoip.metadb", "GeoSite.dat"]
+            : []
+        let resolvedJSON = MihomoResolveGeoDownloadURLs(configYAML, settingsJSON)
+        if let resolvedData = resolvedJSON.data(using: .utf8),
+           let resolved = (try? JSONSerialization.jsonObject(with: resolvedData)) as? [String: Any],
+           (resolved["asnRequired"] as? Bool) == true {
+            required.append("ASN.mmdb")
+        }
+        guard !required.isEmpty else { return nil }
         let missing = required.filter { name in
             let path = (home as NSString).appendingPathComponent(name)
             let attributes = try? FileManager.default.attributesOfItem(atPath: path)
@@ -396,7 +406,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             domain: "MiClashTunnel",
             code: -4,
             userInfo: [NSLocalizedDescriptionKey:
-                "缺少 GEO 数据文件：\(missing.joined(separator: "、"))。请在主 App 设置中下载后重试。"]
+                "缺少 GEO / ASN 数据文件：\(missing.joined(separator: "、"))。请在主 App 设置中下载后重试。"]
         )
     }
 

@@ -1,6 +1,7 @@
 package mihomo
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -13,7 +14,7 @@ func TestValidateGeoDatabaseRejectsInvalidContent(t *testing.T) {
 	if err := os.WriteFile(path, []byte("not a GEO database"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	for _, kind := range []string{"mmdb", "geoip", "geosite", "unknown"} {
+	for _, kind := range []string{"mmdb", "asn", "geoip", "geosite", "unknown"} {
 		if err := ValidateGeoDatabase(path, kind); err == nil {
 			t.Errorf("ValidateGeoDatabase(%q) accepted invalid content", kind)
 		}
@@ -97,6 +98,7 @@ func TestMergeConfigGeoModeAndMainAppUpdateSettings(t *testing.T) {
 		"geoip":   settings.GeoIPDatURL,
 		"mmdb":    settings.GeoMMDBURL,
 		"geosite": settings.GeoSiteURL,
+		"asn":     defaultASNURL,
 	}
 	for key, want := range wantURLs {
 		if got := urls[key]; got != want {
@@ -117,10 +119,12 @@ geox-url:
   asn: https://example.com/asn.mmdb
 rules:
   - GEOIP,CN,DIRECT
+  - IP-ASN,13335,Proxy,no-resolve
   - MATCH,DIRECT
 sub-rules:
   nested:
     - GEOSITE,cn,DIRECT
+    - SRC-IP-ASN,4134,DIRECT
     - DOMAIN,example.com,DIRECT
 `
 	m := mergedMapWithSettings(t, input, appSettings{
@@ -140,13 +144,13 @@ sub-rules:
 		t.Errorf("geox-url = %v, want only the unrelated ASN URL preserved", geoXURL)
 	}
 	rules, ok := m["rules"].([]any)
-	if !ok || len(rules) != 1 || rules[0] != "MATCH,DIRECT" {
-		t.Errorf("rules = %v, want only MATCH,DIRECT", m["rules"])
+	if !ok || len(rules) != 2 || rules[0] != "IP-ASN,13335,Proxy,no-resolve" || rules[1] != "MATCH,DIRECT" {
+		t.Errorf("rules = %v, want ASN and MATCH rules retained", m["rules"])
 	}
 	subRules := nestedMap(t, m, "sub-rules")
 	nested, ok := subRules["nested"].([]any)
-	if !ok || len(nested) != 1 || nested[0] != "DOMAIN,example.com,DIRECT" {
-		t.Errorf("sub-rules.nested = %v, want only DOMAIN rule", subRules["nested"])
+	if !ok || len(nested) != 2 || nested[0] != "SRC-IP-ASN,4134,DIRECT" || nested[1] != "DOMAIN,example.com,DIRECT" {
+		t.Errorf("sub-rules.nested = %v, want ASN and DOMAIN rules retained", subRules["nested"])
 	}
 
 	m = mergedMapWithSettings(t, `geox-url: {geoip: https://example.com/geoip.dat}`, appSettings{
@@ -154,6 +158,63 @@ sub-rules:
 	})
 	if _, exists := m["geox-url"]; exists {
 		t.Errorf("geox-url should be absent when it contains no unrelated URLs: %v", m["geox-url"])
+	}
+}
+
+func TestResolveGeoDownloadURLsPrefersActiveConfig(t *testing.T) {
+	const input = `
+geox-url:
+  geoip: https://config.example/geoip.dat
+  mmdb: https://config.example/geoip.metadb
+  geosite: https://config.example/geosite.dat
+  asn: https://config.example/ASN.mmdb
+rules:
+  - IP-ASN,13335,Proxy,no-resolve
+`
+	settings := appSettings{
+		GeoIPDatURL: "https://fallback.example/geoip.dat",
+		GeoMMDBURL:  "https://fallback.example/geoip.metadb",
+		GeoSiteURL:  "https://fallback.example/geosite.dat",
+	}
+	got := resolveGeoDownloadURLs(input, settings)
+	if got.GeoIP != "https://config.example/geoip.dat" ||
+		got.MMDB != "https://config.example/geoip.metadb" ||
+		got.GeoSite != "https://config.example/geosite.dat" ||
+		got.ASN != "https://config.example/ASN.mmdb" {
+		t.Fatalf("resolved URLs = %+v, want active config values", got)
+	}
+	if !got.ASNRequired {
+		t.Fatal("ASNRequired = false, want true")
+	}
+}
+
+func TestResolveGeoDownloadURLsUsesFallbackAndDetectsNestedASN(t *testing.T) {
+	settings := parseSettings("")
+	got := resolveGeoDownloadURLs(`
+sub-rules:
+  nested:
+    - SRC-IP-ASN,4134,DIRECT
+`, settings)
+	if got.GeoIP != settings.GeoIPDatURL || got.MMDB != settings.GeoMMDBURL ||
+		got.GeoSite != settings.GeoSiteURL || got.ASN != defaultASNURL {
+		t.Fatalf("resolved fallback URLs = %+v", got)
+	}
+	if !got.ASNRequired {
+		t.Fatal("nested SRC-IP-ASN should require ASN database")
+	}
+}
+
+func TestResolveGeoDownloadURLsExportsJSON(t *testing.T) {
+	encoded := ResolveGeoDownloadURLs(`
+geox-url:
+  asn: https://config.example/ASN.mmdb
+`, `{}`)
+	var got geoDownloadURLs
+	if err := json.Unmarshal([]byte(encoded), &got); err != nil {
+		t.Fatalf("ResolveGeoDownloadURLs returned invalid JSON %q: %v", encoded, err)
+	}
+	if got.ASN != "https://config.example/ASN.mmdb" || !got.ASNRequired {
+		t.Fatalf("ResolveGeoDownloadURLs = %+v", got)
 	}
 }
 
@@ -206,7 +267,15 @@ profile:
   store-selected: false
   store-fake-ip: false
 dns:
+  enhanced-mode: redir-host
   cache-max-size: 4096
+  default-nameserver:
+    - 223.5.5.5
+  nameserver-policy:
+    "+.qpic.cn":
+      - system
+    "rule-set:Ai":
+      - https://dns.google/dns-query#Ai
 `)
 
 	wantUI := map[string]any{
@@ -229,6 +298,22 @@ dns:
 	dns := nestedMap(t, m, "dns")
 	if got := dns["cache-max-size"]; got != 512 {
 		t.Errorf("dns.cache-max-size = %v, want 512", got)
+	}
+	if got := dns["enhanced-mode"]; got != "fake-ip" {
+		t.Errorf("dns.enhanced-mode = %v, want forced fake-ip", got)
+	}
+	defaultNameserver, ok := dns["default-nameserver"].([]any)
+	if !ok || len(defaultNameserver) != 1 || defaultNameserver[0] != "223.5.5.5" {
+		t.Errorf("dns.default-nameserver = %v, want subscription value preserved", dns["default-nameserver"])
+	}
+	policy := nestedMap(t, dns, "nameserver-policy")
+	qpic, ok := policy["+.qpic.cn"].([]any)
+	if !ok || len(qpic) != 1 || qpic[0] != "system" {
+		t.Errorf("dns.nameserver-policy[+.qpic.cn] = %v, want subscription value preserved", policy["+.qpic.cn"])
+	}
+	ai, ok := policy["rule-set:Ai"].([]any)
+	if !ok || len(ai) != 1 || ai[0] != "https://dns.google/dns-query#Ai" {
+		t.Errorf("dns.nameserver-policy[rule-set:Ai] = %v, want subscription value preserved", policy["rule-set:Ai"])
 	}
 }
 
