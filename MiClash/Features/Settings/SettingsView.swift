@@ -4,8 +4,7 @@ import SwiftUI
 struct SettingsView: View {
     @EnvironmentObject private var settings: SettingsStore
     @EnvironmentObject private var core: CoreStateManager
-    @State private var geoUpdating = false
-    @State private var geoResult: String?
+    @EnvironmentObject private var geoDatabase: GeoDatabaseManager
 
     var body: some View {
         NavigationStack {
@@ -27,7 +26,14 @@ struct SettingsView: View {
                         Picker("加载器", selection: $settings.geoLoader) {
                             ForEach(SettingsStore.geoLoaderOptions, id: \.self) { Text($0).tag($0) }
                         }
+                        Toggle("Geodata 模式（GeoIP.dat）", isOn: $settings.geodataMode)
                         Toggle("忽略 GEO 取反规则", isOn: $settings.ignoreGeoNegation)
+                        if settings.geodataMode {
+                            GeoURLField(title: "GeoIP.dat 地址", text: $settings.geoIPDatURL)
+                        } else {
+                            GeoURLField(title: "MMDB 地址", text: $settings.geoMMDBURL)
+                        }
+                        GeoURLField(title: "GeoSite.dat 地址", text: $settings.geoSiteURL)
                         Toggle("自动更新", isOn: $settings.geoAutoUpdate)
                         if settings.geoAutoUpdate {
                             Stepper("更新间隔 \(settings.geoUpdateInterval) 小时",
@@ -37,22 +43,36 @@ struct SettingsView: View {
                             Task { await updateGeo() }
                         } label: {
                             HStack {
-                                Label("立即更新 geo", systemImage: "arrow.down.circle")
+                                Label("下载 / 更新 GEO 数据", systemImage: "arrow.down.circle")
                                 Spacer()
-                                if geoUpdating { ProgressView() }
+                                if geoDatabase.isUpdating { ProgressView() }
                             }
                         }
-                        .disabled(geoUpdating)
-                        if let r = geoResult {
-                            Text(r).font(.caption).foregroundStyle(.secondary)
+                        .disabled(geoDatabase.isUpdating)
+                        if let date = geoDatabase.lastUpdatedAt(geodataMode: settings.geodataMode) {
+                            HStack {
+                                Text("本地数据")
+                                Spacer()
+                                if let size = geoDatabase.installedSize(geodataMode: settings.geodataMode) {
+                                    Text("\(ByteFormat.size(size)) · ")
+                                }
+                                Text(date, style: .relative)
+                            }
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        }
+                        if let result = geoDatabase.statusText {
+                            Text(result)
+                                .font(.caption)
+                                .foregroundStyle(geoDatabase.statusIsError ? Color.red : Color.secondary)
                         }
                     }
                 } header: {
                     Text("geo 规则")
                 } footer: {
-                    Text("关闭=剔除订阅里的 GEOIP/GEOSITE 规则（省内存）。开启则保留并由内核加载 geo 数据库；"
+                    Text("关闭 GEO=剔除订阅里的 GEOIP/GEOSITE 规则。Geodata 模式关闭时使用 MMDB，开启时使用 GeoIP.dat；"
                        + "“忽略 GEO 取反规则”可单独控制 geolocation-!cn / NOT(GEOIP) 等规则。"
-                       + "扩展内存有限，建议用 memconservative 加载器。")
+                       + "数据库由主 App 下载到共享目录，自动更新会在打开 App 或连接前按间隔检查，更新后需重新连接。")
                 }
 
                 Section {
@@ -148,15 +168,31 @@ struct SettingsView: View {
     }
 
     private func updateGeo() async {
-        geoUpdating = true
-        geoResult = nil
-        defer { geoUpdating = false }
         do {
-            try await MihomoAPI.updateGeo()
-            geoResult = "更新成功"
+            try await geoDatabase.updateManually()
         } catch {
-            geoResult = "更新失败：\(error.localizedDescription)（需先连接 VPN）"
+            // 具体错误由 GeoDatabaseManager 发布到设置页。
         }
+    }
+}
+
+private struct GeoURLField: View {
+    let title: String
+    @Binding var text: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            TextField(title, text: $text, axis: .vertical)
+                .font(.footnote.monospaced())
+                .keyboardType(.URL)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .lineLimit(1...3)
+        }
+        .padding(.vertical, 2)
     }
 }
 

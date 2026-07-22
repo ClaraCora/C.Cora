@@ -10,6 +10,8 @@ struct MiClashApp: App {
     @StateObject private var subscriptions = SubscriptionStore.shared
     /// 设置 Store：内核栈/日志/IPv6/geo/外部控制。
     @StateObject private var settings = SettingsStore.shared
+    /// GEO 数据由主 App 下载到 App Group，NE 只负责读取。
+    @StateObject private var geoDatabase = GeoDatabaseManager.shared
     /// 全局内核运行态（模式+速率）与日志流——跨页面常驻。
     @StateObject private var kernel = KernelController.shared
     @StateObject private var logs = LogStreamController.shared
@@ -20,8 +22,10 @@ struct MiClashApp: App {
                 .environmentObject(core)
                 .environmentObject(subscriptions)
                 .environmentObject(settings)
+                .environmentObject(geoDatabase)
                 .environmentObject(kernel)
                 .environmentObject(logs)
+                .task { await geoDatabase.updateOnLaunch() }
         }
     }
 }

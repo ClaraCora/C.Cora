@@ -23,6 +23,8 @@ import (
 	"github.com/metacubex/mihomo/adapter/outboundgroup"
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/component/dialer"
+	"github.com/metacubex/mihomo/component/geodata"
+	"github.com/metacubex/mihomo/component/mmdb"
 	"github.com/metacubex/mihomo/component/profile/cachefile"
 	"github.com/metacubex/mihomo/component/updater"
 	"github.com/metacubex/mihomo/config"
@@ -61,6 +63,40 @@ func Version() string {
 		v = "unknown"
 	}
 	return "mihomo " + v + " / " + runtime.Version()
+}
+
+// ValidateGeoDatabase 使用 mihomo 自身的解析器校验主 App 下载的 GEO 文件。
+// 主 App 只在校验通过后安装文件，避免 NE 遇到损坏文件时触发内核下载。
+func ValidateGeoDatabase(path string, kind string) error {
+	defer runtime.GC()
+	normalizedKind := strings.ToLower(strings.TrimSpace(kind))
+	switch normalizedKind {
+	case "mmdb":
+		if !mmdb.Verify(path) {
+			return fmt.Errorf("invalid MMDB database")
+		}
+		return nil
+	case "geoip", "geosite":
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		loader, err := geodata.GetGeoDataLoader("standard")
+		if err != nil {
+			return err
+		}
+		if normalizedKind == "geoip" {
+			_, err = loader.LoadIPByBytes(data, "cn")
+		} else {
+			_, err = loader.LoadSiteByBytes(data, "cn")
+		}
+		if err != nil {
+			return fmt.Errorf("invalid %s database: %w", normalizedKind, err)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown GEO database kind: %s", normalizedKind)
+	}
 }
 
 // Setup 设置 mihomo 的工作目录（home dir）并启动日志捕获。
@@ -112,6 +148,10 @@ type appSettings struct {
 	IPv6              bool   `json:"ipv6"`
 	GeoEnabled        bool   `json:"geoEnabled"`
 	GeoLoader         string `json:"geoLoader"`
+	GeodataMode       bool   `json:"geodataMode"`
+	GeoIPDatURL       string `json:"geoIPDatURL"`
+	GeoMMDBURL        string `json:"geoMMDBURL"`
+	GeoSiteURL        string `json:"geoSiteURL"`
 	IgnoreGeoNegation bool   `json:"ignoreGeoNegation"`
 	GeoAutoUpdate     bool   `json:"geoAutoUpdate"`
 	GeoUpdateInterval int    `json:"geoUpdateInterval"`
@@ -125,7 +165,10 @@ type appSettings struct {
 // parseSettings 解析设置 JSON，缺省值兜底（与主 App SettingsStore 默认一致）。
 func parseSettings(settingsJSON string) appSettings {
 	s := appSettings{Stack: "gvisor", LogLevel: "info", ControllerPort: 9090,
-		GeoLoader: "memconservative", IgnoreGeoNegation: true, GeoUpdateInterval: 24}
+		GeoLoader: "memconservative", IgnoreGeoNegation: true, GeoUpdateInterval: 24,
+		GeoIPDatURL: "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat",
+		GeoMMDBURL:  "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb",
+		GeoSiteURL:  "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat"}
 	if strings.TrimSpace(settingsJSON) != "" {
 		_ = json.Unmarshal([]byte(settingsJSON), &s)
 	}
@@ -144,6 +187,15 @@ func parseSettings(settingsJSON string) appSettings {
 	if s.GeoUpdateInterval <= 0 {
 		s.GeoUpdateInterval = 24
 	}
+	if s.GeoIPDatURL == "" {
+		s.GeoIPDatURL = "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat"
+	}
+	if s.GeoMMDBURL == "" {
+		s.GeoMMDBURL = "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb"
+	}
+	if s.GeoSiteURL == "" {
+		s.GeoSiteURL = "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat"
+	}
 	return s
 }
 
@@ -160,8 +212,9 @@ func StartWithConfig(fd int, configYAML string, settingsJSON string) (err error)
 	}()
 
 	st := parseSettings(settingsJSON)
-	appendRunLog(fmt.Sprintf("StartWithConfig: fd=%d stack=%s ipv6=%v geo=%v(%s,ignoreNegation=%v) log=%s port=%d",
-		fd, st.Stack, st.IPv6, st.GeoEnabled, st.GeoLoader, st.IgnoreGeoNegation, st.LogLevel, st.ControllerPort))
+	appendRunLog(fmt.Sprintf("StartWithConfig: fd=%d stack=%s ipv6=%v geo=%v(mode=%v,%s,ignoreNegation=%v) log=%s port=%d",
+		fd, st.Stack, st.IPv6, st.GeoEnabled, st.GeodataMode, st.GeoLoader,
+		st.IgnoreGeoNegation, st.LogLevel, st.ControllerPort))
 
 	merged, err := mergeConfig(configYAML, st)
 	if err != nil {
@@ -176,6 +229,12 @@ func StartWithConfig(fd int, configYAML string, settingsJSON string) (err error)
 	}
 	rawCfg.Tun.Enable = true
 	rawCfg.Tun.FileDescriptor = fd
+
+	// 主 App 可能已替换 GEO 文件；清掉上次连接遗留的 matcher/MMDB 缓存后再解析。
+	geodata.ClearGeoSiteCache()
+	geodata.ClearGeoIPCache()
+	mmdb.ReloadIP()
+	runtime.GC()
 
 	cfg, err := config.ParseRawConfig(rawCfg)
 	if err != nil {
@@ -307,20 +366,27 @@ func mergeConfig(subYAML string, st appSettings) ([]byte, error) {
 
 	// geo 规则处理：
 	//   开 → 保留普通 geo 规则；IgnoreGeoNegation 开启时再剔除 geolocation-!cn /
-	//        NOT,((GEOIP,CN)) 等取反规则，并配置加载器/自动更新；
+	//        NOT,((GEOIP,CN)) 等取反规则，并配置加载器和下载地址；
 	//   关 → 剔除**所有** GEOIP/GEOSITE/GEODATA 规则（含逻辑规则里嵌的），省内存。
-	m["geodata-mode"] = false // false=用 mmdb
+	m["geodata-mode"] = st.GeodataMode
+	m["geodata-loader"] = st.GeoLoader
+	m["geo-auto-update"] = false // GEO 下载/定时更新统一由主 App 完成
+	m["geo-update-interval"] = st.GeoUpdateInterval
+	geoXURL, _ := m["geox-url"].(map[string]any)
+	if geoXURL == nil {
+		geoXURL = map[string]any{}
+	}
+	geoXURL["geoip"] = st.GeoIPDatURL
+	geoXURL["mmdb"] = st.GeoMMDBURL
+	geoXURL["geosite"] = st.GeoSiteURL
+	m["geox-url"] = geoXURL
 	if st.GeoEnabled {
-		m["geodata-loader"] = st.GeoLoader
-		m["geo-auto-update"] = st.GeoAutoUpdate
-		m["geo-update-interval"] = st.GeoUpdateInterval
 		if st.IgnoreGeoNegation {
 			if rules, ok := m["rules"].([]any); ok {
 				m["rules"] = filterGeoNegationRules(rules)
 			}
 		}
 	} else {
-		m["geo-auto-update"] = false
 		if rules, ok := m["rules"].([]any); ok {
 			m["rules"] = filterGeoRules(rules)
 		}

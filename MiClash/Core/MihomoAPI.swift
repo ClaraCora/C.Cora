@@ -104,14 +104,6 @@ enum MihomoAPI {
         try check(resp)
     }
 
-    /// POST /configs/geo —— 手动触发 geo 数据库更新（成功 204）。可能耗时，用宽松超时。
-    static func updateGeo() async throws {
-        var req = makeRequest(path: "configs/geo", method: "POST")
-        req.timeoutInterval = 60
-        let (_, resp) = try await streamSession.data(for: req)
-        try check(resp)
-    }
-
     /// GET /group/{name}/delay —— 测全组节点延迟，返回 node→毫秒。
     static func groupDelay(group: String,
                            testURL: String = "http://www.gstatic.com/generate_204",

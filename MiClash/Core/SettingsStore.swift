@@ -17,11 +17,16 @@ final class SettingsStore: ObservableObject {
     @Published var geoEnabled: Bool { didSet { d.set(geoEnabled, forKey: K.geoEnabled) } }
     /// geo 加载器：standard / memconservative（小内存优化，NE 推荐）。
     @Published var geoLoader: String { didSet { d.set(geoLoader, forKey: K.geoLoader) } }
+    /// true 使用 GeoIP.dat；false 使用 MMDB（geoip.metadb）。
+    @Published var geodataMode: Bool { didSet { d.set(geodataMode, forKey: K.geodataMode) } }
+    @Published var geoIPDatURL: String { didSet { d.set(geoIPDatURL, forKey: K.geoIPDatURL) } }
+    @Published var geoMMDBURL: String { didSet { d.set(geoMMDBURL, forKey: K.geoMMDBURL) } }
+    @Published var geoSiteURL: String { didSet { d.set(geoSiteURL, forKey: K.geoSiteURL) } }
     /// 是否忽略 geolocation-!cn / NOT(GEOIP) 等 geo 取反规则。
     @Published var ignoreGeoNegation: Bool {
         didSet { d.set(ignoreGeoNegation, forKey: K.ignoreGeoNegation) }
     }
-    /// 自动更新 geo 数据库。
+    /// 由主 App 自动更新 geo 数据库。
     @Published var geoAutoUpdate: Bool { didSet { d.set(geoAutoUpdate, forKey: K.geoAuto) } }
     /// 自动更新间隔（小时）。
     @Published var geoUpdateInterval: Int { didSet { d.set(geoUpdateInterval, forKey: K.geoInterval) } }
@@ -59,11 +64,20 @@ final class SettingsStore: ObservableObject {
     static let stackOptions = ["gvisor", "system", "mixed"]
     static let logLevelOptions = ["silent", "error", "warning", "info", "debug"]
     static let geoLoaderOptions = ["memconservative", "standard"]
+    static let defaultGeoIPDatURL =
+        "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat"
+    static let defaultGeoMMDBURL =
+        "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb"
+    static let defaultGeoSiteURL =
+        "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat"
 
     private let d = UserDefaults.standard
     private enum K {
         static let stack = "set.stack", ipv6 = "set.ipv6"
         static let geoEnabled = "set.geoEnabled", geoLoader = "set.geoLoader"
+        static let geodataMode = "set.geodataMode"
+        static let geoIPDatURL = "set.geoIPDatURL", geoMMDBURL = "set.geoMMDBURL"
+        static let geoSiteURL = "set.geoSiteURL"
         static let ignoreGeoNegation = "set.ignoreGeoNegation"
         static let geoAuto = "set.geoAuto", geoInterval = "set.geoInterval"
         static let logLevel = "set.logLevel", port = "set.port", secret = "set.secret", allowLan = "set.allowLan"
@@ -78,6 +92,10 @@ final class SettingsStore: ObservableObject {
         ipv6 = d.object(forKey: K.ipv6) as? Bool ?? false
         geoEnabled = d.object(forKey: K.geoEnabled) as? Bool ?? false
         geoLoader = d.string(forKey: K.geoLoader) ?? "memconservative"
+        geodataMode = d.object(forKey: K.geodataMode) as? Bool ?? false
+        geoIPDatURL = d.string(forKey: K.geoIPDatURL) ?? Self.defaultGeoIPDatURL
+        geoMMDBURL = d.string(forKey: K.geoMMDBURL) ?? Self.defaultGeoMMDBURL
+        geoSiteURL = d.string(forKey: K.geoSiteURL) ?? Self.defaultGeoSiteURL
         ignoreGeoNegation = d.object(forKey: K.ignoreGeoNegation) as? Bool ?? true
         geoAutoUpdate = d.object(forKey: K.geoAuto) as? Bool ?? false
         let gi = d.integer(forKey: K.geoInterval)
@@ -107,6 +125,10 @@ final class SettingsStore: ObservableObject {
             "ipv6": ipv6,
             "geoEnabled": geoEnabled,
             "geoLoader": geoLoader,
+            "geodataMode": geodataMode,
+            "geoIPDatURL": geoIPDatURL,
+            "geoMMDBURL": geoMMDBURL,
+            "geoSiteURL": geoSiteURL,
             "ignoreGeoNegation": ignoreGeoNegation,
             "geoAutoUpdate": geoAutoUpdate,
             "geoUpdateInterval": geoUpdateInterval,

@@ -1,10 +1,24 @@
 package mihomo
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"gopkg.in/yaml.v3"
 )
+
+func TestValidateGeoDatabaseRejectsInvalidContent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "invalid.dat")
+	if err := os.WriteFile(path, []byte("not a GEO database"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{"mmdb", "geoip", "geosite", "unknown"} {
+		if err := ValidateGeoDatabase(path, kind); err == nil {
+			t.Errorf("ValidateGeoDatabase(%q) accepted invalid content", kind)
+		}
+	}
+}
 
 func mergedMap(t *testing.T, input string) map[string]any {
 	t.Helper()
@@ -25,11 +39,69 @@ func mergedMapWithSettings(t *testing.T, input string, settings appSettings) map
 }
 
 func TestParseSettingsGeoNegationDefaultAndOverride(t *testing.T) {
-	if got := parseSettings("").IgnoreGeoNegation; !got {
+	defaults := parseSettings("")
+	if got := defaults.IgnoreGeoNegation; !got {
 		t.Error("IgnoreGeoNegation default = false, want true")
 	}
-	if got := parseSettings(`{"ignoreGeoNegation":false}`).IgnoreGeoNegation; got {
+	if defaults.GeodataMode {
+		t.Error("GeodataMode default = true, want false (MMDB)")
+	}
+	if defaults.GeoMMDBURL == "" || defaults.GeoIPDatURL == "" || defaults.GeoSiteURL == "" {
+		t.Error("default GEO download URLs must not be empty")
+	}
+	custom := parseSettings(`{
+		"ignoreGeoNegation": false,
+		"geodataMode": true,
+		"geoIPDatURL": "https://example.com/GeoIP.dat",
+		"geoMMDBURL": "https://example.com/geoip.metadb",
+		"geoSiteURL": "https://example.com/GeoSite.dat"
+	}`)
+	if custom.IgnoreGeoNegation {
 		t.Error("IgnoreGeoNegation override = true, want false")
+	}
+	if !custom.GeodataMode {
+		t.Error("GeodataMode override = false, want true")
+	}
+	if custom.GeoIPDatURL != "https://example.com/GeoIP.dat" ||
+		custom.GeoMMDBURL != "https://example.com/geoip.metadb" ||
+		custom.GeoSiteURL != "https://example.com/GeoSite.dat" {
+		t.Error("GEO download URL overrides were not parsed")
+	}
+}
+
+func TestMergeConfigGeoModeAndMainAppUpdateSettings(t *testing.T) {
+	settings := appSettings{
+		Stack:             "gvisor",
+		LogLevel:          "info",
+		GeoEnabled:        true,
+		GeodataMode:       true,
+		GeoLoader:         "memconservative",
+		GeoAutoUpdate:     true,
+		GeoUpdateInterval: 12,
+		GeoIPDatURL:       "https://example.com/GeoIP.dat",
+		GeoMMDBURL:        "https://example.com/geoip.metadb",
+		GeoSiteURL:        "https://example.com/GeoSite.dat",
+	}
+	m := mergedMapWithSettings(t, "rules: []\n", settings)
+	if got := m["geodata-mode"]; got != true {
+		t.Errorf("geodata-mode = %v, want true", got)
+	}
+	if got := m["geo-auto-update"]; got != false {
+		t.Errorf("geo-auto-update = %v, want false because the main App owns updates", got)
+	}
+	if got := m["geo-update-interval"]; got != 12 {
+		t.Errorf("geo-update-interval = %v, want 12", got)
+	}
+	urls := nestedMap(t, m, "geox-url")
+	wantURLs := map[string]any{
+		"geoip":   settings.GeoIPDatURL,
+		"mmdb":    settings.GeoMMDBURL,
+		"geosite": settings.GeoSiteURL,
+	}
+	for key, want := range wantURLs {
+		if got := urls[key]; got != want {
+			t.Errorf("geox-url.%s = %v, want %v", key, got, want)
+		}
 	}
 }
 

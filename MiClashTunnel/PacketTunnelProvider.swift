@@ -80,6 +80,13 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             let settings = self.resolveCached(incoming: settingsJSON.isEmpty ? nil : settingsJSON,
                                               home: home, file: "settings.json") ?? ""
 
+            // GEO 文件必须由主 App 预先写入共享 home；NE 启动阶段不再联网下载。
+            if let geoError = Self.validateGeoAssets(settingsJSON: settings, home: home) {
+                FileLog.write("GEO 数据检查失败：\(geoError.localizedDescription)")
+                completionHandler(geoError)
+                return
+            }
+
             // gomobile 把带 error 返回的 Go 函数生成为「返回 BOOL + NSError** 出参」的 C 函数，
             // 不会自动桥接成 Swift throws，所以用经典 NSError 指针写法：成功返回 true。
             FileLog.write("调用 MihomoStartWithConfig…")
@@ -368,6 +375,29 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             }
         }
         return nil
+    }
+
+    private static func validateGeoAssets(settingsJSON: String, home: String) -> NSError? {
+        guard let data = settingsJSON.data(using: .utf8),
+              let settings = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              (settings["geoEnabled"] as? Bool) == true else {
+            return nil
+        }
+
+        let geodataMode = (settings["geodataMode"] as? Bool) ?? false
+        let required = [geodataMode ? "GeoIP.dat" : "geoip.metadb", "GeoSite.dat"]
+        let missing = required.filter { name in
+            let path = (home as NSString).appendingPathComponent(name)
+            let attributes = try? FileManager.default.attributesOfItem(atPath: path)
+            return ((attributes?[.size] as? NSNumber)?.int64Value ?? 0) < 1_024
+        }
+        guard !missing.isEmpty else { return nil }
+        return NSError(
+            domain: "MiClashTunnel",
+            code: -4,
+            userInfo: [NSLocalizedDescriptionKey:
+                "缺少 GEO 数据文件：\(missing.joined(separator: "、"))。请在主 App 设置中下载后重试。"]
+        )
     }
 
     // MARK: - App Group

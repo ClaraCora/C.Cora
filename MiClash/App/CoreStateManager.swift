@@ -99,6 +99,8 @@ final class CoreStateManager: ObservableObject {
         defer { isBusy = false }
         lastError = nil
         do {
+            // GEO 首次下载与定时更新在主 App 完成，避免 NE 启动阶段联网和冲高内存。
+            try await GeoDatabaseManager.shared.prepareForConnection()
             // App 主动连接时明确下发配置意图：nil=使用内建 DIRECT，不复活旧订阅缓存。
             let yaml = SubscriptionStore.shared.activeYAML
             let settings = SettingsStore.shared.asJSON()
