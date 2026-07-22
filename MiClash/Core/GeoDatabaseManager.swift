@@ -61,12 +61,24 @@ final class GeoDatabaseManager: ObservableObject {
         }
 
         let settings = SettingsStore.shared
-        let config = try DownloadConfiguration(settings: settings)
+        guard let home = AppGroup.containerURL else { throw GeoError.appGroupUnavailable }
+        let geodataMode = settings.geodataMode
+        let autoUpdate = settings.geoAutoUpdate
+        let updateInterval = settings.geoUpdateInterval
+        let geoIPURL = geodataMode ? settings.geoIPDatURL : settings.geoMMDBURL
+        let geoSiteURL = settings.geoSiteURL
+        let config = DownloadConfiguration(
+            home: home,
+            geodataMode: geodataMode,
+            geoIPURL: geoIPURL,
+            geoIPFileName: geodataMode ? "GeoIP.dat" : "geoip.metadb",
+            geoSiteURL: geoSiteURL
+        )
         let filesMissing = !assetsAvailable(home: config.home, geodataMode: config.geodataMode)
         let stale = assetsAreStale(home: config.home,
                                    geodataMode: config.geodataMode,
-                                   intervalHours: settings.geoUpdateInterval)
-        guard force || filesMissing || (settings.geoAutoUpdate && stale) else { return }
+                                   intervalHours: updateInterval)
+        guard force || filesMissing || (autoUpdate && stale) else { return }
 
         let task: Task<Void, Error> = Task.detached(priority: .utility) {
             try await Self.downloadAndInstall(config)
@@ -131,15 +143,6 @@ final class GeoDatabaseManager: ObservableObject {
         let geoIPURL: String
         let geoIPFileName: String
         let geoSiteURL: String
-
-        init(settings: SettingsStore) throws {
-            guard let home = AppGroup.containerURL else { throw GeoError.appGroupUnavailable }
-            self.home = home
-            geodataMode = settings.geodataMode
-            geoIPURL = settings.geodataMode ? settings.geoIPDatURL : settings.geoMMDBURL
-            geoIPFileName = settings.geodataMode ? "GeoIP.dat" : "geoip.metadb"
-            geoSiteURL = settings.geoSiteURL
-        }
     }
 
     private struct StagedAsset: Sendable {
