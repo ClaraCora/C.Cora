@@ -367,29 +367,41 @@ func mergeConfig(subYAML string, st appSettings) ([]byte, error) {
 	// geo 规则处理：
 	//   开 → 保留普通 geo 规则；IgnoreGeoNegation 开启时再剔除 geolocation-!cn /
 	//        NOT,((GEOIP,CN)) 等取反规则，并配置加载器和下载地址；
-	//   关 → 剔除**所有** GEOIP/GEOSITE/GEODATA 规则（含逻辑规则里嵌的），省内存。
-	m["geodata-mode"] = st.GeodataMode
-	m["geodata-loader"] = st.GeoLoader
-	m["geo-auto-update"] = false // GEO 下载/定时更新统一由主 App 完成
-	m["geo-update-interval"] = st.GeoUpdateInterval
-	geoXURL, _ := m["geox-url"].(map[string]any)
-	if geoXURL == nil {
-		geoXURL = map[string]any{}
-	}
-	geoXURL["geoip"] = st.GeoIPDatURL
-	geoXURL["mmdb"] = st.GeoMMDBURL
-	geoXURL["geosite"] = st.GeoSiteURL
-	m["geox-url"] = geoXURL
+	//   关 → 移除 geo 配置，并剔除 rules/sub-rules 中全部 GEOIP/GEOSITE/GEODATA 规则。
+	// 自动下载始终关闭，GEO 文件只允许主 App 管理。
+	m["geo-auto-update"] = false
 	if st.GeoEnabled {
+		m["geodata-mode"] = st.GeodataMode
+		m["geodata-loader"] = st.GeoLoader
+		m["geo-update-interval"] = st.GeoUpdateInterval
+		geoXURL, _ := m["geox-url"].(map[string]any)
+		if geoXURL == nil {
+			geoXURL = map[string]any{}
+		}
+		geoXURL["geoip"] = st.GeoIPDatURL
+		geoXURL["mmdb"] = st.GeoMMDBURL
+		geoXURL["geosite"] = st.GeoSiteURL
+		m["geox-url"] = geoXURL
 		if st.IgnoreGeoNegation {
 			if rules, ok := m["rules"].([]any); ok {
 				m["rules"] = filterGeoNegationRules(rules)
 			}
 		}
 	} else {
-		if rules, ok := m["rules"].([]any); ok {
-			m["rules"] = filterGeoRules(rules)
+		delete(m, "geodata-mode")
+		delete(m, "geodata-loader")
+		delete(m, "geo-update-interval")
+		if geoXURL, ok := m["geox-url"].(map[string]any); ok {
+			delete(geoXURL, "geoip")
+			delete(geoXURL, "mmdb")
+			delete(geoXURL, "geosite")
+			if len(geoXURL) == 0 {
+				delete(m, "geox-url")
+			} else {
+				m["geox-url"] = geoXURL
+			}
 		}
+		filterGeoRulesFromConfig(m)
 	}
 
 	// 解析各节点协议摘要（如 "VLESS · TCP · Reality · Vision"），供节点页副标题。
@@ -522,12 +534,33 @@ func filterGeoNegationRules(rules []any) []any {
 	return out
 }
 
-// filterGeoRules 删除任何**包含** GEOIP,/GEOSITE,/GEODATA, 的规则条目（不分大小写）。
-// 用 Contains 而非 HasPrefix：除了 `GEOSITE,geolocation-!cn,…` `GEOIP,CN,…` 这种直接形式，
-// 还要抓住**逻辑规则里嵌的 geo**，如 `NOT,((GEOIP,CN)),节点`、`AND,((GEOSITE,cn),(…)),节点`
-// （即用户说的「geo 取反/组合」）——这些 geo 关闭时也必须剔除，否则内核仍会去加载 geo 库，
-// 在 50MB 的 NE 里 OOM/下载失败导致连不上。非 geo 规则正文几乎不可能含 "GEOIP," 子串，误伤可忽略。
-func filterGeoRules(rules []any) []any {
+// filterGeoRulesFromConfig 删除 rules 与 sub-rules 中任何包含 GEOIP,/GEOSITE,/GEODATA,
+// 的条目。用 Contains 抓住逻辑规则内嵌的 geo，避免 geo 关闭后内核仍触发数据库下载。
+func filterGeoRulesFromConfig(m map[string]any) {
+	dropped := 0
+	if rules, ok := m["rules"].([]any); ok {
+		var count int
+		m["rules"], count = filterGeoRules(rules)
+		dropped += count
+	}
+	if subRules, ok := m["sub-rules"].(map[string]any); ok {
+		for name, raw := range subRules {
+			if rules, ok := raw.([]any); ok {
+				filtered, count := filterGeoRules(rules)
+				subRules[name] = filtered
+				dropped += count
+			}
+		}
+		m["sub-rules"] = subRules
+	}
+	if dropped > 0 {
+		appendRunLog(fmt.Sprintf("剔除 geo 规则 %d 条", dropped))
+		configNotices = append(configNotices,
+			fmt.Sprintf("已忽略 %d 条 GEOIP/GEOSITE 规则（geo 未启用，可在设置里开启）", dropped))
+	}
+}
+
+func filterGeoRules(rules []any) ([]any, int) {
 	out := make([]any, 0, len(rules))
 	dropped := 0
 	for _, r := range rules {
@@ -540,12 +573,7 @@ func filterGeoRules(rules []any) []any {
 		}
 		out = append(out, r)
 	}
-	if dropped > 0 {
-		appendRunLog(fmt.Sprintf("剔除 geo 规则 %d 条", dropped))
-		configNotices = append(configNotices,
-			fmt.Sprintf("已忽略 %d 条 GEOIP/GEOSITE 规则（geo 未启用，可在设置里开启）", dropped))
-	}
-	return out
+	return out, dropped
 }
 
 // QueryProxies 返回**精简**的策略组 JSON：{"proxies":{<组名>:{type,now,all}}}。

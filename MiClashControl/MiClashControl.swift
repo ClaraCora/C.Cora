@@ -20,12 +20,43 @@ struct MiClashControlBundle: WidgetBundle {
 /// NE 隧道的 providerBundleIdentifier，用来在多个 VPN 配置里认出我们自己的那个。
 private let tunnelBundleID = "com.miclash.app.tunnel"
 
-/// 找到 MiClash 自己的 VPN 管理对象（按 provider bundle id 过滤，认不出就退回第一个）。
+/// 找到 MiClash 自己的 VPN 管理对象，不能退回其它陈旧配置。
 private func miclashManager() async throws -> NETunnelProviderManager? {
     let all = try await NETunnelProviderManager.loadAllFromPreferences()
     return all.first {
         ($0.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier == tunnelBundleID
-    } ?? all.first
+    }
+}
+
+/// 覆盖安装后系统可能吞掉第一次启动请求；只在未进入运行态时刷新配置并补试一次。
+private func startVPN(_ manager: NETunnelProviderManager) async throws {
+    try await manager.loadFromPreferences()
+    do {
+        try manager.connection.startVPNTunnel()
+    } catch {
+        try await manager.loadFromPreferences()
+        try manager.connection.startVPNTunnel()
+        return
+    }
+
+    for _ in 0..<6 {
+        switch manager.connection.status {
+        case .connected, .connecting, .reasserting:
+            return
+        case .invalid, .disconnected, .disconnecting:
+            break
+        @unknown default:
+            break
+        }
+        try? await Task.sleep(nanoseconds: 250_000_000)
+    }
+
+    for _ in 0..<8 {
+        guard manager.connection.status == .disconnecting else { break }
+        try? await Task.sleep(nanoseconds: 250_000_000)
+    }
+    try await manager.loadFromPreferences()
+    try manager.connection.startVPNTunnel()
 }
 
 /// 控制中心「代理开关」磁贴。
@@ -87,7 +118,7 @@ struct ToggleVPNIntent: SetValueIntent {
             try? await mgr.loadFromPreferences()
         }
         if value {
-            try mgr.connection.startVPNTunnel()
+            try await startVPN(mgr)
         } else {
             mgr.connection.stopVPNTunnel()
         }

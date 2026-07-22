@@ -61,6 +61,7 @@ final class GeoDatabaseManager: ObservableObject {
         }
 
         let settings = SettingsStore.shared
+        guard settings.geoEnabled else { return }
         guard let home = AppGroup.containerURL else { throw GeoError.appGroupUnavailable }
         let geodataMode = settings.geodataMode
         let autoUpdate = settings.geoAutoUpdate

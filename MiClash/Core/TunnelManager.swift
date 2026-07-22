@@ -21,27 +21,21 @@ final class TunnelManager {
     /// 当前使用的 provider 管理对象。懒加载/复用，避免重复创建系统描述文件。
     private var manager: NETunnelProviderManager?
 
-    /// 加载（或创建）唯一的 VPN 描述文件。
+    /// 加载（或创建）MiClash 的 VPN 描述文件。
     /// iOS 要求 VPN 配置先 saveToPreferences 落到「设置 > VPN」里，用户授权一次后方可启动。
-    /// 传入 options 时一并设置隧道协议开关；nil（仅查状态）时保留已有协议配置不动。
-    func loadOrCreateManager(options: ProtocolOptions? = nil) async throws -> NETunnelProviderManager {
-        // 先尝试读取已有配置，避免每次新建导致系统里堆叠多个 VPN 条目
+    private func loadOrCreateManager(options: ProtocolOptions) async throws -> NETunnelProviderManager {
         let existing = try await NETunnelProviderManager.loadAllFromPreferences()
-        let mgr = existing.first ?? NETunnelProviderManager()
+        let mgr = existing.first { Self.isMiClashManager($0) } ?? NETunnelProviderManager()
 
-        // NETunnelProviderProtocol 指向我们的 NE 扩展
-        let proto = (mgr.protocolConfiguration as? NETunnelProviderProtocol) ?? NETunnelProviderProtocol()
+        // 每次连接都写入一份新协议对象，避免覆盖安装后继续引用旧扩展配置快照。
+        let proto = NETunnelProviderProtocol()
         proto.providerBundleIdentifier = AppConstants.tunnelBundleID
-        // serverAddress 仅用于系统 UI 展示，Phase 0 用占位串即可
         proto.serverAddress = "MiClash"
-
-        if let o = options {
-            proto.includeAllNetworks = o.includeAllNetworks
-            proto.enforceRoutes = o.enforceRoutes
-            proto.excludeCellularServices = o.excludeCellularServices
-            proto.excludeAPNs = o.excludeAPNs
-            proto.excludeDeviceCommunication = o.excludeDeviceCommunication
-        }
+        proto.includeAllNetworks = options.includeAllNetworks
+        proto.enforceRoutes = options.enforceRoutes
+        proto.excludeCellularServices = options.excludeCellularServices
+        proto.excludeAPNs = options.excludeAPNs
+        proto.excludeDeviceCommunication = options.excludeDeviceCommunication
 
         mgr.protocolConfiguration = proto
         mgr.localizedDescription = AppConstants.vpnProfileName
@@ -56,13 +50,61 @@ final class TunnelManager {
         return mgr
     }
 
+    /// 只读加载已保存配置。状态查询不能顺带创建/保存配置，否则覆盖安装后容易刷新旧快照。
+    private func loadSavedManager() async throws -> NETunnelProviderManager? {
+        let existing = try await NETunnelProviderManager.loadAllFromPreferences()
+        let mgr = existing.first { Self.isMiClashManager($0) }
+        self.manager = mgr
+        return mgr
+    }
+
+    private static func isMiClashManager(_ manager: NETunnelProviderManager) -> Bool {
+        (manager.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier
+            == AppConstants.tunnelBundleID
+    }
+
     /// 启动隧道，并把订阅配置 + 设置经 options 下发给 NE（不依赖 App Group）。
     /// App 启动始终携带 config：非空=订阅，空串=明确 DIRECT；系统无 options 重连才复用缓存。
     func start(configYAML: String?, settingsJSON: String, protocolOptions: ProtocolOptions) async throws {
         let mgr = try await loadOrCreateManager(options: protocolOptions)
         var options: [String: NSObject] = ["config": (configYAML ?? "") as NSString]
         if !settingsJSON.isEmpty { options["settings"] = settingsJSON as NSString }
+        do {
+            try mgr.connection.startVPNTunnel(options: options)
+        } catch {
+            try await mgr.loadFromPreferences()
+            try mgr.connection.startVPNTunnel(options: options)
+            return
+        }
+
+        // iOS 覆盖安装时偶尔会让第一次启动请求立即回到 disconnected/disconnecting，且不抛错。
+        // 短暂观察状态；只有确认没有进入运行态时才重新加载系统配置并重试一次。
+        guard !(await reachesRunningState(mgr.connection)) else { return }
+        await waitUntilDisconnected(mgr.connection)
+        try await mgr.loadFromPreferences()
         try mgr.connection.startVPNTunnel(options: options)
+    }
+
+    private func reachesRunningState(_ connection: NEVPNConnection) async -> Bool {
+        for _ in 0..<6 {
+            switch connection.status {
+            case .connected, .connecting, .reasserting:
+                return true
+            case .invalid, .disconnected, .disconnecting:
+                break
+            @unknown default:
+                break
+            }
+            try? await Task.sleep(nanoseconds: 250_000_000)
+        }
+        return false
+    }
+
+    private func waitUntilDisconnected(_ connection: NEVPNConnection) async {
+        for _ in 0..<8 {
+            guard connection.status == .disconnecting else { return }
+            try? await Task.sleep(nanoseconds: 250_000_000)
+        }
     }
 
     /// 停止隧道。
@@ -72,7 +114,10 @@ final class TunnelManager {
 
     /// 读取当前连接状态（用于 UI 初始化时同步）。
     func currentStatus() async -> NEVPNStatus {
-        guard let mgr = try? await loadOrCreateManager() else { return .invalid }
+        if let manager, Self.isMiClashManager(manager) {
+            return manager.connection.status
+        }
+        guard let mgr = try? await loadSavedManager() else { return .invalid }
         return mgr.connection.status
     }
 
@@ -89,7 +134,8 @@ final class TunnelManager {
         let mgr: NETunnelProviderManager
         if let m = manager {
             mgr = m
-        } else if let all = try? await NETunnelProviderManager.loadAllFromPreferences(), let m = all.first {
+        } else if let all = try? await NETunnelProviderManager.loadAllFromPreferences(),
+                  let m = all.first(where: { Self.isMiClashManager($0) }) {
             self.manager = m
             mgr = m
         } else {

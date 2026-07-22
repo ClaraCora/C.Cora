@@ -105,6 +105,58 @@ func TestMergeConfigGeoModeAndMainAppUpdateSettings(t *testing.T) {
 	}
 }
 
+func TestMergeConfigGeoDisabledRemovesSettingsAndNestedRules(t *testing.T) {
+	const input = `
+geodata-mode: true
+geodata-loader: standard
+geo-auto-update: true
+geo-update-interval: 6
+geox-url:
+  geoip: https://example.com/geoip.dat
+  geosite: https://example.com/geosite.dat
+  asn: https://example.com/asn.mmdb
+rules:
+  - GEOIP,CN,DIRECT
+  - MATCH,DIRECT
+sub-rules:
+  nested:
+    - GEOSITE,cn,DIRECT
+    - DOMAIN,example.com,DIRECT
+`
+	m := mergedMapWithSettings(t, input, appSettings{
+		Stack: "gvisor", LogLevel: "info", GeoEnabled: false,
+	})
+
+	if got := m["geo-auto-update"]; got != false {
+		t.Errorf("geo-auto-update = %v, want false", got)
+	}
+	for _, key := range []string{"geodata-mode", "geodata-loader", "geo-update-interval"} {
+		if _, exists := m[key]; exists {
+			t.Errorf("%s should be absent while GEO is disabled", key)
+		}
+	}
+	geoXURL := nestedMap(t, m, "geox-url")
+	if len(geoXURL) != 1 || geoXURL["asn"] != "https://example.com/asn.mmdb" {
+		t.Errorf("geox-url = %v, want only the unrelated ASN URL preserved", geoXURL)
+	}
+	rules, ok := m["rules"].([]any)
+	if !ok || len(rules) != 1 || rules[0] != "MATCH,DIRECT" {
+		t.Errorf("rules = %v, want only MATCH,DIRECT", m["rules"])
+	}
+	subRules := nestedMap(t, m, "sub-rules")
+	nested, ok := subRules["nested"].([]any)
+	if !ok || len(nested) != 1 || nested[0] != "DOMAIN,example.com,DIRECT" {
+		t.Errorf("sub-rules.nested = %v, want only DOMAIN rule", subRules["nested"])
+	}
+
+	m = mergedMapWithSettings(t, `geox-url: {geoip: https://example.com/geoip.dat}`, appSettings{
+		Stack: "gvisor", LogLevel: "info", GeoEnabled: false,
+	})
+	if _, exists := m["geox-url"]; exists {
+		t.Errorf("geox-url should be absent when it contains no unrelated URLs: %v", m["geox-url"])
+	}
+}
+
 func TestMergeConfigGeoNegationSwitch(t *testing.T) {
 	const input = `
 rules:
