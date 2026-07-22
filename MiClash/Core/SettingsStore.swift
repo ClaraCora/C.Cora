@@ -17,6 +17,10 @@ final class SettingsStore: ObservableObject {
     @Published var geoEnabled: Bool { didSet { d.set(geoEnabled, forKey: K.geoEnabled) } }
     /// geo 加载器：standard / memconservative（小内存优化，NE 推荐）。
     @Published var geoLoader: String { didSet { d.set(geoLoader, forKey: K.geoLoader) } }
+    /// 是否忽略 geolocation-!cn / NOT(GEOIP) 等 geo 取反规则。
+    @Published var ignoreGeoNegation: Bool {
+        didSet { d.set(ignoreGeoNegation, forKey: K.ignoreGeoNegation) }
+    }
     /// 自动更新 geo 数据库。
     @Published var geoAutoUpdate: Bool { didSet { d.set(geoAutoUpdate, forKey: K.geoAuto) } }
     /// 自动更新间隔（小时）。
@@ -60,6 +64,7 @@ final class SettingsStore: ObservableObject {
     private enum K {
         static let stack = "set.stack", ipv6 = "set.ipv6"
         static let geoEnabled = "set.geoEnabled", geoLoader = "set.geoLoader"
+        static let ignoreGeoNegation = "set.ignoreGeoNegation"
         static let geoAuto = "set.geoAuto", geoInterval = "set.geoInterval"
         static let logLevel = "set.logLevel", port = "set.port", secret = "set.secret", allowLan = "set.allowLan"
         static let mixedPort = "set.mixedPort"
@@ -73,6 +78,7 @@ final class SettingsStore: ObservableObject {
         ipv6 = d.object(forKey: K.ipv6) as? Bool ?? false
         geoEnabled = d.object(forKey: K.geoEnabled) as? Bool ?? false
         geoLoader = d.string(forKey: K.geoLoader) ?? "memconservative"
+        ignoreGeoNegation = d.object(forKey: K.ignoreGeoNegation) as? Bool ?? true
         geoAutoUpdate = d.object(forKey: K.geoAuto) as? Bool ?? false
         let gi = d.integer(forKey: K.geoInterval)
         geoUpdateInterval = gi == 0 ? 24 : gi
@@ -101,6 +107,7 @@ final class SettingsStore: ObservableObject {
             "ipv6": ipv6,
             "geoEnabled": geoEnabled,
             "geoLoader": geoLoader,
+            "ignoreGeoNegation": ignoreGeoNegation,
             "geoAutoUpdate": geoAutoUpdate,
             "geoUpdateInterval": geoUpdateInterval,
             "logLevel": logLevel,

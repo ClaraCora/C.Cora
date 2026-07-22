@@ -112,6 +112,7 @@ type appSettings struct {
 	IPv6              bool   `json:"ipv6"`
 	GeoEnabled        bool   `json:"geoEnabled"`
 	GeoLoader         string `json:"geoLoader"`
+	IgnoreGeoNegation bool   `json:"ignoreGeoNegation"`
 	GeoAutoUpdate     bool   `json:"geoAutoUpdate"`
 	GeoUpdateInterval int    `json:"geoUpdateInterval"`
 	LogLevel          string `json:"logLevel"`
@@ -124,7 +125,7 @@ type appSettings struct {
 // parseSettings 解析设置 JSON，缺省值兜底（与主 App SettingsStore 默认一致）。
 func parseSettings(settingsJSON string) appSettings {
 	s := appSettings{Stack: "gvisor", LogLevel: "info", ControllerPort: 9090,
-		GeoLoader: "memconservative", GeoUpdateInterval: 24}
+		GeoLoader: "memconservative", IgnoreGeoNegation: true, GeoUpdateInterval: 24}
 	if strings.TrimSpace(settingsJSON) != "" {
 		_ = json.Unmarshal([]byte(settingsJSON), &s)
 	}
@@ -159,8 +160,8 @@ func StartWithConfig(fd int, configYAML string, settingsJSON string) (err error)
 	}()
 
 	st := parseSettings(settingsJSON)
-	appendRunLog(fmt.Sprintf("StartWithConfig: fd=%d stack=%s ipv6=%v geo=%v(%s) log=%s port=%d",
-		fd, st.Stack, st.IPv6, st.GeoEnabled, st.GeoLoader, st.LogLevel, st.ControllerPort))
+	appendRunLog(fmt.Sprintf("StartWithConfig: fd=%d stack=%s ipv6=%v geo=%v(%s,ignoreNegation=%v) log=%s port=%d",
+		fd, st.Stack, st.IPv6, st.GeoEnabled, st.GeoLoader, st.IgnoreGeoNegation, st.LogLevel, st.ControllerPort))
 
 	merged, err := mergeConfig(configYAML, st)
 	if err != nil {
@@ -305,16 +306,18 @@ func mergeConfig(subYAML string, st appSettings) ([]byte, error) {
 	}
 
 	// geo 规则处理：
-	//   开 → 保留普通 geo 规则，**只剔「取反」的**（geolocation-!cn / NOT,((GEOIP,CN)) 等，
-	//        这类在 NE 里易出问题），并配置加载器/自动更新；
+	//   开 → 保留普通 geo 规则；IgnoreGeoNegation 开启时再剔除 geolocation-!cn /
+	//        NOT,((GEOIP,CN)) 等取反规则，并配置加载器/自动更新；
 	//   关 → 剔除**所有** GEOIP/GEOSITE/GEODATA 规则（含逻辑规则里嵌的），省内存。
 	m["geodata-mode"] = false // false=用 mmdb
 	if st.GeoEnabled {
 		m["geodata-loader"] = st.GeoLoader
 		m["geo-auto-update"] = st.GeoAutoUpdate
 		m["geo-update-interval"] = st.GeoUpdateInterval
-		if rules, ok := m["rules"].([]any); ok {
-			m["rules"] = filterGeoNegationRules(rules)
+		if st.IgnoreGeoNegation {
+			if rules, ok := m["rules"].([]any); ok {
+				m["rules"] = filterGeoNegationRules(rules)
+			}
 		}
 	} else {
 		m["geo-auto-update"] = false
@@ -600,17 +603,6 @@ func TrafficNow() string {
 	out, err := json.Marshal(map[string]int64{"up": up, "down": down})
 	if err != nil {
 		return `{"up":0,"down":0}`
-	}
-	return string(out)
-}
-
-// MemoryUsage 返回 NE 进程当前驻留内存（RSS，字节）：{"rss":..}。
-// Memory() 会主动刷新 Darwin proc_pidinfo；不要改用 Snapshot().Memory（它只读缓存，且会枚举连接）。
-func MemoryUsage() string {
-	rss := statistic.DefaultManager.Memory()
-	out, err := json.Marshal(map[string]uint64{"rss": rss})
-	if err != nil {
-		return `{"rss":0}`
 	}
 	return string(out)
 }

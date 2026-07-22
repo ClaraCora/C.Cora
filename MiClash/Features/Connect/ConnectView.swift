@@ -1,7 +1,7 @@
 import SwiftUI
 import Charts
 
-/// 连接页：一张「连接卡片」（大圆形开关 + 状态 + 模式三合一）+ 实时流量卡片。
+/// 连接页：连接控制 + 紧凑运行指标 + 实时流量曲线。
 /// 内核状态等诊断信息移到设置页，这里只保留最常用的连接与模式。
 struct ConnectView: View {
     @EnvironmentObject private var core: CoreStateManager
@@ -13,8 +13,10 @@ struct ConnectView: View {
                 VStack(spacing: 16) {
                     ConnectionCard()
                     if core.isActive {
-                        TrafficCard(samples: kernel.samples, up: kernel.up, down: kernel.down,
-                                    memoryRSS: kernel.memoryRSS)
+                        RuntimeMetricsRow(up: kernel.up,
+                                          down: kernel.down,
+                                          memoryFootprint: kernel.memoryFootprint)
+                        TrafficChart(samples: kernel.samples)
                     }
                     if !core.configNotices.isEmpty {
                         NoticesCard(notices: core.configNotices)
@@ -37,23 +39,21 @@ private struct ConnectionCard: View {
     @EnvironmentObject private var kernel: KernelController
 
     var body: some View {
-        VStack(spacing: 20) {
-            // 大圆形电源按钮
+        VStack(spacing: 14) {
             Button {
                 Task { await core.toggleConnection() }
             } label: {
                 ZStack {
                     Circle()
                         .fill(buttonGradient)
-                        .frame(width: 150, height: 150)
-                        .shadow(color: glowColor.opacity(0.45), radius: 20, x: 0, y: 8)
+                        .frame(width: 124, height: 124)
+                        .shadow(color: glowColor.opacity(0.38), radius: 14, x: 0, y: 6)
                     if core.isBusy {
                         ProgressView()
-                            .controlSize(.large)
                             .tint(.white)
                     } else {
                         Image(systemName: "power")
-                            .font(.system(size: 52, weight: .bold))
+                            .font(.system(size: 42, weight: .bold))
                             .foregroundStyle(.white)
                     }
                 }
@@ -94,9 +94,9 @@ private struct ConnectionCard: View {
             .pickerStyle(.segmented)
             .disabled(!core.isActive)
         }
-        .padding(20)
+        .padding(16)
         .background(
-            RoundedRectangle(cornerRadius: 20, style: .continuous)
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .fill(Color(uiColor: .secondarySystemGroupedBackground))
         )
     }
@@ -138,69 +138,93 @@ private struct NoticesCard: View {
         }
         .padding(16)
         .background(
-            RoundedRectangle(cornerRadius: 20, style: .continuous)
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .fill(Color(uiColor: .secondarySystemGroupedBackground))
         )
     }
 }
 
-/// 实时流量卡片：上/下行速率折线 + 当前数值。
-private struct TrafficCard: View {
-    let samples: [KernelController.TrafficSample]
+/// 当前运行指标：上下行与内存各自独立，便于快速扫读。
+private struct RuntimeMetricsRow: View {
     let up: Int64
     let down: Int64
-    let memoryRSS: Int64?
+    let memoryFootprint: Int64?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 16) {
-                Label(ByteFormat.rate(down), systemImage: "arrow.down")
-                    .foregroundStyle(.blue)
-                Label(ByteFormat.rate(up), systemImage: "arrow.up")
-                    .foregroundStyle(.orange)
-                Spacer()
-            }
-            .font(.callout.monospacedDigit().weight(.medium))
-
-            HStack(spacing: 6) {
-                Label("NE RSS", systemImage: "memorychip")
-                Spacer()
-                Text(memoryRSS.map(ByteFormat.size) ?? "—")
-                    .monospacedDigit()
-            }
-            .font(.caption)
-            .foregroundStyle(.secondary)
-
-            Chart {
-                ForEach(Array(samples.enumerated()), id: \.element.id) { idx, s in
-                    AreaMark(x: .value("t", idx), y: .value("速率", Double(s.down)))
-                        .foregroundStyle(.blue.opacity(0.12))
-                        .interpolationMethod(.catmullRom)
-                    LineMark(x: .value("t", idx), y: .value("速率", Double(s.down)),
-                             series: .value("方向", "下行"))
-                        .foregroundStyle(.blue)
-                        .interpolationMethod(.catmullRom)
-                    LineMark(x: .value("t", idx), y: .value("速率", Double(s.up)),
-                             series: .value("方向", "上行"))
-                        .foregroundStyle(.orange)
-                        .interpolationMethod(.catmullRom)
-                }
-            }
-            .chartXScale(domain: 0...Double(max(samples.count - 1, 1)))
-            .chartXAxis(.hidden)
-            .chartYAxis {
-                AxisMarks { value in
-                    AxisGridLine()
-                    if let v = value.as(Double.self) {
-                        AxisValueLabel { Text(ByteFormat.rate(Int64(v))).font(.caption2) }
-                    }
-                }
-            }
-            .frame(height: 140)
+        HStack(spacing: 8) {
+            MetricWidget(title: "下行", value: ByteFormat.rate(down),
+                         systemImage: "arrow.down", tint: .blue)
+            MetricWidget(title: "上行", value: ByteFormat.rate(up),
+                         systemImage: "arrow.up", tint: .orange)
+            MetricWidget(title: "内存",
+                         value: memoryFootprint.map(ByteFormat.size) ?? "—",
+                         systemImage: "memorychip", tint: .green)
         }
-        .padding(20)
+    }
+}
+
+private struct MetricWidget: View {
+    let title: String
+    let value: String
+    let systemImage: String
+    let tint: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Label(title, systemImage: systemImage)
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(tint)
+            Text(value)
+                .font(.callout.monospacedDigit().weight(.semibold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+                .foregroundStyle(.primary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.horizontal, 10)
+        .frame(maxWidth: .infinity, minHeight: 62)
         .background(
-            RoundedRectangle(cornerRadius: 20, style: .continuous)
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color(uiColor: .secondarySystemGroupedBackground))
+        )
+        .accessibilityElement(children: .combine)
+    }
+}
+
+/// 只保留趋势信息，当前数值由上方紧凑组件显示。
+private struct TrafficChart: View {
+    let samples: [KernelController.TrafficSample]
+
+    var body: some View {
+        Chart {
+            ForEach(Array(samples.enumerated()), id: \.element.id) { idx, s in
+                AreaMark(x: .value("t", idx), y: .value("速率", Double(s.down)))
+                    .foregroundStyle(.blue.opacity(0.1))
+                    .interpolationMethod(.catmullRom)
+                LineMark(x: .value("t", idx), y: .value("速率", Double(s.down)),
+                         series: .value("方向", "下行"))
+                    .foregroundStyle(.blue)
+                    .interpolationMethod(.catmullRom)
+                LineMark(x: .value("t", idx), y: .value("速率", Double(s.up)),
+                         series: .value("方向", "上行"))
+                    .foregroundStyle(.orange)
+                    .interpolationMethod(.catmullRom)
+            }
+        }
+        .chartXScale(domain: 0...Double(max(samples.count - 1, 1)))
+        .chartXAxis(.hidden)
+        .chartYAxis {
+            AxisMarks(values: .automatic(desiredCount: 3)) { value in
+                AxisGridLine()
+                if let v = value.as(Double.self) {
+                    AxisValueLabel { Text(ByteFormat.rate(Int64(v))).font(.caption2) }
+                }
+            }
+        }
+        .frame(height: 104)
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .fill(Color(uiColor: .secondarySystemGroupedBackground))
         )
     }

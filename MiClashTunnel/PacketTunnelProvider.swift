@@ -222,7 +222,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         case "traffic":
             completionHandler?(Data(MihomoTrafficNow().utf8))
         case "memory":
-            completionHandler?(Data(MihomoMemoryUsage().utf8))
+            completionHandler?(Self.memoryFootprintData())
         case "proxyDetails":
             completionHandler?(Data(MihomoProxyDetails().utf8))
         case "configNotices":
@@ -237,6 +237,24 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             let body = "[cmd=\(cmd)]\n" + collectLogs()
             completionHandler?(Self.tailData(body, maxBytes: 24 * 1024))
         }
+    }
+
+    /// 返回当前 Network Extension 进程的物理内存占用。
+    /// `phys_footprint` 与系统内存压力/Jetsam 口径更接近，不能用 RSS 替代。
+    private static func memoryFootprintData() -> Data {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size
+        )
+        let result = withUnsafeMutablePointer(to: &info) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { rebound in
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), rebound, &count)
+            }
+        }
+        let footprint = result == KERN_SUCCESS ? info.phys_footprint : 0
+        let payload: [String: NSNumber] = ["physFootprint": NSNumber(value: footprint)]
+        return (try? JSONSerialization.data(withJSONObject: payload))
+            ?? Data(#"{"physFootprint":0}"#.utf8)
     }
 
     /// 取字符串末尾不超过 maxBytes 的 UTF-8 数据（避免 IPC 响应超限被丢成空响应）。

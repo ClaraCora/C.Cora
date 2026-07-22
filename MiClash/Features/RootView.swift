@@ -1,9 +1,7 @@
 import SwiftUI
 
 /// 根视图：原生 TabView 五页（连接 / 配置 / 节点 / 日志 / 设置）。
-///
-/// 底栏用**原生 TabView**——用 iOS 26 SDK 编译时，系统底栏自动是「悬浮 + 液态玻璃」，
-/// 折射/定位/内容穿过全由系统处理（与 Everywhere 一致），不用自己画 glassEffect、也不用各页预留高度。
+/// iOS 26 由系统提供悬浮液态玻璃外观，并在向下滚动时自动收起为紧凑形态。
 /// 在这里（始终存在的容器）按连接状态驱动内核速率与日志流的启停，切走再回来数据不清零。
 struct RootView: View {
     @EnvironmentObject private var core: CoreStateManager
@@ -11,22 +9,38 @@ struct RootView: View {
     @EnvironmentObject private var logs: LogStreamController
 
     var body: some View {
-        TabView {
-            ConnectView()
-                .tabItem { Label("连接", systemImage: "power") }
-            SubscriptionsView()
-                .tabItem { Label("配置", systemImage: "doc.text") }
-            ProxiesView()
-                .tabItem { Label("节点", systemImage: "point.3.connected.trianglepath.dotted") }
-            LogsView()
-                .tabItem { Label("日志", systemImage: "list.bullet.rectangle") }
-            SettingsView()
-                .tabItem { Label("设置", systemImage: "gearshape") }
+        Group {
+            if #available(iOS 26.0, *) {
+                tabs
+                    .tabBarMinimizeBehavior(.onScrollDown)
+            } else {
+                tabs
+            }
         }
         .onChange(of: core.isActive) { _, active in
             syncStreams(active)
         }
         .onAppear { syncStreams(core.isActive) }
+    }
+
+    private var tabs: some View {
+        TabView {
+            Tab("连接", systemImage: "power") {
+                ConnectView()
+            }
+            Tab("配置", systemImage: "doc.text") {
+                SubscriptionsView()
+            }
+            Tab("节点", systemImage: "point.3.connected.trianglepath.dotted") {
+                ProxiesView()
+            }
+            Tab("日志", systemImage: "list.bullet.rectangle") {
+                LogsView()
+            }
+            Tab("设置", systemImage: "gearshape") {
+                SettingsView()
+            }
+        }
     }
 
     private func syncStreams(_ active: Bool) {

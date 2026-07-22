@@ -1,6 +1,6 @@
 import Foundation
 
-/// 连接页用的内核运行态：当前模式 + 实时上下行速率 + NE 进程 RSS。
+/// 连接页用的内核运行态：当前模式 + 实时上下行速率 + NE 进程 phys_footprint。
 /// 经 **sendProviderMessage IPC**：模式 getMode/setMode、速率 traffic、内存 memory。
 @MainActor
 final class KernelController: ObservableObject {
@@ -31,8 +31,8 @@ final class KernelController: ObservableObject {
     @Published var up: Int64 = 0
     @Published var down: Int64 = 0
     @Published var reachable = false
-    /// Packet Tunnel Extension 进程的驻留内存（RSS，字节）；nil 表示尚未取到。
-    @Published private(set) var memoryRSS: Int64?
+    /// Packet Tunnel Extension 进程的物理内存占用（task_vm_info.phys_footprint，字节）。
+    @Published private(set) var memoryFootprint: Int64?
     /// 最近若干秒的速率采样（曲线图数据）。
     @Published private(set) var samples: [TrafficSample] = []
 
@@ -107,7 +107,7 @@ final class KernelController: ObservableObject {
         sampleIndex = 0
     }
 
-    /// NE RSS 变化较慢，每 5 秒查询一次，避免每秒调用 Darwin proc_pidinfo。
+    /// phys_footprint 变化较慢，每 5 秒查询一次，避免频繁调用 Mach task_info。
     private func startMemoryPolling() {
         stopMemoryPolling()
         memoryTask = Task { [weak self] in
@@ -118,11 +118,11 @@ final class KernelController: ObservableObject {
                 guard !Task.isCancelled else { return }
                 if case .ok(let data) = result,
                    let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-                   let rss = (obj["rss"] as? NSNumber)?.int64Value,
-                   rss > 0 {
-                    self?.memoryRSS = rss
+                   let footprint = (obj["physFootprint"] as? NSNumber)?.int64Value,
+                   footprint > 0 {
+                    self?.memoryFootprint = footprint
                 } else {
-                    self?.memoryRSS = nil
+                    self?.memoryFootprint = nil
                 }
                 try? await Task.sleep(nanoseconds: 5_000_000_000)
             }
@@ -132,7 +132,7 @@ final class KernelController: ObservableObject {
     private func stopMemoryPolling() {
         memoryTask?.cancel()
         memoryTask = nil
-        memoryRSS = nil
+        memoryFootprint = nil
     }
 
     private func pushSample(up: Int64, down: Int64) {

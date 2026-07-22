@@ -1,6 +1,6 @@
 name: Build unsigned IPA
 
-# 在 macos-15（Xcode 16）上：先用 gomobile 把 mihomo 编成 Mihomo.xcframework，
+# 在 macos-26（Xcode 26）上：先用 gomobile 把 mihomo 编成 Mihomo.xcframework，
 # 再生成 Xcode 工程并构建未签名 ipa。签名由用户用自有开发者证书自理。
 on:
   push:
@@ -9,18 +9,16 @@ on:
 
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: macos-26
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 固定 Xcode，避免 GitHub runner 更新后「同一 commit 重新构建」产出不同。
-      # 14b9b97 的源码今天重构也不可用，说明问题在浮动构建环境而不是业务代码。
-      # 先回到稳定的 Xcode 16.4 / iOS 18 SDK；功能优先，iOS 26 液态玻璃外观暂不作为构建约束。
+      # 固定 Xcode 26，确保 SwiftUI 原生液态玻璃 Tab 栏 API 可编译。
       - name: Select pinned Xcode
         run: |
           set -euo pipefail
-          XCODE_APP="/Applications/Xcode_16.4.app"
+          XCODE_APP="/Applications/Xcode_26.4.1.app"
           if [ ! -d "$XCODE_APP" ]; then
             echo "$XCODE_APP 不存在，当前 runner 可用 Xcode："
             ls -d /Applications/Xcode*.app

@@ -6,7 +6,7 @@
 
 ## 构建
 
-工程用 [XcodeGen](https://github.com/yonsm/XcodeGen) 管理，`.xcodeproj` 不入库。开发机为 Windows，靠 GitHub Actions（macos-15 / Xcode 16）构建未签名 ipa。
+工程用 [XcodeGen](https://github.com/yonsm/XcodeGen) 管理，`.xcodeproj` 不入库。开发机为 Windows，靠 GitHub Actions（macos-26 / Xcode 26）构建未签名 ipa。
 
 - 推送到 `main` 或手动触发 `Build unsigned IPA` 工作流。
 - 产物 `MiClash-unsigned-ipa` 在 Actions artifact 中下载。

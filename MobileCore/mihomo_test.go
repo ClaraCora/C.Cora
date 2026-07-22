@@ -8,7 +8,12 @@ import (
 
 func mergedMap(t *testing.T, input string) map[string]any {
 	t.Helper()
-	out, err := mergeConfig(input, appSettings{Stack: "gvisor", LogLevel: "info"})
+	return mergedMapWithSettings(t, input, appSettings{Stack: "gvisor", LogLevel: "info"})
+}
+
+func mergedMapWithSettings(t *testing.T, input string, settings appSettings) map[string]any {
+	t.Helper()
+	out, err := mergeConfig(input, settings)
 	if err != nil {
 		t.Fatalf("mergeConfig: %v", err)
 	}
@@ -17,6 +22,46 @@ func mergedMap(t *testing.T, input string) map[string]any {
 		t.Fatalf("unmarshal merged config: %v", err)
 	}
 	return m
+}
+
+func TestParseSettingsGeoNegationDefaultAndOverride(t *testing.T) {
+	if got := parseSettings("").IgnoreGeoNegation; !got {
+		t.Error("IgnoreGeoNegation default = false, want true")
+	}
+	if got := parseSettings(`{"ignoreGeoNegation":false}`).IgnoreGeoNegation; got {
+		t.Error("IgnoreGeoNegation override = true, want false")
+	}
+}
+
+func TestMergeConfigGeoNegationSwitch(t *testing.T) {
+	const input = `
+rules:
+  - GEOIP,CN,DIRECT
+  - GEOSITE,geolocation-!cn,Proxy
+  - NOT,((GEOIP,CN)),Proxy
+  - MATCH,DIRECT
+`
+	settings := appSettings{
+		Stack: "gvisor", LogLevel: "info", GeoEnabled: true, IgnoreGeoNegation: true,
+	}
+	m := mergedMapWithSettings(t, input, settings)
+	rules, ok := m["rules"].([]any)
+	if !ok {
+		t.Fatalf("rules is %T, want []any", m["rules"])
+	}
+	if len(rules) != 2 {
+		t.Fatalf("rules with ignore enabled = %v, want 2 retained rules", rules)
+	}
+
+	settings.IgnoreGeoNegation = false
+	m = mergedMapWithSettings(t, input, settings)
+	rules, ok = m["rules"].([]any)
+	if !ok {
+		t.Fatalf("rules is %T, want []any", m["rules"])
+	}
+	if len(rules) != 4 {
+		t.Fatalf("rules with ignore disabled = %v, want all 4 rules", rules)
+	}
 }
 
 func nestedMap(t *testing.T, m map[string]any, key string) map[string]any {

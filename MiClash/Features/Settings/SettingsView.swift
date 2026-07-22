@@ -27,6 +27,7 @@ struct SettingsView: View {
                         Picker("加载器", selection: $settings.geoLoader) {
                             ForEach(SettingsStore.geoLoaderOptions, id: \.self) { Text($0).tag($0) }
                         }
+                        Toggle("忽略 GEO 取反规则", isOn: $settings.ignoreGeoNegation)
                         Toggle("自动更新", isOn: $settings.geoAutoUpdate)
                         if settings.geoAutoUpdate {
                             Stepper("更新间隔 \(settings.geoUpdateInterval) 小时",
@@ -50,7 +51,8 @@ struct SettingsView: View {
                     Text("geo 规则")
                 } footer: {
                     Text("关闭=剔除订阅里的 GEOIP/GEOSITE 规则（省内存）。开启则保留并由内核加载 geo 数据库；"
-                       + "扩展内存有限，建议用 memconservative 加载器。geo 库由内核按需下载/更新，不再随包编译。")
+                       + "“忽略 GEO 取反规则”可单独控制 geolocation-!cn / NOT(GEOIP) 等规则。"
+                       + "扩展内存有限，建议用 memconservative 加载器。")
                 }
 
                 Section {
