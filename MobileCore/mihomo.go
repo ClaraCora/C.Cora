@@ -128,7 +128,7 @@ func Setup(home string) {
 // <home>/run.log。用户在 Windows 无 Mac/Console，靠这个文件 + 主 App 读取，
 // 才能看到内核内部输出（如出站接口选择、bind 失败、DNS 等），不靠猜。
 //
-// 依据：metacubex/mihomo v1.19.27 log/log.go ——
+// 依据：metacubex/mihomo v1.19.29 log/log.go ——
 //
 //	func Subscribe() observable.Subscription[Event]（即 <-chan Event）
 //	type Event struct { LogLevel LogLevel; Payload string }
