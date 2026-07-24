@@ -5,6 +5,7 @@ struct SettingsView: View {
     @EnvironmentObject private var settings: SettingsStore
     @EnvironmentObject private var core: CoreStateManager
     @EnvironmentObject private var geoDatabase: GeoDatabaseManager
+    @State private var installedGeoInfo: GeoInstalledInfo?
 
     var body: some View {
         NavigationStack {
@@ -20,62 +21,7 @@ struct SettingsView: View {
                     Text("TCP/IP 栈固定 gvisor（iOS 隧道扩展里 system 栈 TCP 走不通）。")
                 }
 
-                Section {
-                    Toggle("启用 geo 规则", isOn: $settings.geoEnabled)
-                    if settings.geoEnabled {
-                        Picker("加载器", selection: $settings.geoLoader) {
-                            ForEach(SettingsStore.geoLoaderOptions, id: \.self) { Text($0).tag($0) }
-                        }
-                        Toggle("Geodata 模式（GeoIP.dat）", isOn: $settings.geodataMode)
-                        Toggle("忽略 GEO 取反规则", isOn: $settings.ignoreGeoNegation)
-                        if settings.geodataMode {
-                            GeoURLField(title: "备用 GeoIP.dat 地址", text: $settings.geoIPDatURL)
-                        } else {
-                            GeoURLField(title: "备用 MMDB 地址", text: $settings.geoMMDBURL)
-                        }
-                        GeoURLField(title: "备用 GeoSite.dat 地址", text: $settings.geoSiteURL)
-                        Toggle("自动更新", isOn: $settings.geoAutoUpdate)
-                        if settings.geoAutoUpdate {
-                            Stepper("更新间隔 \(settings.geoUpdateInterval) 小时",
-                                    value: $settings.geoUpdateInterval, in: 1...168)
-                        }
-                        Button {
-                            Task { await updateGeo() }
-                        } label: {
-                            HStack {
-                                Label("下载 / 更新 GEO 与 ASN 数据", systemImage: "arrow.down.circle")
-                                Spacer()
-                                if geoDatabase.isUpdating { ProgressView() }
-                            }
-                        }
-                        .disabled(geoDatabase.isUpdating)
-                        if let date = geoDatabase.lastUpdatedAt(geodataMode: settings.geodataMode) {
-                            HStack {
-                                Text("本地数据")
-                                Spacer()
-                                if let size = geoDatabase.installedSize(geodataMode: settings.geodataMode) {
-                                    Text("\(ByteFormat.size(size)) · ")
-                                }
-                                Text(date, style: .relative)
-                            }
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        }
-                        if let result = geoDatabase.statusText {
-                            Text(result)
-                                .font(.caption)
-                                .foregroundStyle(geoDatabase.statusIsError ? Color.red : Color.secondary)
-                        }
-                    }
-                } header: {
-                    Text("GEO 与 ASN")
-                } footer: {
-                    Text("关闭 GEO=剔除订阅里的 GEOIP/GEOSITE 规则。Geodata 模式关闭时使用 MMDB，开启时使用 GeoIP.dat；"
-                       + "“忽略 GEO 取反规则”可单独控制 geolocation-!cn / NOT(GEOIP) 等规则。"
-                       + "主 App 优先读取当前配置的 geox-url 下载数据库，设置中的地址仅在配置缺少对应地址时使用。"
-                       + "IP-ASN/SRC-IP-ASN 规则会保留；ASN 优先使用配置中的 geox-url.asn，缺少时使用内置备用地址。"
-                       + "更新后需重新连接。")
-                }
+                GeoSettingsSection(installedInfo: installedGeoInfo)
 
                 Section {
                     HStack {
@@ -96,7 +42,8 @@ struct SettingsView: View {
                     HStack {
                         Text("端口")
                         Spacer()
-                        TextField("9090", value: $settings.controllerPort, format: .number)
+                        TextField("9090", value: $settings.controllerPort,
+                                  format: IntegerFormatStyle<Int>.number.grouping(.never))
                             .keyboardType(.numberPad)
                             .multilineTextAlignment(.trailing)
                             .frame(width: 90)
@@ -120,7 +67,8 @@ struct SettingsView: View {
                     HStack {
                         Text("混合代理端口")
                         Spacer()
-                        TextField("0=不开", value: $settings.mixedPort, format: .number)
+                        TextField("0=不开", value: $settings.mixedPort,
+                                  format: IntegerFormatStyle<Int>.number.grouping(.never))
                             .keyboardType(.numberPad)
                             .multilineTextAlignment(.trailing)
                             .frame(width: 90)
@@ -166,6 +114,84 @@ struct SettingsView: View {
                 }
             }
             .navigationTitle("设置")
+            .task(id: geoInfoRefreshID) {
+                guard settings.geoEnabled else {
+                    installedGeoInfo = nil
+                    return
+                }
+                installedGeoInfo = nil
+                let info = await geoDatabase.installedInfo(geodataMode: settings.geodataMode)
+                guard !Task.isCancelled else { return }
+                installedGeoInfo = info
+            }
+        }
+    }
+
+    private var geoInfoRefreshID: String {
+        "\(settings.geoEnabled)-\(settings.geodataMode)-\(geoDatabase.revision)"
+    }
+}
+
+private struct GeoSettingsSection: View {
+    @EnvironmentObject private var settings: SettingsStore
+    @EnvironmentObject private var geoDatabase: GeoDatabaseManager
+    let installedInfo: GeoInstalledInfo?
+
+    var body: some View {
+        Section {
+            Toggle("启用 geo 规则", isOn: $settings.geoEnabled)
+            if settings.geoEnabled {
+                Picker("加载器", selection: $settings.geoLoader) {
+                    ForEach(SettingsStore.geoLoaderOptions, id: \.self) { Text($0).tag($0) }
+                }
+                Toggle("Geodata 模式（GeoIP.dat）", isOn: $settings.geodataMode)
+                Toggle("忽略 GEO 取反规则", isOn: $settings.ignoreGeoNegation)
+                if settings.geodataMode {
+                    GeoURLField(title: "备用 GeoIP.dat 地址", text: $settings.geoIPDatURL)
+                } else {
+                    GeoURLField(title: "备用 MMDB 地址", text: $settings.geoMMDBURL)
+                }
+                GeoURLField(title: "备用 GeoSite.dat 地址", text: $settings.geoSiteURL)
+                Toggle("自动更新", isOn: $settings.geoAutoUpdate)
+                if settings.geoAutoUpdate {
+                    Stepper("更新间隔 \(settings.geoUpdateInterval) 小时",
+                            value: $settings.geoUpdateInterval, in: 1...168)
+                }
+                Button {
+                    Task { await updateGeo() }
+                } label: {
+                    HStack {
+                        Label("下载 / 更新 GEO 与 ASN 数据", systemImage: "arrow.down.circle")
+                        Spacer()
+                        if geoDatabase.isUpdating { ProgressView() }
+                    }
+                }
+                .disabled(geoDatabase.isUpdating)
+                if let installedInfo {
+                    HStack {
+                        Text("本地数据")
+                        Spacer()
+                        Text("\(ByteFormat.size(installedInfo.size)) · "
+                           + installedInfo.updatedAt.formatted(date: .abbreviated,
+                                                               time: .shortened))
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+                if let result = geoDatabase.statusText {
+                    Text(result)
+                        .font(.caption)
+                        .foregroundStyle(geoDatabase.statusIsError ? Color.red : Color.secondary)
+                }
+            }
+        } header: {
+            Text("GEO 与 ASN")
+        } footer: {
+            Text("关闭 GEO=剔除订阅里的 GEOIP/GEOSITE 规则。Geodata 模式关闭时使用 MMDB，开启时使用 GeoIP.dat；"
+               + "“忽略 GEO 取反规则”可单独控制 geolocation-!cn / NOT(GEOIP) 等规则。"
+               + "主 App 优先读取当前配置的 geox-url 下载数据库，设置中的地址仅在配置缺少对应地址时使用。"
+               + "IP-ASN/SRC-IP-ASN 规则会保留；ASN 优先使用配置中的 geox-url.asn，缺少时使用内置备用地址。"
+               + "更新后需重新连接。")
         }
     }
 

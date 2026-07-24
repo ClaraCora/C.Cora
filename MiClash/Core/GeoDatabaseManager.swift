@@ -1,6 +1,27 @@
 import Foundation
 import Mihomo
 
+struct GeoInstalledInfo: Sendable {
+    let updatedAt: Date
+    let size: Int64
+}
+
+private struct InstalledInfoConfiguration: Sendable {
+    let home: URL
+    let configYAML: String
+    let settingsJSON: String
+    let geoEnabled: Bool
+    let geodataMode: Bool
+}
+
+private struct ResolvedGeoURLs: Decodable, Sendable {
+    let geoip: String
+    let mmdb: String
+    let geosite: String
+    let asn: String
+    let asnRequired: Bool
+}
+
 /// 主 App 负责下载 GEO / ASN 数据到 App Group；NE 只读取已安装文件。
 @MainActor
 final class GeoDatabaseManager: ObservableObject {
@@ -50,24 +71,19 @@ final class GeoDatabaseManager: ObservableObject {
                                  configYAML: SubscriptionStore.shared.activeYAML ?? "")
     }
 
-    func lastUpdatedAt(geodataMode: Bool) -> Date? {
+    /// 设置页只在相关状态变化时调用一次；配置解析和文件读取均放到后台。
+    func installedInfo(geodataMode: Bool) async -> GeoInstalledInfo? {
         guard let home = AppGroup.containerURL else { return nil }
-        let names = requiredAssets(configYAML: SubscriptionStore.shared.activeYAML ?? "",
-                                   geodataMode: geodataMode).map(\.fileName)
-        guard !names.isEmpty else { return nil }
-        let dates = names.compactMap { modificationDate(home.appendingPathComponent($0)) }
-        guard dates.count == names.count else { return nil }
-        return dates.min()
-    }
-
-    func installedSize(geodataMode: Bool) -> Int64? {
-        guard let home = AppGroup.containerURL else { return nil }
-        let names = requiredAssets(configYAML: SubscriptionStore.shared.activeYAML ?? "",
-                                   geodataMode: geodataMode).map(\.fileName)
-        guard !names.isEmpty else { return nil }
-        let sizes = names.compactMap { fileSize(home.appendingPathComponent($0)) }
-        guard sizes.count == names.count else { return nil }
-        return sizes.reduce(0, +)
+        let settings = SettingsStore.shared
+        let config = InstalledInfoConfiguration(
+            home: home,
+            configYAML: SubscriptionStore.shared.activeYAML ?? "",
+            settingsJSON: settings.asJSON(),
+            geoEnabled: settings.geoEnabled,
+            geodataMode: geodataMode)
+        return await Task.detached(priority: .utility) {
+            Self.readInstalledInfo(config)
+        }.value
     }
 
     private func updateIfNeeded(force: Bool, configYAML: String) async throws {
@@ -164,11 +180,11 @@ final class GeoDatabaseManager: ObservableObject {
         return assets
     }
 
-    private func resolveURLs(configYAML: String, settingsJSON: String) -> ResolvedURLs {
+    private func resolveURLs(configYAML: String, settingsJSON: String) -> ResolvedGeoURLs {
         let json = MihomoResolveGeoDownloadURLs(configYAML, settingsJSON)
         guard let data = json.data(using: .utf8),
-              let resolved = try? JSONDecoder().decode(ResolvedURLs.self, from: data) else {
-            return ResolvedURLs(
+              let resolved = try? JSONDecoder().decode(ResolvedGeoURLs.self, from: data) else {
+            return ResolvedGeoURLs(
                 geoip: SettingsStore.defaultGeoIPDatURL,
                 mmdb: SettingsStore.defaultGeoMMDBURL,
                 geosite: SettingsStore.defaultGeoSiteURL,
@@ -188,6 +204,39 @@ final class GeoDatabaseManager: ObservableObject {
         return (attributes?[.size] as? NSNumber)?.int64Value
     }
 
+    nonisolated private static func readInstalledInfo(
+        _ config: InstalledInfoConfiguration
+    ) -> GeoInstalledInfo? {
+        let resolvedJSON = MihomoResolveGeoDownloadURLs(config.configYAML,
+                                                        config.settingsJSON)
+        let resolved = resolvedJSON.data(using: .utf8).flatMap {
+            try? JSONDecoder().decode(ResolvedGeoURLs.self, from: $0)
+        }
+        var names: [String] = []
+        if config.geoEnabled {
+            names = [config.geodataMode ? "GeoIP.dat" : "geoip.metadb", "GeoSite.dat"]
+        }
+        if resolved?.asnRequired == true {
+            names.append("ASN.mmdb")
+        }
+        guard !names.isEmpty else { return nil }
+
+        var oldestDate: Date?
+        var totalSize: Int64 = 0
+        for name in names {
+            let url = config.home.appendingPathComponent(name)
+            guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+                  let date = attributes[.modificationDate] as? Date,
+                  let size = (attributes[.size] as? NSNumber)?.int64Value else {
+                return nil
+            }
+            oldestDate = min(oldestDate ?? date, date)
+            totalSize += size
+        }
+        guard let oldestDate else { return nil }
+        return GeoInstalledInfo(updatedAt: oldestDate, size: totalSize)
+    }
+
     private func publish(error: Error) {
         statusIsError = true
         statusText = error.localizedDescription
@@ -203,14 +252,6 @@ final class GeoDatabaseManager: ObservableObject {
         let url: String
         let fileName: String
         let kind: String
-    }
-
-    private struct ResolvedURLs: Decodable, Sendable {
-        let geoip: String
-        let mmdb: String
-        let geosite: String
-        let asn: String
-        let asnRequired: Bool
     }
 
     private struct StagedAsset: Sendable {

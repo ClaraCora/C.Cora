@@ -9,25 +9,24 @@ struct LogsView: View {
     @State private var autoScroll = true
 
     var body: some View {
-        NavigationStack {
-            content
-                .navigationTitle("日志")
-                .searchable(text: $controller.searchText,
-                            placement: .navigationBarDrawer(displayMode: .always),
-                            prompt: "搜索日志")
-                .toolbar {
-                    ToolbarItem(placement: .topBarLeading) {
-                        levelMenu
-                    }
-                    ToolbarItem(placement: .topBarTrailing) {
-                        Button { controller.clear() } label: {
-                            Image(systemName: "trash")
-                        }
-                        .disabled(!controller.hasBufferedLines)
-                        .accessibilityLabel("清空日志")
-                    }
+        content
+            .navigationTitle("日志")
+            .navigationBarTitleDisplayMode(.inline)
+            .searchable(text: $controller.searchText,
+                        placement: .navigationBarDrawer(displayMode: .always),
+                        prompt: "搜索日志")
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    levelMenu
                 }
-        }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button { controller.clear() } label: {
+                        Image(systemName: "trash")
+                    }
+                    .disabled(!controller.hasBufferedLines)
+                    .accessibilityLabel("清空日志")
+                }
+            }
     }
 
     @ViewBuilder private var content: some View {

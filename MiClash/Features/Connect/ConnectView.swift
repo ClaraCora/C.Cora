@@ -1,7 +1,7 @@
 import SwiftUI
 import Charts
 
-/// 连接页：连接控制 + 紧凑运行指标 + 实时流量曲线。
+/// 主页：连接控制 + 紧凑运行指标 + 实时流量曲线。
 /// 内核状态等诊断信息移到设置页，这里只保留最常用的连接与模式。
 struct ConnectView: View {
     @EnvironmentObject private var core: CoreStateManager
@@ -93,23 +93,6 @@ private struct ConnectionCard: View {
             }
             .pickerStyle(.segmented)
             .disabled(!core.isActive)
-
-            Divider()
-
-            NavigationLink {
-                ConnectionsView()
-            } label: {
-                HStack {
-                    Label("活动连接", systemImage: "arrow.left.arrow.right.circle")
-                        .font(.subheadline.weight(.medium))
-                    Spacer()
-                    Image(systemName: "chevron.right")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.tertiary)
-                }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
         }
         .padding(16)
         .background(

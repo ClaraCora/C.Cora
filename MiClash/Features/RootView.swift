@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// 根视图：原生 TabView 五页（连接 / 配置 / 节点 / 日志 / 设置）。
+/// 根视图：原生 TabView 五页（主页 / 配置 / 节点 / 连接 / 设置）。
 /// iOS 26 由系统提供悬浮液态玻璃外观，并在向下滚动时自动收起为紧凑形态。
 /// 在这里（始终存在的容器）按连接状态驱动内核速率与日志流的启停，切走再回来数据不清零。
 struct RootView: View {
@@ -23,7 +23,7 @@ struct RootView: View {
 
     private var tabs: some View {
         TabView {
-            Tab("连接", systemImage: "power") {
+            Tab("主页", systemImage: "power") {
                 ConnectView()
             }
             Tab("配置", systemImage: "doc.text") {
@@ -32,8 +32,8 @@ struct RootView: View {
             Tab("节点", systemImage: "point.3.connected.trianglepath.dotted") {
                 ProxiesView()
             }
-            Tab("日志", systemImage: "list.bullet.rectangle") {
-                LogsView()
+            Tab("连接", systemImage: "arrow.left.arrow.right.circle") {
+                ActivityView()
             }
             Tab("设置", systemImage: "gearshape") {
                 SettingsView()
