@@ -486,54 +486,83 @@ private struct GroupHeaderRow: View {
         Button(action: onTest) {
             testLabel
         }
-        .buttonStyle(.plain)
+        .buttonStyle(SpeedTestButtonStyle())
         .disabled(isTesting)
         .accessibilityLabel("测试\(group.name)延迟")
-        .accessibilityValue(DelayBadge.accessibilityText(currentDelay))
+        .accessibilityValue(
+            isTesting ? "正在测速" : DelayBadge.accessibilityText(currentDelay))
+        .accessibilityHint("测试该策略组全部节点")
     }
 
-    @ViewBuilder private var testLabel: some View {
-        if isTesting {
-            ProgressView()
-                .controlSize(.small)
-                .frame(width: dynamicTypeSize.isAccessibilitySize ? 112 : 58, height: 44)
-                .background(testButtonBackground)
-        } else if dynamicTypeSize.isAccessibilitySize {
-            HStack(spacing: 7) {
-                Image(systemName: "speedometer")
-                    .foregroundStyle(Color.accentColor)
-                Text("测速")
-                Text(DelayBadge.shortText(currentDelay))
-                    .foregroundStyle(DelayBadge.tint(currentDelay))
-                    .monospacedDigit()
+    private var testLabel: some View {
+        HStack(spacing: 6) {
+            ZStack {
+                Circle()
+                    .fill(testTint.opacity(0.13))
+
+                if isTesting {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .tint(testTint)
+                } else {
+                    Image(systemName: "speedometer")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(testTint)
+                }
             }
-            .font(.caption.weight(.semibold))
-            .padding(.horizontal, 10)
-            .frame(minWidth: 112, minHeight: 44)
-            .background(testButtonBackground)
-        } else {
-            VStack(spacing: 1) {
-                Image(systemName: "speedometer")
-                    .font(.caption)
-                    .foregroundStyle(Color.accentColor)
-                Text(DelayBadge.shortText(currentDelay))
-                    .font(.caption2.monospacedDigit().weight(.semibold))
-                    .foregroundStyle(DelayBadge.tint(currentDelay))
-            }
-            .frame(width: 58, height: 44)
-            .background(testButtonBackground)
+            .frame(width: 24, height: 24)
+
+            Text(testStatusText)
+                .font(.caption.monospacedDigit().weight(.semibold))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
         }
+        .padding(.horizontal, 7)
+        .frame(width: testButtonWidth, height: 34)
+        .background(testButtonBackground)
+        .frame(width: testButtonWidth, height: 44)
+        .contentShape(Rectangle())
+    }
+
+    private var testButtonWidth: CGFloat {
+        if dynamicTypeSize.isAccessibilitySize { return 124 }
+        if dynamicTypeSize == .xxLarge || dynamicTypeSize == .xxxLarge { return 96 }
+        return 84
+    }
+
+    private var testStatusText: String {
+        if isTesting { return "测速中" }
+        return currentDelay == nil ? "测速" : DelayBadge.shortText(currentDelay)
+    }
+
+    private var testTint: Color {
+        if isTesting || currentDelay == nil { return Color.accentColor }
+        return DelayBadge.tint(currentDelay)
     }
 
     private var testButtonBackground: some View {
-        RoundedRectangle(cornerRadius: 7, style: .continuous)
-            .fill(Color.accentColor.opacity(0.08))
+        RoundedRectangle(cornerRadius: 8, style: .continuous)
+            .fill(testTint.opacity(0.075))
+            .overlay {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(testTint.opacity(0.18), lineWidth: 0.5)
+            }
     }
 
     private var accessibilityValue: String {
         let current = group.now.isEmpty ? "未选择节点" : "当前节点 \(group.now)"
         let state = canToggle ? (isExpanded ? "已展开" : "已折叠") : "搜索结果"
         return "\(group.displayType)，\(group.all.count) 个节点，\(current)，\(DelayBadge.accessibilityText(currentDelay))，\(state)"
+    }
+}
+
+private struct SpeedTestButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.96 : 1)
+            .opacity(configuration.isPressed ? 0.78 : 1)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
     }
 }
 
