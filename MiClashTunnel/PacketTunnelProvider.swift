@@ -21,6 +21,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     /// 当前 mihomo 工作目录（含 run.log）。供 handleAppMessage 回传内核日志用。
     private var homeDir: String?
 
+    /// 当前运行中的 utun fd。配置重载只复用它，不重建系统隧道。
+    private var tunnelFileDescriptor: Int32?
+    private var isStopping = false
+    private let reloadQueue = DispatchQueue(label: "com.miclash.tunnel.reload", qos: .userInitiated)
+
     // 物理接口监控：把真实出站接口（en0/pdp_ip0）显式喂给内核，取代 mihomo 自带的不可靠监控。
     private var pathMonitor: NWPathMonitor?
     private let pathMonitorQueue = DispatchQueue(label: "com.miclash.tunnel.pathmonitor", qos: .utility)
@@ -29,6 +34,10 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
     override func startTunnel(options: [String: NSObject]?,
                               completionHandler: @escaping (Error?) -> Void) {
+        reloadQueue.sync {
+            isStopping = false
+            tunnelFileDescriptor = nil
+        }
         // 每次启动清空 ne.log，避免历史残留干扰排查
         FileLog.reset()
         FileLog.write("startTunnel：开始配置网络设置")
@@ -97,10 +106,22 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             if ok {
                 FileLog.write("MihomoStartWithConfig 返回成功")
                 self.log.info("mihomo 启动成功")
-                AppGroupState.vpnConnected = true // 共享给控制中心磁贴显示
-                ControlCenter.shared.reloadControls(ofKind: ControlWidgetKind.vpn)
-                self.startPathMonitor() // 开始把真实出站接口喂给内核
-                completionHandler(nil)
+                let shouldFinishStarting = self.reloadQueue.sync {
+                    guard !self.isStopping else { return false }
+                    self.tunnelFileDescriptor = fd
+                    AppGroupState.vpnConnected = true // 共享给控制中心磁贴显示
+                    ControlCenter.shared.reloadControls(ofKind: ControlWidgetKind.vpn)
+                    self.startPathMonitor() // 开始把真实出站接口喂给内核
+                    completionHandler(nil)
+                    return true
+                }
+                guard shouldFinishStarting else {
+                    completionHandler(NSError(
+                        domain: "MiClashTunnel",
+                        code: -5,
+                        userInfo: [NSLocalizedDescriptionKey: "VPN 启动已取消"]))
+                    return
+                }
             } else {
                 let err = startError ?? NSError(domain: "MiClashTunnel", code: -3,
                     userInfo: [NSLocalizedDescriptionKey: "mihomo 启动失败（未知错误）"])
@@ -149,10 +170,14 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                             completionHandler: @escaping () -> Void) {
         FileLog.write("stopTunnel，原因 rawValue=\(reason.rawValue)")
         log.info("stopTunnel，原因：\(reason.rawValue, privacy: .public)")
-        AppGroupState.vpnConnected = false // 同步给控制中心磁贴
-        ControlCenter.shared.reloadControls(ofKind: ControlWidgetKind.vpn)
-        stopPathMonitor()
-        MihomoStop()
+        reloadQueue.sync {
+            isStopping = true
+            tunnelFileDescriptor = nil
+            AppGroupState.vpnConnected = false // 同步给控制中心磁贴
+            ControlCenter.shared.reloadControls(ofKind: ControlWidgetKind.vpn)
+            stopPathMonitor()
+            MihomoStop()
+        }
         completionHandler()
     }
 
@@ -241,10 +266,146 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         case "setMode":
             MihomoSetMode((obj?["mode"] as? String) ?? "rule")
             completionHandler?(Data(#"{"ok":true}"#.utf8))
+        case "reloadConfig":
+            reloadConfiguration(obj, completionHandler: completionHandler)
         default: // getLogs 及未知命令都回传日志，便于排查
             // 日志可能很大，IPC 响应有体积上限 → 只回传末尾约 24KB，取最新内容。
             let body = "[cmd=\(cmd)]\n" + collectLogs()
             completionHandler?(Self.tailData(body, maxBytes: 24 * 1024))
+        }
+    }
+
+    private func reloadConfiguration(_ object: [String: Any]?,
+                                     completionHandler: ((Data?) -> Void)?) {
+        let transfer = object?["transfer"] as? String
+        let token = object?["token"] as? String
+        let inlineConfig = object?["config"] as? String
+        let inlineSettings = object?["settings"] as? String
+
+        reloadQueue.async { [weak self] in
+            guard let self else {
+                completionHandler?(Self.reloadResponse(error: "Tunnel 已停止"))
+                return
+            }
+            guard !self.isStopping,
+                  let fd = self.tunnelFileDescriptor,
+                  let home = self.homeDir else {
+                completionHandler?(Self.reloadResponse(error: "VPN 尚未完成启动"))
+                return
+            }
+
+            let input: (config: String, settings: String)
+            do {
+                input = try Self.loadReloadInput(
+                    transfer: transfer,
+                    token: token,
+                    inlineConfig: inlineConfig,
+                    inlineSettings: inlineSettings)
+            } catch {
+                FileLog.write("读取重载配置失败：\(error.localizedDescription)")
+                completionHandler?(Self.reloadResponse(
+                    error: error.localizedDescription,
+                    code: (error as? ReloadInputError)?.responseCode))
+                return
+            }
+
+            let configYAML = input.config.isEmpty
+                ? MihomoConfig.directModeYAML()
+                : input.config
+            if let geoError = Self.validateGeoAssets(configYAML: configYAML,
+                                                      settingsJSON: input.settings,
+                                                      home: home) {
+                FileLog.write("重载前 GEO / ASN 数据检查失败：\(geoError.localizedDescription)")
+                completionHandler?(Self.reloadResponse(error: geoError.localizedDescription))
+                return
+            }
+
+            FileLog.write("调用 MihomoReloadConfig（config=\(configYAML.count) 字节）…")
+            var reloadError: NSError?
+            let ok = MihomoReloadConfig(Int(fd), configYAML, input.settings, &reloadError)
+            guard ok else {
+                let message = reloadError?.localizedDescription ?? "mihomo 重载失败（未知错误）"
+                FileLog.write("MihomoReloadConfig 失败：\(message)")
+                completionHandler?(Self.reloadResponse(error: message))
+                return
+            }
+
+            // 只有应用成功才更新系统重连使用的缓存，避免坏配置污染下一次启动。
+            let configPath = (home as NSString).appendingPathComponent("config.yaml")
+            let settingsPath = (home as NSString).appendingPathComponent("settings.json")
+            do {
+                try configYAML.write(toFile: configPath, atomically: true, encoding: .utf8)
+                try input.settings.write(toFile: settingsPath, atomically: true, encoding: .utf8)
+            } catch {
+                FileLog.write("配置已重载，但更新重连缓存失败：\(error.localizedDescription)")
+            }
+            FileLog.write("配置重载成功")
+            completionHandler?(Self.reloadResponse())
+        }
+    }
+
+    private static func loadReloadInput(transfer: String?,
+                                        token: String?,
+                                        inlineConfig: String?,
+                                        inlineSettings: String?) throws -> (config: String, settings: String) {
+        if transfer == "appGroup" {
+            guard let token, UUID(uuidString: token) != nil,
+                  let container = AppGroup.containerURL else {
+                throw ReloadInputError.unavailableTransfer
+            }
+            let directory = container.appendingPathComponent("ReloadRequests", isDirectory: true)
+            let configURL = directory.appendingPathComponent("\(token).yaml")
+            let settingsURL = directory.appendingPathComponent("\(token).json")
+            defer {
+                try? FileManager.default.removeItem(at: configURL)
+                try? FileManager.default.removeItem(at: settingsURL)
+            }
+            do {
+                return (
+                    try String(contentsOf: configURL, encoding: .utf8),
+                    try String(contentsOf: settingsURL, encoding: .utf8)
+                )
+            } catch {
+                throw ReloadInputError.readFailed(error.localizedDescription)
+            }
+        }
+
+        guard let inlineConfig, let inlineSettings else {
+            throw ReloadInputError.missingPayload
+        }
+        return (inlineConfig, inlineSettings)
+    }
+
+    private static func reloadResponse(error: String? = nil, code: String? = nil) -> Data {
+        var response: [String: Any] = ["ok": error == nil]
+        if let error { response["error"] = error }
+        if let code { response["code"] = code }
+        return (try? JSONSerialization.data(withJSONObject: response)) ?? Data()
+    }
+
+    private enum ReloadInputError: LocalizedError {
+        case unavailableTransfer
+        case missingPayload
+        case readFailed(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .unavailableTransfer:
+                return "App Group 重载通道不可用"
+            case .missingPayload:
+                return "重载配置内容缺失"
+            case .readFailed(let reason):
+                return "读取重载配置失败：\(reason)"
+            }
+        }
+
+        var responseCode: String? {
+            switch self {
+            case .unavailableTransfer, .readFailed:
+                return "reloadTransferUnavailable"
+            case .missingPayload:
+                return nil
+            }
         }
     }
 
@@ -384,8 +545,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                                           home: String) -> NSError? {
         let data = settingsJSON.data(using: .utf8) ?? Data()
         let settings = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
-        let geoEnabled = (settings["geoEnabled"] as? Bool) == true
-        let geodataMode = (settings["geodataMode"] as? Bool) ?? false
+        let geoEnabled = (settings["geoEnabled"] as? Bool) ?? true
+        let geodataMode = (settings["geodataMode"] as? Bool) ?? true
         var required = geoEnabled
             ? [geodataMode ? "GeoIP.dat" : "geoip.metadb", "GeoSite.dat"]
             : []

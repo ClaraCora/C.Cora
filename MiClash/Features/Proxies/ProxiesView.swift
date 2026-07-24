@@ -7,6 +7,9 @@ struct ProxiesView: View {
     @StateObject private var controller = ProxyController()
     @State private var expanded: Set<String> = []
     @State private var searchText = ""
+    @State private var showingReloadConfirmation = false
+    @State private var configurationReloadState = ConfigurationReloadState.idle
+    @State private var configurationReloadFailure: ConfigurationReloadFailure?
 
     var body: some View {
         NavigationStack {
@@ -18,6 +21,26 @@ struct ProxiesView: View {
                             refreshControl
                         }
                     }
+                    if canReloadConfiguration {
+                        ToolbarItem(placement: .topBarTrailing) {
+                            configurationReloadControl
+                        }
+                    }
+                }
+                .confirmationDialog("重载当前配置？",
+                                    isPresented: $showingReloadConfirmation,
+                                    titleVisibility: .visible) {
+                    Button("重载配置") {
+                        Task { await reloadConfiguration() }
+                    }
+                    Button("取消", role: .cancel) {}
+                } message: {
+                    Text("将重新应用「\(configurationName)」，策略组和节点选择可能会更新。")
+                }
+                .alert(item: $configurationReloadFailure) { failure in
+                    Alert(title: Text("重载配置失败"),
+                          message: Text(failure.message),
+                          dismissButton: .default(Text("好")))
                 }
                 .task(id: core.status) {
                     guard canQueryNodes else { return }
@@ -27,6 +50,8 @@ struct ProxiesView: View {
                     guard !active else { return }
                     searchText = ""
                     expanded.removeAll()
+                    showingReloadConfirmation = false
+                    configurationReloadState = .idle
                     controller.resetSession()
                 }
         }
@@ -45,6 +70,10 @@ struct ProxiesView: View {
 
     private var canRefresh: Bool {
         canQueryNodes && controller.mode != "direct"
+    }
+
+    private var canReloadConfiguration: Bool {
+        core.status == .connected
     }
 
     private var showsSearch: Bool {
@@ -83,6 +112,31 @@ struct ProxiesView: View {
         }
     }
 
+    private var configurationReloadControl: some View {
+        Group {
+            switch configurationReloadState {
+            case .reloading:
+                ProgressView()
+                    .controlSize(.small)
+                    .accessibilityLabel("正在重载配置")
+            case .succeeded:
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+                    .accessibilityLabel("配置已重载")
+            case .idle:
+                Button {
+                    showingReloadConfirmation = true
+                } label: {
+                    Image(systemName: "arrow.triangle.2.circlepath")
+                }
+                .disabled(core.isBusy || hasNodeOperationInFlight)
+                .accessibilityLabel("重载当前配置")
+                .help("重载当前配置")
+            }
+        }
+        .frame(width: 44, height: 44)
+    }
+
     private var refreshControl: some View {
         Group {
             if controller.isLoading {
@@ -94,7 +148,9 @@ struct ProxiesView: View {
                 } label: {
                     Image(systemName: "arrow.clockwise")
                 }
+                .disabled(isReloadingConfiguration)
                 .accessibilityLabel("刷新节点")
+                .help("刷新节点")
             }
         }
         .frame(width: 44, height: 44)
@@ -139,7 +195,10 @@ struct ProxiesView: View {
                             currentDelay: controller.delays[result.group.now],
                             canToggle: normalizedSearch.isEmpty,
                             onToggle: { openGroup(result.group.name) },
-                            onTest: { Task { await controller.testGroup(result.group.name) } })
+                            onTest: {
+                                guard !isReloadingConfiguration else { return }
+                                Task { await controller.testGroup(result.group.name) }
+                            })
                         .listRowInsets(EdgeInsets(top: 8, leading: 14, bottom: 8, trailing: 8))
                         .listRowSeparator(.hidden)
 
@@ -162,6 +221,7 @@ struct ProxiesView: View {
                                     delay: controller.delays[item.name],
                                     detail: controller.details[item.name],
                                     onSelect: {
+                                        guard !isReloadingConfiguration else { return }
                                         Task {
                                             await controller.select(
                                                 group: result.group.name,
@@ -238,9 +298,57 @@ struct ProxiesView: View {
     }
 
     private func reload() async {
-        guard canQueryNodes else { return }
+        guard canQueryNodes, !isReloadingConfiguration else { return }
         await controller.load()
     }
+
+    private var isReloadingConfiguration: Bool {
+        configurationReloadState == .reloading
+    }
+
+    private var hasNodeOperationInFlight: Bool {
+        controller.isLoading || !controller.testing.isEmpty || !controller.selecting.isEmpty
+    }
+
+    private var configurationName: String {
+        guard SubscriptionStore.shared.activeYAML != nil else { return "直连配置" }
+        return SubscriptionStore.shared.selected?.name ?? "当前配置"
+    }
+
+    private func reloadConfiguration() async {
+        guard canReloadConfiguration,
+              !isReloadingConfiguration,
+              !hasNodeOperationInFlight else { return }
+        configurationReloadState = .reloading
+        do {
+            try await core.reloadConfiguration()
+            expanded.removeAll()
+            controller.resetSession()
+            await controller.load()
+            configurationReloadState = .succeeded
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
+            if configurationReloadState == .succeeded {
+                configurationReloadState = .idle
+            }
+        } catch {
+            configurationReloadState = .idle
+            configurationReloadFailure = ConfigurationReloadFailure(
+                message: error.localizedDescription)
+            UINotificationFeedbackGenerator().notificationOccurred(.error)
+        }
+    }
+}
+
+private enum ConfigurationReloadState: Equatable {
+    case idle
+    case reloading
+    case succeeded
+}
+
+private struct ConfigurationReloadFailure: Identifiable {
+    let id = UUID()
+    let message: String
 }
 
 private struct DisplayedProxyGroup: Identifiable {

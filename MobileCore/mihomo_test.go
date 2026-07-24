@@ -39,29 +39,36 @@ func mergedMapWithSettings(t *testing.T, input string, settings appSettings) map
 	return m
 }
 
-func TestParseSettingsGeoNegationDefaultAndOverride(t *testing.T) {
+func TestParseSettingsGeoDefaultsAndOverride(t *testing.T) {
 	defaults := parseSettings("")
-	if got := defaults.IgnoreGeoNegation; !got {
-		t.Error("IgnoreGeoNegation default = false, want true")
+	if !defaults.GeoEnabled {
+		t.Error("GeoEnabled default = false, want true")
 	}
-	if defaults.GeodataMode {
-		t.Error("GeodataMode default = true, want false (MMDB)")
+	if !defaults.GeodataMode {
+		t.Error("GeodataMode default = false, want true (GeoIP.dat)")
+	}
+	if defaults.IgnoreGeoNegation {
+		t.Error("IgnoreGeoNegation default = true, want false")
 	}
 	if defaults.GeoMMDBURL == "" || defaults.GeoIPDatURL == "" || defaults.GeoSiteURL == "" {
 		t.Error("default GEO download URLs must not be empty")
 	}
 	custom := parseSettings(`{
-		"ignoreGeoNegation": false,
-		"geodataMode": true,
+		"geoEnabled": false,
+		"ignoreGeoNegation": true,
+		"geodataMode": false,
 		"geoIPDatURL": "https://example.com/GeoIP.dat",
 		"geoMMDBURL": "https://example.com/geoip.metadb",
 		"geoSiteURL": "https://example.com/GeoSite.dat"
 	}`)
-	if custom.IgnoreGeoNegation {
-		t.Error("IgnoreGeoNegation override = true, want false")
+	if custom.GeoEnabled {
+		t.Error("GeoEnabled override = true, want false")
 	}
-	if !custom.GeodataMode {
-		t.Error("GeodataMode override = false, want true")
+	if !custom.IgnoreGeoNegation {
+		t.Error("IgnoreGeoNegation override = false, want true")
+	}
+	if custom.GeodataMode {
+		t.Error("GeodataMode override = true, want false")
 	}
 	if custom.GeoIPDatURL != "https://example.com/GeoIP.dat" ||
 		custom.GeoMMDBURL != "https://example.com/geoip.metadb" ||

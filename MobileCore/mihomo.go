@@ -31,6 +31,7 @@ import (
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/hub/executor"
 	"github.com/metacubex/mihomo/hub/route"
+	"github.com/metacubex/mihomo/listener"
 	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/tunnel"
 	"github.com/metacubex/mihomo/tunnel/statistic"
@@ -50,9 +51,10 @@ const ControllerAddr = "127.0.0.1:9090"
 
 // homeDir 是 mihomo 工作目录（= App Group 容器），run.log 也写在这里。
 var (
-	homeDir      string
-	logCaptureMu sync.Once
-	logFileMu    sync.Mutex
+	homeDir       string
+	logCaptureMu  sync.Once
+	logFileMu     sync.Mutex
+	configApplyMu sync.Mutex
 
 	// 最近一次合并配置时收集的：不适用内容提示 + 各节点协议摘要（供主 App 经 IPC 取用）。
 	configNotices   []string
@@ -184,7 +186,8 @@ type appSettings struct {
 // parseSettings 解析设置 JSON，缺省值兜底（与主 App SettingsStore 默认一致）。
 func parseSettings(settingsJSON string) appSettings {
 	s := appSettings{Stack: "gvisor", LogLevel: "info", ControllerPort: 9090,
-		GeoLoader: "memconservative", IgnoreGeoNegation: true, GeoUpdateInterval: 24,
+		GeoEnabled: true, GeoLoader: "memconservative", GeodataMode: true,
+		IgnoreGeoNegation: false, GeoUpdateInterval: 24,
 		GeoIPDatURL: "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat",
 		GeoMMDBURL:  "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb",
 		GeoSiteURL:  "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat"}
@@ -304,6 +307,8 @@ func StartWithConfig(fd int, configYAML string, settingsJSON string) (err error)
 			err = fmt.Errorf("mihomo panic: %v", r)
 		}
 	}()
+	configApplyMu.Lock()
+	defer configApplyMu.Unlock()
 
 	resetError := resetRunLog()
 	st := parseSettings(settingsJSON)
@@ -314,15 +319,61 @@ func StartWithConfig(fd int, configYAML string, settingsJSON string) (err error)
 		appendRunLog("run.log 重置失败: " + resetError.Error())
 	}
 
+	if err := applyRuntimeConfig(fd, configYAML, st, "启动", false); err != nil {
+		return err
+	}
+	configureController(configYAML, st, true)
+	return nil
+}
+
+// ReloadConfig 在当前 utun 上重新合并并应用主 App 下发的配置。
+// 与 StartWithConfig 共用同一条 iOS 配置处理路径，但不会清空现有日志或重复下载 Web UI。
+func ReloadConfig(fd int, configYAML string, settingsJSON string) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			stack := fmt.Sprintf("panic: %v\n%s", r, debug.Stack())
+			appendRunLog("===== mihomo 重载 panic =====\n" + stack)
+			err = fmt.Errorf("mihomo reload panic: %v", r)
+		}
+	}()
+	configApplyMu.Lock()
+	defer configApplyMu.Unlock()
+
+	st := parseSettings(settingsJSON)
+	appendRunLog(fmt.Sprintf("ReloadConfig: fd=%d stack=%s ipv6=%v geo=%v(mode=%v,%s,ignoreNegation=%v) log=%s port=%d",
+		fd, st.Stack, st.IPv6, st.GeoEnabled, st.GeodataMode, st.GeoLoader,
+		st.IgnoreGeoNegation, st.LogLevel, st.ControllerPort))
+	if err := applyRuntimeConfig(fd, configYAML, st, "重载", true); err != nil {
+		return err
+	}
+	configureController(configYAML, st, false)
+	appendRunLog("配置重载完成")
+	return nil
+}
+
+func applyRuntimeConfig(fd int, configYAML string, st appSettings, operation string, preserveTun bool) (err error) {
+	previousNotices := append([]string(nil), configNotices...)
+	previousDetails := make(map[string]string, len(proxyDetailsMap))
+	for name, detail := range proxyDetailsMap {
+		previousDetails[name] = detail
+	}
+	applied := false
+	defer func() {
+		if !applied {
+			configNotices = previousNotices
+			proxyDetailsMap = previousDetails
+		}
+	}()
+
 	merged, err := mergeConfig(configYAML, st)
 	if err != nil {
-		appendRunLog("合并配置失败: " + err.Error())
+		appendRunLog(operation + "合并配置失败: " + err.Error())
 		return err
 	}
 
 	rawCfg, err := config.UnmarshalRawConfig(merged)
 	if err != nil {
-		appendRunLog("UnmarshalRawConfig 失败: " + err.Error())
+		appendRunLog(operation + " UnmarshalRawConfig 失败: " + err.Error())
 		return err
 	}
 	rawCfg.Tun.Enable = true
@@ -336,15 +387,27 @@ func StartWithConfig(fd int, configYAML string, settingsJSON string) (err error)
 
 	cfg, err := config.ParseRawConfig(rawCfg)
 	if err != nil {
-		appendRunLog("ParseRawConfig 失败: " + err.Error())
+		appendRunLog(operation + " ParseRawConfig 失败: " + err.Error())
 		return err
 	}
+	if preserveTun {
+		if !listener.LastTunConf.Enable || listener.LastTunConf.FileDescriptor == 0 {
+			return fmt.Errorf("当前 TUN 配置不可用，请重新连接 VPN")
+		}
+		// 热重载不能让 ReCreateTun 关闭 iOS 交给扩展的原始 utun fd。
+		// 固定为当前运行配置后，mihomo 会命中 Tun.OnReload，仅更新其余组件。
+		cfg.General.Tun = listener.LastTunConf
+	}
 
-	appendRunLog("ParseRawConfig 成功，开始 ApplyConfig")
+	appendRunLog(operation + " ParseRawConfig 成功，开始 ApplyConfig")
 	executor.ApplyConfig(cfg, true)
-	appendRunLog("ApplyConfig 返回，内核已启动")
+	applied = true
+	appendRunLog(operation + " ApplyConfig 返回")
+	return nil
+}
 
-	// 起 external-controller（executor.ApplyConfig 不会自动起，ReCreate 可重复调用）。
+// configureController 让主 App 的控制接口跟随当前设置。首次启动才触发 Web UI 下载检查。
+func configureController(configYAML string, st appSettings, downloadUI bool) {
 	host := "127.0.0.1"
 	if st.AllowLan {
 		host = "0.0.0.0"
@@ -379,6 +442,10 @@ func StartWithConfig(fd int, configYAML string, settingsJSON string) (err error)
 	appendRunLog(fmt.Sprintf("external-controller 已启动: %s (UI: /ui, %s)", addr,
 		map[bool]string{true: "默认 zashboard", false: "配置指定"}[usingDefault]))
 
+	if !downloadUI {
+		return
+	}
+
 	// 后台下载面板到 ui 目录（空才下，已有则跳过）。best-effort，失败不影响代理。
 	go func() {
 		defer func() {
@@ -389,7 +456,6 @@ func StartWithConfig(fd int, configYAML string, settingsJSON string) (err error)
 		updater.NewUiUpdater(externalUI, externalUIURL, uiCfg.ExternalUIName).AutoDownloadUI()
 		appendRunLog("webui 就绪: /ui/")
 	}()
-	return nil
 }
 
 // mergeConfig 把订阅 YAML 与 iOS 必需设置 + 用户设置合并。
@@ -602,6 +668,8 @@ func summarizeProxy(p map[string]any) string {
 // ConfigNotices 返回最近一次合并配置时的不适用内容提示（JSON 字符串数组）。
 // 对应 Swift 侧 `MihomoConfigNotices()`。
 func ConfigNotices() string {
+	configApplyMu.Lock()
+	defer configApplyMu.Unlock()
 	out, err := json.Marshal(configNotices)
 	if err != nil {
 		return "[]"
@@ -611,6 +679,8 @@ func ConfigNotices() string {
 
 // ProxyDetails 返回 {节点名: 协议摘要} 的 JSON。对应 Swift 侧 `MihomoProxyDetails()`。
 func ProxyDetails() string {
+	configApplyMu.Lock()
+	defer configApplyMu.Unlock()
 	out, err := json.Marshal(proxyDetailsMap)
 	if err != nil {
 		return "{}"
@@ -882,6 +952,8 @@ func SetDefaultInterface(name string) {
 
 // Stop 关闭内核与所有监听器。对应 Swift 侧 `MihomoStop()`。
 func Stop() {
+	configApplyMu.Lock()
+	defer configApplyMu.Unlock()
 	appendRunLog("Stop: 关闭内核")
 	executor.Shutdown()
 }

@@ -13,7 +13,7 @@ final class SettingsStore: ObservableObject {
     /// TCP/IP 栈：gvisor / system / mixed。iOS NE 强烈建议 gvisor（system 栈 TCP 常走不通）。
     @Published var stack: String { didSet { d.set(stack, forKey: K.stack) } }
     @Published var ipv6: Bool { didSet { d.set(ipv6, forKey: K.ipv6) } }
-    /// 启用 geo 规则（默认关=剔除 GEOIP/GEOSITE 防 NE OOM）。开启则保留规则并按下列 geo 设置加载。
+    /// 启用 geo 规则（默认开启）。关闭时剔除 GEOIP/GEOSITE 规则。
     @Published var geoEnabled: Bool { didSet { d.set(geoEnabled, forKey: K.geoEnabled) } }
     /// geo 加载器：standard / memconservative（小内存优化，NE 推荐）。
     @Published var geoLoader: String { didSet { d.set(geoLoader, forKey: K.geoLoader) } }
@@ -92,13 +92,13 @@ final class SettingsStore: ObservableObject {
     private init() {
         stack = d.string(forKey: K.stack) ?? "gvisor"
         ipv6 = d.object(forKey: K.ipv6) as? Bool ?? false
-        geoEnabled = d.object(forKey: K.geoEnabled) as? Bool ?? false
+        geoEnabled = d.object(forKey: K.geoEnabled) as? Bool ?? true
         geoLoader = d.string(forKey: K.geoLoader) ?? "memconservative"
-        geodataMode = d.object(forKey: K.geodataMode) as? Bool ?? false
+        geodataMode = d.object(forKey: K.geodataMode) as? Bool ?? true
         geoIPDatURL = d.string(forKey: K.geoIPDatURL) ?? Self.defaultGeoIPDatURL
         geoMMDBURL = d.string(forKey: K.geoMMDBURL) ?? Self.defaultGeoMMDBURL
         geoSiteURL = d.string(forKey: K.geoSiteURL) ?? Self.defaultGeoSiteURL
-        ignoreGeoNegation = d.object(forKey: K.ignoreGeoNegation) as? Bool ?? true
+        ignoreGeoNegation = d.object(forKey: K.ignoreGeoNegation) as? Bool ?? false
         geoAutoUpdate = d.object(forKey: K.geoAuto) as? Bool ?? false
         let gi = d.integer(forKey: K.geoInterval)
         geoUpdateInterval = gi == 0 ? 24 : gi
