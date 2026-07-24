@@ -458,8 +458,8 @@ dns:
 	if got := dns["cache-max-size"]; got != 512 {
 		t.Errorf("dns.cache-max-size = %v, want 512", got)
 	}
-	if got := dns["enhanced-mode"]; got != "fake-ip" {
-		t.Errorf("dns.enhanced-mode = %v, want forced fake-ip", got)
+	if got := dns["enhanced-mode"]; got != "redir-host" {
+		t.Errorf("dns.enhanced-mode = %v, want subscription redir-host preserved", got)
 	}
 	nameserver, ok := dns["nameserver"].([]any)
 	if !ok || len(nameserver) != 1 || nameserver[0] != "https://dns.google/dns-query#Proxy" {
@@ -490,6 +490,9 @@ func TestMergeConfigSubscriptionDefaults(t *testing.T) {
 		t.Errorf("profile.store-selected = %v, want true", got)
 	}
 	dns := nestedMap(t, m, "dns")
+	if got, exists := dns["enhanced-mode"]; exists {
+		t.Errorf("dns.enhanced-mode = %v, want omitted so Mihomo uses its default", got)
+	}
 	nameserver, ok := dns["nameserver"].([]any)
 	if !ok || len(nameserver) != 2 || nameserver[0] != "https://223.5.5.5/dns-query" ||
 		nameserver[1] != "https://1.1.1.1/dns-query" {
@@ -499,6 +502,18 @@ func TestMergeConfigSubscriptionDefaults(t *testing.T) {
 	m = mergedMap(t, "mode: global\n")
 	if got := m["mode"]; got != "global" {
 		t.Errorf("mode = %v, want global", got)
+	}
+}
+
+func TestMergeConfigPreservesDNSEnhancedMode(t *testing.T) {
+	for _, mode := range []string{"fake-ip", "redir-host"} {
+		t.Run(mode, func(t *testing.T) {
+			m := mergedMap(t, "dns:\n  enhanced-mode: "+mode+"\n")
+			dns := nestedMap(t, m, "dns")
+			if got := dns["enhanced-mode"]; got != mode {
+				t.Errorf("dns.enhanced-mode = %v, want %s preserved", got, mode)
+			}
+		})
 	}
 }
 

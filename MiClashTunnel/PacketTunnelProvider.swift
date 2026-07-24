@@ -516,7 +516,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         ipv4.includedRoutes = [NEIPv4Route.default()]
         settings.ipv4Settings = ipv4
 
-        // DNS：指向 mihomo 的 fake-ip 网关，matchDomains=[""] 强制所有查询进 tunnel
+        // DNS：指向 mihomo 的隧道 DNS 网关，matchDomains=[""] 强制所有查询进 tunnel
         let dns = NEDNSSettings(servers: [MihomoConfig.dnsServerIP])
         dns.matchDomains = [""]
         dns.matchDomainsNoSearch = true

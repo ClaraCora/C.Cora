@@ -522,7 +522,7 @@ func configureController(configYAML string, st appSettings, downloadUI bool) {
 }
 
 // mergeConfig 把订阅 YAML 与 iOS 必需设置 + 用户设置合并。
-// 强制 tun/dns（tun 必须 fake-ip 才通），其余按设置：栈、ipv6、日志等级、是否剔 geo。
+// 强制 iOS TUN 与 DNS 接管所需参数；DNS enhanced-mode 保留配置值，未配置时使用 Mihomo 默认值。
 // fd 不在此写入（运行期值）；MTU 优先使用配置值，缺省时使用 iOS utun 的实际值。
 func mergeConfig(subYAML string, st appSettings, tunnelMTU int) ([]byte, error) {
 	m := map[string]any{}
@@ -560,15 +560,15 @@ func mergeConfig(subYAML string, st appSettings, tunnelMTU int) ([]byte, error) 
 		}
 	}
 	m["tun"] = tunCfg
-	// 保留订阅中的 nameserver、nameserver-policy 等 DNS 配置，只覆盖 iOS tun
-	// 必须固定的工作模式。配置未提供 nameserver 时才使用纯 IP DoH 兜底。
+	// 保留订阅中的 enhanced-mode、nameserver、nameserver-policy 等 DNS 配置。
+	// fake-ip-range 同时决定 Mihomo 内部 TUN 地址，必须与 iOS 固定的 198.18.0.x 网段一致；
+	// 配置未提供 nameserver 时才使用纯 IP DoH 兜底。
 	dnsCfg, _ := m["dns"].(map[string]any)
 	if dnsCfg == nil {
 		dnsCfg = map[string]any{}
 	}
 	dnsCfg["enable"] = true
 	dnsCfg["ipv6"] = st.IPv6
-	dnsCfg["enhanced-mode"] = "fake-ip"
 	dnsCfg["fake-ip-range"] = "198.18.0.1/16"
 	dnsCfg["cache-max-size"] = 512
 	rawNameservers, hasNameservers := dnsCfg["nameserver"]
