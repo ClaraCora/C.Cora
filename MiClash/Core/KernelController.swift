@@ -21,49 +21,65 @@ final class KernelController: ObservableObject {
     }
 
     /// 一条速率采样（用于曲线图）。
-    struct TrafficSample: Identifiable {
+    struct TrafficSample: Identifiable, Equatable {
         let id: Int        // 单调递增序号，作 x 轴
         let up: Int64
         let down: Int64
     }
 
+    struct RuntimeSnapshot: Equatable {
+        let up: Int64
+        let down: Int64
+        let samples: [TrafficSample]
+
+        static let empty = RuntimeSnapshot(up: 0, down: 0, samples: [])
+    }
+
     @Published var mode: Mode = .rule
-    @Published var up: Int64 = 0
-    @Published var down: Int64 = 0
-    @Published var reachable = false
+    @Published private(set) var runtime = RuntimeSnapshot.empty
+    @Published private(set) var reachable = false
     /// Packet Tunnel Extension 进程的物理内存占用（task_vm_info.phys_footprint，字节）。
     @Published private(set) var memoryFootprint: Int64?
     /// 最近若干秒的速率采样（曲线图数据）。
-    @Published private(set) var samples: [TrafficSample] = []
+    var up: Int64 { runtime.up }
+    var down: Int64 { runtime.down }
+    var samples: [TrafficSample] { runtime.samples }
 
     private var trafficTask: Task<Void, Never>?
     private var memoryTask: Task<Void, Never>?
+    private var modeTask: Task<Void, Never>?
     private var sampleIndex = 0
     private let maxSamples = 60
 
     /// 连接建立后调用：读模式 + 开始速率/内存采样。
     func start() {
-        Task { await loadMode() }
+        guard trafficTask == nil, memoryTask == nil else { return }
+        modeTask = Task { [weak self] in await self?.loadMode() }
         startTraffic()
         startMemoryPolling()
     }
 
     /// 断开后调用：停止采样。
     func stop() {
+        modeTask?.cancel()
+        modeTask = nil
         stopTraffic()
         stopMemoryPolling()
+        setReachable(false)
     }
 
     /// 读取当前模式（IPC getMode，连通即标记 reachable）。
     func loadMode() async {
         let result = await CoreStateManager.shared.sendMessage(["cmd": "getMode"])
+        guard !Task.isCancelled else { return }
         switch result {
         case .ok(let data):
             let m = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            mode = Mode(rawValue: m) ?? .rule
-            reachable = true
+            let loadedMode = Mode(rawValue: m) ?? .rule
+            if mode != loadedMode { mode = loadedMode }
+            setReachable(true)
         case .failure:
-            reachable = false
+            setReachable(false)
         }
     }
 
@@ -81,16 +97,15 @@ final class KernelController: ObservableObject {
         trafficTask = Task { [weak self] in
             while !Task.isCancelled {
                 let result = await CoreStateManager.shared.sendMessage(["cmd": "traffic"])
+                guard !Task.isCancelled else { return }
                 if case .ok(let data) = result,
                    let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
                     let u = (obj["up"] as? NSNumber)?.int64Value ?? 0
                     let d = (obj["down"] as? NSNumber)?.int64Value ?? 0
-                    self?.up = u
-                    self?.down = d
                     self?.pushSample(up: u, down: d)
-                    self?.reachable = true
+                    self?.setReachable(true)
                 } else {
-                    self?.reachable = false
+                    self?.setReachable(false)
                 }
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
             }
@@ -101,9 +116,7 @@ final class KernelController: ObservableObject {
     func stopTraffic() {
         trafficTask?.cancel()
         trafficTask = nil
-        up = 0
-        down = 0
-        samples.removeAll()
+        if runtime != .empty { runtime = .empty }
         sampleIndex = 0
     }
 
@@ -120,9 +133,11 @@ final class KernelController: ObservableObject {
                    let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
                    let footprint = (obj["physFootprint"] as? NSNumber)?.int64Value,
                    footprint > 0 {
-                    self?.memoryFootprint = footprint
+                    if let self, self.memoryFootprint != footprint {
+                        self.memoryFootprint = footprint
+                    }
                 } else {
-                    self?.memoryFootprint = nil
+                    if let self, self.memoryFootprint != nil { self.memoryFootprint = nil }
                 }
                 try? await Task.sleep(nanoseconds: 5_000_000_000)
             }
@@ -132,12 +147,20 @@ final class KernelController: ObservableObject {
     private func stopMemoryPolling() {
         memoryTask?.cancel()
         memoryTask = nil
-        memoryFootprint = nil
+        if memoryFootprint != nil { memoryFootprint = nil }
     }
 
     private func pushSample(up: Int64, down: Int64) {
-        samples.append(TrafficSample(id: sampleIndex, up: up, down: down))
+        var updatedSamples = runtime.samples
+        updatedSamples.append(TrafficSample(id: sampleIndex, up: up, down: down))
         sampleIndex += 1
-        if samples.count > maxSamples { samples.removeFirst(samples.count - maxSamples) }
+        if updatedSamples.count > maxSamples {
+            updatedSamples.removeFirst(updatedSamples.count - maxSamples)
+        }
+        runtime = RuntimeSnapshot(up: up, down: down, samples: updatedSamples)
+    }
+
+    private func setReachable(_ value: Bool) {
+        if reachable != value { reachable = value }
     }
 }

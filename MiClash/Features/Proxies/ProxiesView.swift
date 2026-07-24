@@ -133,7 +133,6 @@ struct ProxiesView: View {
         .listStyle(.insetGrouped)
         .listSectionSpacing(6)
         .refreshable { await reload() }
-        .animation(.easeInOut(duration: 0.18), value: expanded)
     }
 
     private var normalizedSearch: String {
@@ -170,12 +169,10 @@ struct ProxiesView: View {
 
     private func toggle(_ name: String) {
         guard normalizedSearch.isEmpty else { return }
-        withAnimation(.easeInOut(duration: 0.18)) {
-            if expanded.contains(name) {
-                expanded.remove(name)
-            } else {
-                expanded.insert(name)
-            }
+        if expanded.contains(name) {
+            expanded.remove(name)
+        } else {
+            expanded.insert(name)
         }
     }
 
@@ -221,6 +218,7 @@ private struct GroupHeaderRow: View {
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(.tertiary)
                         .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                        .animation(.easeInOut(duration: 0.16), value: isExpanded)
                 }
                 .contentShape(Rectangle())
             }
@@ -281,10 +279,6 @@ private struct GroupIcon: View {
     }
 
     private func load(_ url: URL) async {
-        if let hit = IconCache.shared.cached(url) {
-            image = hit
-            return
-        }
         if let loaded = await IconCache.shared.load(url) {
             image = loaded
         } else {

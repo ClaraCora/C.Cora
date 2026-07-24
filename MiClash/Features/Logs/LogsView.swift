@@ -1,7 +1,7 @@
 import SwiftUI
+import UIKit
 
-/// 日志页：实时显示 mihomo 内核日志（external-controller /logs 流）。
-/// 顶部可切过滤级别；右下悬浮按钮可暂停/恢复自动滚动并随时跳到最新。
+/// 实时内核日志。断开后继续显示上一会话，直到用户清空或下一次连接开始。
 struct LogsView: View {
     @EnvironmentObject private var core: CoreStateManager
     @EnvironmentObject private var controller: LogStreamController
@@ -10,138 +10,193 @@ struct LogsView: View {
 
     var body: some View {
         NavigationStack {
-            Group {
-                if !core.isActive {
-                    ContentUnavailableView("未连接",
-                        systemImage: "doc.text.magnifyingglass",
-                        description: Text("先连接 VPN 才能查看内核日志"))
-                } else if let err = controller.error, controller.lines.isEmpty {
-                    ContentUnavailableView("暂无日志", systemImage: "doc.text",
-                        description: Text(err))
-                } else {
-                    logList
-                }
-            }
-            .navigationTitle("日志")
-            .searchable(text: $controller.searchText, placement: .navigationBarDrawer(displayMode: .always), prompt: "搜索日志")
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Menu {
-                        Picker("级别", selection: Binding(
-                            get: { controller.level },
-                            set: { controller.setLevel($0) }
-                        )) {
-                            ForEach(SettingsStore.logLevelOptions, id: \.self) { Text($0).tag($0) }
+            content
+                .navigationTitle("日志")
+                .searchable(text: $controller.searchText,
+                            placement: .navigationBarDrawer(displayMode: .always),
+                            prompt: "搜索日志")
+                .toolbar {
+                    ToolbarItem(placement: .topBarLeading) {
+                        levelMenu
+                    }
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button { controller.clear() } label: {
+                            Image(systemName: "trash")
                         }
-                    } label: {
-                        Label(controller.level, systemImage: "line.3.horizontal.decrease.circle")
-                            .font(.subheadline)
+                        .disabled(!controller.hasBufferedLines)
+                        .accessibilityLabel("清空日志")
                     }
                 }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button { controller.clear() } label: { Image(systemName: "trash") }
-                        .disabled(controller.lines.isEmpty)
+        }
+    }
+
+    @ViewBuilder private var content: some View {
+        if !controller.lines.isEmpty {
+            VStack(spacing: 0) {
+                if !controller.isStreaming || controller.isAwaitingNewSession {
+                    previousSessionHeader
+                }
+                logList
+            }
+        } else if controller.hasBufferedLines {
+            VStack(spacing: 0) {
+                if !controller.isStreaming || controller.isAwaitingNewSession {
+                    previousSessionHeader
+                }
+                if controller.searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    ContentUnavailableView("当前级别无日志",
+                                           systemImage: "line.3.horizontal.decrease.circle")
+                } else {
+                    ContentUnavailableView.search(text: controller.searchText)
                 }
             }
+        } else if core.isActive && controller.error == nil {
+            ProgressView("等待内核日志…")
+        } else if let error = controller.error {
+            ContentUnavailableView("暂无日志", systemImage: "doc.text",
+                                   description: Text(error))
+        } else {
+            ContentUnavailableView("暂无日志", systemImage: "doc.text.magnifyingglass")
         }
+    }
+
+    private var levelMenu: some View {
+        Menu {
+            Picker("级别", selection: Binding(
+                get: { controller.level },
+                set: { controller.setLevel($0) }
+            )) {
+                ForEach(SettingsStore.logLevelOptions, id: \.self) {
+                    Text($0.uppercased()).tag($0)
+                }
+            }
+        } label: {
+            Label(controller.level.uppercased(), systemImage: "line.3.horizontal.decrease.circle")
+                .font(.subheadline)
+        }
+    }
+
+    private var previousSessionHeader: some View {
+        HStack(spacing: 7) {
+            Image(systemName: "clock.arrow.circlepath")
+            Text("上次连接")
+                .fontWeight(.medium)
+            Spacer()
+            Text("\(controller.bufferedLineCount) 条")
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+        }
+        .font(.caption)
+        .padding(.horizontal, 16)
+        .frame(height: 34)
+        .background(.thinMaterial)
+        .accessibilityElement(children: .combine)
     }
 
     private var logList: some View {
         ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 8) {
-                    ForEach(controller.lines) { line in
-                        LogRow(line: line)
-                            .id(line.id)
-                    }
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 10)
+            List(controller.lines) { line in
+                LogRow(line: line)
+                    .id(line.id)
+                    .listRowInsets(EdgeInsets(top: 6, leading: 14, bottom: 6, trailing: 12))
+                    .listRowSeparator(.hidden)
             }
-            .scrollIndicators(.visible)
+            .listStyle(.plain)
             .overlay(alignment: .bottomTrailing) {
                 scrollControl(proxy)
             }
-            .onChange(of: controller.lines.count) { _, _ in
-                guard autoScroll, let last = controller.lines.last else { return }
-                withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo(last.id, anchor: .bottom) }
+            .onScrollPhaseChange { _, phase in
+                if phase.isScrolling && phase != .animating {
+                    autoScroll = false
+                }
+            }
+            .onChange(of: controller.lines.last?.id) { _, id in
+                guard autoScroll, let id else { return }
+                proxy.scrollTo(id, anchor: .bottom)
             }
             .onAppear {
-                if let last = controller.lines.last { proxy.scrollTo(last.id, anchor: .bottom) }
+                if let last = controller.lines.last {
+                    proxy.scrollTo(last.id, anchor: .bottom)
+                }
             }
         }
     }
 
-    /// 暂停/恢复自动滚动 + 跳到最新。
     private func scrollControl(_ proxy: ScrollViewProxy) -> some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 8) {
             if !autoScroll {
                 Button {
-                    if let last = controller.lines.last {
-                        withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                    guard let last = controller.lines.last else { return }
+                    withAnimation(.easeOut(duration: 0.18)) {
+                        proxy.scrollTo(last.id, anchor: .bottom)
                     }
                 } label: {
                     Image(systemName: "arrow.down.to.line")
-                        .font(.system(size: 16, weight: .semibold))
-                        .padding(12)
+                        .frame(width: 38, height: 38)
                         .background(.ultraThinMaterial, in: Circle())
                 }
+                .accessibilityLabel("跳到最新日志")
             }
+
             Button {
                 autoScroll.toggle()
                 if autoScroll, let last = controller.lines.last {
-                    withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                    proxy.scrollTo(last.id, anchor: .bottom)
                 }
             } label: {
                 Image(systemName: autoScroll ? "pause.fill" : "play.fill")
-                    .font(.system(size: 16, weight: .semibold))
                     .foregroundStyle(.white)
-                    .padding(14)
+                    .frame(width: 40, height: 40)
                     .background(autoScroll ? Color.orange : Color.green, in: Circle())
-                    .shadow(color: .black.opacity(0.2), radius: 6, y: 3)
             }
+            .accessibilityLabel(autoScroll ? "暂停自动滚动" : "恢复自动滚动")
         }
-        .padding(.trailing, 16)
-        .padding(.bottom, 16)
+        .padding(.trailing, 14)
+        .padding(.bottom, 12)
     }
 }
 
-/// 单条日志：级别色块 + 时间 + 正文。
+/// 轻量控制台行：避免每条日志的卡片、阴影和全文选择参与滚动布局。
 private struct LogRow: View {
     let line: LogLine
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            Text(line.type.uppercased())
-                .font(.system(size: 9, weight: .bold, design: .monospaced))
-                .foregroundStyle(.white)
-                .frame(width: 52)
-                .padding(.vertical, 3)
-                .background(levelColor, in: RoundedRectangle(cornerRadius: 5, style: .continuous))
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            RoundedRectangle(cornerRadius: 1)
+                .fill(levelColor)
+                .frame(width: 3, height: 15)
 
-            VStack(alignment: .leading, spacing: 2) {
-                Text(line.payload)
-                    .font(.system(.caption, design: .monospaced))
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
-                Text(line.time, format: .dateTime.hour().minute().second())
-                    .font(.system(size: 9, design: .monospaced))
-                    .foregroundStyle(.tertiary)
-            }
-            Spacer(minLength: 0)
+            Text(line.time, format: .dateTime.hour().minute().second())
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.tertiary)
+                .frame(width: 54, alignment: .leading)
+
+            Text(line.type.uppercased())
+                .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                .foregroundStyle(levelColor)
+                .frame(width: 48, alignment: .leading)
+
+            Text(line.payload)
+                .font(.system(.caption, design: .monospaced))
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(10)
-        .background(Color(uiColor: .secondarySystemGroupedBackground),
-                    in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .contentShape(Rectangle())
+        .contextMenu {
+            Button {
+                UIPasteboard.general.string = line.payload
+            } label: {
+                Label("复制日志", systemImage: "doc.on.doc")
+            }
+        }
+        .accessibilityElement(children: .combine)
     }
 
     private var levelColor: Color {
         switch line.type.lowercased() {
-        case "error":             return .red
-        case "warning", "warn":   return .orange
-        case "debug":             return .gray
-        default:                  return .blue
+        case "error": return .red
+        case "warning", "warn": return .orange
+        case "debug": return .gray
+        default: return .blue
         }
     }
 }

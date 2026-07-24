@@ -143,9 +143,11 @@ final class ProxyController: ObservableObject {
                 self.error = "测速失败：\(err)"
                 return
             }
+            var updated = delays
             for (node, ms) in dict {
-                if let v = (ms as? NSNumber)?.intValue { delays[node] = v }
+                if let value = (ms as? NSNumber)?.intValue { updated[node] = value }
             }
+            delays = updated
         case .failure(let reason):
             self.error = "测速失败：\(reason)"
         }

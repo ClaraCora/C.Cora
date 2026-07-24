@@ -93,6 +93,23 @@ private struct ConnectionCard: View {
             }
             .pickerStyle(.segmented)
             .disabled(!core.isActive)
+
+            Divider()
+
+            NavigationLink {
+                ConnectionsView()
+            } label: {
+                HStack {
+                    Label("活动连接", systemImage: "arrow.left.arrow.right.circle")
+                        .font(.subheadline.weight(.medium))
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.tertiary)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
         }
         .padding(16)
         .background(
@@ -197,21 +214,21 @@ private struct TrafficChart: View {
 
     var body: some View {
         Chart {
-            ForEach(Array(samples.enumerated()), id: \.element.id) { idx, s in
-                AreaMark(x: .value("t", idx), y: .value("速率", Double(s.down)))
+            ForEach(samples) { s in
+                AreaMark(x: .value("t", s.id), y: .value("速率", Double(s.down)))
                     .foregroundStyle(.blue.opacity(0.1))
                     .interpolationMethod(.catmullRom)
-                LineMark(x: .value("t", idx), y: .value("速率", Double(s.down)),
+                LineMark(x: .value("t", s.id), y: .value("速率", Double(s.down)),
                          series: .value("方向", "下行"))
                     .foregroundStyle(.blue)
                     .interpolationMethod(.catmullRom)
-                LineMark(x: .value("t", idx), y: .value("速率", Double(s.up)),
+                LineMark(x: .value("t", s.id), y: .value("速率", Double(s.up)),
                          series: .value("方向", "上行"))
                     .foregroundStyle(.orange)
                     .interpolationMethod(.catmullRom)
             }
         }
-        .chartXScale(domain: 0...Double(max(samples.count - 1, 1)))
+        .chartXScale(domain: xDomain)
         .chartXAxis(.hidden)
         .chartYAxis {
             AxisMarks(values: .automatic(desiredCount: 3)) { value in
@@ -227,5 +244,10 @@ private struct TrafficChart: View {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .fill(Color(uiColor: .secondarySystemGroupedBackground))
         )
+    }
+
+    private var xDomain: ClosedRange<Int> {
+        let first = samples.first?.id ?? 0
+        return first...max(samples.last?.id ?? 1, first + 1)
     }
 }

@@ -89,6 +89,25 @@ enum MihomoAPI {
         return (down, up)
     }
 
+    /// 当前活动连接快照。非 actor 隔离的 API 方法不会占用主线程执行解码。
+    static func connectionsSnapshot() async throws -> ConnectionsSnapshot {
+        let (data, resp) = try await session.data(for: makeRequest(path: "connections"))
+        try check(resp)
+        return try JSONDecoder().decode(ConnectionsSnapshot.self, from: data)
+    }
+
+    static func closeConnection(id: String) async throws {
+        let (_, resp) = try await session.data(
+            for: makeRequest(path: "connections/\(id)", method: "DELETE"))
+        try check(resp)
+    }
+
+    static func closeAllConnections() async throws {
+        let (_, resp) = try await session.data(
+            for: makeRequest(path: "connections", method: "DELETE"))
+        try check(resp)
+    }
+
     static func currentMode() async throws -> String {
         let (data, resp) = try await session.data(for: makeRequest(path: "configs"))
         try check(resp)

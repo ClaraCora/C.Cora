@@ -8,16 +8,24 @@ final class LogFileTailer: @unchecked Sendable {
 
     private let url: URL
     private var offset: UInt64 = 0
+    private var prefix = Data()
+    private var expectingReset = false
     private var timer: DispatchSourceTimer?
     private let queue = DispatchQueue(label: "com.miclash.logtail", qos: .utility)
 
     /// 新解析出的日志行（在后台队列回调，调用方自行切主线程）。
-    var onLines: (([LogLine]) -> Void)?
+    var onLines: (([LogLine], _ fileWasReset: Bool) -> Void)?
 
     init(url: URL) { self.url = url }
 
-    func start() {
+    func start(expectFileReset: Bool = false) {
         offset = 0
+        prefix.removeAll()
+        expectingReset = expectFileReset
+        if expectFileReset {
+            // 连接状态先于 NE 启动变为 connecting；记录旧文件末尾，等待新会话截断。
+            queue.sync { captureBaseline() }
+        }
         let t = DispatchSource.makeTimerSource(queue: queue)
         t.schedule(deadline: .now(), repeating: .milliseconds(800))
         t.setEventHandler { [weak self] in self?.poll() }
@@ -25,9 +33,13 @@ final class LogFileTailer: @unchecked Sendable {
         t.resume()
     }
 
-    func stop() {
+    func stop(flushRemaining: Bool = false) {
         timer?.cancel()
         timer = nil
+        if flushRemaining {
+            // 队列串行，若定时 poll 已入队也不会重复读取同一偏移。
+            queue.async { [self] in poll() }
+        }
     }
 
     private func poll() {
@@ -35,18 +47,48 @@ final class LogFileTailer: @unchecked Sendable {
         defer { try? handle.close() }
 
         let size = (try? handle.seekToEnd()) ?? 0
-        if size < offset { offset = 0 }      // 文件被截断（重连），从头读
-        guard size > offset else { return }
+        try? handle.seek(toOffset: 0)
+        let newPrefix = (try? handle.read(upToCount: 512)) ?? Data()
+        let prefixChanged = !prefix.isEmpty && !Self.isPrefixGrowth(from: prefix, to: newPrefix)
+        let fileCreated = expectingReset && prefix.isEmpty && !newPrefix.isEmpty && offset == 0
+        prefix = newPrefix
+
+        let fileWasReset = size < offset || prefixChanged || fileCreated
+        if fileWasReset {
+            offset = 0
+            expectingReset = false
+        }
+        guard size > offset else {
+            if fileWasReset { onLines?([], true) }
+            return
+        }
 
         try? handle.seek(toOffset: offset)
         let data = (try? handle.readToEnd()) ?? Data()
-        offset = size
+        offset += UInt64(data.count)
 
-        guard let text = String(data: data, encoding: .utf8), !text.isEmpty else { return }
+        guard let text = String(data: data, encoding: .utf8), !text.isEmpty else {
+            if fileWasReset { onLines?([], true) }
+            return
+        }
         let parsed = text
             .split(separator: "\n", omittingEmptySubsequences: true)
             .map { parse(String($0)) }
-        if !parsed.isEmpty { onLines?(parsed) }
+        if fileWasReset || !parsed.isEmpty { onLines?(parsed, fileWasReset) }
+    }
+
+    private func captureBaseline() {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return }
+        defer { try? handle.close() }
+        offset = (try? handle.seekToEnd()) ?? 0
+        try? handle.seek(toOffset: 0)
+        prefix = (try? handle.read(upToCount: 512)) ?? Data()
+    }
+
+    /// 正常追加时前缀只会从短内容增长到 512 字节；截断重写则公共前缀会变化。
+    private static func isPrefixGrowth(from old: Data, to new: Data) -> Bool {
+        if new.count >= old.count { return new.starts(with: old) }
+        return old.starts(with: new)
     }
 
     /// 解析 `15:04:05.000 [info] payload`；解析不出就整行当 info。

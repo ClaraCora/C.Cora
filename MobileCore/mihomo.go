@@ -52,6 +52,7 @@ const ControllerAddr = "127.0.0.1:9090"
 var (
 	homeDir      string
 	logCaptureMu sync.Once
+	logFileMu    sync.Mutex
 
 	// 最近一次合并配置时收集的：不适用内容提示 + 各节点协议摘要（供主 App 经 IPC 取用）。
 	configNotices   []string
@@ -135,13 +136,13 @@ func Setup(home string) {
 //	func (e *Event) Type() string  // 级别字符串
 func startLogCapture() {
 	logCaptureMu.Do(func() {
+		f, err := os.OpenFile(filepath.Join(homeDir, "run.log"),
+			os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			return
+		}
 		sub := log.Subscribe()
 		go func() {
-			f, err := os.OpenFile(filepath.Join(homeDir, "run.log"),
-				os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
-			if err != nil {
-				return
-			}
 			defer f.Close()
 			for elm := range sub {
 				// 总线收所有级别（mihomo 的 logCh 无条件推送），这里按配置级别过滤，
@@ -149,9 +150,12 @@ func startLogCapture() {
 				if elm.LogLevel < log.Level() {
 					continue
 				}
+				logFileMu.Lock()
 				_, _ = f.WriteString(fmt.Sprintf("%s [%s] %s\n",
 					time.Now().Format("15:04:05.000"), elm.Type(), elm.Payload))
-				_ = f.Sync()
+				logFileMu.Unlock()
+				// WriteString 已立即写入系统页缓存，主 App 可以读取；逐行 Sync 会在
+				// 高日志量时强制刷盘，拖慢 Tunnel 和前台 UI。
 			}
 		}()
 	})
@@ -301,10 +305,14 @@ func StartWithConfig(fd int, configYAML string, settingsJSON string) (err error)
 		}
 	}()
 
+	resetError := resetRunLog()
 	st := parseSettings(settingsJSON)
 	appendRunLog(fmt.Sprintf("StartWithConfig: fd=%d stack=%s ipv6=%v geo=%v(mode=%v,%s,ignoreNegation=%v) log=%s port=%d",
 		fd, st.Stack, st.IPv6, st.GeoEnabled, st.GeodataMode, st.GeoLoader,
 		st.IgnoreGeoNegation, st.LogLevel, st.ControllerPort))
+	if resetError != nil {
+		appendRunLog("run.log 重置失败: " + resetError.Error())
+	}
 
 	merged, err := mergeConfig(configYAML, st)
 	if err != nil {
@@ -883,6 +891,8 @@ func appendRunLog(msg string) {
 	if homeDir == "" {
 		return
 	}
+	logFileMu.Lock()
+	defer logFileMu.Unlock()
 	f, err := os.OpenFile(filepath.Join(homeDir, "run.log"),
 		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
@@ -891,4 +901,20 @@ func appendRunLog(msg string) {
 	defer f.Close()
 	_, _ = f.WriteString(fmt.Sprintf("%s [WRAP] %s\n",
 		time.Now().Format("15:04:05.000"), msg))
+}
+
+// 每次真实启动都开启新的 run.log 会话。日志页在内存中保留上一会话，因此这里截断
+// 不会让用户断开后看不到日志，同时避免同一 NE 进程重连时重复读取历史内容。
+func resetRunLog() error {
+	if homeDir == "" {
+		return nil
+	}
+	logFileMu.Lock()
+	defer logFileMu.Unlock()
+	f, err := os.OpenFile(filepath.Join(homeDir, "run.log"),
+		os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	return f.Close()
 }
