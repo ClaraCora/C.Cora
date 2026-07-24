@@ -28,7 +28,7 @@ func mergedMap(t *testing.T, input string) map[string]any {
 
 func mergedMapWithSettings(t *testing.T, input string, settings appSettings) map[string]any {
 	t.Helper()
-	out, err := mergeConfig(input, settings)
+	out, err := mergeConfig(input, settings, 1420)
 	if err != nil {
 		t.Fatalf("mergeConfig: %v", err)
 	}
@@ -37,6 +37,102 @@ func mergedMapWithSettings(t *testing.T, input string, settings appSettings) map
 		t.Fatalf("unmarshal merged config: %v", err)
 	}
 	return m
+}
+
+func TestConfiguredTunMTU(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  int
+	}{
+		{name: "configured", input: "tun:\n  mtu: 1380\n", want: 1380},
+		{name: "missing", input: "tun:\n  enable: true\n", want: 0},
+		{name: "invalid string", input: "tun:\n  mtu: auto\n", want: 0},
+		{name: "too small", input: "tun:\n  mtu: 1\n", want: 0},
+		{name: "zero", input: "tun:\n  mtu: 0\n", want: 0},
+		{name: "too large", input: "tun:\n  mtu: 65536\n", want: 0},
+		{name: "invalid yaml", input: "tun: [", want: 0},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := ConfiguredTunMTU(test.input); got != test.want {
+				t.Fatalf("ConfiguredTunMTU() = %d, want %d", got, test.want)
+			}
+		})
+	}
+}
+
+func TestMergeConfigUsesConfiguredOrSystemMTU(t *testing.T) {
+	settings := appSettings{Stack: "gvisor", LogLevel: "info"}
+
+	configured, err := mergeConfig("tun:\n  mtu: 1380\n", settings, 1420)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var configuredMap map[string]any
+	if err := yaml.Unmarshal(configured, &configuredMap); err != nil {
+		t.Fatal(err)
+	}
+	if got := nestedMap(t, configuredMap, "tun")["mtu"]; got != 1380 {
+		t.Errorf("configured tun.mtu = %v, want 1380", got)
+	}
+
+	system, err := mergeConfig("tun:\n  enable: true\n", settings, 1420)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var systemMap map[string]any
+	if err := yaml.Unmarshal(system, &systemMap); err != nil {
+		t.Fatal(err)
+	}
+	if got := nestedMap(t, systemMap, "tun")["mtu"]; got != 1420 {
+		t.Errorf("system tun.mtu = %v, want 1420", got)
+	}
+
+	fallback, err := mergeConfig("", settings, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fallbackMap map[string]any
+	if err := yaml.Unmarshal(fallback, &fallbackMap); err != nil {
+		t.Fatal(err)
+	}
+	if got := nestedMap(t, fallbackMap, "tun")["mtu"]; got != defaultTunnelMTU {
+		t.Errorf("fallback tun.mtu = %v, want %d", got, defaultTunnelMTU)
+	}
+
+	for _, input := range []string{"tun:\n  mtu: 0\n", "tun:\n  mtu: null\n"} {
+		merged, err := mergeConfig(input, settings, 1420)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var result map[string]any
+		if err := yaml.Unmarshal(merged, &result); err != nil {
+			t.Fatal(err)
+		}
+		if got := nestedMap(t, result, "tun")["mtu"]; got != 1420 {
+			t.Errorf("unset tun.mtu = %v, want system MTU 1420", got)
+		}
+	}
+
+	if _, err := mergeConfig("tun:\n  mtu: auto\n", settings, 1420); err == nil {
+		t.Error("invalid tun.mtu should fail configuration merge")
+	}
+	if _, err := mergeConfig("tun:\n  mtu: 1\n", settings, 1420); err == nil {
+		t.Error("too-small tun.mtu should fail configuration merge")
+	}
+
+	tooSmallSystem, err := mergeConfig("", settings, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tooSmallSystemMap map[string]any
+	if err := yaml.Unmarshal(tooSmallSystem, &tooSmallSystemMap); err != nil {
+		t.Fatal(err)
+	}
+	if got := nestedMap(t, tooSmallSystemMap, "tun")["mtu"]; got != defaultTunnelMTU {
+		t.Errorf("invalid system tun.mtu = %v, want fallback %d", got, defaultTunnelMTU)
+	}
 }
 
 func TestParseSettingsGeoDefaultsAndOverride(t *testing.T) {

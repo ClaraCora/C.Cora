@@ -44,6 +44,10 @@ const defaultWebUIURL = "https://github.com/Zephyruso/zashboard/archive/refs/hea
 
 const defaultASNURL = "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/GeoLite2-ASN.mmdb"
 
+const defaultTunnelMTU = 1500
+
+const minimumTunnelMTU = 576
+
 // ControllerAddr 是 NE 内 mihomo external-controller 的监听地址。
 // 主 App 经 sendProviderMessage IPC 在重签环境下不投递，改用本地回环 HTTP 直连——
 // 127.0.0.1 是 loopback，不经 tun，跨进程可达，是 clash 类 iOS App 的通用做法。
@@ -69,6 +73,65 @@ func Version() string {
 		v = "unknown"
 	}
 	return "mihomo " + v + " / " + runtime.Version()
+}
+
+// ConfiguredTunMTU 返回配置文件显式声明的 tun.mtu。
+// 0 表示未声明或值无效，供 Network Extension 决定是否让 iOS 选择系统 MTU。
+func ConfiguredTunMTU(configYAML string) int {
+	m := map[string]any{}
+	if err := yaml.Unmarshal([]byte(configYAML), &m); err != nil {
+		return 0
+	}
+	tun, ok := m["tun"].(map[string]any)
+	if !ok {
+		return 0
+	}
+	mtu, ok := validTunnelMTU(tun["mtu"])
+	if !ok {
+		return 0
+	}
+	return mtu
+}
+
+func validTunnelMTU(value any) (int, bool) {
+	var mtu int
+	switch typed := value.(type) {
+	case int:
+		mtu = typed
+	case int64:
+		mtu = int(typed)
+	case uint64:
+		if typed > 65535 {
+			return 0, false
+		}
+		mtu = int(typed)
+	default:
+		return 0, false
+	}
+	return mtu, mtu >= minimumTunnelMTU && mtu <= 65535
+}
+
+func normalizedTunnelMTU(mtu int) int {
+	if mtu < minimumTunnelMTU || mtu > 65535 {
+		return defaultTunnelMTU
+	}
+	return mtu
+}
+
+func tunnelMTUIsUnset(value any) bool {
+	if value == nil {
+		return true
+	}
+	switch typed := value.(type) {
+	case int:
+		return typed == 0
+	case int64:
+		return typed == 0
+	case uint64:
+		return typed == 0
+	default:
+		return false
+	}
 }
 
 // ValidateGeoDatabase 使用 mihomo 自身的解析器校验主 App 下载的 GEO 文件。
@@ -298,8 +361,8 @@ func rulesUseASN(value any) bool {
 
 // StartWithConfig 用订阅/自定义 YAML + 设置启动内核：先把订阅配置与「iOS 必需的安全设置」
 // 及用户设置合并、按需剔除 geo 规则，再注入 fd 启动，最后起 external-controller。
-// 对应 Swift 侧 `MihomoStartWithConfig(_:_:_:error:)`。
-func StartWithConfig(fd int, configYAML string, settingsJSON string) (err error) {
+// 对应 Swift 侧 `MihomoStartWithConfig(_:_:_:_:error:)`。
+func StartWithConfig(fd int, tunnelMTU int, configYAML string, settingsJSON string) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			stack := fmt.Sprintf("panic: %v\n%s", r, debug.Stack())
@@ -312,14 +375,14 @@ func StartWithConfig(fd int, configYAML string, settingsJSON string) (err error)
 
 	resetError := resetRunLog()
 	st := parseSettings(settingsJSON)
-	appendRunLog(fmt.Sprintf("StartWithConfig: fd=%d stack=%s ipv6=%v geo=%v(mode=%v,%s,ignoreNegation=%v) log=%s port=%d",
-		fd, st.Stack, st.IPv6, st.GeoEnabled, st.GeodataMode, st.GeoLoader,
+	appendRunLog(fmt.Sprintf("StartWithConfig: fd=%d mtu=%d stack=%s ipv6=%v geo=%v(mode=%v,%s,ignoreNegation=%v) log=%s port=%d",
+		fd, tunnelMTU, st.Stack, st.IPv6, st.GeoEnabled, st.GeodataMode, st.GeoLoader,
 		st.IgnoreGeoNegation, st.LogLevel, st.ControllerPort))
 	if resetError != nil {
 		appendRunLog("run.log 重置失败: " + resetError.Error())
 	}
 
-	if err := applyRuntimeConfig(fd, configYAML, st, "启动", false); err != nil {
+	if err := applyRuntimeConfig(fd, tunnelMTU, configYAML, st, "启动", false); err != nil {
 		return err
 	}
 	configureController(configYAML, st, true)
@@ -328,7 +391,7 @@ func StartWithConfig(fd int, configYAML string, settingsJSON string) (err error)
 
 // ReloadConfig 在当前 utun 上重新合并并应用主 App 下发的配置。
 // 与 StartWithConfig 共用同一条 iOS 配置处理路径，但不会清空现有日志或重复下载 Web UI。
-func ReloadConfig(fd int, configYAML string, settingsJSON string) (err error) {
+func ReloadConfig(fd int, tunnelMTU int, configYAML string, settingsJSON string) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			stack := fmt.Sprintf("panic: %v\n%s", r, debug.Stack())
@@ -340,10 +403,10 @@ func ReloadConfig(fd int, configYAML string, settingsJSON string) (err error) {
 	defer configApplyMu.Unlock()
 
 	st := parseSettings(settingsJSON)
-	appendRunLog(fmt.Sprintf("ReloadConfig: fd=%d stack=%s ipv6=%v geo=%v(mode=%v,%s,ignoreNegation=%v) log=%s port=%d",
-		fd, st.Stack, st.IPv6, st.GeoEnabled, st.GeodataMode, st.GeoLoader,
+	appendRunLog(fmt.Sprintf("ReloadConfig: fd=%d mtu=%d stack=%s ipv6=%v geo=%v(mode=%v,%s,ignoreNegation=%v) log=%s port=%d",
+		fd, tunnelMTU, st.Stack, st.IPv6, st.GeoEnabled, st.GeodataMode, st.GeoLoader,
 		st.IgnoreGeoNegation, st.LogLevel, st.ControllerPort))
-	if err := applyRuntimeConfig(fd, configYAML, st, "重载", true); err != nil {
+	if err := applyRuntimeConfig(fd, tunnelMTU, configYAML, st, "重载", true); err != nil {
 		return err
 	}
 	configureController(configYAML, st, false)
@@ -351,7 +414,7 @@ func ReloadConfig(fd int, configYAML string, settingsJSON string) (err error) {
 	return nil
 }
 
-func applyRuntimeConfig(fd int, configYAML string, st appSettings, operation string, preserveTun bool) (err error) {
+func applyRuntimeConfig(fd int, tunnelMTU int, configYAML string, st appSettings, operation string, preserveTun bool) (err error) {
 	previousNotices := append([]string(nil), configNotices...)
 	previousDetails := make(map[string]string, len(proxyDetailsMap))
 	for name, detail := range proxyDetailsMap {
@@ -365,7 +428,7 @@ func applyRuntimeConfig(fd int, configYAML string, st appSettings, operation str
 		}
 	}()
 
-	merged, err := mergeConfig(configYAML, st)
+	merged, err := mergeConfig(configYAML, st, tunnelMTU)
 	if err != nil {
 		appendRunLog(operation + "合并配置失败: " + err.Error())
 		return err
@@ -460,8 +523,8 @@ func configureController(configYAML string, st appSettings, downloadUI bool) {
 
 // mergeConfig 把订阅 YAML 与 iOS 必需设置 + 用户设置合并。
 // 强制 tun/dns（tun 必须 fake-ip 才通），其余按设置：栈、ipv6、日志等级、是否剔 geo。
-// fd 不在此写入（运行期值），由 StartWithConfig 解析后注入 Tun.FileDescriptor。
-func mergeConfig(subYAML string, st appSettings) ([]byte, error) {
+// fd 不在此写入（运行期值）；MTU 优先使用配置值，缺省时使用 iOS utun 的实际值。
+func mergeConfig(subYAML string, st appSettings, tunnelMTU int) ([]byte, error) {
 	m := map[string]any{}
 	if strings.TrimSpace(subYAML) != "" {
 		if err := yaml.Unmarshal([]byte(subYAML), &m); err != nil {
@@ -476,9 +539,17 @@ func mergeConfig(subYAML string, st appSettings) ([]byte, error) {
 	tunCfg := map[string]any{
 		"enable":        true,
 		"stack":         st.Stack,
-		"mtu":           1500,
 		"dns-hijack":    []any{"any:53"},
 		"inet4-address": []any{"198.18.0.1/16"},
+	}
+	if value, exists := sourceTun["mtu"]; exists && !tunnelMTUIsUnset(value) {
+		mtu, valid := validTunnelMTU(value)
+		if !valid {
+			return nil, fmt.Errorf("tun.mtu must be an integer between %d and 65535", minimumTunnelMTU)
+		}
+		tunCfg["mtu"] = mtu
+	} else {
+		tunCfg["mtu"] = normalizedTunnelMTU(tunnelMTU)
 	}
 	if st.IPv6 {
 		tunCfg["inet6-address"] = []any{"fdfe:dcba:9876::1/126"}

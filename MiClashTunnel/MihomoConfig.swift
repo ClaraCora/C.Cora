@@ -16,7 +16,7 @@ enum MihomoConfig {
     static let tunGatewayIP = "198.18.0.1"
     static let tunSubnetMask = "255.255.0.0"
     static let dnsServerIP = "198.18.0.2"
-    static let mtu = 1500
+    static let fallbackMTU = 1500
 
     /// 生成 DIRECT 直连模式的最小配置 YAML。
     /// 注意：tun.file-descriptor 不在此处填写——它是运行期值，由 Go 侧
@@ -38,7 +38,6 @@ enum MihomoConfig {
             - any:53
           auto-route: true
           auto-detect-interface: true
-          mtu: \(mtu)
 
         dns:
           enable: true
@@ -64,5 +63,17 @@ enum MihomoConfig {
         rules:
           - MATCH,DIRECT
         """
+    }
+
+    /// 覆盖安装后，旧版内建 DIRECT 缓存仍带固定的 mtu: 1500。
+    /// 仅匹配 App 自己生成的完整旧模板，避免改动用户自定义配置。
+    static func migrateLegacyDirectModeYAML(_ yaml: String) -> String? {
+        let current = directModeYAML()
+        let marker = "  auto-detect-interface: true"
+        let legacy = current.replacingOccurrences(
+            of: marker,
+            with: marker + "\n  mtu: 1500"
+        )
+        return yaml == legacy ? current : nil
     }
 }

@@ -23,6 +23,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
     /// 当前运行中的 utun fd。配置重载只复用它，不重建系统隧道。
     private var tunnelFileDescriptor: Int32?
+    private var tunnelMTU: Int?
+    private var configuredTunnelMTU: Int?
     private var isStopping = false
     private let reloadQueue = DispatchQueue(label: "com.miclash.tunnel.reload", qos: .userInitiated)
 
@@ -37,6 +39,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         reloadQueue.sync {
             isStopping = false
             tunnelFileDescriptor = nil
+            tunnelMTU = nil
+            configuredTunnelMTU = nil
         }
         // 每次启动清空 ne.log，避免历史残留干扰排查
         FileLog.reset()
@@ -52,8 +56,34 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             : "无 options（系统重连，将用缓存/DIRECT 兜底）"
         FileLog.write("收到配置：\(configSource)，settings=\(settingsJSON.count)字节")
 
-        let settings = makeNetworkSettings()
-        setTunnelNetworkSettings(settings) { [weak self] error in
+        // 在创建 utun 前先解析配置，只有显式 tun.mtu 才固定接口 MTU；否则交给 iOS 计算。
+        let sharedHome = appGroupContainerPath()
+        let home = sharedHome ?? fallbackHomePath()
+        homeDir = home
+        FileLog.write("home dir = \(home)（\(sharedHome != nil ? "App Group 共享" : "NE 沙盒回退")），调用 MihomoSetup")
+        MihomoSetup(home)
+
+        let configYAML = resolveConfig(incoming: incomingConfig,
+                                       hasOption: hasConfigOption, home: home)
+        let resolvedSettings = resolveCached(incoming: settingsJSON.isEmpty ? nil : settingsJSON,
+                                             home: home, file: "settings.json") ?? ""
+
+        // GEO / ASN 文件必须由主 App 预先写入共享 home；NE 启动阶段不再联网下载。
+        if let geoError = Self.validateGeoAssets(configYAML: configYAML,
+                                                  settingsJSON: resolvedSettings,
+                                                  home: home) {
+            FileLog.write("GEO / ASN 数据检查失败：\(geoError.localizedDescription)")
+            completionHandler(geoError)
+            return
+        }
+
+        let configuredMTUValue = Int(MihomoConfiguredTunMTU(configYAML))
+        let configuredMTU: Int? = configuredMTUValue > 0 ? configuredMTUValue : nil
+        FileLog.write(configuredMTU.map { "MTU 使用配置值：\($0)" }
+            ?? "配置未设置 tun.mtu，由 iOS 选择系统 MTU")
+
+        let networkSettings = makeNetworkSettings(configuredMTU: configuredMTU)
+        setTunnelNetworkSettings(networkSettings) { [weak self] error in
             guard let self else { return }
             if let error {
                 FileLog.write("应用网络设置失败：\(error.localizedDescription)")
@@ -63,71 +93,78 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             }
             FileLog.write("网络设置已生效")
 
-            // 网络设置生效后，iOS 才创建好 utun 接口，此时定位 fd
-            guard let fd = self.findTunnelFileDescriptor() else {
+            // 网络设置生效后，iOS 才创建好 utun 接口，此时读取系统选定的 MTU 并定位 fd。
+            guard let interface = self.tunnelInterfaceInfo(),
+                  let fd = self.findTunnelFileDescriptor(named: interface.name) else {
                 FileLog.write("未找到 utun fd（getifaddrs/getsockopt 都没命中网关 IP）")
                 self.log.error("未找到 utun 文件描述符")
                 completionHandler(NSError(domain: "MiClashTunnel", code: -1,
                     userInfo: [NSLocalizedDescriptionKey: "未找到 utun fd"]))
                 return
             }
-            FileLog.write("拿到 utun fd = \(fd)")
-            self.log.info("拿到 utun fd = \(fd, privacy: .public)，启动 mihomo 内核")
-
-            // mihomo 工作目录：优先 App Group 容器（与主 App 共享，日志可被读取）；
-            // App Group 不可用时回退到 NE 自己的沙盒目录——保证代理仍能跑起来，
-            // App Group 只影响“日志/配置共享”，不该卡死整个 VPN。
-            let home = self.appGroupContainerPath() ?? self.fallbackHomePath()
-            let usingShared = self.appGroupContainerPath() != nil
-            self.homeDir = home
-            FileLog.write("home dir = \(home)（\(usingShared ? "App Group 共享" : "NE 沙盒回退")），调用 MihomoSetup")
-            MihomoSetup(home)
-
-            // App 明确配置（含空串=DIRECT）会覆盖缓存；系统无 options 重连才读取缓存。
-            let configYAML = self.resolveConfig(incoming: incomingConfig,
-                                                hasOption: hasConfigOption, home: home)
-            let settings = self.resolveCached(incoming: settingsJSON.isEmpty ? nil : settingsJSON,
-                                              home: home, file: "settings.json") ?? ""
-
-            // GEO / ASN 文件必须由主 App 预先写入共享 home；NE 启动阶段不再联网下载。
-            if let geoError = Self.validateGeoAssets(configYAML: configYAML,
-                                                      settingsJSON: settings,
-                                                      home: home) {
-                FileLog.write("GEO / ASN 数据检查失败：\(geoError.localizedDescription)")
-                completionHandler(geoError)
+            if let configuredMTU,
+               let systemMTU = interface.mtu,
+               configuredMTU != systemMTU {
+                let message = "iOS 创建的 MTU（\(systemMTU)）与配置 tun.mtu（\(configuredMTU)）不一致"
+                FileLog.write("MTU 应用失败：\(message)")
+                self.log.error("MTU 应用失败：\(message, privacy: .public)")
+                completionHandler(NSError(
+                    domain: "MiClashTunnel",
+                    code: -6,
+                    userInfo: [NSLocalizedDescriptionKey: message]))
                 return
             }
+            let actualMTU = interface.mtu ?? configuredMTU ?? MihomoConfig.fallbackMTU
+            FileLog.write("拿到 \(interface.name) fd=\(fd)，实际 MTU=\(actualMTU)"
+                + (interface.mtu == nil ? "（读取失败，已回退）" : ""))
+            self.log.info("拿到 \(interface.name, privacy: .public) fd=\(fd, privacy: .public)，MTU=\(actualMTU, privacy: .public)，启动 mihomo 内核")
 
             // gomobile 把带 error 返回的 Go 函数生成为「返回 BOOL + NSError** 出参」的 C 函数，
             // 不会自动桥接成 Swift throws，所以用经典 NSError 指针写法：成功返回 true。
             FileLog.write("调用 MihomoStartWithConfig…")
             var startError: NSError?
-            let ok = MihomoStartWithConfig(Int(fd), configYAML, settings, &startError)
-            if ok {
-                FileLog.write("MihomoStartWithConfig 返回成功")
-                self.log.info("mihomo 启动成功")
-                let shouldFinishStarting = self.reloadQueue.sync {
-                    guard !self.isStopping else { return false }
+            let startResult: Bool? = self.reloadQueue.sync {
+                guard !self.isStopping else { return nil }
+                let ok = MihomoStartWithConfig(
+                    Int(fd), actualMTU, configYAML, resolvedSettings, &startError)
+                if ok {
+                    FileLog.write("MihomoStartWithConfig 返回成功")
+                    self.log.info("mihomo 启动成功")
                     self.tunnelFileDescriptor = fd
+                    self.tunnelMTU = actualMTU
+                    self.configuredTunnelMTU = configuredMTU
                     AppGroupState.vpnConnected = true // 共享给控制中心磁贴显示
                     ControlCenter.shared.reloadControls(ofKind: ControlWidgetKind.vpn)
                     self.startPathMonitor() // 开始把真实出站接口喂给内核
-                    completionHandler(nil)
-                    return true
                 }
-                guard shouldFinishStarting else {
-                    completionHandler(NSError(
-                        domain: "MiClashTunnel",
-                        code: -5,
-                        userInfo: [NSLocalizedDescriptionKey: "VPN 启动已取消"]))
-                    return
-                }
-            } else {
-                let err = startError ?? NSError(domain: "MiClashTunnel", code: -3,
+                return ok
+            }
+            guard let startResult else {
+                completionHandler(NSError(
+                    domain: "MiClashTunnel",
+                    code: -5,
+                    userInfo: [NSLocalizedDescriptionKey: "VPN 启动已取消"]))
+                return
+            }
+            guard startResult else {
+                let error = startError ?? NSError(domain: "MiClashTunnel", code: -3,
                     userInfo: [NSLocalizedDescriptionKey: "mihomo 启动失败（未知错误）"])
-                FileLog.write("MihomoStartWithConfig 失败：\(err.localizedDescription)")
-                self.log.error("mihomo 启动失败：\(err.localizedDescription, privacy: .public)")
-                completionHandler(err)
+                FileLog.write("MihomoStartWithConfig 失败：\(error.localizedDescription)")
+                self.log.error("mihomo 启动失败：\(error.localizedDescription, privacy: .public)")
+                completionHandler(error)
+                return
+            }
+
+            let stillRunning = self.reloadQueue.sync {
+                !self.isStopping && self.tunnelFileDescriptor == fd
+            }
+            if stillRunning {
+                completionHandler(nil)
+            } else {
+                completionHandler(NSError(
+                    domain: "MiClashTunnel",
+                    code: -5,
+                    userInfo: [NSLocalizedDescriptionKey: "VPN 启动已取消"]))
             }
         }
     }
@@ -144,6 +181,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             return value
         }
         if let cached = try? String(contentsOfFile: cachePath, encoding: .utf8), !cached.isEmpty {
+            if let migrated = MihomoConfig.migrateLegacyDirectModeYAML(cached) {
+                try? migrated.write(toFile: cachePath, atomically: true, encoding: .utf8)
+                FileLog.write("系统无 options 重连：已将旧版内建 DIRECT 缓存迁移为系统 MTU")
+                return migrated
+            }
             FileLog.write("系统无 options 重连：使用缓存 config.yaml（\(cached.count) 字节）")
             return cached
         }
@@ -173,6 +215,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         reloadQueue.sync {
             isStopping = true
             tunnelFileDescriptor = nil
+            tunnelMTU = nil
+            configuredTunnelMTU = nil
             AppGroupState.vpnConnected = false // 同步给控制中心磁贴
             ControlCenter.shared.reloadControls(ofKind: ControlWidgetKind.vpn)
             stopPathMonitor()
@@ -289,6 +333,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             }
             guard !self.isStopping,
                   let fd = self.tunnelFileDescriptor,
+                  let tunnelMTU = self.tunnelMTU,
                   let home = self.homeDir else {
                 completionHandler?(Self.reloadResponse(error: "VPN 尚未完成启动"))
                 return
@@ -312,6 +357,16 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             let configYAML = input.config.isEmpty
                 ? MihomoConfig.directModeYAML()
                 : input.config
+            let requestedMTUValue = Int(MihomoConfiguredTunMTU(configYAML))
+            let requestedMTU: Int? = requestedMTUValue > 0 ? requestedMTUValue : nil
+            guard requestedMTU == self.configuredTunnelMTU else {
+                let oldValue = self.configuredTunnelMTU.map(String.init) ?? "系统"
+                let newValue = requestedMTU.map(String.init) ?? "系统"
+                let message = "tun.mtu 从 \(oldValue) 变为 \(newValue)，请断开并重新连接后生效"
+                FileLog.write("拒绝热重载：\(message)")
+                completionHandler?(Self.reloadResponse(error: message))
+                return
+            }
             if let geoError = Self.validateGeoAssets(configYAML: configYAML,
                                                       settingsJSON: input.settings,
                                                       home: home) {
@@ -322,7 +377,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
             FileLog.write("调用 MihomoReloadConfig（config=\(configYAML.count) 字节）…")
             var reloadError: NSError?
-            let ok = MihomoReloadConfig(Int(fd), configYAML, input.settings, &reloadError)
+            let ok = MihomoReloadConfig(Int(fd), tunnelMTU, configYAML, input.settings, &reloadError)
             guard ok else {
                 let message = reloadError?.localizedDescription ?? "mihomo 重载失败（未知错误）"
                 FileLog.write("MihomoReloadConfig 失败：\(message)")
@@ -450,7 +505,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     // MARK: - 网络设置
 
     /// 构建隧道网络设置。地址与 mihomo 配置严格对齐（198.18.0.x）。
-    private func makeNetworkSettings() -> NEPacketTunnelNetworkSettings {
+    private func makeNetworkSettings(configuredMTU: Int?) -> NEPacketTunnelNetworkSettings {
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: MihomoConfig.tunGatewayIP)
 
         // IPv4：网关 198.18.0.1/16，默认路由全量接管。
@@ -467,7 +522,12 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         dns.matchDomainsNoSearch = true
         settings.dnsSettings = dns
 
-        settings.mtu = NSNumber(value: MihomoConfig.mtu)
+        if let configuredMTU {
+            settings.mtu = NSNumber(value: configuredMTU)
+        } else {
+            // mtu 为 nil 时，iOS 会用物理接口 MTU 减去该开销计算 utun MTU。
+            settings.tunnelOverheadBytes = NSNumber(value: 0)
+        }
         return settings
     }
 
@@ -487,11 +547,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     /// 1. getifaddrs 找出「IPv4 地址 == 我们网关 198.18.0.1」的那块 utun 接口名——
     ///    网络设置生效后该 IP 已绑到我们自己的 utun 上，能唯一区分于别的 VPN 的 utun；
     /// 2. 遍历 fd，用 getsockopt(UTUN_OPT_IFNAME) 取名，精确匹配第 1 步的接口名。
-    private func findTunnelFileDescriptor() -> Int32? {
-        guard let wantName = tunnelInterfaceName() else {
-            log.error("getifaddrs 未找到 IP=\(MihomoConfig.tunGatewayIP, privacy: .public) 的 utun 接口")
-            return nil
-        }
+    private func findTunnelFileDescriptor(named wantName: String) -> Int32? {
         log.info("目标 utun 接口名：\(wantName, privacy: .public)")
 
         let SYSPROTO_CONTROL: Int32 = 2 // <sys/sys_domain.h>
@@ -514,30 +570,47 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         return nil
     }
 
-    /// 用 getifaddrs 找到绑定了我们网关 IP 的 utun 接口名。
-    private func tunnelInterfaceName() -> String? {
+    /// 用 getifaddrs 找到绑定了网关 IP 的 utun，并从 AF_LINK 记录读取 iOS 实际 MTU。
+    private func tunnelInterfaceInfo() -> (name: String, mtu: Int?)? {
         var ifaddrPtr: UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&ifaddrPtr) == 0 else { return nil }
         defer { freeifaddrs(ifaddrPtr) }
 
+        var targetName: String?
+        var interfaceMTUs: [String: Int] = [:]
         var cursor = ifaddrPtr
         while let cur = cursor {
-            defer { cursor = cur.pointee.ifa_next }
             let ifa = cur.pointee
-            guard let sa = ifa.ifa_addr, sa.pointee.sa_family == sa_family_t(AF_INET) else {
-                continue
-            }
+            cursor = ifa.ifa_next
+            guard let sa = ifa.ifa_addr else { continue }
+
             let ifName = String(cString: ifa.ifa_name)
             guard ifName.hasPrefix("utun") else { continue }
+
+            if sa.pointee.sa_family == sa_family_t(AF_LINK),
+               let data = ifa.ifa_data {
+                let linkData = data.assumingMemoryBound(to: if_data.self).pointee
+                let mtu = Int(linkData.ifi_mtu)
+                if mtu > 0 {
+                    interfaceMTUs[ifName] = mtu
+                }
+                continue
+            }
+
+            guard sa.pointee.sa_family == sa_family_t(AF_INET) else { continue }
 
             var sin = sockaddr_in()
             memcpy(&sin, sa, Int(MemoryLayout<sockaddr_in>.size))
             let ip = String(cString: inet_ntoa(sin.sin_addr))
             if ip == MihomoConfig.tunGatewayIP {
-                return ifName
+                targetName = ifName
             }
         }
-        return nil
+        guard let targetName else {
+            log.error("getifaddrs 未找到 IP=\(MihomoConfig.tunGatewayIP, privacy: .public) 的 utun 接口")
+            return nil
+        }
+        return (targetName, interfaceMTUs[targetName])
     }
 
     private static func validateGeoAssets(configYAML: String,
