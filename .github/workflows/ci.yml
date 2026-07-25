@@ -48,7 +48,7 @@ jobs:
           key: ${{ runner.os }}-go-${{ hashFiles('MobileCore/go.sum', 'MobileCore/dependency-patches/**', 'MobileCore/scripts/**') }}
           restore-keys: ${{ runner.os }}-go-
 
-      - name: Build Mihomo.xcframework (gomobile bind)
+      - name: Install Go mobile tools and resolve MobileCore
         run: |
           set -euxo pipefail
           # “|direct” 会在代理 DNS/网络错误时也回退源码站；逗号仅在 404/410 时回退。
@@ -66,7 +66,7 @@ jobs:
           MOBILE_VERSION="v0.0.0-20260611195102-4dd8f1dbf5d2"
           retry go install golang.org/x/mobile/cmd/gomobile@${MOBILE_VERSION}
           retry go install golang.org/x/mobile/cmd/gobind@${MOBILE_VERSION}
-          export PATH="$PATH:$(go env GOPATH)/bin"
+          printf '%s\n' "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
           cd MobileCore
           # 用 tool 指令把 golang.org/x/mobile 钉进模块依赖图，
           # 否则 go mod tidy 会因源码未直接 import 而剪掉它，导致 gomobile bind 报
@@ -74,28 +74,83 @@ jobs:
           retry go get -tool golang.org/x/mobile/cmd/gobind@${MOBILE_VERSION}
           # go.mod 已 pin mihomo 版本；tidy 补齐间接依赖与 go.sum
           retry go mod tidy
-          # Apply version-locked memory patches to temporary dependency copies,
-          # then run their regression tests before gomobile.
+      - name: Prepare patched sing allocator
+        run: |
+          set -euxo pipefail
+          cd MobileCore
           PATCHED_SING="$(bash scripts/prepare-ios-sing.sh)"
-          PATCHED_MIHOMO="$(PATCHED_SING_DIR="$PATCHED_SING" \
-            bash scripts/prepare-ios-mihomo.sh)"
+          printf 'PATCHED_SING=%s\n' "$PATCHED_SING" >> "$GITHUB_ENV"
+
+      - name: Prepare patched Mihomo allocator
+        run: |
+          set -euxo pipefail
+          cd MobileCore
+          PATCHED_MIHOMO="$(PATCHED_SING_DIR="$PATCHED_SING" bash scripts/prepare-ios-mihomo.sh)"
+          printf 'PATCHED_MIHOMO=%s\n' "$PATCHED_MIHOMO" >> "$GITHUB_ENV"
+
+      - name: Prepare patched gVisor
+        run: |
+          set -euxo pipefail
+          cd MobileCore
           PATCHED_GVISOR="$(bash scripts/prepare-ios-gvisor.sh)"
+          printf 'PATCHED_GVISOR=%s\n' "$PATCHED_GVISOR" >> "$GITHUB_ENV"
+
+      - name: Prepare patched sing-tun
+        run: |
+          set -euxo pipefail
+          cd MobileCore
           PATCHED_SING_TUN="$(bash scripts/prepare-ios-sing-tun.sh)"
-          PATCHED_SS2="$(PATCHED_SING_DIR="$PATCHED_SING" \
-            bash scripts/prepare-ios-sing-shadowsocks2.sh)"
+          printf 'PATCHED_SING_TUN=%s\n' "$PATCHED_SING_TUN" >> "$GITHUB_ENV"
+
+      - name: Prepare patched Shadowsocks reader
+        run: |
+          set -euxo pipefail
+          cd MobileCore
+          PATCHED_SS2="$(PATCHED_SING_DIR="$PATCHED_SING" bash scripts/prepare-ios-sing-shadowsocks2.sh)"
+          printf 'PATCHED_SS2=%s\n' "$PATCHED_SS2" >> "$GITHUB_ENV"
+
+      - name: Verify patched sing allocator
+        run: |
+          set -euxo pipefail
           go -C "$PATCHED_SING" test ./common/buf
           go -C "$PATCHED_SING" test -tags "with_low_memory" ./common/buf
+
+      - name: Verify patched Mihomo allocator
+        run: |
+          set -euxo pipefail
           go -C "$PATCHED_MIHOMO" test ./common/pool
           go -C "$PATCHED_MIHOMO" test -tags "with_low_memory" ./common/pool
+
+      - name: Verify patched gVisor TCP
+        run: |
+          set -euxo pipefail
           go -C "$PATCHED_GVISOR" test ./pkg/tcpip/transport/tcp
+
+      - name: Verify patched sing-tun Darwin transport
+        run: |
+          set -euxo pipefail
           go -C "$PATCHED_SING_TUN" test -tags "with_gvisor,with_low_memory" \
             . ./internal/fdbased_darwin
+
+      - name: Verify patched Shadowsocks reader
+        run: |
+          set -euxo pipefail
           go -C "$PATCHED_SS2" test ./internal/shadowio
           go -C "$PATCHED_SS2" test -tags "with_low_memory" ./internal/shadowio
+
+      - name: Test MobileCore with patched dependencies
+        run: |
+          set -euxo pipefail
+          cd MobileCore
           go test -tags "with_gvisor,with_low_memory" ./...
+
+      - name: Build Mihomo.xcframework (gomobile bind)
+        run: |
+          set -euxo pipefail
+          cd MobileCore
           # 取出真实 mihomo 版本，用 ldflags 注入 constant.Version
           # （源码默认值是陈旧占位串，官方靠 ldflags 注入真实版本，这里照做）
-          MIHOMO_VERSION=$(retry go list -m -f '{{.Version}}' github.com/metacubex/mihomo)
+          MIHOMO_VERSION=$(go list -m -f '{{.Version}}' github.com/metacubex/mihomo)
           echo "注入 mihomo 版本：${MIHOMO_VERSION}"
           # 交叉编译 mihomo 为 iOS 框架（含 device arm64 + simulator 切片）。
           # with_gvisor：iOS NE 的 system 栈 TCP 不通；with_low_memory：转发缓冲减半，降低峰值。

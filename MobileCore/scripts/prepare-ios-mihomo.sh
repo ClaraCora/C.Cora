@@ -10,7 +10,7 @@ readonly SOURCE_REL="common/pool/alloc.go"
 readonly TEST_REL="common/pool/oversize_pool_test.go"
 readonly EXPECTED_SOURCE_SHA="acfdffbbd6050aa0481fe4ea60f0f73a10bca6ed7a6cfbca108e2c1acb0a78f5"
 readonly EXPECTED_PATCHED_SHA="743d8bd6d5990bffc6c4e3bcca85b076f57d5065032495d335d65f02d10fdb44"
-readonly EXPECTED_TEST_SHA="89c8f16770938f8ee4f7503df39e6139620fdacfdfc9a52a5b7eef0977dcb0df"
+readonly EXPECTED_TEST_SHA="89c8f16770938f8ee4f7503df39e6139620fdacfdcf9a52a5b7eef0977dcb0df"
 readonly PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/mihomo-v1.19.29-oversize-buffer-pool.patch"
 readonly PATCHED_DIR="${RUNNER_TEMP:?}/mihomo-v1.19.29-ios-oversize-pool-v1"
 
