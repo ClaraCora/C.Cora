@@ -303,6 +303,12 @@ func ResolveGeoDownloadURLs(configYAML string, settingsJSON string) string {
 	return string(out)
 }
 
+// TrimMemory forces a garbage collection and returns unused Go heap pages to
+// iOS when the Network Extension reports memory pressure.
+func TrimMemory() {
+	debug.FreeOSMemory()
+}
+
 func resolveGeoDownloadURLs(configYAML string, st appSettings) geoDownloadURLs {
 	resolved := geoDownloadURLs{
 		GeoIP:   st.GeoIPDatURL,

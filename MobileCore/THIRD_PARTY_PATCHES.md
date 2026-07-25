@@ -72,6 +72,60 @@ Revert the commit that added this patch. For a manual rollback, remove:
 
 No configuration or user-data migration is involved.
 
+## mihomo-ss2022-tcp-connection-limit-and-pressure-trim
+
+- Added: 2026-07-25
+- Upstream module: `github.com/metacubex/mihomo v1.19.29`
+- Patched file: `adapter/outbound/shadowsocks.go`
+- App files: `mihomo.go`, `MiClashTunnel/MemoryDiagnostics.swift`
+- Build tags: default and `with_low_memory`
+
+### Reason
+
+SS2022 must authenticate a complete encrypted record before exposing its
+plaintext. A single stream is stable at high throughput, but parallel download
+workers multiply live cipher records, relay buffers, TCP state, and queued Go
+work inside the iOS Network Extension. The process can cross the platform's
+memory limit before garbage collection returns idle pages, even after removing
+the known per-record allocations and bounding the gVisor queues.
+
+### Local behavior
+
+Each Shadowsocks proxy whose cipher name starts with `2022-` permits at most
+eight active TCP connections. A ninth dial waits for a connection to close and
+honors its `context.Context`, so canceled requests do not remain stuck. The
+permit wraps Mihomo's final `C.Conn` and is released exactly once; this preserves
+the extended Reader/Writer interfaces and the reusable SS Reader used by the
+single-stream fast path. Legacy Shadowsocks ciphers, every other proxy type,
+and native Shadowsocks UDP are unchanged.
+
+Eight is an iOS memory-safety ceiling, not a Speedtest-specific thread count.
+Sites opening more than eight simultaneous TCP connections through the same
+SS2022 node may queue briefly, and a many-stream benchmark can report lower
+peak throughput. Existing connections are never terminated by the limiter.
+
+When iOS reports warning or critical memory pressure, the tunnel records a
+before sample, calls the exported `TrimMemory` bridge (`debug.FreeOSMemory()`),
+and records an after sample. This can introduce a short full-GC pause only under
+actual memory pressure; startup retains its existing one-time reclamation.
+
+### Verification
+
+The Mihomo preparation script verifies the upstream and patched SHA-256 hashes
+for the allocator and Shadowsocks sources plus both regression tests. CI runs
+`common/pool` and `adapter/outbound` in default and low-memory modes. Limiter
+tests cover cipher scoping, the eight-connection boundary, context cancellation,
+and exactly-once permit release. MobileCore tests verify that `TrimMemory`
+increments Go's forced-GC counter.
+
+### Rollback
+
+Revert the commit that added this section. For a targeted manual rollback,
+remove the SS2022 limiter and its test from the Mihomo dependency patch, remove
+the SS source/test hashes from `prepare-ios-mihomo.sh`, restore the allocator-only
+CI command, remove exported `TrimMemory`, and restore the pressure handler to a
+single diagnostic sample. No configuration or user-data migration is involved.
+
 ## sing-shadowsocks2-v0.2.7-reusable-length-buffer
 
 - Added: 2026-07-25

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -46,6 +47,17 @@ func TestRuntimeStatsReturnsDiagnosticSnapshot(t *testing.T) {
 	}
 	if snapshot.Goroutines < 1 {
 		t.Fatalf("RuntimeStats goroutines = %d, want at least 1", snapshot.Goroutines)
+	}
+}
+
+func TestTrimMemoryForcesGarbageCollection(t *testing.T) {
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+	TrimMemory()
+	var after runtime.MemStats
+	runtime.ReadMemStats(&after)
+	if after.NumForcedGC <= before.NumForcedGC {
+		t.Fatalf("NumForcedGC = %d, want greater than %d", after.NumForcedGC, before.NumForcedGC)
 	}
 }
 
