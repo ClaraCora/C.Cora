@@ -89,7 +89,7 @@ jobs:
           SIMULATOR_BINARY="../Vendor/Mihomo.xcframework/ios-arm64_x86_64-simulator/Mihomo.framework/Mihomo"
           plutil -lint ../Vendor/Mihomo.xcframework/Info.plist
           test "$(xcrun lipo -archs "$DEVICE_BINARY")" = "arm64"
-          xcrun lipo -verify_arch arm64 x86_64 "$SIMULATOR_BINARY"
+          xcrun lipo "$SIMULATOR_BINARY" -verify_arch arm64 x86_64
           echo "===== Mihomo.xcframework 切片 ====="
           ls -R ../Vendor/Mihomo.xcframework | head -40
           echo "===== Info.plist ====="
