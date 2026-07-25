@@ -45,7 +45,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/Library/Caches/go-build
-          key: ${{ runner.os }}-go-${{ hashFiles('MobileCore/go.sum') }}
+          key: ${{ runner.os }}-go-${{ hashFiles('MobileCore/go.sum', 'MobileCore/dependency-patches/**', 'MobileCore/scripts/**') }}
           restore-keys: ${{ runner.os }}-go-
 
       - name: Build Mihomo.xcframework (gomobile bind)
@@ -74,6 +74,14 @@ jobs:
           retry go get -tool golang.org/x/mobile/cmd/gobind@${MOBILE_VERSION}
           # go.mod 已 pin mihomo 版本；tidy 补齐间接依赖与 go.sum
           retry go mod tidy
+          # Apply version-locked queue bounds to temporary dependency copies,
+          # then run their regression tests before gomobile.
+          PATCHED_GVISOR="$(bash scripts/prepare-ios-gvisor.sh)"
+          PATCHED_SING_TUN="$(bash scripts/prepare-ios-sing-tun.sh)"
+          go -C "$PATCHED_GVISOR" test ./pkg/tcpip/transport/tcp
+          go -C "$PATCHED_SING_TUN" test -tags "with_gvisor,with_low_memory" \
+            ./internal/fdbased_darwin
+          go test -tags "with_gvisor,with_low_memory" ./...
           # 取出真实 mihomo 版本，用 ldflags 注入 constant.Version
           # （源码默认值是陈旧占位串，官方靠 ldflags 注入真实版本，这里照做）
           MIHOMO_VERSION=$(retry go list -m -f '{{.Version}}' github.com/metacubex/mihomo)

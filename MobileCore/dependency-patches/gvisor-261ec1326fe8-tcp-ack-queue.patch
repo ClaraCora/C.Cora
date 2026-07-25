@@ -1,0 +1,267 @@
+diff --git a/pkg/tcpip/transport/tcp/segment_queue.go b/pkg/tcpip/transport/tcp/segment_queue.go
+--- a/pkg/tcpip/transport/tcp/segment_queue.go
++++ b/pkg/tcpip/transport/tcp/segment_queue.go
+@@ -14,6 +14,12 @@
+ 
+ package tcp
+ 
++import "github.com/metacubex/gvisor/pkg/tcpip/header"
++
++// Keep enough cumulative ACKs for loss recovery while preventing each TCP
++// endpoint from retaining an unbounded number of empty TUN packet buffers.
++const maxQueuedACKSegments = 64
++
+ // segmentQueue is a bounded, thread-safe queue of TCP segments.
+ //
+ // +stateify savable
+@@ -23,5 +29,31 @@ type segmentQueue struct {
+ 	ep     *Endpoint
+ 	frozen bool
++
++	queuedACKs               int  `state:"nosave"`
++	queueCountersInitialized bool `state:"nosave"`
++}
++
++func isQueueLimitedACK(s *segment) bool {
++	const exemptFlags = header.TCPFlagSyn | header.TCPFlagFin | header.TCPFlagRst
++	return s.payloadSize() == 0 &&
++		s.flags&header.TCPFlagAck != 0 &&
++		s.flags&exemptFlags == 0
++}
++
++// initializeQueueCountersLocked reconstructs counters after state restore.
++// Fresh queues pay the list walk only on their first operation.
++// Preconditions: q.mu must be held.
++func (q *segmentQueue) initializeQueueCountersLocked() {
++	if q.queueCountersInitialized {
++		return
++	}
++	q.queuedACKs = 0
++	for s := q.list.Front(); s != nil; s = s.Next() {
++		if isQueueLimitedACK(s) {
++			q.queuedACKs++
++		}
++	}
++	q.queueCountersInitialized = true
+ }
+ 
+ // emptyLocked determines if the queue is empty.
+@@ -48,12 +80,18 @@ func (q *segmentQueue) enqueue(s *segment) bool {
+ 	// avoid lock order inversion.
+ 	bufSz := q.ep.ops.GetReceiveBufferSize()
+-	used := q.ep.receiveMemUsed()
+ 
+ 	q.mu.Lock()
+ 	defer q.mu.Unlock()
++	q.initializeQueueCountersLocked()
++
++	limitedACK := isQueueLimitedACK(s)
++	if limitedACK && q.queuedACKs >= maxQueuedACKSegments {
++		return false
++	}
+ 
+ 	// Allow zero sized segments (ACK/FIN/RSTs etc even if the segment queue
+ 	// is currently full).
++	used := q.ep.receiveMemUsed()
+ 	allow := (used <= int(bufSz) || s.payloadSize() == 0) && !q.frozen
+ 
+ 	if allow {
+@@ -63,6 +101,9 @@ func (q *segmentQueue) enqueue(s *segment) bool {
+ 		q.list.PushBack(s)
+ 		// Set the owner now that the endpoint owns the segment.
+ 		s.setOwner(q.ep, recvQ)
++		if limitedACK {
++			q.queuedACKs++
++		}
+ 	}
+ 
+ 	return allow
+@@ -73,9 +114,13 @@ func (q *segmentQueue) dequeue() *segment {
+ 	q.mu.Lock()
+ 	defer q.mu.Unlock()
++	q.initializeQueueCountersLocked()
+ 
+ 	s := q.list.Front()
+ 	if s != nil {
+ 		q.list.Remove(s)
++		if isQueueLimitedACK(s) {
++			q.queuedACKs--
++		}
+ 	}
+ 
+ 	return s
+diff --git a/pkg/tcpip/transport/tcp/segment_queue_test.go b/pkg/tcpip/transport/tcp/segment_queue_test.go
+new file mode 100644
+--- /dev/null
++++ b/pkg/tcpip/transport/tcp/segment_queue_test.go
+@@ -0,0 +1,170 @@
++package tcp
++
++import (
++	"testing"
++
++	"github.com/metacubex/gvisor/pkg/tcpip/header"
++	"github.com/metacubex/gvisor/pkg/tcpip/stack"
++)
++
++func newQueueTestSegment(flags header.TCPFlags) *segment {
++	s := newSegment()
++	s.flags = flags
++	s.pkt = stack.NewPacketBuffer(stack.PacketBufferOptions{})
++	s.dataMemSize = s.pkt.MemSize()
++	return s
++}
++
++func enqueueQueueTestSegment(q *segmentQueue, s *segment) bool {
++	queued := q.enqueue(s)
++	s.DecRef()
++	return queued
++}
++
++func drainQueueTestSegments(q *segmentQueue) []header.TCPFlags {
++	var flags []header.TCPFlags
++	for {
++		s := q.dequeue()
++		if s == nil {
++			return flags
++		}
++		flags = append(flags, s.flags)
++		s.DecRef()
++	}
++}
++
++func newQueueTestEndpoint() *Endpoint {
++	ep := &Endpoint{}
++	ep.ops.SetReceiveBufferSize(1<<30, false)
++	return ep
++}
++
++func TestSegmentQueueBoundsACKs(t *testing.T) {
++	ep := newQueueTestEndpoint()
++	q := segmentQueue{ep: ep}
++
++	for i := 0; i < maxQueuedACKSegments; i++ {
++		if !enqueueQueueTestSegment(&q, newQueueTestSegment(header.TCPFlagAck)) {
++			t.Fatalf("pure ACK %d was rejected before the limit", i)
++		}
++	}
++	memAtLimit := ep.receiveMemUsed()
++	if enqueueQueueTestSegment(&q, newQueueTestSegment(header.TCPFlagAck)) {
++		t.Fatal("pure ACK beyond the limit was accepted")
++	}
++	if got := ep.receiveMemUsed(); got != memAtLimit {
++		t.Fatalf("receive memory changed after rejected ACK: got %d, want %d", got, memAtLimit)
++	}
++	dequeued := q.dequeue()
++	if dequeued == nil {
++		t.Fatal("bounded queue unexpectedly empty")
++	}
++	dequeued.DecRef()
++	if !enqueueQueueTestSegment(&q, newQueueTestSegment(header.TCPFlagAck)) {
++		t.Fatal("pure ACK was rejected after one queue slot was released")
++	}
++
++	flags := drainQueueTestSegments(&q)
++	if got := len(flags); got != maxQueuedACKSegments {
++		t.Fatalf("queued ACK count = %d, want %d", got, maxQueuedACKSegments)
++	}
++	if got := ep.receiveMemUsed(); got != 0 {
++		t.Fatalf("receive memory after drain = %d, want 0", got)
++	}
++}
++
++func TestSegmentQueuePreservesControlSegments(t *testing.T) {
++	ep := newQueueTestEndpoint()
++	q := segmentQueue{ep: ep}
++	for i := 0; i < maxQueuedACKSegments; i++ {
++		if !enqueueQueueTestSegment(&q, newQueueTestSegment(header.TCPFlagAck)) {
++			t.Fatalf("pure ACK %d was rejected before the limit", i)
++		}
++	}
++
++	controls := []header.TCPFlags{
++		header.TCPFlagSyn,
++		header.TCPFlagFin | header.TCPFlagAck,
++		header.TCPFlagRst | header.TCPFlagAck,
++	}
++	for _, flags := range controls {
++		if !enqueueQueueTestSegment(&q, newQueueTestSegment(flags)) {
++			t.Fatalf("control segment %s was rejected", flags)
++		}
++	}
++	flags := drainQueueTestSegments(&q)
++	if got, want := len(flags), maxQueuedACKSegments+len(controls); got != want {
++		t.Fatalf("queued segment count = %d, want %d", got, want)
++	}
++	if got := ep.receiveMemUsed(); got != 0 {
++		t.Fatalf("receive memory after drain = %d, want 0", got)
++	}
++}
++
++func TestSegmentQueueBoundsACKVariants(t *testing.T) {
++	tests := []struct {
++		name  string
++		flags header.TCPFlags
++		sack  bool
++	}{
++		{name: "SACK", flags: header.TCPFlagAck, sack: true},
++		{name: "ECE", flags: header.TCPFlagAck | header.TCPFlagEce},
++		{name: "CWR", flags: header.TCPFlagAck | header.TCPFlagCwr},
++		{name: "PSH", flags: header.TCPFlagAck | header.TCPFlagPsh},
++		{name: "URG", flags: header.TCPFlagAck | header.TCPFlagUrg},
++	}
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			ep := newQueueTestEndpoint()
++			q := segmentQueue{ep: ep}
++			for i := 0; i < maxQueuedACKSegments-1; i++ {
++				if !enqueueQueueTestSegment(&q, newQueueTestSegment(header.TCPFlagAck)) {
++					t.Fatalf("pure ACK %d was rejected before the limit", i)
++				}
++			}
++			variant := newQueueTestSegment(test.flags)
++			if test.sack {
++				variant.parsedOptions.SACKBlocks = []header.SACKBlock{{}}
++			}
++			if !enqueueQueueTestSegment(&q, variant) {
++				t.Fatalf("%s ACK was rejected before the limit", test.name)
++			}
++			if enqueueQueueTestSegment(&q, newQueueTestSegment(header.TCPFlagAck)) {
++				t.Fatalf("pure ACK beyond the limit was accepted after %s", test.name)
++			}
++			drainQueueTestSegments(&q)
++			if got := ep.receiveMemUsed(); got != 0 {
++				t.Fatalf("receive memory after drain = %d, want 0", got)
++			}
++		})
++	}
++}
++
++func TestSegmentQueueRebuildsACKCount(t *testing.T) {
++	ep := newQueueTestEndpoint()
++	q := segmentQueue{ep: ep, queueCountersInitialized: true}
++	for i := 0; i < maxQueuedACKSegments; i++ {
++		if !enqueueQueueTestSegment(&q, newQueueTestSegment(header.TCPFlagAck)) {
++			t.Fatalf("pure ACK %d was rejected before the limit", i)
++		}
++	}
++	q.queueCountersInitialized = false
++	q.queuedACKs = 0
++	if enqueueQueueTestSegment(&q, newQueueTestSegment(header.TCPFlagAck)) {
++		t.Fatal("pure ACK beyond rebuilt limit was accepted")
++	}
++	drainQueueTestSegments(&q)
++}
++
++func TestSegmentQueueFrozenRejectsControlSegments(t *testing.T) {
++	ep := newQueueTestEndpoint()
++	q := segmentQueue{ep: ep}
++	q.freeze()
++
++	if enqueueQueueTestSegment(&q, newQueueTestSegment(header.TCPFlagRst)) {
++		t.Fatal("frozen queue accepted RST")
++	}
++	if got := ep.receiveMemUsed(); got != 0 {
++		t.Fatalf("receive memory after rejected RST = %d, want 0", got)
++	}
++}

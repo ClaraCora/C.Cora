@@ -1,0 +1,125 @@
+diff --git a/internal/fdbased_darwin/processors.go b/internal/fdbased_darwin/processors.go
+index ea863cd..e43cd37 100644
+--- a/internal/fdbased_darwin/processors.go
++++ b/internal/fdbased_darwin/processors.go
+@@ -28,17 +28,40 @@ import (
+ 	"github.com/metacubex/gvisor/pkg/tcpip/stack/gro"
+ )
+ 
++const maxProcessorQueueBytes = 512 * 1024
++
+ // +stateify savable
+ type processor struct {
+ 	mu processorMutex `state:"nosave"`
+ 	// +checklocks:mu
+ 	pkts stack.PacketBufferList
+ 
+-	e           *endpoint
+-	gro         gro.GRO
+-	sleeper     sleep.Sleeper
+-	packetWaker sleep.Waker
+-	closeWaker  sleep.Waker
++	maxQueuedPackets int `state:"nosave"`
++	e                *endpoint
++	gro              gro.GRO
++	sleeper          sleep.Sleeper
++	packetWaker      sleep.Waker
++	closeWaker       sleep.Waker
++}
++
++func processorQueueLimit(mtu uint32) int {
++	if mtu == 0 {
++		return 1
++	}
++	return maxProcessorQueueBytes/int(mtu) + 1
++}
++
++// enqueue bounds the asynchronous Darwin packet queue. When the consumer is
++// delayed, dropping at this boundary lets TCP apply backpressure/retransmit
++// instead of allowing the Network Extension process to run out of memory.
++func (p *processor) enqueue(pkt *stack.PacketBuffer) bool {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	if p.pkts.Len() >= p.maxQueuedPackets {
++		return false
++	}
++	p.pkts.PushBack(pkt.IncRef())
++	return true
+ }
+ 
+ func (p *processor) start(wg *sync.WaitGroup) {
+@@ -102,6 +125,7 @@ func newProcessorManager(opts *Options, e *endpoint) *processorManager {
+ 	m.wg.Add(opts.ProcessorsPerChannel)
+ 
+ 	for i := range m.processors {
++		m.processors[i].maxQueuedPackets = processorQueueLimit(opts.MTU)
+ 		p := &m.processors[i]
+ 		p.sleeper.AddWaker(&p.packetWaker)
+ 		p.sleeper.AddWaker(&p.closeWaker)
+@@ -127,6 +151,9 @@ func (m *processorManager) start() {
+ // afterLoad is invoked by stateify.
+ func (m *processorManager) afterLoad(context.Context) {
+ 	m.wg.Add(len(m.processors))
++	for i := range m.processors {
++		m.processors[i].maxQueuedPackets = processorQueueLimit(m.e.MTU())
++	}
+ 	m.start()
+ }
+ 
+@@ -162,10 +189,9 @@ func (m *processorManager) queuePacket(pkt *stack.PacketBuffer, hasEthHeader boo
+ 		pIdx = m.connectionHash(&cid) % uint32(len(m.processors))
+ 	}
+ 	p := &m.processors[pIdx]
+-	p.mu.Lock()
+-	defer p.mu.Unlock()
+-	p.pkts.PushBack(pkt.IncRef())
+-	m.ready[pIdx] = true
++	if p.enqueue(pkt) {
++		m.ready[pIdx] = true
++	}
+ }
+ 
+ type connectionID struct {
+diff --git a/internal/fdbased_darwin/processors_test.go b/internal/fdbased_darwin/processors_test.go
+new file mode 100644
+index 0000000..115c82f
+--- /dev/null
++++ b/internal/fdbased_darwin/processors_test.go
+@@ -0,0 +1,37 @@
++package fdbased
++
++import (
++	"testing"
++
++	"github.com/metacubex/gvisor/pkg/tcpip/stack"
++)
++
++func TestProcessorQueueLimit(t *testing.T) {
++	const mtu = 1500
++	want := maxProcessorQueueBytes/mtu + 1
++	if got := processorQueueLimit(mtu); got != want {
++		t.Fatalf("processorQueueLimit(%d) = %d, want %d", mtu, got, want)
++	}
++	if got := processorQueueLimit(0); got != 1 {
++		t.Fatalf("processorQueueLimit(0) = %d, want 1", got)
++	}
++}
++
++func TestProcessorQueueIsBounded(t *testing.T) {
++	p := processor{maxQueuedPackets: 2}
++	defer p.pkts.Reset()
++
++	for i := 0; i < 3; i++ {
++		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{})
++		queued := p.enqueue(pkt)
++		pkt.DecRef()
++		wantQueued := i < p.maxQueuedPackets
++		if queued != wantQueued {
++			t.Fatalf("enqueue packet %d = %v, want %v", i, queued, wantQueued)
++		}
++	}
++
++	if got := p.pkts.Len(); got != p.maxQueuedPackets {
++		t.Fatalf("queued packets = %d, want %d", got, p.maxQueuedPackets)
++	}
++}

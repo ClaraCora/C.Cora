@@ -464,6 +464,12 @@ func applyRuntimeConfig(fd int, tunnelMTU int, configYAML string, st appSettings
 
 	appendRunLog(operation + " ParseRawConfig 成功，开始 ApplyConfig")
 	executor.ApplyConfig(cfg, true)
+	if !preserveTun {
+		// Parsing and applying a large configuration can leave temporary heap
+		// pages resident. Return them once during startup, never during a live
+		// reload where a second full GC would interrupt forwarding.
+		debug.FreeOSMemory()
+	}
 	applied = true
 	appendRunLog(operation + " ApplyConfig 返回")
 	return nil
