@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly MODULE="github.com/metacubex/sing-tun"
-readonly EXPECTED_VERSION="v0.4.21"
-readonly PROCESSOR_SOURCE_REL="internal/fdbased_darwin/processors.go"
-readonly DARWIN_STACK_SOURCE_REL="tun_darwin_gvisor.go"
-readonly DARWIN_STACK_TEST_REL="tun_darwin_gvisor_test.go"
-readonly EXPECTED_PROCESSOR_SOURCE_SHA="4a140130e600a373754218ebefa94db9fd3d18e8ec56136ebad881e60debde94"
-readonly EXPECTED_DARWIN_STACK_SOURCE_SHA="232842a816568665b6739b4b9165aecea229c2d7549c8f584f8de8adc8a274a1"
-readonly EXPECTED_PROCESSOR_PATCHED_SHA="200cf2bdb826b72ea66fcfd2be0239f1742c193590edd400857dd8dd42eab0dc"
-readonly EXPECTED_DARWIN_STACK_PATCHED_SHA="3d4bc2e32d4eeb99298b62310b0f126da1ce8ead3ef757a03bfc17cad426cf52"
-readonly EXPECTED_DARWIN_STACK_TEST_SHA="6d7a62d602fedd3aba86093dbdbfcb4e102d515908c4b10fb10ade3153dbe910"
-readonly PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/sing-tun-v0.4.21-darwin-queue.patch"
-readonly PATCHED_DIR="${RUNNER_TEMP:?}/sing-tun-v0.4.21-ios-memory-v2"
+readonly MODULE="github.com/metacubex/sing"
+readonly EXPECTED_VERSION="v0.5.7"
+readonly ALLOC_SOURCE_REL="common/buf/alloc.go"
+readonly BUFFER_SOURCE_REL="common/buf/buffer.go"
+readonly TEST_REL="common/buf/oversize_pool_test.go"
+readonly EXPECTED_ALLOC_SOURCE_SHA="c8033e748f43cd1813cd56ef20fb9576f7c0c301f468046398fe8b92c196afbd"
+readonly EXPECTED_BUFFER_SOURCE_SHA="52f5b5d03d238665a9013bc5c4ea26ec9ca575a8db0d70df76a1410f86bb24fa"
+readonly EXPECTED_ALLOC_PATCHED_SHA="1c1093d09c8f8acbb0185f3868b512d2be03cbb3d6a43ccd16fb7f58912137a7"
+readonly EXPECTED_BUFFER_PATCHED_SHA="5c63a04120be7924e4a6277638e4e04609a0292536772f31cd3977fcbf773148"
+readonly EXPECTED_TEST_SHA="6339cded8cb6461a2d207cf31bc5909cf6ef2dcbdc56cb2f4f209a1f721af653"
+readonly PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/sing-v0.5.7-oversize-buffer-pool.patch"
+readonly PATCHED_DIR="${RUNNER_TEMP:?}/sing-v0.5.7-ios-oversize-pool-v1"
 
 check_sha256() {
   local expected="$1"
@@ -41,8 +41,8 @@ if [[ -z "$SOURCE_DIR" || ! -d "$SOURCE_DIR" ]]; then
   echo "Unable to resolve source directory for $MODULE" >&2
   exit 1
 fi
-check_sha256 "$EXPECTED_PROCESSOR_SOURCE_SHA" "$SOURCE_DIR/$PROCESSOR_SOURCE_REL"
-check_sha256 "$EXPECTED_DARWIN_STACK_SOURCE_SHA" "$SOURCE_DIR/$DARWIN_STACK_SOURCE_REL"
+check_sha256 "$EXPECTED_ALLOC_SOURCE_SHA" "$SOURCE_DIR/$ALLOC_SOURCE_REL"
+check_sha256 "$EXPECTED_BUFFER_SOURCE_SHA" "$SOURCE_DIR/$BUFFER_SOURCE_REL"
 
 case "$PATCHED_DIR" in
   "$RUNNER_TEMP"/*) ;;
@@ -59,9 +59,9 @@ git -c core.autocrlf=false -C "$PATCHED_DIR" \
   apply --check --whitespace=error-all "$PATCH_FILE"
 git -c core.autocrlf=false -C "$PATCHED_DIR" \
   apply --whitespace=error-all "$PATCH_FILE"
-check_sha256 "$EXPECTED_PROCESSOR_PATCHED_SHA" "$PATCHED_DIR/$PROCESSOR_SOURCE_REL"
-check_sha256 "$EXPECTED_DARWIN_STACK_PATCHED_SHA" "$PATCHED_DIR/$DARWIN_STACK_SOURCE_REL"
-check_sha256 "$EXPECTED_DARWIN_STACK_TEST_SHA" "$PATCHED_DIR/$DARWIN_STACK_TEST_REL"
+check_sha256 "$EXPECTED_ALLOC_PATCHED_SHA" "$PATCHED_DIR/$ALLOC_SOURCE_REL"
+check_sha256 "$EXPECTED_BUFFER_PATCHED_SHA" "$PATCHED_DIR/$BUFFER_SOURCE_REL"
+check_sha256 "$EXPECTED_TEST_SHA" "$PATCHED_DIR/$TEST_REL"
 
 go mod edit -replace="$MODULE@$EXPECTED_VERSION=$PATCHED_DIR"
 readonly RESOLUTION="$(go list -m -f '{{.Version}}|{{if .Replace}}{{.Replace.Dir}}{{end}}' "$MODULE")"

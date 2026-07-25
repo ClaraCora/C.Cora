@@ -11,6 +11,8 @@ import Foundation
 enum FileLog {
 
     private static let queue = DispatchQueue(label: "com.miclash.tunnel.filelog")
+    private static let maxBufferedLines = 512
+    private static let trimBufferedLinesAt = 640
     private static var buffer: [String] = []
 
     private static let formatter: DateFormatter = {
@@ -26,8 +28,14 @@ enum FileLog {
 
     /// 追加一行（带时间戳）。
     static func write(_ message: String) {
-        let line = "\(formatter.string(from: Date())) [NE] \(message)"
-        queue.sync { buffer.append(line) }
+        let line: String = queue.sync {
+            let line = "\(formatter.string(from: Date())) [NE] \(message)"
+            buffer.append(line)
+            if buffer.count >= trimBufferedLinesAt {
+                buffer.removeFirst(buffer.count - maxBufferedLines)
+            }
+            return line
+        }
 
         // best-effort：App Group 可用时也落一份文件，便于将来排查
         if let url = AppGroup.containerURL?.appendingPathComponent("ne.log") {

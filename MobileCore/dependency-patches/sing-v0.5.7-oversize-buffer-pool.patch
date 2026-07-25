@@ -1,0 +1,165 @@
+diff --git a/common/buf/alloc.go b/common/buf/alloc.go
+index 6d2f7b7..20cd57f 100644
+--- a/common/buf/alloc.go
++++ b/common/buf/alloc.go
+@@ -8,6 +8,8 @@ import (
+ 	"sync"
+ )
+ 
++const maxPooledSize = (1 << 16) + 16
++
+ var DefaultAllocator = newDefaultAllocator()
+ 
+ type Allocator interface {
+@@ -18,12 +20,13 @@ type Allocator interface {
+ 
+ // defaultAllocator for incoming frames, optimized to prevent overwriting after zeroing
+ type defaultAllocator struct {
+-	buffers [11]sync.Pool
++	buffers  [11]sync.Pool
++	oversize sync.Pool
+ }
+ 
+-// NewAllocator initiates a []byte allocator for frames less than 65536 bytes,
+-// the waste(memory fragmentation) of space allocation is guaranteed to be
+-// no more than 50%.
++// NewAllocator initiates a []byte allocator for frames up to maxPooledSize.
++// Power-of-two buckets cover the normal range; one exact bucket covers the
++// SS AEAD protocol maximum plus its authentication tag.
+ func newDefaultAllocator() Allocator {
+ 	return &defaultAllocator{
+ 		buffers: [...]sync.Pool{ // 64B -> 64K
+@@ -39,14 +43,19 @@ func newDefaultAllocator() Allocator {
+ 			{New: func() any { return new([1 << 15]byte) }},
+ 			{New: func() any { return new([1 << 16]byte) }},
+ 		},
++		oversize: sync.Pool{New: func() any { return new([maxPooledSize]byte) }},
+ 	}
+ }
+ 
+ // Get a []byte from pool with most appropriate cap
+ func (alloc *defaultAllocator) Get(size int) []byte {
+-	if size <= 0 || size > 65536 {
++	if size <= 0 || size > maxPooledSize {
+ 		return nil
+ 	}
++	if size > 1<<16 {
++		buffer := alloc.oversize.Get().(*[maxPooledSize]byte)
++		return buffer[:size]
++	}
+ 
+ 	var index uint16
+ 	if size > 64 {
+@@ -86,8 +94,13 @@ func (alloc *defaultAllocator) Get(size int) []byte {
+ }
+ 
+ // Put returns a []byte to pool for future use,
+-// which the cap must be exactly 2^n
++// which the cap must be exactly 2^n or the dedicated 65552-byte size.
+ func (alloc *defaultAllocator) Put(buf []byte) error {
++	if cap(buf) == maxPooledSize {
++		buf = buf[:maxPooledSize]
++		alloc.oversize.Put((*[maxPooledSize]byte)(buf))
++		return nil
++	}
+ 	bits := msb(cap(buf))
+ 	if cap(buf) == 0 || cap(buf) > 65536 || cap(buf) != 1<<bits {
+ 		return errors.New("allocator Put() incorrect buffer size")
+diff --git a/common/buf/buffer.go b/common/buf/buffer.go
+index 3bc1bb5..b310617 100644
+--- a/common/buf/buffer.go
++++ b/common/buf/buffer.go
+@@ -42,7 +42,7 @@ func NewPacket() *Buffer {
+ func NewSize(size int) *Buffer {
+ 	if size == 0 {
+ 		return &Buffer{}
+-	} else if size > 65535 {
++	} else if size > maxPooledSize {
+ 		return &Buffer{
+ 			data:     make([]byte, size),
+ 			capacity: size,
+diff --git a/common/buf/oversize_pool_test.go b/common/buf/oversize_pool_test.go
+new file mode 100644
+index 0000000..24992a8
+--- /dev/null
++++ b/common/buf/oversize_pool_test.go
+@@ -0,0 +1,79 @@
++package buf
++
++import (
++	"testing"
++)
++
++func TestNewSizeOversizePoolBoundary(t *testing.T) {
++	tests := []struct {
++		size        int
++		wantCap     int
++		wantManaged bool
++	}{
++		{size: 65535, wantCap: 65536, wantManaged: true},
++		{size: 65536, wantCap: 65536, wantManaged: true},
++		{size: 65537, wantCap: maxPooledSize, wantManaged: true},
++		{size: 65551, wantCap: maxPooledSize, wantManaged: true},
++		{size: 65552, wantCap: maxPooledSize, wantManaged: true},
++		{size: 65553, wantCap: 65553, wantManaged: false},
++	}
++
++	for _, test := range tests {
++		buffer := NewSize(test.size)
++		if got := len(buffer.data); got != test.size {
++			t.Errorf("NewSize(%d) len = %d, want %d", test.size, got, test.size)
++		}
++		if got := cap(buffer.data); got != test.wantCap {
++			t.Errorf("NewSize(%d) cap = %d, want %d", test.size, got, test.wantCap)
++		}
++		if buffer.managed != test.wantManaged {
++			t.Errorf("NewSize(%d) managed = %v, want %v", test.size, buffer.managed, test.wantManaged)
++		}
++		buffer.Release()
++		if test.wantManaged && buffer.data != nil {
++			t.Errorf("NewSize(%d) retained data after Release", test.size)
++		}
++		if !test.wantManaged && buffer.data == nil {
++			t.Errorf("NewSize(%d) unexpectedly released unmanaged data", test.size)
++		}
++	}
++}
++
++func TestAllocatorOversizePoolBoundary(t *testing.T) {
++	tests := []struct {
++		size    int
++		wantCap int
++	}{
++		{size: 65536, wantCap: 65536},
++		{size: 65537, wantCap: maxPooledSize},
++		{size: 65551, wantCap: maxPooledSize},
++		{size: 65552, wantCap: maxPooledSize},
++	}
++	for _, test := range tests {
++		data := DefaultAllocator.Get(test.size)
++		if got := len(data); got != test.size {
++			t.Errorf("Get(%d) len = %d, want %d", test.size, got, test.size)
++		}
++		if got := cap(data); got != test.wantCap {
++			t.Errorf("Get(%d) cap = %d, want %d", test.size, got, test.wantCap)
++		}
++		if err := DefaultAllocator.Put(data); err != nil {
++			t.Errorf("Put(Get(%d)) failed: %v", test.size, err)
++		}
++	}
++
++	if data := DefaultAllocator.Get(maxPooledSize + 1); data != nil {
++		t.Fatal("allocator accepted a size above the dedicated bucket")
++	}
++	if err := DefaultAllocator.Put(make([]byte, maxPooledSize-1)); err == nil {
++		t.Fatal("allocator accepted a non-bucket capacity")
++	}
++}
++
++func BenchmarkNewSize65551(b *testing.B) {
++	b.ReportAllocs()
++	for i := 0; i < b.N; i++ {
++		buffer := NewSize(65551)
++		buffer.Release()
++	}
++}

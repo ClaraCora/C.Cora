@@ -1,10 +1,139 @@
 # Third-party patches
 
-## sing-tun-v0.4.21-darwin-processor-queue
+## sing-and-mihomo-ss-record-oversize-buffer-pool
+
+- Added: 2026-07-25
+- Upstream modules: `github.com/metacubex/sing v0.5.7`,
+  `github.com/metacubex/mihomo v1.19.29`
+- Patched files: sing `common/buf/alloc.go`, `common/buf/buffer.go`;
+  Mihomo `common/pool/alloc.go`
+- Build tags: default and `with_low_memory`
+
+### Reason
+
+An SS AEAD record can contain 65535 bytes of plaintext. Its 16-byte AEAD tag
+makes the receive buffer 65551 bytes. In sing v0.5.7, `buf.NewSize` manages only
+sizes up to 65535 bytes, so every protocol-maximum SS record allocates a fresh
+65551-byte backing array and `Release` leaves it to the garbage collector.
+Parallel SS2022 streams can therefore allocate at nearly payload rate and
+outrun the iOS Packet Tunnel memory limit even though the released buffers are
+no longer live.
+
+Mihomo replaces `sing`'s `buf.DefaultAllocator` with its own allocator during
+package initialization. Updating only sing's allocator therefore passes
+standalone dependency tests but has no effect in the real app; both the sing
+buffer boundary and Mihomo's installed allocator must support this size.
+
+### Local behavior
+
+The sing fallback allocator and Mihomo's installed allocator each have one
+dedicated, exact 65552-byte `sync.Pool` bucket. Sizes from 65536 through 65552
+are managed: 65536 keeps using the existing 64 KiB bucket, while 65537 through
+65552 use the new bucket. Sizes below 65536 and above 65552 retain their
+upstream behavior. In particular, this does not add a generic 128 KiB bucket,
+change cipher framing, retain a record buffer on each connection, or copy
+plaintext on the relay path.
+
+During contention the pool can retain multiple 65552-byte backing arrays, so
+memory after a traffic burst can remain higher than immediate live demand.
+Retention follows concurrent demand and Go's scheduler/pool behavior rather
+than a hard item limit. Released arrays are reusable, and Go may discard pooled
+items during garbage collection; this replaces per-record backing allocation
+with shared capacity without adding per-connection retention.
+
+### Verification
+
+The preparation scripts lock both module versions and verify SHA-256 hashes
+before and after applying each patch. CI runs both allocator boundary suites in
+default and low-memory modes. Mihomo's test imports sing, verifies that its
+allocator replacement is installed, and asserts that `buf.NewSize(65551)` uses
+the exact bucket. The patched SS2 module is also forced to resolve this exact
+patched sing directory before its Reader tests run, preventing a standalone
+dependency test from silently selecting sing v0.5.4.
+
+On Windows amd64, with the SS2 Reader patch held constant and only the sing
+allocator switched, the low-memory `WaitReadBuffer` benchmark for 64
+consecutive 65535-byte records dropped from about 4,724,144 B/op and 133
+allocs/op to about 8,086 B/op and 69 allocs/op. The 32734-byte standard-frame
+case remained at 6,721 B/op and 69 allocs/op with either allocator. These
+desktop figures validate allocation shape rather than iOS throughput or
+peak-memory behavior.
+
+### Rollback
+
+Revert the commit that added this patch. For a manual rollback, remove:
+
+- `dependency-patches/sing-v0.5.7-oversize-buffer-pool.patch`;
+- `dependency-patches/mihomo-v1.19.29-oversize-buffer-pool.patch`;
+- `scripts/prepare-ios-sing.sh` and its CI invocation;
+- `scripts/prepare-ios-mihomo.sh` and its CI invocation;
+- the `PATCHED_SING_DIR` wiring in `prepare-ios-sing-shadowsocks2.sh`;
+- this section of the patch record.
+
+No configuration or user-data migration is involved.
+
+## sing-shadowsocks2-v0.2.7-reusable-length-buffer
+
+- Added: 2026-07-25
+- Upstream module: `github.com/metacubex/sing-shadowsocks2 v0.2.7`
+- Patched file: `internal/shadowio/reader.go`
+- Build tags: default and `with_low_memory`
+
+### Reason
+
+The v0.2.7 AEAD reader allocates a managed 18-byte buffer object for every
+received record solely to decrypt its two-byte length. Multi-stream downloads
+repeat this pool get/put and object allocation at record rate even though the
+length chunk has a fixed wire size.
+
+An attempted all-record ciphertext scratch was rejected after benchmarking the
+actual low-memory `WaitReadBuffer` path. Although it improved ordinary `Read`,
+it forced an additional output-buffer allocation and plaintext copy in the
+Mihomo relay path, increased retained per-connection memory, and performed
+worse than upstream there.
+
+### Local behavior
+
+Each AEAD Reader now embeds one fixed 18-byte length chunk. Ciphertext data
+keeps the upstream behavior: it is decrypted in a managed buffer and, when no
+headroom is required, returned directly by `WaitReadBuffer`. The patch adds no
+per-connection record high-water buffer and no data-path copy. It also makes a
+zero-length `Read` return immediately, rejects a full destination buffer with
+`io.ErrShortBuffer`, and implements `Close` so a partially consumed cache is
+released promptly.
+
+On a Windows amd64 comparison using 64 consecutive 32734-byte records (the
+standard build's maximum data frame) and the `with_low_memory` no-headroom
+`WaitReadBuffer` path, upstream measured about 9.6 KiB/op and 132 allocs/op;
+the patch measured about 5.6 KiB/op and 69 allocs/op. Five runs showed no
+meaningful throughput regression within normal benchmark noise. These desktop
+numbers validate allocation shape only and are not an iOS throughput claim.
+
+### Verification
+
+CI verifies the exact module version and source SHA-256, applies the patch to a
+temporary module copy, verifies the patched source and test hashes, and runs the
+Reader tests in default and low-memory modes. Tests cover mixed record sizes up
+to the 65535-byte protocol boundary, all three read APIs, direct no-headroom
+delivery, MTU/headroom handling, authentication and truncation errors,
+zero-length reads, short buffers, and close cleanup.
+
+### Rollback
+
+Revert the commit that added this patch. For a manual rollback, remove:
+
+- `dependency-patches/sing-shadowsocks2-v0.2.7-length-buffer.patch`;
+- `scripts/prepare-ios-sing-shadowsocks2.sh` and its CI invocation;
+- this section of the patch record.
+
+No configuration or user-data migration is involved.
+
+## sing-tun-v0.4.21-darwin-queue-bounds
 
 - Added: 2026-07-25
 - Upstream module: `github.com/metacubex/sing-tun v0.4.21`
-- Patched file: `internal/fdbased_darwin/processors.go`
+- Patched files: `internal/fdbased_darwin/processors.go`,
+  `tun_darwin_gvisor.go`
 - Build tags: `with_gvisor,with_low_memory`
 
 ### Reason
@@ -19,13 +148,21 @@ more likely than a single stream.
 ### Local behavior
 
 Each Darwin processor queue is capped at one nominal 512 KiB receive batch,
-calculated from the configured TUN MTU. Because packet-pool allocations round
-up and the cap is per processor, real retained memory is higher: at MTU 1500,
-each processor can retain about 700 KiB of packet backing plus metadata.
-Packets arriving while that queue is full are not retained. TCP recovers
+calculated from the configured TUN MTU. Darwin gVisor endpoints now use one
+receive processor per TUN channel instead of deriving the count from
+`GOMAXPROCS`, so the nominal cap is no longer multiplied by the device CPU
+count. Because packet-pool allocations round up, real retained memory is
+higher: at MTU 1500, the single processor can retain about 700 KiB of packet
+backing plus metadata.
+
+The Darwin gVisor-to-utun FIFO is reduced from 1000 packets to 128 packets.
+Packets arriving while either queue is full are not retained. TCP recovers
 through its normal retransmission and congestion-control behavior; UDP can lose
-a datagram during sustained overload. The patch keeps the existing
-multi-processor receive path and does not reduce TCP window sizes.
+a datagram during sustained overload. Using one receive processor and a shorter
+output FIFO can reduce peak packet-per-second throughput, increase drops during
+bursts, and make TCP congestion control back off sooner. These limits affect
+only the Darwin/iOS gVisor endpoint; other platform stacks and TCP window sizes
+are unchanged.
 
 The CI preparation script verifies the exact module version and SHA-256 of the
 upstream source, copies the module to the runner's temporary directory, applies
@@ -39,8 +176,9 @@ live configuration reloads deliberately skip the extra full GC.
 
 ### Verification
 
-CI runs the queue-boundary regression tests from the patched module and compiles
-MobileCore with `with_gvisor,with_low_memory` before `gomobile bind`.
+CI runs the processor queue regression tests and Darwin endpoint limit tests
+from the patched module, then compiles MobileCore with
+`with_gvisor,with_low_memory` before `gomobile bind`.
 
 ### Rollback
 

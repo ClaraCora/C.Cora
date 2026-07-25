@@ -1,0 +1,346 @@
+diff --git a/internal/shadowio/reader.go b/internal/shadowio/reader.go
+index 6becd56..2ff1e79 100644
+--- a/internal/shadowio/reader.go
++++ b/internal/shadowio/reader.go
+@@ -19,6 +19,7 @@ const (
+ )
+ 
+ var (
++	_ io.Closer        = (*Reader)(nil)
+ 	_ N.ExtendedReader = (*Reader)(nil)
+ 	_ N.ReadWaiter     = (*Reader)(nil)
+ )
+@@ -29,6 +30,7 @@ type Reader struct {
+ 	nonce           []byte
+ 	cache           *buf.Buffer
+ 	readWaitOptions N.ReadWaitOptions
++	lengthBuffer    [PacketLengthBufferSize + Overhead]byte
+ }
+ 
+ func NewReader(upstream io.Reader, cipher cipher.AEAD) *Reader {
+@@ -39,6 +41,14 @@ func NewReader(upstream io.Reader, cipher cipher.AEAD) *Reader {
+ 	}
+ }
+ 
++func (r *Reader) Close() error {
++	if r.cache != nil {
++		r.cache.Release()
++		r.cache = nil
++	}
++	return nil
++}
++
+ func (r *Reader) ReadFixedBuffer(pLen int) (*buf.Buffer, error) {
+ 	buffer := buf.NewSize(pLen + Overhead)
+ 	_, err := buffer.ReadFullFrom(r.reader, buffer.FreeLen())
+@@ -66,6 +76,9 @@ func (r *Reader) Decrypt(destination []byte, source []byte) error {
+ }
+ 
+ func (r *Reader) Read(p []byte) (n int, err error) {
++	if len(p) == 0 {
++		return 0, nil
++	}
+ 	for {
+ 		if r.cache != nil {
+ 			if r.cache.IsEmpty() {
+@@ -87,6 +100,9 @@ func (r *Reader) Read(p []byte) (n int, err error) {
+ }
+ 
+ func (r *Reader) ReadBuffer(buffer *buf.Buffer) error {
++	if buffer.FreeLen() == 0 {
++		return io.ErrShortBuffer
++	}
+ 	var err error
+ 	for {
+ 		if r.cache != nil {
+@@ -151,21 +167,18 @@ func (r *Reader) WaitReadBuffer() (buffer *buf.Buffer, err error) {
+ }
+ 
+ func (r *Reader) readBuffer() (*buf.Buffer, error) {
+-	buffer := buf.NewSize(PacketLengthBufferSize + Overhead)
+-	_, err := buffer.ReadFullFrom(r.reader, buffer.FreeLen())
++	lengthChunk := r.lengthBuffer[:]
++	_, err := io.ReadFull(r.reader, lengthChunk)
+ 	if err != nil {
+-		buffer.Release()
+ 		return nil, err
+ 	}
+-	_, err = r.cipher.Open(buffer.Index(0), r.nonce, buffer.Bytes(), nil)
++	_, err = r.cipher.Open(lengthChunk[:0], r.nonce, lengthChunk, nil)
+ 	if err != nil {
+-		buffer.Release()
+ 		return nil, err
+ 	}
+ 	increaseNonce(r.nonce)
+-	length := int(binary.BigEndian.Uint16(buffer.To(PacketLengthBufferSize)))
+-	buffer.Release()
+-	buffer = buf.NewSize(length + Overhead)
++	length := int(binary.BigEndian.Uint16(lengthChunk[:PacketLengthBufferSize]))
++	buffer := buf.NewSize(length + Overhead)
+ 	_, err = buffer.ReadFullFrom(r.reader, buffer.FreeLen())
+ 	if err != nil {
+ 		buffer.Release()
+diff --git a/internal/shadowio/reader_reuse_test.go b/internal/shadowio/reader_reuse_test.go
+new file mode 100644
+index 0000000..bad96a4
+--- /dev/null
++++ b/internal/shadowio/reader_reuse_test.go
+@@ -0,0 +1,258 @@
++package shadowio
++
++import (
++	"bytes"
++	"crypto/aes"
++	"crypto/cipher"
++	"encoding/binary"
++	"errors"
++	"io"
++	"testing"
++
++	"github.com/metacubex/sing/common/buf"
++	N "github.com/metacubex/sing/common/network"
++)
++
++var reusableLengthTestKey = [16]byte{
++	0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
++	0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
++}
++
++func newReusableLengthTestAEAD(t testing.TB) cipher.AEAD {
++	t.Helper()
++	block, err := aes.NewCipher(reusableLengthTestKey[:])
++	if err != nil {
++		t.Fatal(err)
++	}
++	aead, err := cipher.NewGCM(block)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return aead
++}
++
++func reusableLengthPayload(size int, seed byte) []byte {
++	payload := make([]byte, size)
++	for i := range payload {
++		payload[i] = seed + byte(i*31)
++	}
++	return payload
++}
++
++func encryptReusableLengthRecords(t testing.TB, payloads ...[]byte) []byte {
++	t.Helper()
++	aead := newReusableLengthTestAEAD(t)
++	nonce := make([]byte, aead.NonceSize())
++	var wire []byte
++	for _, payload := range payloads {
++		if len(payload) > 65535 {
++			t.Fatalf("payload length %d exceeds the AEAD record limit", len(payload))
++		}
++		var length [PacketLengthBufferSize]byte
++		binary.BigEndian.PutUint16(length[:], uint16(len(payload)))
++		wire = aead.Seal(wire, nonce, length[:], nil)
++		increaseNonce(nonce)
++		wire = aead.Seal(wire, nonce, payload, nil)
++		increaseNonce(nonce)
++	}
++	return wire
++}
++
++func TestReaderReusableLengthChunkAcrossRecordSizes(t *testing.T) {
++	payloads := [][]byte{
++		reusableLengthPayload(1024, 0x11),
++		reusableLengthPayload(32*1024, 0x32),
++		reusableLengthPayload(65535, 0x53),
++	}
++	reader := NewReader(
++		bytes.NewReader(encryptReusableLengthRecords(t, payloads...)),
++		newReusableLengthTestAEAD(t),
++	)
++
++	for i, payload := range payloads {
++		decoded := make([]byte, len(payload))
++		if _, err := io.ReadFull(reader, decoded); err != nil {
++			t.Fatalf("read record %d: %v", i, err)
++		}
++		if !bytes.Equal(decoded, payload) {
++			t.Fatalf("decoded record %d mismatch", i)
++		}
++	}
++}
++
++func TestReaderReadBufferAndShortBuffer(t *testing.T) {
++	payload := reusableLengthPayload(48*1024, 0x1b)
++	reader := NewReader(
++		bytes.NewReader(encryptReusableLengthRecords(t, payload)),
++		newReusableLengthTestAEAD(t),
++	)
++	if err := reader.ReadBuffer(buf.NewSize(0)); !errors.Is(err, io.ErrShortBuffer) {
++		t.Fatalf("empty ReadBuffer error = %v, want %v", err, io.ErrShortBuffer)
++	}
++	decoded := make([]byte, 0, len(payload))
++	for len(decoded) < len(payload) {
++		buffer := buf.NewSize(1500)
++		if err := reader.ReadBuffer(buffer); err != nil {
++			buffer.Release()
++			t.Fatalf("ReadBuffer: %v", err)
++		}
++		decoded = append(decoded, buffer.Bytes()...)
++		buffer.Release()
++	}
++	if !bytes.Equal(decoded, payload) {
++		t.Fatal("ReadBuffer decoded payload mismatch")
++	}
++}
++
++func TestReaderWaitReadBufferDirectAndHeadroom(t *testing.T) {
++	t.Run("direct", func(t *testing.T) {
++		payload := reusableLengthPayload(32*1024, 0x25)
++		reader := NewReader(
++			bytes.NewReader(encryptReusableLengthRecords(t, payload)),
++			newReusableLengthTestAEAD(t),
++		)
++		reader.InitializeReadWaiter(N.ReadWaitOptions{})
++		buffer, err := reader.WaitReadBuffer()
++		if err != nil {
++			t.Fatalf("WaitReadBuffer: %v", err)
++		}
++		defer buffer.Release()
++		if !bytes.Equal(buffer.Bytes(), payload) {
++			t.Fatal("direct WaitReadBuffer payload mismatch")
++		}
++	})
++
++	t.Run("headroom", func(t *testing.T) {
++		payload := reusableLengthPayload(48*1024, 0x46)
++		reader := NewReader(
++			bytes.NewReader(encryptReusableLengthRecords(t, payload)),
++			newReusableLengthTestAEAD(t),
++		)
++		options := N.ReadWaitOptions{FrontHeadroom: 8, RearHeadroom: 16, MTU: 1500}
++		if !reader.InitializeReadWaiter(options) {
++			t.Fatal("reader did not report the required headroom copy")
++		}
++		decoded := make([]byte, 0, len(payload))
++		for len(decoded) < len(payload) {
++			buffer, err := reader.WaitReadBuffer()
++			if err != nil {
++				t.Fatalf("WaitReadBuffer: %v", err)
++			}
++			if buffer.Start() != options.FrontHeadroom || buffer.Len() > options.MTU {
++				buffer.Release()
++				t.Fatalf("returned start/len = %d/%d", buffer.Start(), buffer.Len())
++			}
++			decoded = append(decoded, buffer.Bytes()...)
++			buffer.Release()
++		}
++		if !bytes.Equal(decoded, payload) {
++			t.Fatal("headroom WaitReadBuffer payload mismatch")
++		}
++	})
++}
++
++func TestReaderReusableLengthErrorsAndClose(t *testing.T) {
++	payload := reusableLengthPayload(32*1024, 0x4f)
++	validWire := encryptReusableLengthRecords(t, payload)
++	tamperedWire := append([]byte(nil), validWire...)
++	tamperedWire[len(tamperedWire)-1] ^= 0x80
++	for name, wire := range map[string][]byte{
++		"truncated": validWire[:len(validWire)-1],
++		"tampered":  tamperedWire,
++	} {
++		t.Run(name, func(t *testing.T) {
++			reader := NewReader(bytes.NewReader(wire), newReusableLengthTestAEAD(t))
++			if _, err := io.ReadAll(reader); err == nil {
++				t.Fatal("invalid record was accepted")
++			}
++		})
++	}
++
++	reader := NewReader(bytes.NewReader(validWire), newReusableLengthTestAEAD(t))
++	partial := make([]byte, 1024)
++	if _, err := reader.Read(partial); err != nil {
++		t.Fatalf("read partial record: %v", err)
++	}
++	if reader.cache == nil || reader.cache.IsEmpty() {
++		t.Fatal("test did not leave a partially consumed cache")
++	}
++	if err := reader.Close(); err != nil {
++		t.Fatalf("Close: %v", err)
++	}
++	if reader.cache != nil {
++		t.Fatal("Close retained the record cache")
++	}
++	if err := reader.Close(); err != nil {
++		t.Fatalf("second Close: %v", err)
++	}
++}
++
++func TestReaderZeroLengthReadDoesNotConsumeRecord(t *testing.T) {
++	payload := reusableLengthPayload(1024, 0x59)
++	reader := NewReader(
++		bytes.NewReader(encryptReusableLengthRecords(t, payload)),
++		newReusableLengthTestAEAD(t),
++	)
++	if n, err := reader.Read(nil); n != 0 || err != nil {
++		t.Fatalf("zero-length Read = (%d, %v), want (0, nil)", n, err)
++	}
++	decoded, err := io.ReadAll(reader)
++	if err != nil {
++		t.Fatalf("ReadAll: %v", err)
++	}
++	if !bytes.Equal(decoded, payload) {
++		t.Fatal("zero-length Read consumed or changed the next record")
++	}
++}
++
++func BenchmarkReaderWaitReadBufferMaxStandardFrame(b *testing.B) {
++	const records = 64
++	payload := reusableLengthPayload(32*1024-34, 0x63)
++	payloads := make([][]byte, records)
++	for i := range payloads {
++		payloads[i] = payload
++	}
++	wire := encryptReusableLengthRecords(b, payloads...)
++	b.SetBytes(int64(records * len(payload)))
++	b.ReportAllocs()
++	b.ResetTimer()
++
++	for i := 0; i < b.N; i++ {
++		reader := NewReader(bytes.NewReader(wire), newReusableLengthTestAEAD(b))
++		reader.InitializeReadWaiter(N.ReadWaitOptions{})
++		for j := 0; j < records; j++ {
++			buffer, err := reader.WaitReadBuffer()
++			if err != nil {
++				b.Fatal(err)
++			}
++			buffer.Release()
++		}
++		_ = reader.Close()
++	}
++}
++
++func BenchmarkReaderWaitReadBufferProtocolMaxFrame(b *testing.B) {
++	const records = 64
++	payload := reusableLengthPayload(65535, 0x71)
++	payloads := make([][]byte, records)
++	for i := range payloads {
++		payloads[i] = payload
++	}
++	wire := encryptReusableLengthRecords(b, payloads...)
++	b.SetBytes(int64(records * len(payload)))
++	b.ReportAllocs()
++	b.ResetTimer()
++
++	for i := 0; i < b.N; i++ {
++		reader := NewReader(bytes.NewReader(wire), newReusableLengthTestAEAD(b))
++		reader.InitializeReadWaiter(N.ReadWaitOptions{})
++		for j := 0; j < records; j++ {
++			buffer, err := reader.WaitReadBuffer()
++			if err != nil {
++				b.Fatal(err)
++			}
++			buffer.Release()
++		}
++		_ = reader.Close()
++	}
++}

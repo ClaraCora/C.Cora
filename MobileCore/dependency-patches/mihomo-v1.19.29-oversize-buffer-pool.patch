@@ -1,0 +1,128 @@
+diff --git a/common/pool/alloc.go b/common/pool/alloc.go
+index cb58644..c7ffeb6 100644
+--- a/common/pool/alloc.go
++++ b/common/pool/alloc.go
+@@ -8,6 +8,8 @@ import (
+ 	"sync"
+ )
+ 
++const maxPooledSize = (1 << 16) + 16
++
+ var DefaultAllocator = NewAllocator()
+ 
+ type Allocator interface {
+@@ -17,12 +19,12 @@ type Allocator interface {
+ 
+ // defaultAllocator for incoming frames, optimized to prevent overwriting after zeroing
+ type defaultAllocator struct {
+-	buffers [11]sync.Pool
++	buffers  [11]sync.Pool
++	oversize sync.Pool
+ }
+ 
+-// NewAllocator initiates a []byte allocator for frames less than 65536 bytes,
+-// the waste(memory fragmentation) of space allocation is guaranteed to be
+-// no more than 50%.
++// NewAllocator uses power-of-two buckets for normal frames and one exact
++// bucket for the SS AEAD protocol maximum plus its authentication tag.
+ func NewAllocator() Allocator {
+ 	return &defaultAllocator{
+ 		buffers: [...]sync.Pool{ // 64B -> 64K
+@@ -38,6 +40,7 @@ func NewAllocator() Allocator {
+ 			{New: func() any { return new([1 << 15]byte) }},
+ 			{New: func() any { return new([1 << 16]byte) }},
+ 		},
++		oversize: sync.Pool{New: func() any { return new([maxPooledSize]byte) }},
+ 	}
+ }
+ 
+@@ -48,8 +51,11 @@ func (alloc *defaultAllocator) Get(size int) []byte {
+ 		panic("alloc.Get: len out of range")
+ 	case size == 0:
+ 		return nil
+-	case size > 65536:
++	case size > maxPooledSize:
+ 		return make([]byte, size)
++	case size > 1<<16:
++		buffer := alloc.oversize.Get().(*[maxPooledSize]byte)
++		return buffer[:size]
+ 	default:
+ 		var index uint16
+ 		if size > 64 {
+@@ -91,8 +97,13 @@ func (alloc *defaultAllocator) Get(size int) []byte {
+ }
+ 
+ // Put returns a []byte to pool for future use,
+-// which the cap must be exactly 2^n
++// which the cap must be exactly 2^n or the dedicated 65552-byte size.
+ func (alloc *defaultAllocator) Put(buf []byte) error {
++	if cap(buf) == maxPooledSize {
++		buf = buf[:maxPooledSize]
++		alloc.oversize.Put((*[maxPooledSize]byte)(buf))
++		return nil
++	}
+ 	if cap(buf) == 0 || cap(buf) > 65536 {
+ 		return nil
+ 	}
+diff --git a/common/pool/oversize_pool_test.go b/common/pool/oversize_pool_test.go
+new file mode 100644
+index 0000000..80cdffa
+--- /dev/null
++++ b/common/pool/oversize_pool_test.go
+@@ -0,0 +1,56 @@
++package pool
++
++import (
++	"testing"
++
++	"github.com/metacubex/sing/common/buf"
++)
++
++func TestOversizePoolBoundary(t *testing.T) {
++	tests := []struct {
++		size    int
++		wantCap int
++	}{
++		{size: 65535, wantCap: 65536},
++		{size: 65536, wantCap: 65536},
++		{size: 65537, wantCap: maxPooledSize},
++		{size: 65551, wantCap: maxPooledSize},
++		{size: 65552, wantCap: maxPooledSize},
++		{size: 65553, wantCap: 65553},
++	}
++
++	for _, test := range tests {
++		data := DefaultAllocator.Get(test.size)
++		if got := len(data); got != test.size {
++			t.Errorf("Get(%d) len = %d, want %d", test.size, got, test.size)
++		}
++		if got := cap(data); got != test.wantCap {
++			t.Errorf("Get(%d) cap = %d, want %d", test.size, got, test.wantCap)
++		}
++		if err := DefaultAllocator.Put(data); err != nil {
++			t.Errorf("Put(Get(%d)) failed: %v", test.size, err)
++		}
++	}
++}
++
++func TestSingBufferUsesMihomoOversizePool(t *testing.T) {
++	if buf.DefaultAllocator != DefaultAllocator {
++		t.Fatal("sing buffer allocator was not replaced by Mihomo")
++	}
++	buffer := buf.NewSize(65551)
++	if got := cap(buffer.FreeBytes()); got != maxPooledSize {
++		buffer.Release()
++		t.Fatalf("sing NewSize(65551) cap = %d, want %d", got, maxPooledSize)
++	}
++	buffer.Release()
++}
++
++func BenchmarkOversizePool65551(b *testing.B) {
++	b.ReportAllocs()
++	for i := 0; i < b.N; i++ {
++		data := DefaultAllocator.Get(65551)
++		if err := DefaultAllocator.Put(data); err != nil {
++			b.Fatal(err)
++		}
++	}
++}

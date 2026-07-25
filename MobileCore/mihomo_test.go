@@ -21,6 +21,34 @@ func TestValidateGeoDatabaseRejectsInvalidContent(t *testing.T) {
 	}
 }
 
+func TestRuntimeStatsReturnsDiagnosticSnapshot(t *testing.T) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(RuntimeStats()), &fields); err != nil {
+		t.Fatalf("RuntimeStats returned invalid JSON: %v", err)
+	}
+	for _, key := range []string{"heapAlloc", "sys", "goroutines", "connections"} {
+		if _, exists := fields[key]; !exists {
+			t.Fatalf("RuntimeStats omitted %q", key)
+		}
+	}
+
+	var snapshot struct {
+		HeapAlloc   uint64 `json:"heapAlloc"`
+		Sys         uint64 `json:"sys"`
+		Goroutines  int    `json:"goroutines"`
+		Connections int    `json:"connections"`
+	}
+	if err := json.Unmarshal([]byte(RuntimeStats()), &snapshot); err != nil {
+		t.Fatalf("RuntimeStats returned invalid JSON: %v", err)
+	}
+	if snapshot.HeapAlloc == 0 || snapshot.Sys == 0 {
+		t.Fatalf("RuntimeStats omitted memory counters: %+v", snapshot)
+	}
+	if snapshot.Goroutines < 1 {
+		t.Fatalf("RuntimeStats goroutines = %d, want at least 1", snapshot.Goroutines)
+	}
+}
+
 func mergedMap(t *testing.T, input string) map[string]any {
 	t.Helper()
 	return mergedMapWithSettings(t, input, appSettings{Stack: "gvisor", LogLevel: "info"})

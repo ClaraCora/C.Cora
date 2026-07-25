@@ -27,6 +27,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private var configuredTunnelMTU: Int?
     private var isStopping = false
     private let reloadQueue = DispatchQueue(label: "com.miclash.tunnel.reload", qos: .userInitiated)
+    private let memoryDiagnostics = MemoryDiagnostics()
 
     // 物理接口监控：把真实出站接口（en0/pdp_ip0）显式喂给内核，取代 mihomo 自带的不可靠监控。
     private var pathMonitor: NWPathMonitor?
@@ -122,6 +123,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             // gomobile 把带 error 返回的 Go 函数生成为「返回 BOOL + NSError** 出参」的 C 函数，
             // 不会自动桥接成 Swift throws，所以用经典 NSError 指针写法：成功返回 true。
             FileLog.write("调用 MihomoStartWithConfig…")
+            self.memoryDiagnostics.start(directoryPath: home)
             var startError: NSError?
             let startResult: Bool? = self.reloadQueue.sync {
                 guard !self.isStopping else { return nil }
@@ -140,6 +142,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 return ok
             }
             guard let startResult else {
+                self.memoryDiagnostics.stop(event: "startCancelled")
                 completionHandler(NSError(
                     domain: "MiClashTunnel",
                     code: -5,
@@ -147,6 +150,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 return
             }
             guard startResult else {
+                self.memoryDiagnostics.stop(event: "startFailed")
                 let error = startError ?? NSError(domain: "MiClashTunnel", code: -3,
                     userInfo: [NSLocalizedDescriptionKey: "mihomo 启动失败（未知错误）"])
                 FileLog.write("MihomoStartWithConfig 失败：\(error.localizedDescription)")
@@ -220,6 +224,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             AppGroupState.vpnConnected = false // 同步给控制中心磁贴
             ControlCenter.shared.reloadControls(ofKind: ControlWidgetKind.vpn)
             stopPathMonitor()
+            memoryDiagnostics.stop(event: "stop")
             MihomoStop()
         }
         completionHandler()
@@ -278,7 +283,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                                   completionHandler: ((Data?) -> Void)?) {
         let obj = (try? JSONSerialization.jsonObject(with: messageData)) as? [String: Any]
         let cmd = (obj?["cmd"] as? String) ?? String(data: messageData, encoding: .utf8) ?? ""
-        FileLog.write("handleAppMessage：cmd=\(cmd)")
+        if cmd != "traffic" && cmd != "memory" {
+            FileLog.write("handleAppMessage：cmd=\(cmd)")
+        }
 
         switch cmd {
         case "queryProxies":
@@ -376,8 +383,10 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             }
 
             FileLog.write("调用 MihomoReloadConfig（config=\(configYAML.count) 字节）…")
+            self.memoryDiagnostics.record(event: "reloadBefore")
             var reloadError: NSError?
             let ok = MihomoReloadConfig(Int(fd), tunnelMTU, configYAML, input.settings, &reloadError)
+            self.memoryDiagnostics.record(event: ok ? "reloadAfter" : "reloadFailed")
             guard ok else {
                 let message = reloadError?.localizedDescription ?? "mihomo 重载失败（未知错误）"
                 FileLog.write("MihomoReloadConfig 失败：\(message)")
@@ -467,16 +476,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     /// 返回当前 Network Extension 进程的物理内存占用。
     /// `phys_footprint` 与系统内存压力/Jetsam 口径更接近，不能用 RSS 替代。
     private static func memoryFootprintData() -> Data {
-        var info = task_vm_info_data_t()
-        var count = mach_msg_type_number_t(
-            MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size
-        )
-        let result = withUnsafeMutablePointer(to: &info) { pointer in
-            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { rebound in
-                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), rebound, &count)
-            }
-        }
-        let footprint = result == KERN_SUCCESS ? info.phys_footprint : 0
+        let footprint = MemoryDiagnostics.physicalFootprint()
         let payload: [String: NSNumber] = ["physFootprint": NSNumber(value: footprint)]
         return (try? JSONSerialization.data(withJSONObject: payload))
             ?? Data(#"{"physFootprint":0}"#.utf8)
@@ -489,17 +489,43 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         return Data("…（已截断，仅显示最新 \(maxBytes / 1024)KB）\n".utf8) + data.suffix(maxBytes)
     }
 
-    /// 汇总 NE 步骤日志（内存）+ mihomo 内核 run.log（home 目录）。
+    /// 汇总 NE 步骤日志、mihomo 日志和持久化内存诊断。
     private func collectLogs() -> String {
         var out = "===== ne（NE 启动步骤，内存）=====\n" + FileLog.dump()
         if let home = homeDir {
             let runPath = (home as NSString).appendingPathComponent("run.log")
-            let run = (try? String(contentsOfFile: runPath, encoding: .utf8)) ?? "(run.log 不存在)"
+            let run = Self.tailTextFile(runPath, maxBytes: 10 * 1024) ?? "(run.log 不存在)"
             out += "\n\n===== run.log（mihomo 内核）=====\n" + (run.isEmpty ? "(空)" : run)
+
+            let previousPath = (home as NSString)
+                .appendingPathComponent("memory-diagnostic.previous.ndjson")
+            let currentPath = (home as NSString)
+                .appendingPathComponent("memory-diagnostic.ndjson")
+            let previous = Self.tailTextFile(previousPath, maxBytes: 4 * 1024) ?? "(不存在)"
+            let current = Self.tailTextFile(currentPath, maxBytes: 6 * 1024) ?? "(不存在)"
+            out += "\n\n===== memory diagnostic（上一段）=====\n" + previous
+            out += "\n\n===== memory diagnostic（当前段）=====\n" + current
         } else {
             out += "\n\n(home 未设置，mihomo 尚未启动)"
         }
         return out
+    }
+
+    /// 只读取文件末尾，避免 getLogs 本身因读取大日志造成额外内存峰值。
+    private static func tailTextFile(_ path: String, maxBytes: UInt64) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path)) else {
+            return nil
+        }
+        defer { try? handle.close() }
+        do {
+            let size = try handle.seekToEnd()
+            let offset = size > maxBytes ? size - maxBytes : 0
+            try handle.seek(toOffset: offset)
+            let data = try handle.readToEnd() ?? Data()
+            return String(decoding: data, as: UTF8.self)
+        } catch {
+            return nil
+        }
     }
 
     // MARK: - 网络设置

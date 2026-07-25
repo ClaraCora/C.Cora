@@ -123,3 +123,70 @@ index 0000000..115c82f
 +		t.Fatalf("queued packets = %d, want %d", got, p.maxQueuedPackets)
 +	}
 +}
+diff --git a/tun_darwin_gvisor.go b/tun_darwin_gvisor.go
+index c036861..6ff01a8 100644
+--- a/tun_darwin_gvisor.go
++++ b/tun_darwin_gvisor.go
+@@ -15 +15,6 @@
++const (
++	darwinGVisorProcessorsPerChannel = 1
++	darwinGVisorQDiscQueueLen        = 128
++)
++
+ var _ GVisorTun = (*NativeTun)(nil)
+@@ -51,15 +56,16 @@
+ func (t *NativeTun) NewEndpoint() (stack.LinkEndpoint, stack.NICOptions, error) {
+-	ep, err := fdbased.New(&fdbased.Options{
+-		FDs:               []int{t.tunFd},
+-		MTU:               t.options.MTU,
+-		RXChecksumOffload: true,
+-		RecvMsgX:          t.options.EXP_RecvMsgX,
+-		SendMsgX:          t.options.EXP_SendMsgX,
+-	})
+-	if err != nil {
+-		return nil, stack.NICOptions{}, err
+-	}
+-	return ep, stack.NICOptions{
+-		QDisc: fifo.New(ep, 1, 1000),
+-	}, nil
++	ep, err := fdbased.New(&fdbased.Options{
++		FDs:                  []int{t.tunFd},
++		MTU:                  t.options.MTU,
++		RXChecksumOffload:    true,
++		RecvMsgX:             t.options.EXP_RecvMsgX,
++		SendMsgX:             t.options.EXP_SendMsgX,
++		ProcessorsPerChannel: darwinGVisorProcessorsPerChannel,
++	})
++	if err != nil {
++		return nil, stack.NICOptions{}, err
++	}
++	return ep, stack.NICOptions{
++		QDisc: fifo.New(ep, 1, darwinGVisorQDiscQueueLen),
++	}, nil
+ }
+diff --git a/tun_darwin_gvisor_test.go b/tun_darwin_gvisor_test.go
+new file mode 100644
+index 0000000..6e3a6d2
+--- /dev/null
++++ b/tun_darwin_gvisor_test.go
+@@ -0,0 +1,20 @@
++//go:build with_gvisor && darwin
++
++package tun
++
++import "testing"
++
++func TestDarwinGVisorMemoryBounds(t *testing.T) {
++	if got, want := darwinGVisorProcessorsPerChannel, 1; got != want {
++		t.Fatalf("processors per channel = %d, want %d", got, want)
++	}
++	if got, want := darwinGVisorQDiscQueueLen, 128; got != want {
++		t.Fatalf("qdisc queue length = %d, want %d", got, want)
++	}
++}
++
++func TestDarwinGVisorBoundsArePositive(t *testing.T) {
++	if darwinGVisorProcessorsPerChannel <= 0 || darwinGVisorQDiscQueueLen <= 0 {
++		t.Fatal("Darwin gVisor memory bounds must remain positive")
++	}
++}

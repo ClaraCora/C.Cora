@@ -1019,6 +1019,112 @@ func TrafficNow() string {
 	return string(out)
 }
 
+// RuntimeStats returns a compact process snapshot for the Network Extension's
+// persistent OOM diagnostics. It reads runtime/statistic counters without
+// forcing a garbage collection.
+func RuntimeStats() string {
+	var mem runtime.MemStats
+	runtime.ReadMemStats(&mem)
+
+	connections := 0
+	tcpConnections := 0
+	udpConnections := 0
+	statistic.DefaultManager.Range(func(tracker statistic.Tracker) bool {
+		connections++
+		info := tracker.Info()
+		if info == nil || info.Metadata == nil {
+			return true
+		}
+		switch info.Metadata.NetWork {
+		case C.TCP:
+			tcpConnections++
+		case C.UDP:
+			udpConnections++
+		}
+		return true
+	})
+
+	up, down := statistic.DefaultManager.Now()
+	upTotal, downTotal := statistic.DefaultManager.Total()
+	var lastPause uint64
+	if mem.NumGC != 0 {
+		lastPause = mem.PauseNs[(mem.NumGC-1)%uint32(len(mem.PauseNs))]
+	}
+
+	snapshot := struct {
+		HeapAlloc      uint64  `json:"heapAlloc"`
+		HeapObjects    uint64  `json:"heapObjects"`
+		HeapInuse      uint64  `json:"heapInuse"`
+		HeapIdle       uint64  `json:"heapIdle"`
+		HeapReleased   uint64  `json:"heapReleased"`
+		HeapSys        uint64  `json:"heapSys"`
+		StackInuse     uint64  `json:"stackInuse"`
+		StackSys       uint64  `json:"stackSys"`
+		MSpanInuse     uint64  `json:"mspanInuse"`
+		MCacheInuse    uint64  `json:"mcacheInuse"`
+		BuckHashSys    uint64  `json:"buckHashSys"`
+		GCSys          uint64  `json:"gcSys"`
+		OtherSys       uint64  `json:"otherSys"`
+		Sys            uint64  `json:"sys"`
+		TotalAlloc     uint64  `json:"totalAlloc"`
+		Mallocs        uint64  `json:"mallocs"`
+		Frees          uint64  `json:"frees"`
+		NextGC         uint64  `json:"nextGC"`
+		LastGC         uint64  `json:"lastGC"`
+		NumGC          uint32  `json:"numGC"`
+		NumForcedGC    uint32  `json:"numForcedGC"`
+		PauseTotalNs   uint64  `json:"pauseTotalNs"`
+		LastPauseNs    uint64  `json:"lastPauseNs"`
+		GCCPUFraction  float64 `json:"gcCPUFraction"`
+		Goroutines     int     `json:"goroutines"`
+		Connections    int     `json:"connections"`
+		TCPConnections int     `json:"tcpConnections"`
+		UDPConnections int     `json:"udpConnections"`
+		Upload         int64   `json:"up"`
+		Download       int64   `json:"down"`
+		UploadTotal    int64   `json:"upTotal"`
+		DownloadTotal  int64   `json:"downTotal"`
+	}{
+		HeapAlloc:      mem.HeapAlloc,
+		HeapObjects:    mem.HeapObjects,
+		HeapInuse:      mem.HeapInuse,
+		HeapIdle:       mem.HeapIdle,
+		HeapReleased:   mem.HeapReleased,
+		HeapSys:        mem.HeapSys,
+		StackInuse:     mem.StackInuse,
+		StackSys:       mem.StackSys,
+		MSpanInuse:     mem.MSpanInuse,
+		MCacheInuse:    mem.MCacheInuse,
+		BuckHashSys:    mem.BuckHashSys,
+		GCSys:          mem.GCSys,
+		OtherSys:       mem.OtherSys,
+		Sys:            mem.Sys,
+		TotalAlloc:     mem.TotalAlloc,
+		Mallocs:        mem.Mallocs,
+		Frees:          mem.Frees,
+		NextGC:         mem.NextGC,
+		LastGC:         mem.LastGC,
+		NumGC:          mem.NumGC,
+		NumForcedGC:    mem.NumForcedGC,
+		PauseTotalNs:   mem.PauseTotalNs,
+		LastPauseNs:    lastPause,
+		GCCPUFraction:  mem.GCCPUFraction,
+		Goroutines:     runtime.NumGoroutine(),
+		Connections:    connections,
+		TCPConnections: tcpConnections,
+		UDPConnections: udpConnections,
+		Upload:         up,
+		Download:       down,
+		UploadTotal:    upTotal,
+		DownloadTotal:  downTotal,
+	}
+	out, err := json.Marshal(snapshot)
+	if err != nil {
+		return `{}`
+	}
+	return string(out)
+}
+
 // SetDefaultInterface 把所有出站绑定到指定物理接口（en0/pdp_ip0…）。
 // 由 NE 的 NWPathMonitor 在网络路径变化时调用，取代 mihomo 自带的（iOS 下不可靠的）接口监控。
 // 对应 Swift 侧 `MihomoSetDefaultInterface(_:)`。
