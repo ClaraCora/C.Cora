@@ -1,0 +1,25 @@
+diff --git a/src/internal/cpu/cpu_arm64_other.go b/src/internal/cpu/cpu_arm64_other.go
+--- a/src/internal/cpu/cpu_arm64_other.go
++++ b/src/internal/cpu/cpu_arm64_other.go
+@@ -5 +5 @@
+-//go:build arm64 && !linux && !freebsd && !android && (!darwin || ios) && !openbsd
++//go:build arm64 && !linux && !freebsd && !android && !darwin && !ios && !openbsd
+diff --git a/src/internal/cpu/cpu_arm64_ios.go b/src/internal/cpu/cpu_arm64_ios.go
+new file mode 100644
+--- /dev/null
++++ b/src/internal/cpu/cpu_arm64_ios.go
+@@ -0,0 +1,14 @@
++// Copyright 2020 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++//go:build arm64 && ios
++
++package cpu
++
++func osInit() {
++	// Go 1.25.4 leaves CPU feature detection empty for GOOS=ios. MiClash
++	// targets iOS 18+ devices, which are expected to provide these instructions.
++	ARM64.HasAES = true
++	ARM64.HasPMULL = true
++}

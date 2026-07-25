@@ -36,6 +36,9 @@ jobs:
         with:
           go-version: '1.25.4'
 
+      - name: Enable iOS ARM64 AES-GCM acceleration
+        run: bash MobileCore/scripts/prepare-ios-go-toolchain.sh
+
       - name: Cache Go modules
         uses: actions/cache@v4
         with:
@@ -78,9 +81,15 @@ jobs:
           # 交叉编译 mihomo 为 iOS 框架（含 device arm64 + simulator 切片）。
           # with_gvisor：iOS NE 的 system 栈 TCP 不通；with_low_memory：转发缓冲减半，降低峰值。
           gomobile bind \
+            -iosversion=18.0 \
             -tags "with_gvisor,with_low_memory" \
             -ldflags="-X github.com/metacubex/mihomo/constant.Version=${MIHOMO_VERSION}" \
             -target=ios -o ../Vendor/Mihomo.xcframework .
+          DEVICE_BINARY="../Vendor/Mihomo.xcframework/ios-arm64/Mihomo.framework/Mihomo"
+          SIMULATOR_BINARY="../Vendor/Mihomo.xcframework/ios-arm64_x86_64-simulator/Mihomo.framework/Mihomo"
+          plutil -lint ../Vendor/Mihomo.xcframework/Info.plist
+          test "$(xcrun lipo -archs "$DEVICE_BINARY")" = "arm64"
+          xcrun lipo -verify_arch arm64 x86_64 "$SIMULATOR_BINARY"
           echo "===== Mihomo.xcframework 切片 ====="
           ls -R ../Vendor/Mihomo.xcframework | head -40
           echo "===== Info.plist ====="
