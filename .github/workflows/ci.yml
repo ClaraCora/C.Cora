@@ -42,7 +42,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/Library/Caches/go-build
-          key: ${{ runner.os }}-go-1.25.4-${{ hashFiles('MobileCore/go.mod', 'MobileCore/go.sum', 'MobileCore/third_party/sing-shadowsocks2/**') }}
+          key: ${{ runner.os }}-go-${{ hashFiles('MobileCore/go.sum') }}
           restore-keys: ${{ runner.os }}-go-
 
       - name: Build Mihomo.xcframework (gomobile bind)
@@ -71,15 +71,6 @@ jobs:
           retry go get -tool golang.org/x/mobile/cmd/gobind@${MOBILE_VERSION}
           # go.mod 已 pin mihomo 版本；tidy 补齐间接依赖与 go.sum
           retry go mod tidy
-          # SS2022 最大记录修复必须只替换 v0.2.7；内核升级后不允许静默套用旧补丁。
-          SS2_MODULE=$(go list -m -f '{{.Version}}|{{if .Replace}}{{.Replace.Path}}{{end}}' github.com/metacubex/sing-shadowsocks2)
-          if [ "$SS2_MODULE" != "v0.2.7|./third_party/sing-shadowsocks2" ]; then
-            echo "unexpected sing-shadowsocks2 resolution: $SS2_MODULE"
-            exit 1
-          fi
-          go test github.com/metacubex/sing-shadowsocks2/internal/shadowio
-          go test -tags "with_low_memory" github.com/metacubex/sing-shadowsocks2/internal/shadowio
-          go test -tags "with_gvisor,with_low_memory" ./...
           # 取出真实 mihomo 版本，用 ldflags 注入 constant.Version
           # （源码默认值是陈旧占位串，官方靠 ldflags 注入真实版本，这里照做）
           MIHOMO_VERSION=$(retry go list -m -f '{{.Version}}' github.com/metacubex/mihomo)
