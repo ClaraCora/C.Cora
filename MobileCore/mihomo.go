@@ -48,6 +48,10 @@ const defaultTunnelMTU = 1500
 
 const minimumTunnelMTU = 576
 
+const mobileGoMemoryLimit int64 = 36 << 20
+
+const mobileGCPercent = 25
+
 // ControllerAddr 是 NE 内 mihomo external-controller 的监听地址。
 // 主 App 经 sendProviderMessage IPC 在重签环境下不投递，改用本地回环 HTTP 直连——
 // 127.0.0.1 是 loopback，不经 tun，跨进程可达，是 clash 类 iOS App 的通用做法。
@@ -185,9 +189,17 @@ func ValidateGeoDatabase(path string, kind string) error {
 // 配置等；同时本封装把内核日志逐条写入 <home>/run.log。须在 StartWithFd 之前调用。
 // 对应 Swift 侧 `MihomoSetup(_:)`。
 func Setup(home string) {
+	configureRuntimeMemoryPolicy()
 	homeDir = home
 	C.SetHomeDir(home)
 	startLogCapture()
+	appendRunLog(fmt.Sprintf("Go memory policy: GOGC=%d, limit=%d MiB",
+		mobileGCPercent, mobileGoMemoryLimit>>20))
+}
+
+func configureRuntimeMemoryPolicy() {
+	debug.SetGCPercent(mobileGCPercent)
+	debug.SetMemoryLimit(mobileGoMemoryLimit)
 }
 
 // startLogCapture 订阅 mihomo 内核日志（官方 log.Subscribe），逐条写入

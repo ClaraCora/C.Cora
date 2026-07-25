@@ -92,15 +92,15 @@ the known per-record allocations and bounding the gVisor queues.
 ### Local behavior
 
 Each Shadowsocks proxy whose cipher name starts with `2022-` permits at most
-eight active TCP connections. A ninth dial waits for a connection to close and
+four active TCP connections. A fifth dial waits for a connection to close and
 honors its `context.Context`, so canceled requests do not remain stuck. The
 permit wraps Mihomo's final `C.Conn` and is released exactly once; this preserves
 the extended Reader/Writer interfaces and the reusable SS Reader used by the
 single-stream fast path. Legacy Shadowsocks ciphers, every other proxy type,
 and native Shadowsocks UDP are unchanged.
 
-Eight is an iOS memory-safety ceiling, not a Speedtest-specific thread count.
-Sites opening more than eight simultaneous TCP connections through the same
+Four is an iOS memory-safety ceiling, not a Speedtest-specific thread count.
+Sites opening more than four simultaneous TCP connections through the same
 SS2022 node may queue briefly, and a many-stream benchmark can report lower
 peak throughput. Existing connections are never terminated by the limiter.
 
@@ -109,14 +109,20 @@ before sample, calls the exported `TrimMemory` bridge (`debug.FreeOSMemory()`),
 and records an after sample. This can introduce a short full-GC pause only under
 actual memory pressure; startup retains its existing one-time reclamation.
 
+Before Mihomo loads its configuration, MobileCore also sets `GOGC=25` and a
+36 MiB Go soft memory limit. This reduces the heap-growth headroom that the
+default `GOGC=100` would permit and reserves process memory for Swift, system
+libraries, and short non-Go peaks. The Go limit is soft: live data can exceed
+it, and aggressive collection can consume more CPU during high throughput.
+
 ### Verification
 
 The Mihomo preparation script verifies the upstream and patched SHA-256 hashes
 for the allocator and Shadowsocks sources plus both regression tests. CI runs
 `common/pool` and `adapter/outbound` in default and low-memory modes. Limiter
-tests cover cipher scoping, the eight-connection boundary, context cancellation,
+tests cover cipher scoping, the four-connection boundary, context cancellation,
 and exactly-once permit release. MobileCore tests verify that `TrimMemory`
-increments Go's forced-GC counter.
+increments Go's forced-GC counter and that the proactive runtime policy is set.
 
 ### Rollback
 
@@ -124,7 +130,9 @@ Revert the commit that added this section. For a targeted manual rollback,
 remove the SS2022 limiter and its test from the Mihomo dependency patch, remove
 the SS source/test hashes from `prepare-ios-mihomo.sh`, restore the allocator-only
 CI command, remove exported `TrimMemory`, and restore the pressure handler to a
-single diagnostic sample. No configuration or user-data migration is involved.
+single diagnostic sample. Remove `configureRuntimeMemoryPolicy` and its call
+from `Setup` to restore Go's default GC policy. No configuration or user-data
+migration is involved.
 
 ## sing-shadowsocks2-v0.2.7-reusable-length-buffer
 
