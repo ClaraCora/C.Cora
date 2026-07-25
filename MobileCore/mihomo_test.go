@@ -564,3 +564,17 @@ tun:
 		t.Error("mixed-port should be absent when the App setting is zero")
 	}
 }
+
+func TestMergeConfigUsesSelectedStack(t *testing.T) {
+	for _, stack := range []string{"gvisor", "system", "mixed"} {
+		t.Run(stack, func(t *testing.T) {
+			m := mergedMapWithSettings(t, "tun:\n  stack: gvisor\n", appSettings{
+				Stack:    stack,
+				LogLevel: "info",
+			})
+			if got := nestedMap(t, m, "tun")["stack"]; got != stack {
+				t.Errorf("tun.stack = %v, want %s", got, stack)
+			}
+		})
+	}
+}

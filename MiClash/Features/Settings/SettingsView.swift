@@ -11,6 +11,12 @@ struct SettingsView: View {
         NavigationStack {
             Form {
                 Section {
+                    Picker("TCP/IP 栈", selection: $settings.stack) {
+                        Text("gVisor").tag("gvisor")
+                        Text("System").tag("system")
+                        Text("Mixed").tag("mixed")
+                    }
+                    .pickerStyle(.segmented)
                     Picker("日志级别", selection: $settings.logLevel) {
                         ForEach(SettingsStore.logLevelOptions, id: \.self) { Text($0).tag($0) }
                     }
@@ -18,7 +24,7 @@ struct SettingsView: View {
                 } header: {
                     Text("内核")
                 } footer: {
-                    Text("TCP/IP 栈固定 gvisor（iOS 隧道扩展里 system 栈 TCP 走不通）。")
+                    Text("gVisor 是默认栈；System 与 Mixed 用于兼容性和内存对照测试。测试 System / Mixed 时请关闭“接管所有网络”，修改后需断开并重新连接 VPN。")
                 }
 
                 GeoSettingsSection(installedInfo: installedGeoInfo)
