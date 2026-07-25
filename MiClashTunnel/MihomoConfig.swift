@@ -6,7 +6,7 @@ import Foundation
 /// 证明「系统流量 → utun → mihomo → 物理网卡出网」整条路通。节点/订阅留到后续阶段。
 ///
 /// 这份配置是上一轮真机调试得出的可工作配方的精简版，关键点：
-/// - stack=gvisor：默认使用已验证的 gVisor；设置页可切换 system / mixed 做兼容性测试。
+/// - stack=gvisor：iOS NE 里 system 栈 TCP 走不通，必须 gVisor（框架已带 with_gvisor）。
 /// - fake-ip + 纯 IP 的 DoH 上游：IP 无需二次解析，杜绝 DNS 死循环。
 /// - 地址统一 198.18.0.x：tun 网关、DNS、fake-ip-range 同段，避免 bind 失败。
 /// - 不含任何 geoip/geosite 规则：geo 数据库在 NE 里加载会 OOM；DIRECT 测试用 MATCH。
@@ -32,7 +32,7 @@ enum MihomoConfig {
 
         tun:
           enable: true
-          # 默认使用已验证的 gvisor；Go 合并设置时可覆盖为 system / mixed
+          # 必须 gvisor：system 栈在 iOS NE 里 TCP 不通
           stack: gvisor
           dns-hijack:
             - any:53

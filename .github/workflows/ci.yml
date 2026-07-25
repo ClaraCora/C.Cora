@@ -85,7 +85,7 @@ jobs:
           MIHOMO_VERSION=$(retry go list -m -f '{{.Version}}' github.com/metacubex/mihomo)
           echo "注入 mihomo 版本：${MIHOMO_VERSION}"
           # 交叉编译 mihomo 为 iOS 框架（含 device arm64 + simulator 切片）。
-          # with_gvisor：同时编入 gVisor / mixed，供设置页在三种栈间切换；with_low_memory：转发缓冲减半，降低峰值。
+          # with_gvisor：iOS NE 的 system 栈 TCP 不通；with_low_memory：转发缓冲减半，降低峰值。
           gomobile bind \
             -tags "with_gvisor,with_low_memory" \
             -ldflags="-X github.com/metacubex/mihomo/constant.Version=${MIHOMO_VERSION}" \

@@ -10,7 +10,7 @@ final class SettingsStore: ObservableObject {
 
     static let shared = SettingsStore()
 
-    /// TCP/IP 栈：gvisor / system / mixed。默认 gvisor，另两种供真机兼容性与内存对照测试。
+    /// TCP/IP 栈：gvisor / system / mixed。iOS NE 强烈建议 gvisor（system 栈 TCP 常走不通）。
     @Published var stack: String { didSet { d.set(stack, forKey: K.stack) } }
     @Published var ipv6: Bool { didSet { d.set(ipv6, forKey: K.ipv6) } }
     /// 启用 geo 规则（默认开启）。关闭时剔除 GEOIP/GEOSITE 规则。
