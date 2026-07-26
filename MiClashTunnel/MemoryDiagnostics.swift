@@ -51,10 +51,7 @@ final class MemoryDiagnostics: @unchecked Sendable {
             let pressure = DispatchSource.makeMemoryPressureSource(
                 eventMask: [.warning, .critical], queue: queue)
             pressure.setEventHandler { [weak self] in
-                guard let self else { return }
-                self.writeSampleLocked(event: "memoryPressureBefore", synchronize: true)
-                MihomoTrimMemory()
-                self.writeSampleLocked(event: "memoryPressureAfter", synchronize: true)
+                self?.writeSampleLocked(event: "memoryPressure", synchronize: true)
             }
             pressureSource = pressure
             pressure.resume()

@@ -4,8 +4,6 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"runtime"
-	"runtime/debug"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -48,35 +46,6 @@ func TestRuntimeStatsReturnsDiagnosticSnapshot(t *testing.T) {
 	}
 	if snapshot.Goroutines < 1 {
 		t.Fatalf("RuntimeStats goroutines = %d, want at least 1", snapshot.Goroutines)
-	}
-}
-
-func TestTrimMemoryForcesGarbageCollection(t *testing.T) {
-	var before runtime.MemStats
-	runtime.ReadMemStats(&before)
-	TrimMemory()
-	var after runtime.MemStats
-	runtime.ReadMemStats(&after)
-	if after.NumForcedGC <= before.NumForcedGC {
-		t.Fatalf("NumForcedGC = %d, want greater than %d", after.NumForcedGC, before.NumForcedGC)
-	}
-}
-
-func TestConfigureRuntimeMemoryPolicy(t *testing.T) {
-	unlimited := int64(^uint64(0) >> 1)
-	previousGC := debug.SetGCPercent(100)
-	previousLimit := debug.SetMemoryLimit(unlimited)
-	defer func() {
-		debug.SetGCPercent(previousGC)
-		debug.SetMemoryLimit(previousLimit)
-	}()
-
-	configureRuntimeMemoryPolicy()
-	if got := debug.SetGCPercent(100); got != mobileGCPercent {
-		t.Fatalf("GOGC = %d, want %d", got, mobileGCPercent)
-	}
-	if got := debug.SetMemoryLimit(unlimited); got != mobileGoMemoryLimit {
-		t.Fatalf("Go memory limit = %d, want %d", got, mobileGoMemoryLimit)
 	}
 }
 
