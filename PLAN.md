@@ -37,7 +37,7 @@ XcodeGen 双 target + entitlements；主 App 一个连接开关（`NETunnelProvi
 `MobileCore/mobile.go` 薄封装导出 `Setup/Start/Stop/Version/Reload`；CI 加 `gomobile bind -target=ios`；App 调 `Version()` 证明核心能加载，暂不接 tun。
 
 ### Phase 2 — tun 接管流量
-NE 内 `tun.enable=true`，经 `packetFlow.value(forKeyPath:"socket.fileDescriptor")` 取真实 utun fd 交 mihomo（`stack=system` 省内存）；`NEPacketTunnelNetworkSettings` 用 **8 段子网路由而非 0.0.0.0/0** 防黑洞断网；DNS 指向 fake-ip。NE 内存限额 ~50MB 注意控住。
+NE 内 `tun.enable=true`，取真实 utun fd 交 mihomo（`stack=gvisor`——iOS NE 里 system 栈 TCP 不通）；`NEPacketTunnelNetworkSettings` 用 **8 段子网路由而非 0.0.0.0/0** 防黑洞断网；DNS 指向 fake-ip。NE 内存限额 ~50MB：Go 侧 `SetMemoryLimit(35MiB)` + `SetGCPercent(50)` 压堆峰值，内存压力事件触发 `ForceGC()` 还页，热重载后延迟 15s `FreeOSMemory()`。
 
 ### Phase 3 — UI（MVVM + ShipSwift）
 `CoreStateManager` 接 mihomo API。四页：Dashboard（SWChart 流量图）/ Proxies（分组/测延迟/切换）/ Profiles（导入/订阅）/ Settings。ShipSwift 经 MCP 或 `npx skills add` 把自包含组件拷进 `UI/ShipSwift/`。

@@ -52,6 +52,9 @@ final class MemoryDiagnostics: @unchecked Sendable {
                 eventMask: [.warning, .critical], queue: queue)
             pressure.setEventHandler { [weak self] in
                 self?.writeSampleLocked(event: "memoryPressure", synchronize: true)
+                // 压力事件时让 Go 侧立即 GC 并归还空闲页，压低 phys_footprint。
+                // 本 handler 在 .utility 队列，GC 短暂停顿不影响转发。
+                MihomoForceGC()
             }
             pressureSource = pressure
             pressure.resume()

@@ -185,9 +185,27 @@ func ValidateGeoDatabase(path string, kind string) error {
 // 配置等；同时本封装把内核日志逐条写入 <home>/run.log。须在 StartWithFd 之前调用。
 // 对应 Swift 侧 `MihomoSetup(_:)`。
 func Setup(home string) {
+	configureMemoryLimits()
 	homeDir = home
 	C.SetHomeDir(home)
 	startLogCapture()
+}
+
+// configureMemoryLimits 给 Go 运行时设软性内存上限。iOS NE 的 jetsam 线约
+// 50MB（按 phys_footprint 计），Go 默认 GOGC=100 会让堆涨到 live set 两倍才
+// 回收、且还页消极。35MiB 软上限让 GC 提前加压，给 Swift/NE 基座与 gVisor
+// 栈外内存留出余量；SetGCPercent(50) 进一步压低堆峰值。若真机观测到 GC
+// 过于频繁（CPU 发热），可上调上限或回调 GCPercent。
+func configureMemoryLimits() {
+	debug.SetMemoryLimit(35 << 20)
+	debug.SetGCPercent(50)
+}
+
+// ForceGC 供 Swift 侧内存压力事件（warning/critical）调用：立即 full GC
+// 并把空闲页归还 OS，压低 phys_footprint，降低被 jetsam 的概率。
+func ForceGC() {
+	runtime.GC()
+	debug.FreeOSMemory()
 }
 
 // startLogCapture 订阅 mihomo 内核日志（官方 log.Subscribe），逐条写入
@@ -466,9 +484,15 @@ func applyRuntimeConfig(fd int, tunnelMTU int, configYAML string, st appSettings
 	executor.ApplyConfig(cfg, true)
 	if !preserveTun {
 		// Parsing and applying a large configuration can leave temporary heap
-		// pages resident. Return them once during startup, never during a live
-		// reload where a second full GC would interrupt forwarding.
+		// pages resident. Return them once during startup.
 		debug.FreeOSMemory()
+	} else {
+		// 热重载时立刻 full GC 会中断转发；延迟 15s 等重载稳定后再还页，
+		// 避免大订阅重载后的临时堆页常驻不还。
+		go func() {
+			time.Sleep(15 * time.Second)
+			debug.FreeOSMemory()
+		}()
 	}
 	applied = true
 	appendRunLog(operation + " ApplyConfig 返回")
