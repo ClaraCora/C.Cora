@@ -7,6 +7,8 @@ struct LogsView: View {
     @EnvironmentObject private var controller: LogStreamController
 
     @State private var autoScroll = true
+    @State private var isCopyingDiagnostic = false
+    @State private var didCopyDiagnostic = false
 
     var body: some View {
         content
@@ -19,7 +21,13 @@ struct LogsView: View {
                 ToolbarItem(placement: .topBarLeading) {
                     levelMenu
                 }
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    Button { copyDiagnostic() } label: {
+                        Image(systemName: didCopyDiagnostic ? "checkmark" : "doc.on.doc")
+                    }
+                    .disabled(isCopyingDiagnostic)
+                    .accessibilityLabel(didCopyDiagnostic ? "诊断已复制" : "复制内存诊断")
+
                     Button { controller.clear() } label: {
                         Image(systemName: "trash")
                     }
@@ -27,6 +35,18 @@ struct LogsView: View {
                     .accessibilityLabel("清空日志")
                 }
             }
+    }
+
+    private func copyDiagnostic() {
+        guard !isCopyingDiagnostic else { return }
+        isCopyingDiagnostic = true
+        Task { @MainActor in
+            UIPasteboard.general.string = await core.fetchLogs()
+            isCopyingDiagnostic = false
+            didCopyDiagnostic = true
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            didCopyDiagnostic = false
+        }
     }
 
     @ViewBuilder private var content: some View {
