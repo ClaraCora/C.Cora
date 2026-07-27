@@ -62,7 +62,7 @@ final class ProxyController: ObservableObject {
 
     /// 节点延迟（毫秒），node 名 → ms。0/缺失表示未测或超时。
     /// 持久化到磁盘：重连/重启后仍展示上次结果，下一次测速成功才覆盖。
-    @Published private(set) var delays: [String: Int] = Self.loadCachedDelays()
+    @Published private(set) var delays: [String: Int] = ProxyController.loadCachedDelays()
     /// 节点协议摘要，node 名 → "VLESS · TCP · Reality · Vision"。
     @Published private(set) var details: [String: String] = [:]
     /// 正在测速的策略组名。
