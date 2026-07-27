@@ -228,11 +228,20 @@ struct ProxiesView: View {
                                     })
                                 .listRowInsets(EdgeInsets(top: 5, leading: 20, bottom: 5, trailing: 14))
                                 .listRowSeparator(.hidden)
-                                .background(
-                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                        .fill(item.name == result.group.now
-                                              ? Color.accentColor.opacity(0.10)
-                                              : Color.clear))
+                                .background {
+                                    // 选中高亮：向外扩 8pt 贴近卡片边缘，呈现为整行选中态，
+                                    // 而不是浮在文字后面的小色块。仅选中行绘制。
+                                    if item.name == result.group.now {
+                                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                            .fill(Color.accentColor.opacity(0.08))
+                                            .overlay(
+                                                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                                    .stroke(Color.accentColor.opacity(0.25),
+                                                            lineWidth: 1))
+                                            .padding(.horizontal, -8)
+                                            .padding(.vertical, -2)
+                                    }
+                                }
                             }
                         }
                     }
