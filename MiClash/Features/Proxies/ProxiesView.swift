@@ -573,26 +573,29 @@ private struct GroupIcon: View {
 
     var body: some View {
         ZStack {
-            RoundedRectangle(cornerRadius: 7, style: .continuous)
-                .fill(LinearGradient(
-                    colors: [Color.accentColor.opacity(0.18), Color.accentColor.opacity(0.07)],
-                    startPoint: .topLeading, endPoint: .bottomTrailing))
-
             if let image {
+                // 加载成功的图标直接显示，不垫任何底色——透明 PNG 的镂空区域保持透明。
                 Image(uiImage: image)
                     .resizable()
                     .scaledToFit()
-            } else if url == nil || failed {
-                Image(systemName: "network")
-                    .font(.system(size: 15, weight: .medium))
-                    .foregroundStyle(Color.accentColor)
+                    .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
             } else {
-                ProgressView()
-                    .controlSize(.mini)
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(LinearGradient(
+                        colors: [Color.accentColor.opacity(0.18), Color.accentColor.opacity(0.07)],
+                        startPoint: .topLeading, endPoint: .bottomTrailing))
+
+                if url == nil || failed {
+                    Image(systemName: "network")
+                        .font(.system(size: 15, weight: .medium))
+                        .foregroundStyle(Color.accentColor)
+                } else {
+                    ProgressView()
+                        .controlSize(.mini)
+                }
             }
         }
         .frame(width: 32, height: 32)
-        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
         .accessibilityHidden(true)
         .task(id: url) {
             image = nil
