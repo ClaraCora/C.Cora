@@ -518,32 +518,25 @@ private struct GroupHeaderRow: View {
     }
 
     private var testLabel: some View {
-        HStack(spacing: 6) {
-            ZStack {
-                Circle()
-                    .fill(testTint.opacity(0.13))
-
-                if isTesting {
-                    ProgressView()
-                        .controlSize(.mini)
-                        .tint(testTint)
-                } else {
-                    Image(systemName: "speedometer")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(testTint)
-                }
+        HStack(spacing: 5) {
+            if isTesting {
+                ProgressView()
+                    .controlSize(.mini)
+                    .tint(testTint)
+            } else {
+                Image(systemName: "speedometer")
+                    .font(.system(size: 11, weight: .semibold))
             }
-            .frame(width: 24, height: 24)
 
             Text(testStatusText)
                 .font(.caption.monospacedDigit().weight(.semibold))
-                .foregroundStyle(.primary)
                 .lineLimit(1)
                 .minimumScaleFactor(0.8)
         }
-        .padding(.horizontal, 7)
-        .frame(width: testButtonWidth, height: 34)
-        .background(testButtonBackground)
+        .foregroundStyle(testTint)
+        .frame(width: testButtonWidth, height: 28)
+        .background(Capsule().fill(testTint.opacity(0.12)))
+        .overlay(Capsule().stroke(testTint.opacity(0.22), lineWidth: 0.5))
         .frame(width: testButtonWidth, height: 44)
         .contentShape(Rectangle())
     }
@@ -562,15 +555,6 @@ private struct GroupHeaderRow: View {
     private var testTint: Color {
         if isTesting || currentDelay == nil { return Color.accentColor }
         return DelayBadge.tint(currentDelay)
-    }
-
-    private var testButtonBackground: some View {
-        RoundedRectangle(cornerRadius: 8, style: .continuous)
-            .fill(testTint.opacity(0.075))
-            .overlay {
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .stroke(testTint.opacity(0.18), lineWidth: 0.5)
-            }
     }
 
     private var accessibilityValue: String {

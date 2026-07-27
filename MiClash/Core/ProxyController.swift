@@ -61,7 +61,8 @@ final class ProxyController: ObservableObject {
     @Published var error: String?
 
     /// 节点延迟（毫秒），node 名 → ms。0/缺失表示未测或超时。
-    @Published private(set) var delays: [String: Int] = [:]
+    /// 持久化到磁盘：重连/重启后仍展示上次结果，下一次测速成功才覆盖。
+    @Published private(set) var delays: [String: Int] = Self.loadCachedDelays()
     /// 节点协议摘要，node 名 → "VLESS · TCP · Reality · Vision"。
     @Published private(set) var details: [String: String] = [:]
     /// 正在测速的策略组名。
@@ -70,6 +71,24 @@ final class ProxyController: ObservableObject {
     @Published private(set) var selecting: [String: String] = [:]
     private var loadGeneration = 0
     private var sessionGeneration = 0
+
+    // MARK: - 延迟缓存持久化
+
+    private static var delaysFileURL: URL {
+        let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        return dir.appendingPathComponent("proxy-delays.json")
+    }
+
+    private static func loadCachedDelays() -> [String: Int] {
+        guard let data = try? Data(contentsOf: delaysFileURL),
+              let dict = try? JSONDecoder().decode([String: Int].self, from: data) else { return [:] }
+        return dict
+    }
+
+    private func saveDelays() {
+        guard let data = try? JSONEncoder().encode(delays) else { return }
+        try? data.write(to: Self.delaysFileURL, options: .atomic)
+    }
 
     func load() async {
         loadGeneration &+= 1
@@ -92,7 +111,7 @@ final class ProxyController: ObservableObject {
             groups = []
             uniqueNodeCount = 0
             details = [:]
-            delays = [:]
+            // 保留 delays 缓存：瞬时失败不该清掉已测结果
             return
         case .ok(let data):
             guard let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
@@ -109,7 +128,6 @@ final class ProxyController: ObservableObject {
                 groups = []
                 uniqueNodeCount = 0
                 details = [:]
-                delays = [:]
                 return
             }
 
@@ -168,6 +186,11 @@ final class ProxyController: ObservableObject {
                 groups = ordered
             }
             uniqueNodeCount = Set(groups.flatMap { $0.all }).count
+
+            // 缓存修剪：丢掉当前配置里已不存在的节点，避免换订阅后展示旧延迟。
+            let knownNodes = Set(groups.flatMap { $0.all })
+            let pruned = delays.filter { knownNodes.contains($0.key) }
+            if pruned.count != delays.count { delays = pruned }
         }
     }
 
@@ -180,7 +203,7 @@ final class ProxyController: ObservableObject {
         isLoading = false
         hasLoaded = false
         error = nil
-        delays = [:]
+        // delays 保留：缓存跨会话生效，下一次测速或 load 修剪时更新
         details = [:]
         testing = []
         selecting = [:]
@@ -243,6 +266,7 @@ final class ProxyController: ObservableObject {
                 if let value = (ms as? NSNumber)?.intValue { updated[node] = value }
             }
             delays = updated
+            saveDelays()
         case .failure(let reason):
             self.error = "测速失败：\(reason)"
         }
