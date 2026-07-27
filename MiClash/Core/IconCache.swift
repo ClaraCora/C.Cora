@@ -1,6 +1,5 @@
 import UIKit
 import CryptoKit
-import ImageIO
 
 /// 策略组图标缓存：内存(NSCache) + 磁盘(Caches/icons)。
 /// 首次下载后落盘，之后(含 App 重启)直接命中，不再重复联网。
@@ -63,20 +62,26 @@ final class IconCache {
         memory.setObject(image, forKey: key as NSString, cost: Int(pixels * 4))
     }
 
-    /// 组件固定为 32pt，按 3x 上限解码，避免大图标在滚动时占用完整纹理内存。
+    /// 组件固定为 32pt，按 96px 上限解码，避免大图标在滚动时占用完整纹理内存。
+    /// 不用 ImageIO 缩略图：它重采样时不按 alpha 加权，透明像素残留的杂散 RGB
+    /// 会渗进半透明边缘，透明图标周围出现一圈杂色。UIGraphicsImageRenderer 在
+    /// 非 opaque（预乘 alpha）上下文中绘制，缩放是 alpha 加权的，边缘干净。
     private static func thumbnail(from data: Data) -> UIImage? {
-        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else {
-            return UIImage(data: data)
+        guard let source = UIImage(data: data) else { return nil }
+        let maxPixel: CGFloat = 96
+        let pixelSize = CGSize(width: source.size.width * source.scale,
+                               height: source.size.height * source.scale)
+        guard max(pixelSize.width, pixelSize.height) > maxPixel else { return source }
+
+        let ratio = maxPixel / max(pixelSize.width, pixelSize.height)
+        let target = CGSize(width: max(1, (pixelSize.width * ratio).rounded(.down)),
+                            height: max(1, (pixelSize.height * ratio).rounded(.down)))
+        let format = UIGraphicsImageRendererFormat()
+        format.opaque = false
+        format.scale = 1 // target 已是像素尺寸，scale 固定 1 避免二次放大
+        return UIGraphicsImageRenderer(size: target, format: format).image { _ in
+            source.draw(in: CGRect(origin: .zero, size: target))
         }
-        let options: [CFString: Any] = [
-            kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceShouldCacheImmediately: true,
-            kCGImageSourceThumbnailMaxPixelSize: 96,
-        ]
-        guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
-        else { return UIImage(data: data) }
-        return UIImage(cgImage: image)
     }
 
     /// 用 URL 的 SHA256 当文件名——跨启动稳定（Swift 的 hashValue 每次运行变，不能用）。

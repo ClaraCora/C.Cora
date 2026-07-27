@@ -199,14 +199,6 @@ struct ProxiesView: View {
                             })
                         .listRowInsets(EdgeInsets(top: 8, leading: 14, bottom: 8, trailing: 8))
                         .listRowSeparator(.hidden)
-                        .listRowBackground(
-                            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                .fill(Color(uiColor: .secondarySystemGroupedBackground))
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                        .stroke(Color.primary.opacity(0.06), lineWidth: 1))
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2))
 
                         if result.isExpanded && result.group.all.isEmpty {
                             Text("该策略组没有节点")
@@ -215,7 +207,6 @@ struct ProxiesView: View {
                                 .frame(maxWidth: .infinity, minHeight: 40, alignment: .leading)
                                 .listRowInsets(EdgeInsets(top: 4, leading: 46, bottom: 4, trailing: 14))
                                 .listRowSeparator(.hidden)
-                                .listRowBackground(Color.clear)
                         } else {
                             ForEach(result.nodes) { item in
                                 let selectingNode = controller.selecting[result.group.name]
@@ -237,19 +228,11 @@ struct ProxiesView: View {
                                     })
                                 .listRowInsets(EdgeInsets(top: 5, leading: 20, bottom: 5, trailing: 14))
                                 .listRowSeparator(.hidden)
-                                .listRowBackground(
-                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
                                         .fill(item.name == result.group.now
                                               ? Color.accentColor.opacity(0.10)
-                                              : Color(uiColor: .secondarySystemGroupedBackground))
-                                        .overlay(
-                                            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                                .stroke(item.name == result.group.now
-                                                        ? Color.accentColor.opacity(0.35)
-                                                        : Color.primary.opacity(0.06),
-                                                        lineWidth: 1))
-                                        .padding(.horizontal, 6)
-                                        .padding(.vertical, 2))
+                                              : Color.clear))
                             }
                         }
                     }
