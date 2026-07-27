@@ -7,6 +7,7 @@ struct SubscriptionDetailView: View {
     let subID: UUID
 
     @State private var showEditor = false
+    @State private var showRemoteEditor = false
     @State private var refreshing = false
     @State private var refreshOK = false
 
@@ -30,6 +31,9 @@ struct SubscriptionDetailView: View {
         .navigationBarTitleDisplayMode(.inline)
         .sheet(isPresented: $showEditor) {
             if let sub { LocalConfigEditorView(editing: sub).environmentObject(store) }
+        }
+        .sheet(isPresented: $showRemoteEditor) {
+            if let sub { EditSubscriptionView(sub: sub).environmentObject(store) }
         }
     }
 
@@ -79,6 +83,12 @@ struct SubscriptionDetailView: View {
                     Label("编辑配置", systemImage: "pencil")
                 }
             } else {
+                Button {
+                    showRemoteEditor = true
+                } label: {
+                    Label("编辑名称 / 链接", systemImage: "pencil")
+                }
+
                 Button {
                     Task {
                         refreshing = true
@@ -151,5 +161,66 @@ private struct MonospacedTextView: UIViewRepresentable {
 
     func updateUIView(_ tv: UITextView, context: Context) {
         if tv.text != text { tv.text = text }
+    }
+}
+
+/// 编辑远程订阅：名称 + 订阅链接。链接变更后自动重新拉取。
+struct EditSubscriptionView: View {
+    @EnvironmentObject private var store: SubscriptionStore
+    @Environment(\.dismiss) private var dismiss
+
+    let sub: Subscription
+    @State private var name: String
+    @State private var url: String
+
+    init(sub: Subscription) {
+        self.sub = sub
+        _name = State(initialValue: sub.name)
+        _url = State(initialValue: sub.url)
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("名称") {
+                    TextField("如：我的机场", text: $name)
+                }
+                Section("订阅链接") {
+                    TextField("https://...", text: $url)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .keyboardType(.URL)
+                }
+                if urlChanged {
+                    Label("保存后将按新链接重新拉取，原有节点与流量信息会被替换。",
+                          systemImage: "exclamationmark.triangle")
+                        .font(.footnote)
+                        .foregroundStyle(.orange)
+                }
+            }
+            .navigationTitle("编辑订阅")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("取消") { dismiss() }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("保存") {
+                        let n = name, u = url
+                        dismiss()
+                        Task { await store.updateRemote(sub.id, name: n, url: u) }
+                    }
+                    .disabled(!isDirty || url.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+            }
+        }
+    }
+
+    private var urlChanged: Bool {
+        url.trimmingCharacters(in: .whitespacesAndNewlines) != sub.url
+    }
+
+    private var isDirty: Bool {
+        urlChanged || name.trimmingCharacters(in: .whitespacesAndNewlines) != sub.name
     }
 }

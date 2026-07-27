@@ -5,6 +5,7 @@ struct SubscriptionsView: View {
     @EnvironmentObject private var store: SubscriptionStore
     @State private var showAddRemote = false
     @State private var showAddLocal = false
+    @State private var editingSub: Subscription?
 
     var body: some View {
         NavigationStack {
@@ -30,6 +31,10 @@ struct SubscriptionsView: View {
                                 Task { await store.refresh(sub.id) }
                             } label: { Label("刷新", systemImage: "arrow.clockwise") }
                             .tint(.blue)
+                            Button {
+                                editingSub = sub
+                            } label: { Label("编辑", systemImage: "pencil") }
+                            .tint(.orange)
                         }
                     }
                     .swipeActions(edge: .leading) {
@@ -65,6 +70,9 @@ struct SubscriptionsView: View {
             }
             .sheet(isPresented: $showAddLocal) {
                 LocalConfigEditorView(editing: nil).environmentObject(store)
+            }
+            .sheet(item: $editingSub) { sub in
+                EditSubscriptionView(sub: sub).environmentObject(store)
             }
             .alert("出错了", isPresented: .constant(store.lastError != nil)) {
                 Button("好") { store.lastError = nil }

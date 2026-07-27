@@ -180,10 +180,8 @@ struct ProxiesView: View {
                         totalGroupCount: controller.groups.count,
                         nodeCount: controller.uniqueNodeCount,
                         isSearching: !normalizedSearch.isEmpty)
-                        .listRowInsets(EdgeInsets(top: 3, leading: 4, bottom: 3, trailing: 4))
+                        .listRowInsets(EdgeInsets(top: 6, leading: 14, bottom: 6, trailing: 14))
                         .listRowSeparator(.hidden)
-                        .listRowBackground(Color.clear)
-                        .environment(\.defaultMinListRowHeight, 30)
                 }
 
                 ForEach(results) { result in
@@ -231,9 +229,18 @@ struct ProxiesView: View {
                                 .listRowInsets(EdgeInsets(top: 5, leading: 20, bottom: 5, trailing: 14))
                                 .listRowSeparator(.hidden)
                                 .listRowBackground(
-                                    item.name == result.group.now
-                                        ? Color.accentColor.opacity(0.075)
-                                        : Color(uiColor: .secondarySystemGroupedBackground))
+                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                        .fill(item.name == result.group.now
+                                              ? Color.accentColor.opacity(0.10)
+                                              : Color(uiColor: .secondarySystemGroupedBackground))
+                                        .overlay(
+                                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                                .stroke(item.name == result.group.now
+                                                        ? Color.accentColor.opacity(0.35)
+                                                        : Color.primary.opacity(0.06),
+                                                        lineWidth: 1))
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 2))
                             }
                         }
                     }
@@ -367,14 +374,27 @@ private struct ProxyOverviewRow: View {
     let isSearching: Bool
 
     var body: some View {
-        HStack(spacing: 8) {
-            Label(modeTitle, systemImage: mode == "global" ? "globe" : "list.bullet.indent")
+        HStack(spacing: 10) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(LinearGradient(
+                        colors: [Color.accentColor.opacity(0.18), Color.accentColor.opacity(0.08)],
+                        startPoint: .topLeading, endPoint: .bottomTrailing))
+                Image(systemName: mode == "global" ? "globe" : "list.bullet.indent")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Color.accentColor)
+            }
+            .frame(width: 28, height: 28)
+
+            Text(modeTitle)
+                .font(.subheadline.weight(.semibold))
+
             Spacer(minLength: 8)
+
             Text(countText)
-                .monospacedDigit()
+                .font(.caption.monospacedDigit().weight(.medium))
+                .foregroundStyle(.secondary)
         }
-        .font(.caption.weight(.medium))
-        .foregroundStyle(.secondary)
         .accessibilityElement(children: .combine)
     }
 
@@ -478,7 +498,10 @@ private struct GroupHeaderRow: View {
     private var metadata: some View {
         Text("\(group.displayType) · \(group.all.count)")
             .font(.caption2.weight(.medium))
-            .foregroundStyle(.tertiary)
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(Capsule().fill(Color.accentColor.opacity(0.08)))
             .lineLimit(1)
     }
 
@@ -575,7 +598,9 @@ private struct GroupIcon: View {
     var body: some View {
         ZStack {
             RoundedRectangle(cornerRadius: 7, style: .continuous)
-                .fill(Color.accentColor.opacity(0.10))
+                .fill(LinearGradient(
+                    colors: [Color.accentColor.opacity(0.18), Color.accentColor.opacity(0.07)],
+                    startPoint: .topLeading, endPoint: .bottomTrailing))
 
             if let image {
                 Image(uiImage: image)
@@ -743,6 +768,9 @@ private struct DelayBadge: View {
         }
         .foregroundStyle(color)
         .font(.caption.monospacedDigit().weight(.medium))
+        .padding(.horizontal, 7)
+        .padding(.vertical, 3)
+        .background(Capsule().fill(color.opacity(0.10)))
         .frame(minWidth: dynamicTypeSize.isAccessibilitySize ? nil : 66,
                alignment: .trailing)
         .fixedSize(horizontal: true, vertical: false)

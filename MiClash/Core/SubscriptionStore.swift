@@ -135,6 +135,34 @@ final class SubscriptionStore: ObservableObject {
         save()
     }
 
+    /// 编辑远程订阅（名称 + 链接）。链接变更时清空旧内容并重新拉取；
+    /// 用户手填过名称后，刷新不再用响应头覆盖（autoNamed 置 false）。
+    func updateRemote(_ id: UUID, name: String, url: String) async {
+        guard let i = subscriptions.firstIndex(where: { $0.id == id }) else { return }
+        let n = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let u = url.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !u.isEmpty else { lastError = "订阅地址为空"; return }
+        guard URL(string: u) != nil else { lastError = "无效的订阅地址"; return }
+
+        if !n.isEmpty {
+            subscriptions[i].name = n
+            subscriptions[i].autoNamed = false
+        }
+        let urlChanged = subscriptions[i].url != u
+        subscriptions[i].url = u
+        if urlChanged {
+            subscriptions[i].yaml = ""
+            subscriptions[i].nodeCount = 0
+            subscriptions[i].updatedAt = nil
+            subscriptions[i].upload = 0
+            subscriptions[i].download = 0
+            subscriptions[i].total = 0
+            subscriptions[i].expire = nil
+        }
+        save()
+        if urlChanged { await refresh(id) }
+    }
+
     func remove(_ id: UUID) {
         subscriptions.removeAll { $0.id == id }
         if selectedID == id { selectedID = subscriptions.first?.id }
