@@ -11,7 +11,9 @@ int miclash_copy_system_dns(char *out, int stride, int maxCount) {
     memset(&res, 0, sizeof(res));
     if (res_ninit(&res) != 0) return 0;
 
-    res_sockaddr_union servers[8];
+    // iOS resolv.h 里 res_sockaddr_union 是宏（→ res_9_sockaddr_union），
+    // 真实类型是 union，声明必须带 union 标签。
+    union res_sockaddr_union servers[8];
     memset(servers, 0, sizeof(servers));
     int count = res_getservers(&res, servers, 8);
 
