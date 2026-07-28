@@ -29,6 +29,21 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private let reloadQueue = DispatchQueue(label: "com.miclash.tunnel.reload", qos: .userInitiated)
     private let memoryDiagnostics = MemoryDiagnostics()
 
+    /// 隧道建立前抓取的物理网络 DNS，供配置里的 `system` nameserver 替换用。
+    private var systemDNSServers: [String] = []
+
+    /// 把抓取到的系统 DNS 注入 settings JSON（key: systemDNS），
+    /// Go 侧 mergeConfig 据此把 DNS 配置里的 "system" 替换为实际 IP。无可用值时原样返回。
+    private func injectingSystemDNS(into settingsJSON: String) -> String {
+        guard !systemDNSServers.isEmpty else { return settingsJSON }
+        var dict = ((try? JSONSerialization.jsonObject(with: Data(settingsJSON.utf8)))
+                    as? [String: Any]) ?? [:]
+        dict["systemDNS"] = systemDNSServers
+        guard let data = try? JSONSerialization.data(withJSONObject: dict),
+              let json = String(data: data, encoding: .utf8) else { return settingsJSON }
+        return json
+    }
+
     // 物理接口监控：把真实出站接口（en0/pdp_ip0）显式喂给内核，取代 mihomo 自带的不可靠监控。
     private var pathMonitor: NWPathMonitor?
     private let pathMonitorQueue = DispatchQueue(label: "com.miclash.tunnel.pathmonitor", qos: .utility)
@@ -44,6 +59,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             configuredTunnelMTU = nil
         }
         // 每次启动清空 ne.log，避免历史残留干扰排查
+        // 隧道建立前先抓物理网络 DNS；隧道起来后系统主解析器会变成隧道自己的 DNS。
+        systemDNSServers = SystemDNS.excludingTunnel(SystemDNS.currentServers())
+        FileLog.write("system DNS = \(systemDNSServers)")
         FileLog.reset()
         FileLog.write("startTunnel：开始配置网络设置")
         log.info("startTunnel：开始配置网络设置")
@@ -66,8 +84,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
         let configYAML = resolveConfig(incoming: incomingConfig,
                                        hasOption: hasConfigOption, home: home)
-        let resolvedSettings = resolveCached(incoming: settingsJSON.isEmpty ? nil : settingsJSON,
-                                             home: home, file: "settings.json") ?? ""
+        let resolvedSettings = injectingSystemDNS(into:
+            resolveCached(incoming: settingsJSON.isEmpty ? nil : settingsJSON,
+                          home: home, file: "settings.json") ?? "")
 
         // GEO / ASN 文件必须由主 App 预先写入共享 home；NE 启动阶段不再联网下载。
         if let geoError = Self.validateGeoAssets(configYAML: configYAML,
@@ -385,7 +404,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             FileLog.write("调用 MihomoReloadConfig（config=\(configYAML.count) 字节）…")
             self.memoryDiagnostics.record(event: "reloadBefore")
             var reloadError: NSError?
-            let ok = MihomoReloadConfig(Int(fd), tunnelMTU, configYAML, input.settings, &reloadError)
+            let ok = MihomoReloadConfig(Int(fd), tunnelMTU, configYAML,
+                                        injectingSystemDNS(into: input.settings), &reloadError)
             self.memoryDiagnostics.record(event: ok ? "reloadAfter" : "reloadFailed")
             guard ok else {
                 let message = reloadError?.localizedDescription ?? "mihomo 重载失败（未知错误）"
