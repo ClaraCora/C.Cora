@@ -90,16 +90,8 @@ struct LogsView: View {
                 }
             }
         } label: {
-            HStack(spacing: 5) {
-                Image(systemName: "line.3.horizontal.decrease.circle")
-                    .font(.caption.weight(.semibold))
-                Text(controller.level.uppercased())
-                    .font(.caption.monospacedDigit().weight(.semibold))
-            }
-            .foregroundStyle(Color.accentColor)
-            .padding(.horizontal, 9)
-            .padding(.vertical, 4)
-            .background(Capsule().fill(Color.accentColor.opacity(0.10)))
+            Label(controller.level.uppercased(), systemImage: "line.3.horizontal.decrease.circle")
+                .font(.subheadline)
         }
     }
 
