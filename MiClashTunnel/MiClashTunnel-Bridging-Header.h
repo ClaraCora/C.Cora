@@ -1,9 +1,8 @@
-// 把 libresolv 的解析器 API 暴露给 Swift：读取 iOS 物理网络 DNS
-// （配置里 `nameserver: [system]` 的实际来源）。项目已链接 -lresolv。
+// 暴露系统 DNS 桥接函数给 Swift（实现见 SystemDNSBridge.c）。
+// iOS 的 <resolv.h> 类型 Swift 导入不了，故由 C 侧完成抓取。
 #ifndef MiClashTunnel_Bridging_Header_h
 #define MiClashTunnel_Bridging_Header_h
 
-#include <resolv.h>
-#include <arpa/inet.h>
+#include "SystemDNSBridge.h"
 
 #endif /* MiClashTunnel_Bridging_Header_h */
