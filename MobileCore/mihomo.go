@@ -602,12 +602,6 @@ func mergeConfig(subYAML string, st appSettings, tunnelMTU int) ([]byte, error) 
 	dnsCfg["ipv6"] = st.IPv6
 	dnsCfg["fake-ip-range"] = "198.18.0.1/16"
 	dnsCfg["cache-max-size"] = 512
-	// 订阅可能写 `nameserver: [system]`。iOS 没有可供 Go 读取的 /etc/resolv.conf，
-	// 内核无法解析 "system"，这里替换为 NE 启动时抓取并注入的物理网络 DNS。
-	// nameserver 要先替换再做空值兜底：替换后为空（NE 未注入）时走默认 DoH。
-	if v, exists := dnsCfg["nameserver"]; exists {
-		dnsCfg["nameserver"] = replaceSystemNameserver(v, st.SystemDNS, "nameserver")
-	}
 	rawNameservers, hasNameservers := dnsCfg["nameserver"]
 	nameservers, isList := rawNameservers.([]any)
 	if !hasNameservers || rawNameservers == nil || (isList && len(nameservers) == 0) {
@@ -616,22 +610,18 @@ func mergeConfig(subYAML string, st appSettings, tunnelMTU int) ([]byte, error) 
 			"https://1.1.1.1/dns-query",
 		}
 	}
-	// 其余可能出现 "system" 的 DNS 字段；替换后为空的字段直接删除，避免空列表报错。
-	for _, key := range []string{"fallback", "default-nameserver", "proxy-server-nameserver", "direct-nameserver"} {
+	// 订阅可能写 `nameserver: [system]`。iOS 没有可供 Go 读取的 /etc/resolv.conf，
+	// 内核无法解析 "system"；NE 启动时会抓取物理网络 DNS 注入（st.SystemDNS），
+	// 这里据此替换。未注入（如抓取失败）时原样保留，行为与旧版一致。
+	for _, key := range []string{"nameserver", "fallback", "default-nameserver", "proxy-server-nameserver", "direct-nameserver"} {
 		if v, exists := dnsCfg[key]; exists {
-			if replaced := replaceSystemNameserver(v, st.SystemDNS, key); isEmptyList(replaced) {
-				delete(dnsCfg, key)
-			} else {
-				dnsCfg[key] = replaced
-			}
+			dnsCfg[key] = replaceSystemNameserver(v, st.SystemDNS, key)
 		}
 	}
-	if policy, ok := dnsCfg["nameserver-policy"].(map[string]any); ok {
-		for k, v := range policy {
-			if replaced := replaceSystemNameserver(v, st.SystemDNS, "nameserver-policy"); isEmptyList(replaced) {
-				delete(policy, k)
-			} else {
-				policy[k] = replaced
+	for _, key := range []string{"nameserver-policy", "proxy-server-nameserver-policy"} {
+		if policy, ok := dnsCfg[key].(map[string]any); ok {
+			for k, v := range policy {
+				policy[k] = replaceSystemNameserver(v, st.SystemDNS, key)
 			}
 		}
 	}
@@ -717,12 +707,14 @@ func mergeConfig(subYAML string, st appSettings, tunnelMTU int) ([]byte, error) 
 }
 
 // replaceSystemNameserver 把 DNS 服务器列表（或单字符串值）中的 "system" 展开为
-// NE 侧注入的物理网络 DNS（system 参数）。注入为空时剔除该条目并记日志，
-// 由调用方决定兜底（nameserver 走默认 DoH，其余字段删键）。
+// NE 侧注入的物理网络 DNS（system 参数）。未注入时原样返回，行为与旧版一致。
 func replaceSystemNameserver(value any, system []string, field string) any {
+	if len(system) == 0 {
+		return value
+	}
 	if s, ok := value.(string); ok {
 		if strings.EqualFold(strings.TrimSpace(s), "system") {
-			logSystemDNSReplacement(field, system)
+			appendRunLog("dns." + field + " 的 system 已替换为 " + strings.Join(system, ","))
 			return stringsToAnyList(system)
 		}
 		return value
@@ -734,7 +726,7 @@ func replaceSystemNameserver(value any, system []string, field string) any {
 	out := make([]any, 0, len(list))
 	for _, item := range list {
 		if s, ok := item.(string); ok && strings.EqualFold(strings.TrimSpace(s), "system") {
-			logSystemDNSReplacement(field, system)
+			appendRunLog("dns." + field + " 的 system 已替换为 " + strings.Join(system, ","))
 			out = append(out, stringsToAnyList(system)...)
 			continue
 		}
@@ -743,25 +735,12 @@ func replaceSystemNameserver(value any, system []string, field string) any {
 	return out
 }
 
-func logSystemDNSReplacement(field string, system []string) {
-	if len(system) == 0 {
-		appendRunLog("dns." + field + " 使用了 system，但 NE 未注入系统 DNS，已剔除")
-	} else {
-		appendRunLog("dns." + field + " 的 system 已替换为 " + strings.Join(system, ","))
-	}
-}
-
 func stringsToAnyList(ss []string) []any {
 	out := make([]any, 0, len(ss))
 	for _, s := range ss {
 		out = append(out, s)
 	}
 	return out
-}
-
-func isEmptyList(v any) bool {
-	l, ok := v.([]any)
-	return ok && len(l) == 0
 }
 
 // filterUnsupportedRules 剔除 iOS 上无效的规则类型（按进程匹配），并登记提示。
