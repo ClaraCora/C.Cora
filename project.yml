@@ -67,6 +67,8 @@ targets:
         GENERATE_INFOPLIST_FILE: NO
         INFOPLIST_FILE: MiClashTunnel/Info.plist
         CODE_SIGN_ENTITLEMENTS: MiClashTunnel/MiClashTunnel.entitlements
+        # 暴露 libresolv（res_9_*）给 Swift：读取物理网络 DNS，见 SystemDNS.swift
+        SWIFT_OBJC_BRIDGING_HEADER: MiClashTunnel/MiClashTunnel-Bridging-Header.h
     dependencies:
       # mihomo 内核必须在 NE 进程内运行（代理逻辑所在）。静态框架，只链接不嵌入。
       - framework: Vendor/Mihomo.xcframework
