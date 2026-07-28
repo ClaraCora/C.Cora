@@ -88,56 +88,80 @@ struct SubscriptionRow: View {
     let isSelected: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                    .foregroundStyle(isSelected ? .green : .secondary)
-                Text(sub.name).font(.headline)
-                if sub.isLocal {
-                    Text("本地")
-                        .font(.system(size: 10, weight: .bold))
-                        .padding(.horizontal, 6).padding(.vertical, 2)
-                        .background(Capsule().fill(Color.orange.opacity(0.18)))
-                        .foregroundStyle(.orange)
+        HStack(alignment: .top, spacing: 12) {
+            // 类型图标：渐变圆角方块，与节点页策略组图标的占位样式一致。
+            ZStack {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(LinearGradient(
+                        colors: [iconTint.opacity(0.18), iconTint.opacity(0.07)],
+                        startPoint: .topLeading, endPoint: .bottomTrailing))
+                Image(systemName: sub.isLocal ? "doc.text" : "link")
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundStyle(iconTint)
+            }
+            .frame(width: 36, height: 36)
+
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    if isSelected {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                    }
+                    Text(sub.name).font(.headline)
+                    if sub.isLocal {
+                        Text("本地")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.orange)
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(Capsule().fill(Color.orange.opacity(0.12)))
+                            .overlay(Capsule().stroke(Color.orange.opacity(0.25), lineWidth: 0.5))
+                    }
+                    Spacer()
+                    if sub.nodeCount > 0 {
+                        Text("\(sub.nodeCount) 节点")
+                            .font(.caption2.monospacedDigit().weight(.medium))
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 7).padding(.vertical, 3)
+                            .background(Capsule().fill(Color.secondary.opacity(0.10)))
+                    }
                 }
-                Spacer()
-                if sub.nodeCount > 0 {
-                    Text("\(sub.nodeCount) 节点")
+
+                // 流量进度（仅远程订阅有）
+                if sub.hasUsage {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ProgressView(value: Double(sub.used), total: Double(max(sub.total, 1)))
+                            .tint(usageTint)
+                        HStack {
+                            Text("已用 \(ByteFormat.size(sub.used)) / \(ByteFormat.size(sub.total))")
+                            Spacer()
+                            Text("剩 \(ByteFormat.size(sub.remaining))")
+                        }
                         .font(.caption2)
                         .foregroundStyle(.secondary)
-                }
-            }
-
-            // 流量进度（仅远程订阅有）
-            if sub.hasUsage {
-                VStack(alignment: .leading, spacing: 4) {
-                    ProgressView(value: Double(sub.used), total: Double(max(sub.total, 1)))
-                        .tint(usageTint)
-                    HStack {
-                        Text("已用 \(ByteFormat.size(sub.used)) / \(ByteFormat.size(sub.total))")
-                        Spacer()
-                        Text("剩 \(ByteFormat.size(sub.remaining))")
                     }
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
                 }
-            }
 
-            HStack(spacing: 12) {
-                if let exp = sub.expire {
-                    Label(exp.formatted(date: .numeric, time: .omitted), systemImage: "calendar")
-                        .foregroundStyle(exp < Date() ? .red : .secondary)
+                HStack(spacing: 12) {
+                    if let exp = sub.expire {
+                        Label(exp.formatted(date: .numeric, time: .omitted), systemImage: "calendar")
+                            .foregroundStyle(exp < Date() ? .red : .secondary)
+                    }
+                    if let t = sub.updatedAt {
+                        Label(t.formatted(date: .omitted, time: .shortened), systemImage: "clock")
+                    } else {
+                        Text("未拉取").foregroundStyle(.orange)
+                    }
                 }
-                if let t = sub.updatedAt {
-                    Label(t.formatted(date: .omitted, time: .shortened), systemImage: "clock")
-                } else {
-                    Text("未拉取").foregroundStyle(.orange)
-                }
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
             }
-            .font(.caption2)
-            .foregroundStyle(.tertiary)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(.vertical, 4)
+    }
+
+    private var iconTint: Color {
+        sub.isLocal ? .orange : Color.accentColor
     }
 
     private var usageTint: Color {

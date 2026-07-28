@@ -61,9 +61,18 @@ private struct ConnectionCard: View {
             .buttonStyle(.plain)
             .disabled(core.isBusy)
 
-            VStack(spacing: 4) {
-                Text(core.statusText)
-                    .font(.title3.weight(.semibold))
+            VStack(spacing: 6) {
+                HStack(spacing: 7) {
+                    Circle()
+                        .fill(glowColor)
+                        .frame(width: 8, height: 8)
+                    Text(core.statusText)
+                        .font(.subheadline.weight(.semibold))
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(Capsule().fill(glowColor.opacity(0.12)))
+
                 Text(core.isActive ? "点按断开" : "点按连接")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
@@ -80,7 +89,7 @@ private struct ConnectionCard: View {
 
             // 代理模式
             HStack {
-                Text("模式")
+                Label("模式", systemImage: "switch.2")
                     .font(.subheadline.weight(.medium))
                     .foregroundStyle(.secondary)
                 Spacer()
@@ -94,9 +103,9 @@ private struct ConnectionCard: View {
             .pickerStyle(.segmented)
             .disabled(!core.isActive)
         }
-        .padding(16)
+        .padding(18)
         .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .fill(Color(uiColor: .secondarySystemGroupedBackground))
         )
     }
@@ -138,7 +147,7 @@ private struct NoticesCard: View {
         }
         .padding(16)
         .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .fill(Color(uiColor: .secondarySystemGroupedBackground))
         )
     }
@@ -170,10 +179,20 @@ private struct MetricWidget: View {
     let tint: Color
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Label(title, systemImage: systemImage)
-                .font(.caption2.weight(.medium))
-                .foregroundStyle(tint)
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(tint)
+                    .frame(width: 20, height: 20)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(tint.opacity(0.12))
+                    )
+                Text(title)
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.secondary)
+            }
             Text(value)
                 .font(.callout.monospacedDigit().weight(.semibold))
                 .lineLimit(1)
@@ -181,13 +200,31 @@ private struct MetricWidget: View {
                 .foregroundStyle(.primary)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .padding(.horizontal, 10)
-        .frame(maxWidth: .infinity, minHeight: 62)
+        .padding(10)
+        .frame(maxWidth: .infinity, minHeight: 66)
         .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .fill(Color(uiColor: .secondarySystemGroupedBackground))
         )
         .accessibilityElement(children: .combine)
+    }
+}
+
+/// 图表图例：彩色圆点 + 标签。
+private struct TrafficLegend: View {
+    let color: Color
+    let title: String
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Circle()
+                .fill(color)
+                .frame(width: 6, height: 6)
+            Text(title)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .accessibilityHidden(true)
     }
 }
 
@@ -196,35 +233,46 @@ private struct TrafficChart: View {
     let samples: [KernelController.TrafficSample]
 
     var body: some View {
-        Chart {
-            ForEach(samples) { s in
-                AreaMark(x: .value("t", s.id), y: .value("速率", Double(s.down)))
-                    .foregroundStyle(.blue.opacity(0.1))
-                    .interpolationMethod(.catmullRom)
-                LineMark(x: .value("t", s.id), y: .value("速率", Double(s.down)),
-                         series: .value("方向", "下行"))
-                    .foregroundStyle(.blue)
-                    .interpolationMethod(.catmullRom)
-                LineMark(x: .value("t", s.id), y: .value("速率", Double(s.up)),
-                         series: .value("方向", "上行"))
-                    .foregroundStyle(.orange)
-                    .interpolationMethod(.catmullRom)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                Label("实时速率", systemImage: "waveform.path.ecg")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                TrafficLegend(color: .blue, title: "下行")
+                TrafficLegend(color: .orange, title: "上行")
             }
-        }
-        .chartXScale(domain: xDomain)
-        .chartXAxis(.hidden)
-        .chartYAxis {
-            AxisMarks(values: .automatic(desiredCount: 3)) { value in
-                AxisGridLine()
-                if let v = value.as(Double.self) {
-                    AxisValueLabel { Text(ByteFormat.rate(Int64(v))).font(.caption2) }
+
+            Chart {
+                ForEach(samples) { s in
+                    AreaMark(x: .value("t", s.id), y: .value("速率", Double(s.down)))
+                        .foregroundStyle(.blue.opacity(0.1))
+                        .interpolationMethod(.catmullRom)
+                    LineMark(x: .value("t", s.id), y: .value("速率", Double(s.down)),
+                             series: .value("方向", "下行"))
+                        .foregroundStyle(.blue)
+                        .interpolationMethod(.catmullRom)
+                    LineMark(x: .value("t", s.id), y: .value("速率", Double(s.up)),
+                             series: .value("方向", "上行"))
+                        .foregroundStyle(.orange)
+                        .interpolationMethod(.catmullRom)
                 }
             }
+            .chartXScale(domain: xDomain)
+            .chartXAxis(.hidden)
+            .chartYAxis {
+                AxisMarks(values: .automatic(desiredCount: 3)) { value in
+                    AxisGridLine()
+                    if let v = value.as(Double.self) {
+                        AxisValueLabel { Text(ByteFormat.rate(Int64(v))).font(.caption2) }
+                    }
+                }
+            }
+            .frame(height: 104)
         }
-        .frame(height: 104)
         .padding(12)
         .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .fill(Color(uiColor: .secondarySystemGroupedBackground))
         )
     }

@@ -77,6 +77,7 @@ struct ConnectionsView: View {
                     Label(error, systemImage: "exclamationmark.triangle.fill")
                         .font(.footnote)
                         .foregroundStyle(.orange)
+                        .listRowBackground(Color.orange.opacity(0.08))
                 }
             }
 
@@ -132,11 +133,14 @@ private struct ConnectionSummary: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            SummaryValue(title: "连接", value: String(snapshot.connections.count), tint: .green)
+            SummaryValue(title: "连接", value: String(snapshot.connections.count),
+                         systemImage: "link", tint: .green)
             Divider().frame(height: 30)
-            SummaryValue(title: "下行", value: ByteFormat.size(snapshot.downloadTotal), tint: .blue)
+            SummaryValue(title: "下行", value: ByteFormat.size(snapshot.downloadTotal),
+                         systemImage: "arrow.down", tint: .blue)
             Divider().frame(height: 30)
-            SummaryValue(title: "上行", value: ByteFormat.size(snapshot.uploadTotal), tint: .orange)
+            SummaryValue(title: "上行", value: ByteFormat.size(snapshot.uploadTotal),
+                         systemImage: "arrow.up", tint: .orange)
         }
         .accessibilityElement(children: .combine)
     }
@@ -145,13 +149,24 @@ private struct ConnectionSummary: View {
 private struct SummaryValue: View {
     let title: String
     let value: String
+    let systemImage: String
     let tint: Color
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text(title)
-                .font(.caption2)
-                .foregroundStyle(tint)
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 5) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(tint)
+                    .frame(width: 18, height: 18)
+                    .background(
+                        RoundedRectangle(cornerRadius: 5, style: .continuous)
+                            .fill(tint.opacity(0.12))
+                    )
+                Text(title)
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.secondary)
+            }
             Text(value)
                 .font(.subheadline.monospacedDigit().weight(.semibold))
                 .lineLimit(1)
@@ -169,9 +184,12 @@ private struct ConnectionRow: View {
         HStack(alignment: .top, spacing: 10) {
             Text(connection.metadata.network.uppercased().isEmpty
                  ? "IP" : connection.metadata.network.uppercased())
-                .font(.caption2.monospaced().weight(.semibold))
+                .font(.caption2.monospaced().weight(.bold))
                 .foregroundStyle(connection.metadata.network.lowercased() == "udp" ? .orange : .blue)
-                .frame(width: 30, alignment: .leading)
+                .frame(width: 34, height: 20)
+                .background(Capsule().fill(
+                    (connection.metadata.network.lowercased() == "udp" ? Color.orange : Color.blue)
+                        .opacity(0.12)))
 
             VStack(alignment: .leading, spacing: 4) {
                 Text(connection.destinationTitle)
