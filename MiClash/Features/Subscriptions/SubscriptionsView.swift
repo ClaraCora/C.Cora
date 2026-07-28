@@ -88,7 +88,7 @@ struct SubscriptionRow: View {
     let isSelected: Bool
 
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
+        HStack(alignment: .top, spacing: 6) {
             // 类型图标：渐变圆角方块，与节点页策略组图标的占位样式一致。
             ZStack {
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -141,19 +141,29 @@ struct SubscriptionRow: View {
                     }
                 }
 
-                HStack(spacing: 12) {
+                HStack(spacing: 14) {
                     if let text = sub.expireText {
-                        Label(text, systemImage: "calendar")
-                            .foregroundStyle((sub.expire ?? .distantFuture) < Date() ? .red : .secondary)
+                        HStack(spacing: 4) {
+                            Image(systemName: "calendar")
+                            Text("到期 \(text)")
+                        }
+                        .foregroundStyle((sub.expire ?? .distantFuture) < Date() ? .red : .primary)
                     }
                     if let text = sub.updatedText {
-                        Label(text, systemImage: "clock")
+                        HStack(spacing: 4) {
+                            Image(systemName: "arrow.clockwise")
+                            Text("更新 \(text)")
+                        }
+                        .foregroundStyle(.primary)
                     } else {
-                        Text("未拉取").foregroundStyle(.orange)
+                        HStack(spacing: 4) {
+                            Image(systemName: "exclamationmark.circle")
+                            Text("未拉取")
+                        }
+                        .foregroundStyle(.orange)
                     }
                 }
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
+                .font(.caption.weight(.medium))
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
