@@ -52,13 +52,11 @@ struct SubscriptionDetailView: View {
                 LabeledContent("流量",
                     value: "\(ByteFormat.size(sub.used)) / \(ByteFormat.size(sub.total))")
             }
-            if let exp = sub.expire {
-                LabeledContent("到期",
-                    value: exp.formatted(date: .numeric, time: .omitted))
+            if let text = sub.expireText {
+                LabeledContent("到期", value: text)
             }
-            if let t = sub.updatedAt {
-                LabeledContent("更新于",
-                    value: t.formatted(date: .numeric, time: .shortened))
+            if let text = sub.updatedText {
+                LabeledContent("更新于", value: text)
             }
         }
     }

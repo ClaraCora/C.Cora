@@ -142,12 +142,12 @@ struct SubscriptionRow: View {
                 }
 
                 HStack(spacing: 12) {
-                    if let exp = sub.expire {
-                        Label(exp.formatted(date: .numeric, time: .omitted), systemImage: "calendar")
-                            .foregroundStyle(exp < Date() ? .red : .secondary)
+                    if let text = sub.expireText {
+                        Label(text, systemImage: "calendar")
+                            .foregroundStyle((sub.expire ?? .distantFuture) < Date() ? .red : .secondary)
                     }
-                    if let t = sub.updatedAt {
-                        Label(t.formatted(date: .omitted, time: .shortened), systemImage: "clock")
+                    if let text = sub.updatedText {
+                        Label(text, systemImage: "clock")
                     } else {
                         Text("未拉取").foregroundStyle(.orange)
                     }

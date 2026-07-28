@@ -39,6 +39,22 @@ struct Subscription: Identifiable, Codable, Equatable {
     /// 本地配置：没有订阅链接，内容由用户手写/粘贴，不可远程刷新。
     var isLocal: Bool { url.isEmpty }
 
+    /// 到期时间显示：机场常用远未来时间（如 2100/1/1）表示「长期有效」，直接显示日期反而奇怪。
+    var expireText: String? {
+        guard let expire else { return nil }
+        if expire.timeIntervalSinceNow > 50 * 365 * 24 * 3600 { return "长期" }
+        return expire.formatted(date: .numeric, time: .omitted)
+    }
+
+    /// 更新时间显示：今天/昨天只显示时刻并标注，更早的带日期。
+    var updatedText: String? {
+        guard let updatedAt else { return nil }
+        let time = updatedAt.formatted(date: .omitted, time: .shortened)
+        if Calendar.current.isDateInToday(updatedAt) { return "今天 \(time)" }
+        if Calendar.current.isDateInYesterday(updatedAt) { return "昨天 \(time)" }
+        return updatedAt.formatted(date: .numeric, time: .shortened)
+    }
+
     // 容错解码：旧版 subscriptions.json 没有新字段，缺失时给默认值，避免整体解码失败丢订阅。
     enum CodingKeys: String, CodingKey {
         case id, name, url, yaml, updatedAt, nodeCount, upload, download, total, expire, autoNamed
