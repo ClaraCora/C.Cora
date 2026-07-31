@@ -138,12 +138,14 @@ final class SettingsStore: ObservableObject {
         let gi = d.integer(forKey: K.geoInterval)
         geoUpdateInterval = gi == 0 ? 24 : gi
         logLevel = d.string(forKey: K.logLevel) ?? "info"
-        controllerPort = Self.normalizedControllerPort(d.integer(forKey: K.port))
-        controllerSecret = d.string(forKey: K.secret) ?? ""
+        let storedControllerPort = Self.normalizedControllerPort(d.integer(forKey: K.port))
+        let storedControllerSecret = d.string(forKey: K.secret) ?? ""
+        controllerPort = storedControllerPort
+        controllerSecret = storedControllerSecret
         allowLan = (d.object(forKey: K.allowLan) as? Bool ?? false)
-            && !controllerSecret.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !storedControllerSecret.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let storedMixedPort = min(max(d.integer(forKey: K.mixedPort), 0), 65_535)
-        mixedPort = storedMixedPort == controllerPort ? 0 : storedMixedPort
+        mixedPort = storedMixedPort == storedControllerPort ? 0 : storedMixedPort
         includeAllNetworks = d.object(forKey: K.inclAll) as? Bool ?? false
         excludeCellularServices = d.object(forKey: K.exCell) as? Bool ?? true
         excludeAPNs = d.object(forKey: K.exAPNs) as? Bool ?? true
