@@ -9,9 +9,12 @@ final class LogFileTailer: @unchecked Sendable {
     private let url: URL
     private var offset: UInt64 = 0
     private var prefix = Data()
+    private var partialLine = Data()
     private var expectingReset = false
     private var timer: DispatchSourceTimer?
     private let queue = DispatchQueue(label: "com.miclash.logtail", qos: .utility)
+    private static let maxReadBytes = 256 * 1024
+    private static let maxPartialLineBytes = 64 * 1024
 
     /// 新解析出的日志行（在后台队列回调，调用方自行切主线程）。
     var onLines: (([LogLine], _ fileWasReset: Bool) -> Void)?
@@ -21,6 +24,7 @@ final class LogFileTailer: @unchecked Sendable {
     func start(expectFileReset: Bool = false) {
         offset = 0
         prefix.removeAll()
+        partialLine.removeAll()
         expectingReset = expectFileReset
         if expectFileReset {
             // 连接状态先于 NE 启动变为 connecting；记录旧文件末尾，等待新会话截断。
@@ -57,6 +61,7 @@ final class LogFileTailer: @unchecked Sendable {
         if fileWasReset {
             offset = 0
             expectingReset = false
+            partialLine.removeAll(keepingCapacity: true)
         }
         guard size > offset else {
             if fileWasReset { onLines?([], true) }
@@ -64,16 +69,25 @@ final class LogFileTailer: @unchecked Sendable {
         }
 
         try? handle.seek(toOffset: offset)
-        let data = (try? handle.readToEnd()) ?? Data()
+        let data = (try? handle.read(upToCount: Self.maxReadBytes)) ?? Data()
         offset += UInt64(data.count)
 
-        guard let text = String(data: data, encoding: .utf8), !text.isEmpty else {
+        guard !data.isEmpty else {
             if fileWasReset { onLines?([], true) }
             return
         }
-        let parsed = text
-            .split(separator: "\n", omittingEmptySubsequences: true)
-            .map { parse(String($0)) }
+        partialLine.append(data)
+        var chunks = partialLine.split(separator: 0x0A, omittingEmptySubsequences: false)
+        if partialLine.last == 0x0A {
+            partialLine.removeAll(keepingCapacity: true)
+            if chunks.last?.isEmpty == true { chunks.removeLast() }
+        } else if let trailing = chunks.popLast() {
+            partialLine = Data(trailing.suffix(Self.maxPartialLineBytes))
+        }
+        let parsed = chunks.compactMap { bytes -> LogLine? in
+            guard !bytes.isEmpty else { return nil }
+            return parse(String(decoding: bytes, as: UTF8.self))
+        }
         if fileWasReset || !parsed.isEmpty { onLines?(parsed, fileWasReset) }
     }
 

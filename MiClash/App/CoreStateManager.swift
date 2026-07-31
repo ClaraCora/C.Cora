@@ -63,7 +63,10 @@ final class CoreStateManager: ObservableObject {
                 AppGroupState.vpnConnected = self.isActive
                 // 主动请求系统刷新磁贴，否则 App 内启停不会同步到控制中心
                 ControlCenter.shared.reloadControls(ofKind: ControlWidgetKind.vpn)
-                if connection.status == .connected { await self.fetchNotices() }
+                if connection.status == .connected {
+                    await self.fetchControllerConfiguration()
+                    await self.fetchNotices()
+                }
                 else if connection.status == .disconnected { self.configNotices = [] }
             }
         }
@@ -72,6 +75,9 @@ final class CoreStateManager: ObservableObject {
     /// 初始化或前台回来时主动拉一次当前状态。
     func refreshStatus() async {
         status = await tunnel.currentStatus()
+        if status == .connected {
+            await fetchControllerConfiguration()
+        }
     }
 
     /// 向运行中的 NE 索取日志（sendProviderMessage，不依赖 App Group）。
@@ -105,8 +111,10 @@ final class CoreStateManager: ObservableObject {
             // GEO 首次下载与定时更新在主 App 完成，避免 NE 启动阶段联网和冲高内存。
             try await GeoDatabaseManager.shared.prepareForConnection(configYAML: yaml)
             // App 主动连接时明确下发配置意图：nil=使用内建 DIRECT，不复活旧订阅缓存。
-            let settings = SettingsStore.shared.asJSON()
+            let settings = SettingsStore.shared.asJSON(
+                geoAvailable: AppGroup.containerURL != nil)
             let s = SettingsStore.shared
+            MihomoAPI.configure(port: s.controllerPort, secret: s.controllerSecret)
             let opts = TunnelManager.ProtocolOptions(
                 includeAllNetworks: s.includeAllNetworks,
                 excludeCellularServices: s.excludeCellularServices,
@@ -134,7 +142,8 @@ final class CoreStateManager: ObservableObject {
 
         let yaml = SubscriptionStore.shared.activeYAML
         try await GeoDatabaseManager.shared.prepareForConnection(configYAML: yaml)
-        let settings = SettingsStore.shared.asJSON()
+        let settings = SettingsStore.shared.asJSON(
+            geoAvailable: AppGroup.containerURL != nil)
         let transfer = await Task.detached(priority: .userInitiated) {
             ReloadTransfer.make(configYAML: yaml ?? "", settingsJSON: settings)
         }.value
@@ -164,6 +173,7 @@ final class CoreStateManager: ObservableObject {
                 throw Self.reloadError((response["error"] as? String) ?? "mihomo 重载失败")
             }
         }
+        await fetchControllerConfiguration()
         await fetchNotices()
     }
 
@@ -187,6 +197,15 @@ final class CoreStateManager: ObservableObject {
             return .failure("命令编码失败")
         }
         return await tunnel.sendMessage(payload)
+    }
+
+    private func fetchControllerConfiguration() async {
+        let result = await sendMessage(["cmd": "controllerInfo"])
+        guard case .ok(let data) = result,
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let port = (object["port"] as? NSNumber)?.intValue,
+              (1...65_535).contains(port) else { return }
+        MihomoAPI.configure(port: port, secret: object["secret"] as? String ?? "")
     }
 
     private static func reloadError(_ message: String) -> NSError {

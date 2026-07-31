@@ -1,6 +1,7 @@
 package mihomo
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -299,13 +300,13 @@ dns:
 		t.Errorf("geox-url = %v, want only the unrelated ASN URL preserved", geoXURL)
 	}
 	rules, ok := m["rules"].([]any)
-	if !ok || len(rules) != 2 || rules[0] != "IP-ASN,13335,Proxy,no-resolve" || rules[1] != "MATCH,DIRECT" {
-		t.Errorf("rules = %v, want ASN and MATCH rules retained", m["rules"])
+	if !ok || len(rules) != 1 || rules[0] != "MATCH,DIRECT" {
+		t.Errorf("rules = %v, want only MATCH retained", m["rules"])
 	}
 	subRules := nestedMap(t, m, "sub-rules")
 	nested, ok := subRules["nested"].([]any)
-	if !ok || len(nested) != 2 || nested[0] != "SRC-IP-ASN,4134,DIRECT" || nested[1] != "DOMAIN,example.com,DIRECT" {
-		t.Errorf("sub-rules.nested = %v, want ASN and DOMAIN rules retained", subRules["nested"])
+	if !ok || len(nested) != 1 || nested[0] != "DOMAIN,example.com,DIRECT" {
+		t.Errorf("sub-rules.nested = %v, want only DOMAIN retained", subRules["nested"])
 	}
 	dns := nestedMap(t, m, "dns")
 	policy := nestedMap(t, dns, "nameserver-policy")
@@ -389,6 +390,32 @@ sub-rules:
 	}
 }
 
+func TestResolveGeoDownloadURLsOnlyRequiresUsedAssets(t *testing.T) {
+	direct := resolveGeoDownloadURLs("mode: direct\nrules:\n  - MATCH,DIRECT\n", parseSettings(""))
+	if direct.GeoRequired || direct.ASNRequired {
+		t.Fatalf("DIRECT config unexpectedly requires GEO assets: %+v", direct)
+	}
+
+	geo := resolveGeoDownloadURLs(`
+dns:
+  nameserver-policy:
+    "geosite:cn": 223.5.5.5
+`, parseSettings(""))
+	if !geo.GeoRequired {
+		t.Fatal("geosite DNS policy should require GEO assets")
+	}
+
+	fallback := resolveGeoDownloadURLs(`
+dns:
+  fallback-filter:
+    geoip: true
+    geoip-code: CN
+`, parseSettings(""))
+	if !fallback.GeoRequired {
+		t.Fatal("geoip fallback filter should require GEO assets")
+	}
+}
+
 func TestResolveGeoDownloadURLsExportsJSON(t *testing.T) {
 	encoded := ResolveGeoDownloadURLs(`
 geox-url:
@@ -398,7 +425,7 @@ geox-url:
 	if err := json.Unmarshal([]byte(encoded), &got); err != nil {
 		t.Fatalf("ResolveGeoDownloadURLs returned invalid JSON %q: %v", encoded, err)
 	}
-	if got.ASN != "https://config.example/ASN.mmdb" || !got.ASNRequired {
+	if got.ASN != "https://config.example/ASN.mmdb" || got.ASNRequired {
 		t.Fatalf("ResolveGeoDownloadURLs = %+v", got)
 	}
 }
@@ -431,6 +458,92 @@ rules:
 	}
 	if len(rules) != 4 {
 		t.Fatalf("rules with ignore disabled = %v, want all 4 rules", rules)
+	}
+}
+
+func TestMergeConfigFiltersNestedUnsupportedAndASNRules(t *testing.T) {
+	const input = `
+rules:
+  - IP-ASN,13335,Proxy
+  - MATCH,DIRECT
+sub-rules:
+  nested:
+    - PROCESS-NAME,Example,DIRECT
+    - SRC-IP-ASN,4134,Proxy
+    - GEOSITE,geolocation-!cn,Proxy
+    - MATCH,DIRECT
+`
+	settings := appSettings{Stack: "gvisor", LogLevel: "info", GeoEnabled: false}
+	m := mergedMapWithSettings(t, input, settings)
+	rules := m["rules"].([]any)
+	if len(rules) != 1 || rules[0] != "MATCH,DIRECT" {
+		t.Fatalf("top-level rules = %v, want only MATCH", rules)
+	}
+	subRules := nestedMap(t, m, "sub-rules")
+	nested := subRules["nested"].([]any)
+	if len(nested) != 1 || nested[0] != "MATCH,DIRECT" {
+		t.Fatalf("nested rules = %v, want only MATCH", nested)
+	}
+
+	settings.GeoEnabled = true
+	settings.IgnoreGeoNegation = true
+	m = mergedMapWithSettings(t, input, settings)
+	nested = nestedMap(t, m, "sub-rules")["nested"].([]any)
+	for _, rule := range nested {
+		if rule == "PROCESS-NAME,Example,DIRECT" || rule == "GEOSITE,geolocation-!cn,Proxy" {
+			t.Fatalf("unsupported nested rule was retained: %v", nested)
+		}
+	}
+}
+
+func TestParseSettingsNormalizesPortsAndLANAuthentication(t *testing.T) {
+	settings := parseSettings(`{
+  "controllerPort": 99999,
+  "controllerSecret": "",
+  "allowLan": true,
+  "mixedPort": -1
+}`)
+	if settings.ControllerPort != 9090 {
+		t.Fatalf("controller port = %d, want 9090", settings.ControllerPort)
+	}
+	if settings.AllowLan {
+		t.Fatal("allowLan should be disabled without a secret")
+	}
+	if settings.MixedPort != 0 {
+		t.Fatalf("mixed port = %d, want 0", settings.MixedPort)
+	}
+
+	settings = parseSettings(`{
+  "controllerPort": 9090,
+  "controllerSecret": "secret",
+  "allowLan": true,
+  "mixedPort": 9090
+}`)
+	if settings.MixedPort != 0 {
+		t.Fatalf("conflicting mixed port = %d, want disabled", settings.MixedPort)
+	}
+	if !settings.AllowLan {
+		t.Fatal("authenticated LAN controller should remain enabled")
+	}
+}
+
+func TestRunLogIsBounded(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "run.log")
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if _, err := file.Write(bytes.Repeat([]byte{'x'}, int(maxRunLogBytes))); err != nil {
+		t.Fatal(err)
+	}
+	writeRunLogLine(file, "next line\n")
+	info, err := file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() >= maxRunLogBytes {
+		t.Fatalf("run.log size = %d, want less than %d after rotation", info.Size(), maxRunLogBytes)
 	}
 }
 
@@ -590,5 +703,11 @@ tun:
 	}
 	if _, exists := m["mixed-port"]; exists {
 		t.Error("mixed-port should be absent when the App setting is zero")
+	}
+	if got := m["allow-lan"]; got != false {
+		t.Errorf("allow-lan = %v, want false", got)
+	}
+	if got := m["bind-address"]; got != "127.0.0.1" {
+		t.Errorf("bind-address = %v, want loopback", got)
 	}
 }

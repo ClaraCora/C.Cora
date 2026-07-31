@@ -132,6 +132,8 @@ final class LogStreamController: ObservableObject {
                 && (q.isEmpty || $0.payload.lowercased().contains(q))
         }
         var updated = display.lines
+        let retainedIDs = Set(rawLines.map(\.id))
+        updated.removeAll { !retainedIDs.contains($0.id) }
         updated.append(contentsOf: accepted)
         if updated.count > maxLines { updated.removeFirst(updated.count - maxLines) }
         display = LogDisplayState(lines: updated, bufferedLineCount: rawLines.count)

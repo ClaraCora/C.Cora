@@ -13,7 +13,9 @@ enum FileLog {
     private static let queue = DispatchQueue(label: "com.miclash.tunnel.filelog")
     private static let maxBufferedLines = 512
     private static let trimBufferedLinesAt = 640
+    private static let maxFileBytes: UInt64 = 512 * 1024
     private static var buffer: [String] = []
+    private static var persistedBytes: UInt64 = 0
 
     private static let formatter: DateFormatter = {
         let f = DateFormatter()
@@ -23,29 +25,38 @@ enum FileLog {
 
     /// 清空（每次 startTunnel 调用）。
     static func reset() {
-        queue.sync { buffer.removeAll() }
+        queue.sync {
+            buffer.removeAll()
+            persistedBytes = 0
+            if let url = AppGroup.containerURL?.appendingPathComponent("ne.log") {
+                try? Data().write(to: url, options: .atomic)
+            }
+        }
     }
 
     /// 追加一行（带时间戳）。
     static func write(_ message: String) {
-        let line: String = queue.sync {
+        queue.sync {
             let line = "\(formatter.string(from: Date())) [NE] \(message)"
             buffer.append(line)
             if buffer.count >= trimBufferedLinesAt {
                 buffer.removeFirst(buffer.count - maxBufferedLines)
             }
-            return line
-        }
-
-        // best-effort：App Group 可用时也落一份文件，便于将来排查
-        if let url = AppGroup.containerURL?.appendingPathComponent("ne.log") {
-            let data = (line + "\n").data(using: .utf8) ?? Data()
-            if let h = try? FileHandle(forWritingTo: url) {
-                defer { try? h.close() }
-                h.seekToEndOfFile()
-                h.write(data)
-            } else {
-                try? (line + "\n").write(to: url, atomically: true, encoding: .utf8)
+            // best-effort：App Group 可用时也落一份有界文件，便于将来排查。
+            if let url = AppGroup.containerURL?.appendingPathComponent("ne.log") {
+                let data = Data((line + "\n").utf8.prefix(64 * 1024))
+                if persistedBytes + UInt64(data.count) > maxFileBytes {
+                    try? Data().write(to: url, options: .atomic)
+                    persistedBytes = 0
+                }
+                if let handle = try? FileHandle(forWritingTo: url) {
+                    defer { try? handle.close() }
+                    persistedBytes = (try? handle.seekToEnd()) ?? persistedBytes
+                    try? handle.write(contentsOf: data)
+                    persistedBytes += UInt64(data.count)
+                } else if (try? data.write(to: url, options: .atomic)) != nil {
+                    persistedBytes = UInt64(data.count)
+                }
             }
         }
     }

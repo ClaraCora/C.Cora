@@ -2,6 +2,8 @@
 
 #include <resolv.h>
 #include <arpa/inet.h>
+#include <net/if.h>
+#include <stdio.h>
 #include <string.h>
 
 int miclash_copy_system_dns(char *out, int stride, int maxCount) {
@@ -24,7 +26,24 @@ int miclash_copy_system_dns(char *out, int stride, int maxCount) {
         if (servers[i].sin.sin_family == AF_INET) {
             p = inet_ntop(AF_INET, &servers[i].sin.sin_addr, slot, (socklen_t)stride);
         } else if (servers[i].sin.sin_family == AF_INET6) {
-            p = inet_ntop(AF_INET6, &servers[i].sin6.sin6_addr, slot, (socklen_t)stride);
+            char address[INET6_ADDRSTRLEN];
+            p = inet_ntop(AF_INET6, &servers[i].sin6.sin6_addr,
+                          address, sizeof(address));
+            if (p != NULL && servers[i].sin6.sin6_scope_id != 0) {
+                char interfaceName[IF_NAMESIZE];
+                if (if_indextoname(servers[i].sin6.sin6_scope_id, interfaceName) != NULL) {
+                    if (snprintf(slot, (size_t)stride, "%s%%%s", address, interfaceName) >= stride) {
+                        p = NULL;
+                    }
+                } else if (snprintf(slot, (size_t)stride, "%s%%%u", address,
+                                    servers[i].sin6.sin6_scope_id) >= stride) {
+                    p = NULL;
+                }
+            } else if (p != NULL) {
+                if (snprintf(slot, (size_t)stride, "%s", address) >= stride) {
+                    p = NULL;
+                }
+            }
         }
         if (p != NULL) written++;
     }

@@ -25,6 +25,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private var tunnelFileDescriptor: Int32?
     private var tunnelMTU: Int?
     private var configuredTunnelMTU: Int?
+    private var configuredIPv6: Bool?
     private var isStopping = false
     private let reloadQueue = DispatchQueue(label: "com.miclash.tunnel.reload", qos: .userInitiated)
     private let memoryDiagnostics = MemoryDiagnostics()
@@ -57,12 +58,13 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             tunnelFileDescriptor = nil
             tunnelMTU = nil
             configuredTunnelMTU = nil
+            configuredIPv6 = nil
         }
         // 每次启动清空 ne.log，避免历史残留干扰排查
         // 隧道建立前先抓物理网络 DNS；隧道起来后系统主解析器会变成隧道自己的 DNS。
+        FileLog.reset()
         systemDNSServers = SystemDNS.excludingTunnel(SystemDNS.currentServers())
         FileLog.write("system DNS = \(systemDNSServers)")
-        FileLog.reset()
         FileLog.write("startTunnel：开始配置网络设置")
         log.info("startTunnel：开始配置网络设置")
 
@@ -84,9 +86,12 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
         let configYAML = resolveConfig(incoming: incomingConfig,
                                        hasOption: hasConfigOption, home: home)
-        let resolvedSettings = injectingSystemDNS(into:
+        var resolvedSettings = injectingSystemDNS(into:
             resolveCached(incoming: settingsJSON.isEmpty ? nil : settingsJSON,
                           home: home, file: "settings.json") ?? "")
+        if sharedHome == nil {
+            resolvedSettings = Self.disablingGeo(in: resolvedSettings)
+        }
 
         // GEO / ASN 文件必须由主 App 预先写入共享 home；NE 启动阶段不再联网下载。
         if let geoError = Self.validateGeoAssets(configYAML: configYAML,
@@ -99,10 +104,12 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
         let configuredMTUValue = Int(MihomoConfiguredTunMTU(configYAML))
         let configuredMTU: Int? = configuredMTUValue > 0 ? configuredMTUValue : nil
+        let ipv6Enabled = Self.ipv6Enabled(settingsJSON: resolvedSettings)
         FileLog.write(configuredMTU.map { "MTU 使用配置值：\($0)" }
             ?? "配置未设置 tun.mtu，由 iOS 选择系统 MTU")
 
-        let networkSettings = makeNetworkSettings(configuredMTU: configuredMTU)
+        let networkSettings = makeNetworkSettings(configuredMTU: configuredMTU,
+                                                  ipv6Enabled: ipv6Enabled)
         setTunnelNetworkSettings(networkSettings) { [weak self] error in
             guard let self else { return }
             if let error {
@@ -154,6 +161,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                     self.tunnelFileDescriptor = fd
                     self.tunnelMTU = actualMTU
                     self.configuredTunnelMTU = configuredMTU
+                    self.configuredIPv6 = ipv6Enabled
                     AppGroupState.vpnConnected = true // 共享给控制中心磁贴显示
                     ControlCenter.shared.reloadControls(ofKind: ControlWidgetKind.vpn)
                     self.startPathMonitor() // 开始把真实出站接口喂给内核
@@ -240,6 +248,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             tunnelFileDescriptor = nil
             tunnelMTU = nil
             configuredTunnelMTU = nil
+            configuredIPv6 = nil
             AppGroupState.vpnConnected = false // 同步给控制中心磁贴
             ControlCenter.shared.reloadControls(ofKind: ControlWidgetKind.vpn)
             stopPathMonitor()
@@ -254,20 +263,28 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     /// 监控网络路径，把真实出站接口名喂给 mihomo（取代其自带的 iOS 下不可靠的接口监控）。
     /// 出站绑对物理网卡才不会被默认路由兜回 tun → 这是吞吐能跑满的关键。
     private func startPathMonitor() {
-        stopPathMonitor()
-        let monitor = NWPathMonitor()
-        monitor.pathUpdateHandler = { [weak self] path in
-            self?.schedulePathUpdate(path)
+        pathMonitorQueue.async { [weak self] in
+            guard let self else { return }
+            self.stopPathMonitorLocked()
+            let monitor = NWPathMonitor()
+            monitor.pathUpdateHandler = { [weak self] path in
+                self?.schedulePathUpdate(path)
+            }
+            monitor.start(queue: self.pathMonitorQueue)
+            self.pathMonitor = monitor
         }
-        monitor.start(queue: pathMonitorQueue)
-        pathMonitor = monitor
     }
 
     private func stopPathMonitor() {
+        pathMonitorQueue.sync { stopPathMonitorLocked() }
+    }
+
+    private func stopPathMonitorLocked() {
         pendingPathUpdate?.cancel()
         pendingPathUpdate = nil
         pathMonitor?.cancel()
         pathMonitor = nil
+        lastInterfaceName = nil
     }
 
     /// 首次立即应用（缩短启动时「出站未绑接口」的窗口）；之后变化用防抖。
@@ -331,6 +348,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             completionHandler?(Data(MihomoProxyDetails().utf8))
         case "configNotices":
             completionHandler?(Data(MihomoConfigNotices().utf8))
+        case "controllerInfo":
+            completionHandler?(Data(MihomoControllerInfo().utf8))
         case "getMode":
             completionHandler?(Data(MihomoMode().utf8))
         case "setMode":
@@ -383,6 +402,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             let configYAML = input.config.isEmpty
                 ? MihomoConfig.directModeYAML()
                 : input.config
+            let effectiveSettings = AppGroup.containerURL == nil
+                ? Self.disablingGeo(in: input.settings)
+                : input.settings
             let requestedMTUValue = Int(MihomoConfiguredTunMTU(configYAML))
             let requestedMTU: Int? = requestedMTUValue > 0 ? requestedMTUValue : nil
             guard requestedMTU == self.configuredTunnelMTU else {
@@ -393,8 +415,15 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 completionHandler?(Self.reloadResponse(error: message))
                 return
             }
+            let requestedIPv6 = Self.ipv6Enabled(settingsJSON: effectiveSettings)
+            guard requestedIPv6 == self.configuredIPv6 else {
+                FileLog.write("拒绝热重载：IPv6 设置发生变化，请断开并重新连接后生效")
+                completionHandler?(Self.reloadResponse(
+                    error: "IPv6 设置发生变化，请断开并重新连接后生效"))
+                return
+            }
             if let geoError = Self.validateGeoAssets(configYAML: configYAML,
-                                                      settingsJSON: input.settings,
+                                                      settingsJSON: effectiveSettings,
                                                       home: home) {
                 FileLog.write("重载前 GEO / ASN 数据检查失败：\(geoError.localizedDescription)")
                 completionHandler?(Self.reloadResponse(error: geoError.localizedDescription))
@@ -405,7 +434,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             self.memoryDiagnostics.record(event: "reloadBefore")
             var reloadError: NSError?
             let ok = MihomoReloadConfig(Int(fd), tunnelMTU, configYAML,
-                                        injectingSystemDNS(into: input.settings), &reloadError)
+                                        injectingSystemDNS(into: effectiveSettings), &reloadError)
             self.memoryDiagnostics.record(event: ok ? "reloadAfter" : "reloadFailed")
             guard ok else {
                 let message = reloadError?.localizedDescription ?? "mihomo 重载失败（未知错误）"
@@ -419,7 +448,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             let settingsPath = (home as NSString).appendingPathComponent("settings.json")
             do {
                 try configYAML.write(toFile: configPath, atomically: true, encoding: .utf8)
-                try input.settings.write(toFile: settingsPath, atomically: true, encoding: .utf8)
+                try effectiveSettings.write(toFile: settingsPath, atomically: true, encoding: .utf8)
             } catch {
                 FileLog.write("配置已重载，但更新重连缓存失败：\(error.localizedDescription)")
             }
@@ -551,7 +580,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     // MARK: - 网络设置
 
     /// 构建隧道网络设置。地址与 mihomo 配置严格对齐（198.18.0.x）。
-    private func makeNetworkSettings(configuredMTU: Int?) -> NEPacketTunnelNetworkSettings {
+    private func makeNetworkSettings(configuredMTU: Int?,
+                                     ipv6Enabled: Bool) -> NEPacketTunnelNetworkSettings {
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: MihomoConfig.tunGatewayIP)
 
         // IPv4：网关 198.18.0.1/16，默认路由全量接管。
@@ -561,6 +591,14 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                                   subnetMasks: [MihomoConfig.tunSubnetMask])
         ipv4.includedRoutes = [NEIPv4Route.default()]
         settings.ipv4Settings = ipv4
+
+        if ipv6Enabled {
+            let ipv6 = NEIPv6Settings(
+                addresses: ["fdfe:dcba:9876::1"],
+                networkPrefixLengths: [126])
+            ipv6.includedRoutes = [NEIPv6Route.default()]
+            settings.ipv6Settings = ipv6
+        }
 
         // DNS：指向 mihomo 的隧道 DNS 网关，matchDomains=[""] 强制所有查询进 tunnel
         let dns = NEDNSSettings(servers: [MihomoConfig.dnsServerIP])
@@ -666,14 +704,19 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         let settings = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
         let geoEnabled = (settings["geoEnabled"] as? Bool) ?? true
         let geodataMode = (settings["geodataMode"] as? Bool) ?? true
-        var required = geoEnabled
-            ? [geodataMode ? "GeoIP.dat" : "geoip.metadb", "GeoSite.dat"]
-            : []
+        var required: [String] = []
         let resolvedJSON = MihomoResolveGeoDownloadURLs(configYAML, settingsJSON)
         if let resolvedData = resolvedJSON.data(using: .utf8),
-           let resolved = (try? JSONSerialization.jsonObject(with: resolvedData)) as? [String: Any],
-           (resolved["asnRequired"] as? Bool) == true {
-            required.append("ASN.mmdb")
+           let resolved = (try? JSONSerialization.jsonObject(with: resolvedData)) as? [String: Any] {
+            if geoEnabled, (resolved["geoRequired"] as? Bool) == true {
+                required.append(contentsOf: [
+                    geodataMode ? "GeoIP.dat" : "geoip.metadb",
+                    "GeoSite.dat"
+                ])
+            }
+            if geoEnabled, (resolved["asnRequired"] as? Bool) == true {
+                required.append("ASN.mmdb")
+            }
         }
         guard !required.isEmpty else { return nil }
         let missing = required.filter { name in
@@ -688,6 +731,22 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             userInfo: [NSLocalizedDescriptionKey:
                 "缺少 GEO / ASN 数据文件：\(missing.joined(separator: "、"))。请在主 App 设置中下载后重试。"]
         )
+    }
+
+    private static func ipv6Enabled(settingsJSON: String) -> Bool {
+        guard let data = settingsJSON.data(using: .utf8),
+              let settings = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        else { return false }
+        return settings["ipv6"] as? Bool ?? false
+    }
+
+    private static func disablingGeo(in settingsJSON: String) -> String {
+        let data = settingsJSON.data(using: .utf8) ?? Data()
+        var settings = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        settings["geoEnabled"] = false
+        guard let encoded = try? JSONSerialization.data(withJSONObject: settings),
+              let result = String(data: encoded, encoding: .utf8) else { return settingsJSON }
+        return result
     }
 
     // MARK: - App Group

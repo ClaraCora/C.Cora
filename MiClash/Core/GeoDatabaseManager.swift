@@ -19,6 +19,7 @@ private struct ResolvedGeoURLs: Decodable, Sendable {
     let mmdb: String
     let geosite: String
     let asn: String
+    let geoRequired: Bool
     let asnRequired: Bool
 }
 
@@ -42,7 +43,8 @@ final class GeoDatabaseManager: ObservableObject {
         guard settings.geoAutoUpdate else { return }
         let configYAML = SubscriptionStore.shared.activeYAML ?? ""
         let resolved = resolveURLs(configYAML: configYAML, settingsJSON: settings.asJSON())
-        guard settings.geoEnabled || resolved.asnRequired else { return }
+        guard settings.geoEnabled && (resolved.geoRequired || resolved.asnRequired) else { return }
+        guard AppGroup.containerURL != nil else { return }
         do {
             try await updateIfNeeded(force: false, configYAML: configYAML)
         } catch {
@@ -55,13 +57,16 @@ final class GeoDatabaseManager: ObservableObject {
         let yaml = configYAML ?? ""
         let settings = SettingsStore.shared
         let resolved = resolveURLs(configYAML: yaml, settingsJSON: settings.asJSON())
-        guard settings.geoEnabled || resolved.asnRequired else { return }
+        guard settings.geoEnabled && (resolved.geoRequired || resolved.asnRequired) else { return }
+        // 重签环境可能拿不到 App Group。连接层会把有效 geo 设置降级为关闭，
+        // 由配置合并层剔除依赖数据库的规则，不能因此阻断整个 VPN。
+        guard AppGroup.containerURL != nil else { return }
         try await updateIfNeeded(force: false, configYAML: yaml)
         do {
-            try validateInstalledAssets(configYAML: yaml)
+            try await validateInstalledAssets(configYAML: yaml)
         } catch {
             try await updateIfNeeded(force: true, configYAML: yaml)
-            try validateInstalledAssets(configYAML: yaml)
+            try await validateInstalledAssets(configYAML: yaml)
         }
     }
 
@@ -132,22 +137,26 @@ final class GeoDatabaseManager: ObservableObject {
         }
     }
 
-    private func validateInstalledAssets(configYAML: String) throws {
+    private func validateInstalledAssets(configYAML: String) async throws {
         guard let home = AppGroup.containerURL else { throw GeoError.appGroupUnavailable }
         let assets = requiredAssets(configYAML: configYAML,
                                     geodataMode: SettingsStore.shared.geodataMode)
-        let missing = assets.map(\.fileName).filter {
-            (fileSize(home.appendingPathComponent($0)) ?? 0) < 1_024
-        }
-        if !missing.isEmpty { throw GeoError.missingFiles(missing) }
-        for asset in assets {
-            let path = home.appendingPathComponent(asset.fileName).path
-            var validationError: NSError?
-            guard MihomoValidateGeoDatabase(path, asset.kind, &validationError) else {
-                throw GeoError.validationFailed(asset.fileName,
-                                                validationError?.localizedDescription)
+        try await Task.detached(priority: .utility) {
+            let missing = assets.map(\.fileName).filter { name in
+                let path = home.appendingPathComponent(name).path
+                let attributes = try? FileManager.default.attributesOfItem(atPath: path)
+                return ((attributes?[.size] as? NSNumber)?.int64Value ?? 0) < 1_024
             }
-        }
+            if !missing.isEmpty { throw GeoError.missingFiles(missing) }
+            for asset in assets {
+                let path = home.appendingPathComponent(asset.fileName).path
+                var validationError: NSError?
+                guard MihomoValidateGeoDatabase(path, asset.kind, &validationError) else {
+                    throw GeoError.validationFailed(asset.fileName,
+                                                    validationError?.localizedDescription)
+                }
+            }
+        }.value
     }
 
     private func assetsAvailable(home: URL, assets: [AssetDownload]) -> Bool {
@@ -164,7 +173,7 @@ final class GeoDatabaseManager: ObservableObject {
         let settings = SettingsStore.shared
         let resolved = resolveURLs(configYAML: configYAML, settingsJSON: settings.asJSON())
         var assets: [AssetDownload] = []
-        if settings.geoEnabled {
+        if settings.geoEnabled && resolved.geoRequired {
             assets.append(AssetDownload(
                 label: geodataMode ? "GeoIP.dat" : "geoip.metadb",
                 url: geodataMode ? resolved.geoip : resolved.mmdb,
@@ -173,7 +182,7 @@ final class GeoDatabaseManager: ObservableObject {
             assets.append(AssetDownload(label: "GeoSite.dat", url: resolved.geosite,
                                         fileName: "GeoSite.dat", kind: "geosite"))
         }
-        if resolved.asnRequired {
+        if settings.geoEnabled && resolved.asnRequired {
             assets.append(AssetDownload(label: "ASN.mmdb", url: resolved.asn,
                                         fileName: "ASN.mmdb", kind: "asn"))
         }
@@ -189,6 +198,7 @@ final class GeoDatabaseManager: ObservableObject {
                 mmdb: SettingsStore.defaultGeoMMDBURL,
                 geosite: SettingsStore.defaultGeoSiteURL,
                 asn: SettingsStore.defaultASNURL,
+                geoRequired: false,
                 asnRequired: false)
         }
         return resolved
@@ -213,10 +223,10 @@ final class GeoDatabaseManager: ObservableObject {
             try? JSONDecoder().decode(ResolvedGeoURLs.self, from: $0)
         }
         var names: [String] = []
-        if config.geoEnabled {
+        if config.geoEnabled && resolved?.geoRequired == true {
             names = [config.geodataMode ? "GeoIP.dat" : "geoip.metadb", "GeoSite.dat"]
         }
-        if resolved?.asnRequired == true {
+        if config.geoEnabled && resolved?.asnRequired == true {
             names.append("ASN.mmdb")
         }
         guard !names.isEmpty else { return nil }

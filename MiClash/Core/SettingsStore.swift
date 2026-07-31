@@ -13,7 +13,7 @@ final class SettingsStore: ObservableObject {
     /// TCP/IP 栈：gvisor / system / mixed。iOS NE 强烈建议 gvisor（system 栈 TCP 常走不通）。
     @Published var stack: String { didSet { d.set(stack, forKey: K.stack) } }
     @Published var ipv6: Bool { didSet { d.set(ipv6, forKey: K.ipv6) } }
-    /// 启用 geo 规则（默认开启）。关闭时剔除 GEOIP/GEOSITE 规则。
+    /// 启用 geo 规则（默认开启）。关闭时剔除 GEOIP/GEOSITE/IP-ASN 规则。
     @Published var geoEnabled: Bool { didSet { d.set(geoEnabled, forKey: K.geoEnabled) } }
     /// geo 加载器：standard / memconservative（小内存优化，NE 推荐）。
     @Published var geoLoader: String { didSet { d.set(geoLoader, forKey: K.geoLoader) } }
@@ -34,16 +34,51 @@ final class SettingsStore: ObservableObject {
     @Published var logLevel: String { didSet { d.set(logLevel, forKey: K.logLevel) } }
     /// external-controller 端口（主 App HTTP 客户端也用它）。
     @Published var controllerPort: Int {
-        didSet { d.set(controllerPort, forKey: K.port); MihomoAPI.port = controllerPort }
+        didSet {
+            let normalized = Self.normalizedControllerPort(controllerPort)
+            if controllerPort != normalized {
+                controllerPort = normalized
+                d.set(normalized, forKey: K.port)
+                return
+            }
+            d.set(controllerPort, forKey: K.port)
+            if mixedPort == controllerPort { mixedPort = 0 }
+        }
     }
     /// external-controller 密钥（空=无鉴权）。
     @Published var controllerSecret: String {
-        didSet { d.set(controllerSecret, forKey: K.secret); MihomoAPI.secret = controllerSecret }
+        didSet {
+            d.set(controllerSecret, forKey: K.secret)
+            if controllerSecret.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               allowLan {
+                allowLan = false
+            }
+        }
     }
     /// 允许局域网访问控制接口（绑 0.0.0.0 而非仅 127.0.0.1）。
-    @Published var allowLan: Bool { didSet { d.set(allowLan, forKey: K.allowLan) } }
+    @Published var allowLan: Bool {
+        didSet {
+            if allowLan && controllerSecret.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                allowLan = false
+                d.set(false, forKey: K.allowLan)
+                return
+            }
+            d.set(allowLan, forKey: K.allowLan)
+        }
+    }
     /// 混合代理端口（HTTP+SOCKS，本机回环）。0=不开。下发给内核 mixed-port。
-    @Published var mixedPort: Int { didSet { d.set(mixedPort, forKey: K.mixedPort) } }
+    @Published var mixedPort: Int {
+        didSet {
+            let normalized = min(max(mixedPort, 0), 65_535)
+            let effective = normalized == controllerPort ? 0 : normalized
+            if mixedPort != effective {
+                mixedPort = effective
+                d.set(effective, forKey: K.mixedPort)
+                return
+            }
+            d.set(mixedPort, forKey: K.mixedPort)
+        }
+    }
     /// 拉取订阅时用的 User-Agent（机场常按 UA 返回不同格式）。默认 clash-meta。
     /// 仅主 App 下载订阅用，不经内核。
     @Published var subscriptionUA: String { didSet { d.set(subscriptionUA, forKey: K.subUA) } }
@@ -103,11 +138,12 @@ final class SettingsStore: ObservableObject {
         let gi = d.integer(forKey: K.geoInterval)
         geoUpdateInterval = gi == 0 ? 24 : gi
         logLevel = d.string(forKey: K.logLevel) ?? "info"
-        let p = d.integer(forKey: K.port)
-        controllerPort = p == 0 ? 9090 : p
+        controllerPort = Self.normalizedControllerPort(d.integer(forKey: K.port))
         controllerSecret = d.string(forKey: K.secret) ?? ""
-        allowLan = d.object(forKey: K.allowLan) as? Bool ?? false
-        mixedPort = d.integer(forKey: K.mixedPort) // 默认 0 = 不开
+        allowLan = (d.object(forKey: K.allowLan) as? Bool ?? false)
+            && !controllerSecret.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let storedMixedPort = min(max(d.integer(forKey: K.mixedPort), 0), 65_535)
+        mixedPort = storedMixedPort == controllerPort ? 0 : storedMixedPort
         includeAllNetworks = d.object(forKey: K.inclAll) as? Bool ?? false
         excludeCellularServices = d.object(forKey: K.exCell) as? Bool ?? true
         excludeAPNs = d.object(forKey: K.exAPNs) as? Bool ?? true
@@ -116,16 +152,15 @@ final class SettingsStore: ObservableObject {
         subscriptionUA = d.string(forKey: K.subUA) ?? "clash-meta"
 
         // 同步给 HTTP 客户端
-        MihomoAPI.port = controllerPort
-        MihomoAPI.secret = controllerSecret
+        MihomoAPI.configure(port: controllerPort, secret: controllerSecret)
     }
 
     /// 序列化为下发给 NE 的 JSON。
-    func asJSON() -> String {
+    func asJSON(geoAvailable: Bool = true) -> String {
         let dict: [String: Any] = [
             "stack": stack,
             "ipv6": ipv6,
-            "geoEnabled": geoEnabled,
+            "geoEnabled": geoEnabled && geoAvailable,
             "geoLoader": geoLoader,
             "geodataMode": geodataMode,
             "geoIPDatURL": geoIPDatURL,
@@ -143,5 +178,9 @@ final class SettingsStore: ObservableObject {
         guard let data = try? JSONSerialization.data(withJSONObject: dict),
               let s = String(data: data, encoding: .utf8) else { return "" }
         return s
+    }
+
+    private static func normalizedControllerPort(_ value: Int) -> Int {
+        (1...65_535).contains(value) ? value : 9090
     }
 }

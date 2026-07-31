@@ -1,33 +1,39 @@
 import Foundation
 
-/// 消费 mihomo external-controller 的流式接口（/traffic、/logs）——WebSocket。
-///
-/// mihomo 流式主通道是 WebSocket（普通 GET 的 chunked 在 iOS URLSession 收不到）。
-/// 实测连上后可能收到一帧就断，故加 **自动重连 + 定时 ping 保活**，保证持续有数据。
-/// 回调在后台触发，调用方自行切回主线程更新 UI。
-final class MihomoStream: NSObject, @unchecked Sendable {
+/// 消费 mihomo external-controller 的流式接口（/traffic、/logs）。
+/// 所有状态都隔离在 MainActor；URLSession 回调只把结果投递回来。
+@MainActor
+final class MihomoStream: NSObject {
 
     var onObject: (([String: Any]) -> Void)?
     var onClose: ((Error?) -> Void)?
 
     private var session: URLSession?
     private var task: URLSessionWebSocketTask?
+    private var reconnectTask: Task<Void, Never>?
+    private var pingTask: Task<Void, Never>?
     private var path = ""
     private var query: [URLQueryItem] = []
     private var active = false
-    private var generation = 0   // 每次 connect 自增，旧的接收/ping/重连循环据此失效
+    private var generation = 0
+    private var reconnectAttempt = 0
 
     func start(path: String, query: [URLQueryItem] = []) {
         stop()
         self.path = path
         self.query = query
         active = true
+        reconnectAttempt = 0
         connect()
     }
 
     func stop() {
         active = false
         generation &+= 1
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        pingTask?.cancel()
+        pingTask = nil
         task?.cancel(with: .goingAway, reason: nil)
         task = nil
         session?.invalidateAndCancel()
@@ -35,59 +41,132 @@ final class MihomoStream: NSObject, @unchecked Sendable {
     }
 
     private func connect() {
+        guard active else { return }
         generation &+= 1
-        let gen = generation
+        let currentGeneration = generation
 
-        let cfg = URLSessionConfiguration.ephemeral
-        cfg.timeoutIntervalForRequest = 3600
-        let s = URLSession(configuration: cfg)
-        session = s
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        pingTask?.cancel()
+        pingTask = nil
+        task?.cancel(with: .goingAway, reason: nil)
+        session?.invalidateAndCancel()
 
-        var comps = URLComponents(url: MihomoAPI.base.appendingPathComponent(path),
-                                  resolvingAgainstBaseURL: false)!
-        comps.scheme = "ws"
-        if !query.isEmpty { comps.queryItems = query }
-        var req = URLRequest(url: comps.url!)
-        if !MihomoAPI.secret.isEmpty {
-            req.setValue("Bearer \(MihomoAPI.secret)", forHTTPHeaderField: "Authorization")
+        let endpoint = MihomoAPI.configuration()
+        var components = URLComponents()
+        components.scheme = "ws"
+        components.host = "127.0.0.1"
+        components.port = endpoint.port
+        components.path = "/" + path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        if !query.isEmpty { components.queryItems = query }
+        guard let url = components.url else {
+            scheduleReconnect(generation: currentGeneration)
+            return
         }
-        let t = s.webSocketTask(with: req)
-        task = t
-        t.resume()
 
-        receive(gen)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 60
+        let newSession = URLSession(configuration: configuration)
+        let request: URLRequest = {
+            var value = URLRequest(url: url)
+            if !endpoint.secret.isEmpty {
+                value.setValue("Bearer \(endpoint.secret)",
+                               forHTTPHeaderField: "Authorization")
+            }
+            return value
+        }()
+        let socket = newSession.webSocketTask(with: request)
+        session = newSession
+        task = socket
+        socket.resume()
+        receive(socket, generation: currentGeneration)
+        startPing(socket, generation: currentGeneration)
     }
 
-    private func receive(_ gen: Int) {
-        task?.receive { [weak self] result in
-            guard let self, self.active, gen == self.generation else { return }
-            switch result {
-            case .success(let message):
-                switch message {
-                case .string(let text): self.emit(Data(text.utf8))
-                case .data(let data): self.emit(data)
-                @unknown default: break
+    private func receive(_ socket: URLSessionWebSocketTask, generation: Int) {
+        socket.receive { [weak self, weak socket] result in
+            guard let socket else { return }
+            Task { @MainActor [weak self] in
+                guard let self,
+                      self.active,
+                      generation == self.generation,
+                      self.task === socket else { return }
+                switch result {
+                case .success(let message):
+                    self.reconnectAttempt = 0
+                    switch message {
+                    case .string(let text): self.emit(Data(text.utf8))
+                    case .data(let data): self.emit(data)
+                    @unknown default: break
+                    }
+                    self.receive(socket, generation: generation)
+                case .failure(let error):
+                    self.handleSocketFailure(error, socket: socket,
+                                             generation: generation)
                 }
-                self.receive(gen)
-            case .failure(let error):
-                self.onClose?(error)
-                self.scheduleReconnect()
             }
         }
     }
 
-    /// 断流后快速重连（页面仍可见、未 stop 时）；间隙短到几乎无感。
-    private func scheduleReconnect() {
-        guard active else { return }
-        DispatchQueue.global().asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            guard let self, self.active else { return }
+    private func startPing(_ socket: URLSessionWebSocketTask, generation: Int) {
+        pingTask = Task { @MainActor [weak self, weak socket] in
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(nanoseconds: 20_000_000_000)
+                } catch {
+                    return
+                }
+                guard let self, let socket,
+                      self.active,
+                      generation == self.generation,
+                      self.task === socket else { return }
+                socket.sendPing { [weak self, weak socket] error in
+                    guard let error, let socket else { return }
+                    Task { @MainActor [weak self] in
+                        self?.handleSocketFailure(error, socket: socket,
+                                                  generation: generation)
+                    }
+                }
+            }
+        }
+    }
+
+    private func handleSocketFailure(_ error: Error,
+                                     socket: URLSessionWebSocketTask,
+                                     generation: Int) {
+        guard active, generation == self.generation, task === socket else { return }
+        pingTask?.cancel()
+        pingTask = nil
+        task?.cancel(with: .goingAway, reason: nil)
+        task = nil
+        session?.invalidateAndCancel()
+        session = nil
+        onClose?(error)
+        scheduleReconnect(generation: generation)
+    }
+
+    private func scheduleReconnect(generation: Int) {
+        guard active, reconnectTask == nil else { return }
+        let exponent = min(reconnectAttempt, 5)
+        let delaySeconds = min(15, 1 << exponent)
+        reconnectAttempt += 1
+        reconnectTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: UInt64(delaySeconds) * 1_000_000_000)
+            } catch {
+                return
+            }
+            guard let self,
+                  self.active,
+                  generation == self.generation else { return }
+            self.reconnectTask = nil
             self.connect()
         }
     }
 
     private func emit(_ data: Data) {
-        if let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
-            onObject?(obj)
+        if let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            onObject?(object)
         }
     }
 }

@@ -3,7 +3,8 @@
 
 /// 把当前系统 DNS 服务器（IPv4/IPv6 字面量）写入扁平缓冲区 out。
 /// out 容量为 stride * maxCount 字节，每个服务器占 stride 字节（含 NUL 结尾，
-/// 建议 stride = 46 = INET6_ADDRSTRLEN）。返回实际写入个数，失败返回 0。
+/// IPv6 link-local 地址会附加 `%<interface>` scope，建议 stride >= 64）。
+/// 返回实际写入个数，失败返回 0。
 ///
 /// 为什么用 C：iOS 的 <resolv.h> 里 res_sockaddr_union / __res_state 等类型
 /// Swift 无法导入（头文件本身在 C 侧可用），抓取逻辑只能放在 C 实现。

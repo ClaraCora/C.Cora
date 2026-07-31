@@ -10,8 +10,8 @@ import Foundation
 /// res_sockaddr_union / __res_state 等类型 Swift 无法导入，
 /// 所以抓取逻辑在 SystemDNSBridge.c，这里只读扁平缓冲区。
 enum SystemDNS {
-    /// 每个地址槽的字节数（= INET6_ADDRSTRLEN）。
-    private static let stride = 46
+    /// IPv6 link-local DNS 还需附带 `%en0` 之类的 scope，因此比 INET6_ADDRSTRLEN 更宽。
+    private static let stride = 64
     private static let maxCount = 8
 
     /// 当前主接口的 DNS 服务器地址（IPv4/IPv6 字面量）。

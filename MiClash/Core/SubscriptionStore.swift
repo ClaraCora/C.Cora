@@ -1,7 +1,7 @@
 import Foundation
 
 /// 一条订阅。
-struct Subscription: Identifiable, Codable, Equatable {
+struct Subscription: Identifiable, Codable, Equatable, Sendable {
     let id: UUID
     var name: String
     var url: String
@@ -87,12 +87,16 @@ final class SubscriptionStore: ObservableObject {
     @Published private(set) var subscriptions: [Subscription] = []
     @Published var selectedID: UUID?
     @Published var lastError: String?
-    @Published var isBusy = false
+    @Published private(set) var isBusy = false
 
-    private let fileURL: URL = {
+    private static let fileURL: URL = {
         let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         return dir.appendingPathComponent("subscriptions.json")
     }()
+    private let persistence = SubscriptionPersistence(fileURL: SubscriptionStore.fileURL)
+    private var persistenceRevision = 0
+    private var refreshGenerations: [UUID: Int] = [:]
+    private var activeRefreshCount = 0
 
     private init() { load() }
 
@@ -165,6 +169,7 @@ final class SubscriptionStore: ObservableObject {
             subscriptions[i].autoNamed = false
         }
         let urlChanged = subscriptions[i].url != u
+        if urlChanged { invalidateRefresh(id) }
         subscriptions[i].url = u
         if urlChanged {
             subscriptions[i].yaml = ""
@@ -180,6 +185,7 @@ final class SubscriptionStore: ObservableObject {
     }
 
     func remove(_ id: UUID) {
+        invalidateRefresh(id)
         subscriptions.removeAll { $0.id == id }
         if selectedID == id { selectedID = subscriptions.first?.id }
         save()
@@ -195,11 +201,17 @@ final class SubscriptionStore: ObservableObject {
         guard let idx = subscriptions.firstIndex(where: { $0.id == id }) else { return }
         let urlString = subscriptions[idx].url
         guard !urlString.isEmpty else { lastError = "本地配置无需刷新"; return }
-        guard let url = URL(string: urlString) else { lastError = "无效的订阅地址"; return }
+        guard let url = URL(string: urlString),
+              let scheme = url.scheme?.lowercased(),
+              ["http", "https"].contains(scheme),
+              url.host != nil else {
+            lastError = "订阅地址必须是有效的 HTTP/HTTPS 链接"
+            return
+        }
 
-        isBusy = true
+        let generation = beginRefresh(id)
         lastError = nil
-        defer { isBusy = false }
+        defer { finishRefresh() }
 
         do {
             var req = URLRequest(url: url)
@@ -207,21 +219,25 @@ final class SubscriptionStore: ObservableObject {
             let ua = SettingsStore.shared.subscriptionUA.trimmingCharacters(in: .whitespaces)
             req.setValue(ua.isEmpty ? "clash-meta" : ua, forHTTPHeaderField: "User-Agent")
             req.timeoutInterval = 30
-            let (data, resp) = try await URLSession.shared.data(for: req)
+            let (temporaryURL, resp) = try await URLSession.shared.download(for: req)
             guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-                lastError = "拉取失败：HTTP \((resp as? HTTPURLResponse)?.statusCode ?? -1)"
-                return
+                throw SubscriptionRefreshError.httpStatus(
+                    (resp as? HTTPURLResponse)?.statusCode ?? -1)
             }
+            let attributes = try FileManager.default.attributesOfItem(atPath: temporaryURL.path)
+            let byteCount = (attributes[.size] as? NSNumber)?.int64Value ?? 0
+            guard byteCount <= 10 * 1024 * 1024 else {
+                throw SubscriptionRefreshError.tooLarge
+            }
+            let data = try Data(contentsOf: temporaryURL, options: .mappedIfSafe)
             guard let text = String(data: data, encoding: .utf8) else {
-                lastError = "订阅内容不是文本"
-                return
+                throw SubscriptionRefreshError.notText
             }
             guard looksLikeClashYAML(text) else {
-                lastError = "订阅内容不是 Clash/mihomo YAML（可能是 base64 订阅，暂不支持）"
-                return
+                throw SubscriptionRefreshError.notClashYAML
             }
-            // firstIndex 可能因并发变化，重新定位
-            guard let i = subscriptions.firstIndex(where: { $0.id == id }) else { return }
+            guard isCurrentRefresh(id, generation: generation, url: urlString),
+                  let i = subscriptions.firstIndex(where: { $0.id == id }) else { return }
             subscriptions[i].yaml = text
             subscriptions[i].updatedAt = Date()
             subscriptions[i].nodeCount = countProxies(text)
@@ -243,6 +259,7 @@ final class SubscriptionStore: ObservableObject {
             }
             save()
         } catch {
+            guard isCurrentRefresh(id, generation: generation, url: urlString) else { return }
             lastError = "拉取失败：\(error.localizedDescription)"
         }
     }
@@ -326,22 +343,85 @@ final class SubscriptionStore: ObservableObject {
     // MARK: - 持久化
 
     private func load() {
-        guard let data = try? Data(contentsOf: fileURL) else { return }
-        if let decoded = try? JSONDecoder().decode(Persisted.self, from: data) {
+        guard let data = try? Data(contentsOf: Self.fileURL) else { return }
+        if let decoded = try? JSONDecoder().decode(PersistedSubscriptions.self, from: data) {
             subscriptions = decoded.subscriptions
             selectedID = decoded.selectedID
         }
     }
 
     private func save() {
-        let payload = Persisted(subscriptions: subscriptions, selectedID: selectedID)
-        if let data = try? JSONEncoder().encode(payload) {
-            try? data.write(to: fileURL, options: .atomic)
+        persistenceRevision &+= 1
+        let revision = persistenceRevision
+        let snapshot = subscriptions
+        let selectedID = selectedID
+        let persistence = persistence
+        Task.detached(priority: .utility) {
+            await persistence.save(subscriptions: snapshot,
+                                   selectedID: selectedID,
+                                   revision: revision)
         }
     }
 
-    private struct Persisted: Codable {
-        var subscriptions: [Subscription]
-        var selectedID: UUID?
+    private func beginRefresh(_ id: UUID) -> Int {
+        let next = (refreshGenerations[id] ?? 0) &+ 1
+        refreshGenerations[id] = next
+        activeRefreshCount += 1
+        isBusy = true
+        return next
+    }
+
+    private func finishRefresh() {
+        activeRefreshCount = max(0, activeRefreshCount - 1)
+        isBusy = activeRefreshCount > 0
+    }
+
+    private func invalidateRefresh(_ id: UUID) {
+        refreshGenerations[id] = (refreshGenerations[id] ?? 0) &+ 1
+    }
+
+    private func isCurrentRefresh(_ id: UUID, generation: Int, url: String) -> Bool {
+        refreshGenerations[id] == generation
+            && subscriptions.first(where: { $0.id == id })?.url == url
+    }
+}
+
+private struct PersistedSubscriptions: Codable, Sendable {
+    let subscriptions: [Subscription]
+    let selectedID: UUID?
+}
+
+private actor SubscriptionPersistence {
+    let fileURL: URL
+    private var latestRevision = 0
+
+    init(fileURL: URL) {
+        self.fileURL = fileURL
+    }
+
+    func save(subscriptions: [Subscription], selectedID: UUID?, revision: Int) {
+        guard revision >= latestRevision else { return }
+        latestRevision = revision
+        let payload = PersistedSubscriptions(subscriptions: subscriptions,
+                                             selectedID: selectedID)
+        guard let data = try? JSONEncoder().encode(payload) else { return }
+        try? data.write(to: fileURL, options: .atomic)
+    }
+}
+
+private enum SubscriptionRefreshError: LocalizedError {
+    case httpStatus(Int)
+    case tooLarge
+    case notText
+    case notClashYAML
+
+    var errorDescription: String? {
+        switch self {
+        case .httpStatus(let code): return "HTTP \(code)"
+        case .tooLarge: return "订阅内容超过 10 MB 上限"
+        case .notText: return "订阅内容不是 UTF-8 文本"
+        case .notClashYAML:
+            return "订阅内容不是 Clash/mihomo YAML（可能是 base64 订阅，暂不支持）"
+        }
     }
 }

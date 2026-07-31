@@ -3,15 +3,33 @@ import Foundation
 /// 主 App 访问 NE 内 mihomo external-controller 的 HTTP 客户端。
 ///
 /// 127.0.0.1 是 loopback，不经 tun、跨进程可达；IP 字面量 ATS 不拦明文 HTTP。
-/// 端口/密钥由 SettingsStore 同步到这里的 `port`/`secret`（这里用普通静态量，
-/// 以便后台的 MihomoStream 也能无隔离地读取）。
+/// 端口/密钥以锁保护的快照保存，连接后再通过 NE IPC 同步实际监听配置。
 enum MihomoAPI {
 
-    /// 由 SettingsStore 同步。默认 127.0.0.1:9090、无密钥。
-    static var port: Int = 9090
-    static var secret: String = ""
+    struct Configuration: Sendable {
+        let port: Int
+        let secret: String
+    }
 
-    static var base: URL { URL(string: "http://127.0.0.1:\(port)")! }
+    private static let configurationLock = NSLock()
+    private static var activeConfiguration = Configuration(port: 9090, secret: "")
+
+    static func configure(port: Int, secret: String) {
+        configurationLock.lock()
+        activeConfiguration = Configuration(port: normalizedPort(port), secret: secret)
+        configurationLock.unlock()
+    }
+
+    static func configuration() -> Configuration {
+        configurationLock.lock()
+        let value = activeConfiguration
+        configurationLock.unlock()
+        return value
+    }
+
+    static var base: URL {
+        baseURL(port: configuration().port)
+    }
 
     enum APIError: LocalizedError {
         case badStatus(Int)
@@ -42,16 +60,31 @@ enum MihomoAPI {
     /// 路径里的中文/空格（保留 "/" 作分隔），避免 appendingPathComponent 误编码。
     static func makeRequest(path: String, method: String = "GET",
                             query: [URLQueryItem] = []) -> URLRequest {
+        let active = configuration()
         var comps = URLComponents()
         comps.scheme = "http"
         comps.host = "127.0.0.1"
-        comps.port = port
+        comps.port = active.port
         comps.path = "/" + path
         if !query.isEmpty { comps.queryItems = query }
-        var req = URLRequest(url: comps.url!)
+        var req = URLRequest(url: comps.url ?? baseURL(port: active.port))
         req.httpMethod = method
-        if !secret.isEmpty { req.setValue("Bearer \(secret)", forHTTPHeaderField: "Authorization") }
+        if !active.secret.isEmpty {
+            req.setValue("Bearer \(active.secret)", forHTTPHeaderField: "Authorization")
+        }
         return req
+    }
+
+    private static func normalizedPort(_ port: Int) -> Int {
+        (1...65_535).contains(port) ? port : 9090
+    }
+
+    private static func baseURL(port: Int) -> URL {
+        var components = URLComponents()
+        components.scheme = "http"
+        components.host = "127.0.0.1"
+        components.port = normalizedPort(port)
+        return components.url ?? URL(string: "http://127.0.0.1:9090")!
     }
 
     // MARK: - 一次性请求

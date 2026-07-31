@@ -57,10 +57,12 @@ struct SettingsView: View {
                             .textInputAutocapitalization(.never)
                     }
                     Toggle("允许局域网访问", isOn: $settings.allowLan)
+                        .disabled(settings.controllerSecret
+                            .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 } header: {
                     Text("外部控制")
                 } footer: {
-                    Text("供主 App 访问内核 API。一般保持默认 9090、无密钥、仅本机。")
+                    Text("供主 App 访问内核 API。局域网访问必须先设置非空密钥；修改后重连生效。")
                 }
 
                 Section {
@@ -141,6 +143,12 @@ private struct GeoSettingsSection: View {
         Section {
             Toggle("启用 geo 规则", isOn: $settings.geoEnabled)
             if settings.geoEnabled {
+                if AppGroup.containerURL == nil {
+                    Label("当前签名没有可用的 App Group，连接时会自动忽略 GEO/ASN 规则。",
+                          systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
                 Picker("加载器", selection: $settings.geoLoader) {
                     ForEach(SettingsStore.geoLoaderOptions, id: \.self) { Text($0).tag($0) }
                 }
@@ -166,7 +174,7 @@ private struct GeoSettingsSection: View {
                         if geoDatabase.isUpdating { ProgressView() }
                     }
                 }
-                .disabled(geoDatabase.isUpdating)
+                .disabled(geoDatabase.isUpdating || AppGroup.containerURL == nil)
                 if let installedInfo {
                     HStack {
                         Text("本地数据")
@@ -187,10 +195,10 @@ private struct GeoSettingsSection: View {
         } header: {
             Text("GEO 与 ASN")
         } footer: {
-            Text("关闭 GEO=剔除订阅里的 GEOIP/GEOSITE 规则。Geodata 模式关闭时使用 MMDB，开启时使用 GeoIP.dat；"
+            Text("关闭 GEO=剔除订阅里的 GEOIP/GEOSITE/IP-ASN 规则。Geodata 模式关闭时使用 MMDB，开启时使用 GeoIP.dat；"
                + "“忽略 GEO 取反规则”可单独控制 geolocation-!cn / NOT(GEOIP) 等规则。"
                + "主 App 优先读取当前配置的 geox-url 下载数据库，设置中的地址仅在配置缺少对应地址时使用。"
-               + "IP-ASN/SRC-IP-ASN 规则会保留；ASN 优先使用配置中的 geox-url.asn，缺少时使用内置备用地址。"
+               + "ASN 优先使用配置中的 geox-url.asn，缺少时使用内置备用地址。"
                + "更新后需重新连接。")
         }
     }

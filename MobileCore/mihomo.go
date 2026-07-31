@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -19,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/metacubex/mihomo/adapter/outboundgroup"
 	"github.com/metacubex/mihomo/common/utils"
@@ -26,7 +28,6 @@ import (
 	"github.com/metacubex/mihomo/component/geodata"
 	"github.com/metacubex/mihomo/component/mmdb"
 	"github.com/metacubex/mihomo/component/profile/cachefile"
-	"github.com/metacubex/mihomo/component/updater"
 	"github.com/metacubex/mihomo/config"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/hub/executor"
@@ -39,14 +40,15 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// 配置文件未指定 external-ui-url 时，默认用 zashboard 面板（gh-pages 构建产物）。
-const defaultWebUIURL = "https://github.com/Zephyruso/zashboard/archive/refs/heads/gh-pages.zip"
-
 const defaultASNURL = "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/GeoLite2-ASN.mmdb"
 
 const defaultTunnelMTU = 1500
 
 const minimumTunnelMTU = 576
+
+const maxRunLogBytes int64 = 2 << 20
+
+const maxRunLogLineBytes = 64 << 10
 
 // ControllerAddr 是 NE 内 mihomo external-controller 的监听地址。
 // 主 App 经 sendProviderMessage IPC 在重签环境下不投递，改用本地回环 HTTP 直连——
@@ -63,6 +65,7 @@ var (
 	// 最近一次合并配置时收集的：不适用内容提示 + 各节点协议摘要（供主 App 经 IPC 取用）。
 	configNotices   []string
 	proxyDetailsMap = map[string]string{}
+	controllerState = appSettings{ControllerPort: 9090}
 )
 
 // Version 返回「mihomo 内核版本 / Go 运行时版本」。
@@ -220,7 +223,7 @@ func ForceGC() {
 func startLogCapture() {
 	logCaptureMu.Do(func() {
 		f, err := os.OpenFile(filepath.Join(homeDir, "run.log"),
-			os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+			os.O_CREATE|os.O_WRONLY, 0o644)
 		if err != nil {
 			return
 		}
@@ -233,9 +236,10 @@ func startLogCapture() {
 				if elm.LogLevel < log.Level() {
 					continue
 				}
+				line := fmt.Sprintf("%s [%s] %s\n",
+					time.Now().Format("15:04:05.000"), elm.Type(), elm.Payload)
 				logFileMu.Lock()
-				_, _ = f.WriteString(fmt.Sprintf("%s [%s] %s\n",
-					time.Now().Format("15:04:05.000"), elm.Type(), elm.Payload))
+				writeRunLogLine(f, line)
 				logFileMu.Unlock()
 				// WriteString 已立即写入系统页缓存，主 App 可以读取；逐行 Sync 会在
 				// 高日志量时强制刷盘，拖慢 Tunnel 和前台 UI。
@@ -285,6 +289,18 @@ func parseSettings(settingsJSON string) appSettings {
 	if s.ControllerPort == 0 {
 		s.ControllerPort = 9090
 	}
+	if s.ControllerPort < 1 || s.ControllerPort > 65535 {
+		s.ControllerPort = 9090
+	}
+	if s.MixedPort < 0 || s.MixedPort > 65535 {
+		s.MixedPort = 0
+	}
+	if s.MixedPort == s.ControllerPort {
+		s.MixedPort = 0
+	}
+	if s.AllowLan && strings.TrimSpace(s.ControllerSecret) == "" {
+		s.AllowLan = false
+	}
 	if s.GeoLoader == "" {
 		s.GeoLoader = "memconservative"
 	}
@@ -308,6 +324,7 @@ type geoDownloadURLs struct {
 	MMDB        string `json:"mmdb"`
 	GeoSite     string `json:"geosite"`
 	ASN         string `json:"asn"`
+	GeoRequired bool   `json:"geoRequired"`
 	ASNRequired bool   `json:"asnRequired"`
 }
 
@@ -345,9 +362,9 @@ func resolveGeoDownloadURLs(configYAML string, st appSettings) geoDownloadURLs {
 		}
 		if value := stringValue(urls["asn"]); value != "" {
 			resolved.ASN = value
-			resolved.ASNRequired = true
 		}
 	}
+	resolved.GeoRequired = rulesUseGeo(m["rules"]) || rulesUseGeo(m["sub-rules"]) || rulesUseGeo(m["dns"])
 	resolved.ASNRequired = resolved.ASNRequired || rulesUseASN(m["rules"]) || rulesUseASN(m["sub-rules"])
 	return resolved
 }
@@ -371,6 +388,39 @@ func rulesUseASN(value any) bool {
 	case map[string]any:
 		for _, item := range typed {
 			if rulesUseASN(item) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func rulesUseGeo(value any) bool {
+	switch typed := value.(type) {
+	case string:
+		u := strings.ToUpper(strings.TrimSpace(typed))
+		return strings.Contains(u, "GEOIP,") ||
+			strings.Contains(u, "GEOSITE,") ||
+			strings.Contains(u, "GEODATA,") ||
+			strings.HasPrefix(u, "GEOSITE:")
+	case []any:
+		for _, item := range typed {
+			if rulesUseGeo(item) {
+				return true
+			}
+		}
+	case map[string]any:
+		for key, item := range typed {
+			normalizedKey := strings.ToUpper(strings.TrimSpace(key))
+			switch normalizedKey {
+			case "GEOIP":
+				if enabled, ok := item.(bool); !ok || enabled {
+					return true
+				}
+			case "GEOIP-CODE", "GEOSITE":
+				return true
+			}
+			if rulesUseGeo(key) || rulesUseGeo(item) {
 				return true
 			}
 		}
@@ -404,7 +454,7 @@ func StartWithConfig(fd int, tunnelMTU int, configYAML string, settingsJSON stri
 	if err := applyRuntimeConfig(fd, tunnelMTU, configYAML, st, "启动", false); err != nil {
 		return err
 	}
-	configureController(configYAML, st, true)
+	configureController(configYAML, st)
 	return nil
 }
 
@@ -428,7 +478,7 @@ func ReloadConfig(fd int, tunnelMTU int, configYAML string, settingsJSON string)
 	if err := applyRuntimeConfig(fd, tunnelMTU, configYAML, st, "重载", true); err != nil {
 		return err
 	}
-	configureController(configYAML, st, false)
+	configureController(configYAML, st)
 	appendRunLog("配置重载完成")
 	return nil
 }
@@ -500,10 +550,11 @@ func applyRuntimeConfig(fd int, tunnelMTU int, configYAML string, st appSettings
 	return nil
 }
 
-// configureController 让主 App 的控制接口跟随当前设置。首次启动才触发 Web UI 下载检查。
-func configureController(configYAML string, st appSettings, downloadUI bool) {
+// configureController 让主 App 的控制接口跟随当前设置。NE 内不下载或解压 Web UI，
+// 避免在 Packet Tunnel 的小内存预算内产生不可取消的后台任务。
+func configureController(configYAML string, st appSettings) {
 	host := "127.0.0.1"
-	if st.AllowLan {
+	if st.AllowLan && strings.TrimSpace(st.ControllerSecret) != "" {
 		host = "0.0.0.0"
 	}
 	addr := fmt.Sprintf("%s:%d", host, st.ControllerPort)
@@ -511,45 +562,37 @@ func configureController(configYAML string, st appSettings, downloadUI bool) {
 	// webui：mihomo 在 /ui 同源提供面板（浏览器访问，无 CORS/混合内容问题）。
 	// 优先用配置文件指定的 external-ui；未指定 URL 时使用默认 zashboard。
 	var uiCfg struct {
-		ExternalUI     string `yaml:"external-ui"`
-		ExternalUIURL  string `yaml:"external-ui-url"`
-		ExternalUIName string `yaml:"external-ui-name"`
+		ExternalUI string `yaml:"external-ui"`
 	}
 	_ = yaml.Unmarshal([]byte(configYAML), &uiCfg)
 	externalUI := uiCfg.ExternalUI
 	if externalUI == "" {
 		externalUI = "ui"
 	}
-	externalUIURL := uiCfg.ExternalUIURL
-	usingDefault := externalUIURL == ""
-	if usingDefault {
-		externalUIURL = defaultWebUIURL
-	}
-
 	uiPath := C.Path.Resolve(externalUI)
 	route.SetUIPath(uiPath)
 	route.ReCreateServer(&route.Config{
 		Addr:   addr,
 		Secret: st.ControllerSecret,
-		Cors:   route.Cors{AllowOrigins: []string{"*"}, AllowPrivateNetwork: true},
+		Cors:   route.Cors{AllowOrigins: []string{}, AllowPrivateNetwork: false},
 	})
-	appendRunLog(fmt.Sprintf("external-controller 已启动: %s (UI: /ui, %s)", addr,
-		map[bool]string{true: "默认 zashboard", false: "配置指定"}[usingDefault]))
+	controllerState = st
+	appendRunLog(fmt.Sprintf("external-controller 已启动: %s", addr))
+}
 
-	if !downloadUI {
-		return
+// ControllerInfo 返回当前实际监听端点，供主 App 在系统/控制中心拉起隧道后同步客户端。
+func ControllerInfo() string {
+	configApplyMu.Lock()
+	defer configApplyMu.Unlock()
+	out, err := json.Marshal(map[string]any{
+		"port":     controllerState.ControllerPort,
+		"secret":   controllerState.ControllerSecret,
+		"allowLan": controllerState.AllowLan,
+	})
+	if err != nil {
+		return `{"port":9090,"secret":"","allowLan":false}`
 	}
-
-	// 后台下载面板到 ui 目录（空才下，已有则跳过）。best-effort，失败不影响代理。
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				appendRunLog(fmt.Sprintf("webui 下载 panic: %v", r))
-			}
-		}()
-		updater.NewUiUpdater(externalUI, externalUIURL, uiCfg.ExternalUIName).AutoDownloadUI()
-		appendRunLog("webui 就绪: /ui/")
-	}()
+	return string(out)
 }
 
 // mergeConfig 把订阅 YAML 与 iOS 必需设置 + 用户设置合并。
@@ -630,6 +673,11 @@ func mergeConfig(subYAML string, st appSettings, tunnelMTU int) ([]byte, error) 
 	m["log-level"] = st.LogLevel
 
 	// 混合代理端口（HTTP+SOCKS，本机回环）。0=不开。
+	for _, key := range []string{"port", "socks-port", "redir-port", "tproxy-port"} {
+		delete(m, key)
+	}
+	m["allow-lan"] = false
+	m["bind-address"] = "127.0.0.1"
 	if st.MixedPort > 0 {
 		m["mixed-port"] = st.MixedPort
 	} else {
@@ -654,9 +702,7 @@ func mergeConfig(subYAML string, st appSettings, tunnelMTU int) ([]byte, error) 
 	configNotices = nil
 
 	// iOS 沙盒拿不到其它进程信息 → PROCESS-NAME/PROCESS-PATH 规则无效，剔除并提示。
-	if rules, ok := m["rules"].([]any); ok {
-		m["rules"] = filterUnsupportedRules(rules)
-	}
+	filterUnsupportedRulesFromConfig(m)
 
 	// geo 规则处理：
 	//   开 → 保留普通 geo 规则；IgnoreGeoNegation 开启时再剔除 geolocation-!cn /
@@ -679,9 +725,7 @@ func mergeConfig(subYAML string, st appSettings, tunnelMTU int) ([]byte, error) 
 		geoXURL["asn"] = resolvedURLs.ASN
 		m["geox-url"] = geoXURL
 		if st.IgnoreGeoNegation {
-			if rules, ok := m["rules"].([]any); ok {
-				m["rules"] = filterGeoNegationRules(rules)
-			}
+			filterGeoNegationRulesFromConfig(m)
 		}
 	} else {
 		delete(m, "geodata-mode")
@@ -762,6 +806,20 @@ func filterUnsupportedRules(rules []any) []any {
 			fmt.Sprintf("已忽略 %d 条按进程分流规则（PROCESS-NAME/PATH，iOS 无法获取其它 App 进程）", dropped))
 	}
 	return out
+}
+
+func filterUnsupportedRulesFromConfig(m map[string]any) {
+	if rules, ok := m["rules"].([]any); ok {
+		m["rules"] = filterUnsupportedRules(rules)
+	}
+	if subRules, ok := m["sub-rules"].(map[string]any); ok {
+		for name, raw := range subRules {
+			if rules, ok := raw.([]any); ok {
+				subRules[name] = filterUnsupportedRules(rules)
+			}
+		}
+		m["sub-rules"] = subRules
+	}
 }
 
 // buildProxyDetails 从 proxies 段解析每个节点的协议摘要。
@@ -871,6 +929,20 @@ func filterGeoNegationRules(rules []any) []any {
 	return out
 }
 
+func filterGeoNegationRulesFromConfig(m map[string]any) {
+	if rules, ok := m["rules"].([]any); ok {
+		m["rules"] = filterGeoNegationRules(rules)
+	}
+	if subRules, ok := m["sub-rules"].(map[string]any); ok {
+		for name, raw := range subRules {
+			if rules, ok := raw.([]any); ok {
+				subRules[name] = filterGeoNegationRules(rules)
+			}
+		}
+		m["sub-rules"] = subRules
+	}
+}
+
 // filterGeoRulesFromConfig 删除 rules、sub-rules 与 DNS 配置中所有依赖 GEO 数据库的条目。
 // DNS 也能通过 nameserver-policy/fallback-filter/fake-ip-filter 引用 GeoSite/GeoIP；
 // 若只过滤分流规则，geo 关闭后仍会在 DNS 初始化阶段加载数据库并导致 NE 内存冲高。
@@ -893,9 +965,9 @@ func filterGeoRulesFromConfig(m map[string]any) {
 	}
 	dropped += filterGeoDNSConfig(m)
 	if dropped > 0 {
-		appendRunLog(fmt.Sprintf("剔除 geo 规则/DNS 策略 %d 条", dropped))
+		appendRunLog(fmt.Sprintf("剔除 geo/ASN 规则或 DNS 策略 %d 条", dropped))
 		configNotices = append(configNotices,
-			fmt.Sprintf("已忽略 %d 条 GEOIP/GEOSITE 规则或 DNS 策略（geo 未启用，可在设置里开启）", dropped))
+			fmt.Sprintf("已忽略 %d 条 GEOIP/GEOSITE/IP-ASN 规则或 DNS 策略（geo 未启用，可在设置里开启）", dropped))
 	}
 }
 
@@ -961,7 +1033,8 @@ func filterGeoRules(rules []any) ([]any, int) {
 	for _, r := range rules {
 		if s, ok := r.(string); ok {
 			u := strings.ToUpper(strings.TrimSpace(s))
-			if strings.Contains(u, "GEOIP,") || strings.Contains(u, "GEOSITE,") || strings.Contains(u, "GEODATA,") {
+			if strings.Contains(u, "GEOIP,") || strings.Contains(u, "GEOSITE,") ||
+				strings.Contains(u, "GEODATA,") || strings.Contains(u, "IP-ASN,") {
 				dropped++
 				continue
 			}
@@ -1226,13 +1299,32 @@ func appendRunLog(msg string) {
 	logFileMu.Lock()
 	defer logFileMu.Unlock()
 	f, err := os.OpenFile(filepath.Join(homeDir, "run.log"),
-		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return
 	}
 	defer f.Close()
-	_, _ = f.WriteString(fmt.Sprintf("%s [WRAP] %s\n",
+	writeRunLogLine(f, fmt.Sprintf("%s [WRAP] %s\n",
 		time.Now().Format("15:04:05.000"), msg))
+}
+
+func writeRunLogLine(file *os.File, line string) {
+	if len(line) > maxRunLogLineBytes {
+		const truncationSuffix = "... (line truncated)\n"
+		end := maxRunLogLineBytes - len(truncationSuffix)
+		for end > 0 && !utf8.RuneStart(line[end]) {
+			end--
+		}
+		line = line[:end] + truncationSuffix
+	}
+	seekWhence := io.SeekEnd
+	if info, err := file.Stat(); err == nil && info.Size()+int64(len(line)) > maxRunLogBytes {
+		if err := file.Truncate(0); err == nil {
+			seekWhence = io.SeekStart
+		}
+	}
+	_, _ = file.Seek(0, seekWhence)
+	_, _ = file.WriteString(line)
 }
 
 // 每次真实启动都开启新的 run.log 会话。日志页在内存中保留上一会话，因此这里截断
