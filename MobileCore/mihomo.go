@@ -26,8 +26,10 @@ import (
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/geodata"
+	"github.com/metacubex/mihomo/component/iface"
 	"github.com/metacubex/mihomo/component/mmdb"
 	"github.com/metacubex/mihomo/component/profile/cachefile"
+	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/config"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/hub/executor"
@@ -61,6 +63,8 @@ var (
 	logCaptureMu  sync.Once
 	logFileMu     sync.Mutex
 	configApplyMu sync.Mutex
+	interfaceMu   sync.RWMutex
+	physicalIface string
 
 	// 最近一次合并配置时收集的：不适用内容提示 + 各节点协议摘要（供主 App 经 IPC 取用）。
 	configNotices   []string
@@ -533,6 +537,14 @@ func applyRuntimeConfig(fd int, tunnelMTU int, configYAML string, st appSettings
 
 	appendRunLog(operation + " ParseRawConfig 成功，开始 ApplyConfig")
 	executor.ApplyConfig(cfg, true)
+	// ApplyConfig 会按 YAML 重写 DefaultInterface；恢复 NWPathMonitor 选出的物理接口，
+	// 否则热重载后新连接可能失去显式出站绑定并回到 utun。
+	if name := currentPhysicalInterface(); name != "" {
+		dialer.DefaultInterface.Store(name)
+		iface.FlushCache()
+		resolver.ResetConnection()
+		appendRunLog(operation + "后恢复物理出站接口 = " + name)
+	}
 	if !preserveTun {
 		// Parsing and applying a large configuration can leave temporary heap
 		// pages resident. Return them once during startup.
@@ -1279,8 +1291,41 @@ func RuntimeStats() string {
 // 由 NE 的 NWPathMonitor 在网络路径变化时调用，取代 mihomo 自带的（iOS 下不可靠的）接口监控。
 // 对应 Swift 侧 `MihomoSetDefaultInterface(_:)`。
 func SetDefaultInterface(name string) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return
+	}
+	configApplyMu.Lock()
+	defer configApplyMu.Unlock()
+	storePhysicalInterface(name)
 	dialer.DefaultInterface.Store(name)
 	appendRunLog("默认出站接口 = " + name)
+}
+
+// NotifyNetworkChange 在 iOS 的物理路径恢复或切换后刷新所有与旧链路绑定的状态。
+// 仅修改 DefaultInterface 只会影响新拨号；微信等长连接仍会停留在失效 socket 上，
+// 因此还需重置 DNS 传输并关闭已跟踪连接，让应用立即在新链路上重连。
+func NotifyNetworkChange(name string) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return
+	}
+	configApplyMu.Lock()
+	defer configApplyMu.Unlock()
+	storePhysicalInterface(name)
+	previous := dialer.DefaultInterface.Load()
+	dialer.DefaultInterface.Store(name)
+	iface.FlushCache()
+	resolver.ResetConnection()
+
+	closed := 0
+	statistic.DefaultManager.Range(func(connection statistic.Tracker) bool {
+		_ = connection.Close()
+		closed++
+		return true
+	})
+	appendRunLog(fmt.Sprintf("网络路径变化：%s -> %s，已关闭 %d 条旧连接",
+		previous, name, closed))
 }
 
 // Stop 关闭内核与所有监听器。对应 Swift 侧 `MihomoStop()`。
@@ -1288,7 +1333,21 @@ func Stop() {
 	configApplyMu.Lock()
 	defer configApplyMu.Unlock()
 	appendRunLog("Stop: 关闭内核")
+	storePhysicalInterface("")
 	executor.Shutdown()
+}
+
+func storePhysicalInterface(name string) {
+	interfaceMu.Lock()
+	physicalIface = name
+	interfaceMu.Unlock()
+}
+
+func currentPhysicalInterface() string {
+	interfaceMu.RLock()
+	name := physicalIface
+	interfaceMu.RUnlock()
+	return name
 }
 
 // appendRunLog 追加一行到 <home>/run.log（封装层自己的标记，便于和内核日志混排）。

@@ -35,6 +35,9 @@ final class CoreStateManager: ObservableObject {
     private var statusObserver: NSObjectProtocol?
 
     private init() {
+        // NE 会把已连接状态同步到 App Group。主 App 被系统重新拉起时先用它恢复界面和
+        // IPC 轮询，再异步向 NetworkExtension 核实，避免运行中的 VPN 首屏短暂显示空值。
+        if AppGroupState.vpnConnected { status = .connected }
         observeVPNStatus()
         // 调用内核取版本号：能返回即证明 mihomo 已正确链接进 App
         coreVersion = MihomoCore.version()
@@ -75,8 +78,11 @@ final class CoreStateManager: ObservableObject {
     /// 初始化或前台回来时主动拉一次当前状态。
     func refreshStatus() async {
         status = await tunnel.currentStatus()
+        AppGroupState.vpnConnected = isActive
         if status == .connected {
             await fetchControllerConfiguration()
+        } else if status == .disconnected || status == .invalid {
+            configNotices = []
         }
     }
 

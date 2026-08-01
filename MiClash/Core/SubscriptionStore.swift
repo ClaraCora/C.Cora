@@ -1,5 +1,7 @@
 import Foundation
 
+private let subscriptionMaximumDownloadBytes: Int64 = 10 * 1_024 * 1_024
+
 /// 一条订阅。
 struct Subscription: Identifiable, Codable, Equatable, Sendable {
     let id: UUID
@@ -95,7 +97,9 @@ final class SubscriptionStore: ObservableObject {
     }()
     private let persistence = SubscriptionPersistence(fileURL: SubscriptionStore.fileURL)
     private var persistenceRevision = 0
+    private var persistenceTask: Task<Void, Never>?
     private var refreshGenerations: [UUID: Int] = [:]
+    private var activeRefreshes: [UUID: ActiveSubscriptionRefresh] = [:]
     private var activeRefreshCount = 0
 
     private init() { load() }
@@ -120,6 +124,10 @@ final class SubscriptionStore: ObservableObject {
         let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedURL = url.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedURL.isEmpty else { lastError = "订阅地址为空"; return }
+        guard Self.remoteURL(trimmedURL) != nil else {
+            lastError = "订阅地址必须是有效的 HTTP/HTTPS 链接"
+            return
+        }
 
         let auto = trimmedName.isEmpty
         let sub = Subscription(name: auto ? "拉取中…" : trimmedName, url: trimmedURL, autoNamed: auto)
@@ -133,11 +141,11 @@ final class SubscriptionStore: ObservableObject {
     func addLocal(name: String, yaml: String) {
         let n = name.trimmingCharacters(in: .whitespacesAndNewlines)
         var sub = Subscription(name: n.isEmpty ? "本地配置" : n, url: "", yaml: yaml)
-        sub.nodeCount = countProxies(yaml)
+        sub.nodeCount = Self.countProxies(yaml)
         sub.updatedAt = Date()
         subscriptions.append(sub)
         if selectedID == nil { selectedID = sub.id }
-        lastError = looksLikeClashYAML(yaml) ? nil
+        lastError = Self.looksLikeClashYAML(yaml) ? nil
             : "已保存，但内容里没找到 proxies/proxy-groups，连接时可能无效"
         save()
     }
@@ -148,40 +156,60 @@ final class SubscriptionStore: ObservableObject {
         let n = name.trimmingCharacters(in: .whitespacesAndNewlines)
         if !n.isEmpty { subscriptions[i].name = n }
         subscriptions[i].yaml = yaml
-        subscriptions[i].nodeCount = countProxies(yaml)
+        subscriptions[i].nodeCount = Self.countProxies(yaml)
         subscriptions[i].updatedAt = Date()
-        lastError = looksLikeClashYAML(yaml) ? nil
+        lastError = Self.looksLikeClashYAML(yaml) ? nil
             : "已保存，但内容里没找到 proxies/proxy-groups，连接时可能无效"
         save()
     }
 
-    /// 编辑远程订阅（名称 + 链接）。链接变更时清空旧内容并重新拉取；
+    /// 编辑远程订阅（名称 + 链接）。链接变更时先拉取并校验，成功后再原子替换旧内容；
     /// 用户手填过名称后，刷新不再用响应头覆盖（autoNamed 置 false）。
     func updateRemote(_ id: UUID, name: String, url: String) async {
         guard let i = subscriptions.firstIndex(where: { $0.id == id }) else { return }
         let n = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let u = url.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !u.isEmpty else { lastError = "订阅地址为空"; return }
-        guard URL(string: u) != nil else { lastError = "无效的订阅地址"; return }
+        guard let remoteURL = Self.remoteURL(u) else {
+            lastError = "订阅地址必须是有效的 HTTP/HTTPS 链接"
+            return
+        }
 
-        if !n.isEmpty {
-            subscriptions[i].name = n
-            subscriptions[i].autoNamed = false
-        }
         let urlChanged = subscriptions[i].url != u
-        if urlChanged { invalidateRefresh(id) }
-        subscriptions[i].url = u
-        if urlChanged {
-            subscriptions[i].yaml = ""
-            subscriptions[i].nodeCount = 0
-            subscriptions[i].updatedAt = nil
-            subscriptions[i].upload = 0
-            subscriptions[i].download = 0
-            subscriptions[i].total = 0
-            subscriptions[i].expire = nil
+        guard urlChanged else {
+            if !n.isEmpty {
+                subscriptions[i].name = n
+                subscriptions[i].autoNamed = false
+                save()
+            }
+            return
         }
-        save()
-        if urlChanged { await refresh(id) }
+
+        let previousURL = subscriptions[i].url
+        let request = makeRequest(url: remoteURL)
+        let (generation, task) = beginRefresh(id, request: request)
+        lastError = nil
+        defer { finishRefresh(id, generation: generation) }
+
+        do {
+            let payload = try await task.value
+            guard isCurrentRefresh(id, generation: generation, url: previousURL),
+                  let index = subscriptions.firstIndex(where: { $0.id == id }) else { return }
+            apply(payload, to: &subscriptions[index], resetMissingUsage: true)
+            subscriptions[index].url = u
+            if !n.isEmpty {
+                subscriptions[index].name = n
+                subscriptions[index].autoNamed = false
+            } else if subscriptions[index].autoNamed, let title = payload.title {
+                subscriptions[index].name = title
+            }
+            save()
+        } catch is CancellationError {
+            return
+        } catch {
+            guard isCurrentRefresh(id, generation: generation, url: previousURL) else { return }
+            lastError = "拉取失败：\(error.localizedDescription)；已保留原订阅配置"
+        }
     }
 
     func remove(_ id: UUID) {
@@ -201,63 +229,27 @@ final class SubscriptionStore: ObservableObject {
         guard let idx = subscriptions.firstIndex(where: { $0.id == id }) else { return }
         let urlString = subscriptions[idx].url
         guard !urlString.isEmpty else { lastError = "本地配置无需刷新"; return }
-        guard let url = URL(string: urlString),
-              let scheme = url.scheme?.lowercased(),
-              ["http", "https"].contains(scheme),
-              url.host != nil else {
+        guard let url = Self.remoteURL(urlString) else {
             lastError = "订阅地址必须是有效的 HTTP/HTTPS 链接"
             return
         }
 
-        let generation = beginRefresh(id)
+        let request = makeRequest(url: url)
+        let (generation, task) = beginRefresh(id, request: request)
         lastError = nil
-        defer { finishRefresh() }
+        defer { finishRefresh(id, generation: generation) }
 
         do {
-            var req = URLRequest(url: url)
-            // 机场常按 UA 返回不同格式；UA 可在设置里改，默认 clash-meta。
-            let ua = SettingsStore.shared.subscriptionUA.trimmingCharacters(in: .whitespaces)
-            req.setValue(ua.isEmpty ? "clash-meta" : ua, forHTTPHeaderField: "User-Agent")
-            req.timeoutInterval = 30
-            let (temporaryURL, resp) = try await URLSession.shared.download(for: req)
-            guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-                throw SubscriptionRefreshError.httpStatus(
-                    (resp as? HTTPURLResponse)?.statusCode ?? -1)
-            }
-            let attributes = try FileManager.default.attributesOfItem(atPath: temporaryURL.path)
-            let byteCount = (attributes[.size] as? NSNumber)?.int64Value ?? 0
-            guard byteCount <= 10 * 1024 * 1024 else {
-                throw SubscriptionRefreshError.tooLarge
-            }
-            let data = try Data(contentsOf: temporaryURL, options: .mappedIfSafe)
-            guard let text = String(data: data, encoding: .utf8) else {
-                throw SubscriptionRefreshError.notText
-            }
-            guard looksLikeClashYAML(text) else {
-                throw SubscriptionRefreshError.notClashYAML
-            }
+            let payload = try await task.value
             guard isCurrentRefresh(id, generation: generation, url: urlString),
                   let i = subscriptions.firstIndex(where: { $0.id == id }) else { return }
-            subscriptions[i].yaml = text
-            subscriptions[i].updatedAt = Date()
-            subscriptions[i].nodeCount = countProxies(text)
-
-            // 解析机场返回的流量/到期（subscription-userinfo 头）
-            if let info = headerValue(http, "subscription-userinfo") {
-                let kv = parseUserInfo(info)
-                subscriptions[i].upload = kv["upload"] ?? 0
-                subscriptions[i].download = kv["download"] ?? 0
-                subscriptions[i].total = kv["total"] ?? 0
-                if let exp = kv["expire"], exp > 0 {
-                    subscriptions[i].expire = Date(timeIntervalSince1970: TimeInterval(exp))
-                }
-            }
-            // 自动名称（用户没手填时）
-            if subscriptions[i].autoNamed,
-               let title = subscriptionTitle(http, fallbackHost: url.host) {
+            apply(payload, to: &subscriptions[i], resetMissingUsage: false)
+            if subscriptions[i].autoNamed, let title = payload.title {
                 subscriptions[i].name = title
             }
             save()
+        } catch is CancellationError {
+            return
         } catch {
             guard isCurrentRefresh(id, generation: generation, url: urlString) else { return }
             lastError = "拉取失败：\(error.localizedDescription)"
@@ -266,8 +258,80 @@ final class SubscriptionStore: ObservableObject {
 
     // MARK: - 校验/统计
 
+    private func makeRequest(url: URL) -> URLRequest {
+        var request = URLRequest(url: url)
+        let userAgent = SettingsStore.shared.subscriptionUA
+            .trimmingCharacters(in: .whitespaces)
+        request.setValue(userAgent.isEmpty ? "clash-meta" : userAgent,
+                         forHTTPHeaderField: "User-Agent")
+        request.timeoutInterval = 30
+        return request
+    }
+
+    nonisolated private static func remoteURL(_ value: String) -> URL? {
+        guard let url = URL(string: value),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              url.host?.isEmpty == false else { return nil }
+        return url
+    }
+
+    nonisolated private static func fetchSubscription(
+        request: URLRequest
+    ) async throws -> SubscriptionFetchPayload {
+        let download: BoundedHTTPDownload
+        do {
+            download = try await BoundedHTTPDownloader.download(
+                for: request,
+                maxBytes: subscriptionMaximumDownloadBytes,
+                resourceTimeout: 45)
+        } catch let error as BoundedHTTPDownloadError {
+            if case .tooLarge = error { throw SubscriptionRefreshError.tooLarge }
+            throw error
+        }
+        defer { try? FileManager.default.removeItem(at: download.fileURL) }
+
+        let data = try Data(contentsOf: download.fileURL, options: .mappedIfSafe)
+        guard let text = String(data: data, encoding: .utf8) else {
+            throw SubscriptionRefreshError.notText
+        }
+        guard looksLikeClashYAML(text) else {
+            throw SubscriptionRefreshError.notClashYAML
+        }
+
+        let usageHeader = headerValue(download.response, "subscription-userinfo")
+        let usage = usageHeader.map(parseUserInfo) ?? [:]
+        let expiration = usage["expire"].flatMap { value in
+            value > 0 ? Date(timeIntervalSince1970: TimeInterval(value)) : nil
+        }
+        return SubscriptionFetchPayload(
+            yaml: text,
+            nodeCount: countProxies(text),
+            title: subscriptionTitle(download.response,
+                                     fallbackHost: download.response.url?.host),
+            hasUsageHeader: usageHeader != nil,
+            upload: usage["upload"] ?? 0,
+            download: usage["download"] ?? 0,
+            total: usage["total"] ?? 0,
+            expire: expiration)
+    }
+
+    private func apply(_ payload: SubscriptionFetchPayload,
+                       to subscription: inout Subscription,
+                       resetMissingUsage: Bool) {
+        subscription.yaml = payload.yaml
+        subscription.updatedAt = Date()
+        subscription.nodeCount = payload.nodeCount
+        if payload.hasUsageHeader || resetMissingUsage {
+            subscription.upload = payload.upload
+            subscription.download = payload.download
+            subscription.total = payload.total
+            subscription.expire = payload.expire
+        }
+    }
+
     /// 大小写不敏感地取响应头。
-    private func headerValue(_ http: HTTPURLResponse, _ key: String) -> String? {
+    nonisolated private static func headerValue(_ http: HTTPURLResponse, _ key: String) -> String? {
         if #available(iOS 13.0, *) {
             return http.value(forHTTPHeaderField: key)
         }
@@ -275,7 +339,7 @@ final class SubscriptionStore: ObservableObject {
     }
 
     /// 解析 subscription-userinfo: "upload=..; download=..; total=..; expire=.."
-    private func parseUserInfo(_ s: String) -> [String: Int64] {
+    nonisolated private static func parseUserInfo(_ s: String) -> [String: Int64] {
         var result: [String: Int64] = [:]
         for part in s.split(separator: ";") {
             let kv = part.split(separator: "=", maxSplits: 1)
@@ -288,7 +352,8 @@ final class SubscriptionStore: ObservableObject {
     }
 
     /// 从响应头推断订阅名称：优先 profile-title（可能 base64），其次 content-disposition 文件名，最后主机名。
-    private func subscriptionTitle(_ http: HTTPURLResponse, fallbackHost: String?) -> String? {
+    nonisolated private static func subscriptionTitle(_ http: HTTPURLResponse,
+                                                       fallbackHost: String?) -> String? {
         if let raw = headerValue(http, "profile-title") {
             if raw.lowercased().hasPrefix("base64:"),
                let data = Data(base64Encoded: String(raw.dropFirst(7))),
@@ -304,7 +369,7 @@ final class SubscriptionStore: ObservableObject {
         return fallbackHost
     }
 
-    private func filename(fromContentDisposition cd: String) -> String? {
+    nonisolated private static func filename(fromContentDisposition cd: String) -> String? {
         // filename*=UTF-8''xxx 优先
         if let range = cd.range(of: "filename*=") {
             var v = String(cd[range.upperBound...])
@@ -321,12 +386,12 @@ final class SubscriptionStore: ObservableObject {
         return nil
     }
 
-    private func looksLikeClashYAML(_ text: String) -> Bool {
+    nonisolated private static func looksLikeClashYAML(_ text: String) -> Bool {
         text.contains("proxies:") || text.contains("proxy-groups:") || text.contains("proxy-providers:")
     }
 
     /// 粗略数 proxies 段下的 `- name:` 条目数，仅用于 UI 展示。
-    private func countProxies(_ text: String) -> Int {
+    nonisolated private static func countProxies(_ text: String) -> Int {
         guard let range = text.range(of: "proxies:") else { return 0 }
         let after = text[range.upperBound...]
         // 数到下一个顶格 key 为止
@@ -356,27 +421,51 @@ final class SubscriptionStore: ObservableObject {
         let snapshot = subscriptions
         let selectedID = selectedID
         let persistence = persistence
-        Task.detached(priority: .utility) {
-            await persistence.save(subscriptions: snapshot,
-                                   selectedID: selectedID,
-                                   revision: revision)
+        let previousTask = persistenceTask
+        persistenceTask = Task(priority: .utility) { [weak self] in
+            await previousTask?.value
+            do {
+                try await persistence.save(subscriptions: snapshot,
+                                           selectedID: selectedID,
+                                           revision: revision)
+            } catch {
+                guard let self, revision == self.persistenceRevision else { return }
+                self.lastError = "保存订阅失败：\(error.localizedDescription)"
+            }
         }
     }
 
-    private func beginRefresh(_ id: UUID) -> Int {
-        let next = (refreshGenerations[id] ?? 0) &+ 1
-        refreshGenerations[id] = next
-        activeRefreshCount += 1
-        isBusy = true
-        return next
+    /// App 进入后台前等待最后一次原子写入，降低刚编辑完就被挂起时的数据丢失概率。
+    func flushPersistence() async {
+        await persistenceTask?.value
     }
 
-    private func finishRefresh() {
+    private func beginRefresh(
+        _ id: UUID,
+        request: URLRequest
+    ) -> (Int, Task<SubscriptionFetchPayload, Error>) {
+        activeRefreshes[id]?.task.cancel()
+        let next = (refreshGenerations[id] ?? 0) &+ 1
+        refreshGenerations[id] = next
+        let task = Task.detached(priority: .userInitiated) {
+            try await Self.fetchSubscription(request: request)
+        }
+        activeRefreshes[id] = ActiveSubscriptionRefresh(generation: next, task: task)
+        activeRefreshCount += 1
+        isBusy = true
+        return (next, task)
+    }
+
+    private func finishRefresh(_ id: UUID, generation: Int) {
+        if activeRefreshes[id]?.generation == generation {
+            activeRefreshes[id] = nil
+        }
         activeRefreshCount = max(0, activeRefreshCount - 1)
         isBusy = activeRefreshCount > 0
     }
 
     private func invalidateRefresh(_ id: UUID) {
+        activeRefreshes.removeValue(forKey: id)?.task.cancel()
         refreshGenerations[id] = (refreshGenerations[id] ?? 0) &+ 1
     }
 
@@ -391,6 +480,22 @@ private struct PersistedSubscriptions: Codable, Sendable {
     let selectedID: UUID?
 }
 
+private struct SubscriptionFetchPayload: Sendable {
+    let yaml: String
+    let nodeCount: Int
+    let title: String?
+    let hasUsageHeader: Bool
+    let upload: Int64
+    let download: Int64
+    let total: Int64
+    let expire: Date?
+}
+
+private struct ActiveSubscriptionRefresh {
+    let generation: Int
+    let task: Task<SubscriptionFetchPayload, Error>
+}
+
 private actor SubscriptionPersistence {
     let fileURL: URL
     private var latestRevision = 0
@@ -399,25 +504,23 @@ private actor SubscriptionPersistence {
         self.fileURL = fileURL
     }
 
-    func save(subscriptions: [Subscription], selectedID: UUID?, revision: Int) {
+    func save(subscriptions: [Subscription], selectedID: UUID?, revision: Int) throws {
         guard revision >= latestRevision else { return }
-        latestRevision = revision
         let payload = PersistedSubscriptions(subscriptions: subscriptions,
                                              selectedID: selectedID)
-        guard let data = try? JSONEncoder().encode(payload) else { return }
-        try? data.write(to: fileURL, options: .atomic)
+        let data = try JSONEncoder().encode(payload)
+        try data.write(to: fileURL, options: .atomic)
+        latestRevision = revision
     }
 }
 
-private enum SubscriptionRefreshError: LocalizedError {
-    case httpStatus(Int)
+private enum SubscriptionRefreshError: LocalizedError, Sendable {
     case tooLarge
     case notText
     case notClashYAML
 
     var errorDescription: String? {
         switch self {
-        case .httpStatus(let code): return "HTTP \(code)"
         case .tooLarge: return "订阅内容超过 10 MB 上限"
         case .notText: return "订阅内容不是 UTF-8 文本"
         case .notClashYAML:

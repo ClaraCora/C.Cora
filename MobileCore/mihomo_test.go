@@ -7,8 +7,34 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/metacubex/mihomo/component/dialer"
 	"gopkg.in/yaml.v3"
 )
+
+func TestNetworkInterfaceUpdates(t *testing.T) {
+	previous := dialer.DefaultInterface.Load()
+	defer dialer.DefaultInterface.Store(previous)
+	previousPhysical := currentPhysicalInterface()
+	defer storePhysicalInterface(previousPhysical)
+
+	SetDefaultInterface("  en0  ")
+	if got := dialer.DefaultInterface.Load(); got != "en0" {
+		t.Fatalf("SetDefaultInterface stored %q, want en0", got)
+	}
+	if got := currentPhysicalInterface(); got != "en0" {
+		t.Fatalf("physical interface stored %q, want en0", got)
+	}
+
+	NotifyNetworkChange("pdp_ip0")
+	if got := dialer.DefaultInterface.Load(); got != "pdp_ip0" {
+		t.Fatalf("NotifyNetworkChange stored %q, want pdp_ip0", got)
+	}
+
+	NotifyNetworkChange("   ")
+	if got := dialer.DefaultInterface.Load(); got != "pdp_ip0" {
+		t.Fatalf("empty network update changed interface to %q", got)
+	}
+}
 
 func TestValidateGeoDatabaseRejectsInvalidContent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "invalid.dat")

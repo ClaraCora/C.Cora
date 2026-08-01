@@ -147,3 +147,6 @@ require (
 )
 
 tool golang.org/x/mobile/cmd/gobind
+
+// 与 mihomo v1.19.29 上游保持一致，规避 Go 1.26 的 protobuf 方法 DCE/体积回归。
+replace google.golang.org/protobuf => github.com/metacubex/protobuf-go v0.0.0-20260306035419-7ceee0674686

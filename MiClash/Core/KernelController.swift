@@ -47,16 +47,19 @@ final class KernelController: ObservableObject {
 
     private var trafficTask: Task<Void, Never>?
     private var memoryTask: Task<Void, Never>?
+    private var memoryRefreshTask: Task<Int64?, Never>?
+    private var memoryRefreshGeneration = 0
     private var modeTask: Task<Void, Never>?
     private var sampleIndex = 0
     private let maxSamples = 60
 
     /// 连接建立后调用：读模式 + 开始速率/内存采样。
     func start() {
-        guard trafficTask == nil, memoryTask == nil else { return }
-        modeTask = Task { [weak self] in await self?.loadMode() }
-        startTraffic()
-        startMemoryPolling()
+        if modeTask == nil {
+            modeTask = Task { [weak self] in await self?.loadMode() }
+        }
+        if trafficTask == nil { startTraffic() }
+        if memoryTask == nil { startMemoryPolling() }
     }
 
     /// 断开后调用：停止采样。
@@ -120,26 +123,47 @@ final class KernelController: ObservableObject {
         sampleIndex = 0
     }
 
-    /// phys_footprint 变化较慢，每 5 秒查询一次，避免频繁调用 Mach task_info。
+    /// 立即读取一次内存；前台恢复时调用，避免等待轮询周期才显示数值。
+    @discardableResult
+    func refreshMemory() async -> Bool {
+        let task: Task<Int64?, Never>
+        let generation: Int
+        if let current = memoryRefreshTask {
+            task = current
+            generation = memoryRefreshGeneration
+        } else {
+            memoryRefreshGeneration &+= 1
+            generation = memoryRefreshGeneration
+            task = Task {
+                let result = await CoreStateManager.shared.sendMessage(["cmd": "memory"])
+                guard !Task.isCancelled,
+                      case .ok(let data) = result,
+                      let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                      let footprint = (object["physFootprint"] as? NSNumber)?.int64Value,
+                      footprint > 0 else { return nil }
+                return footprint
+            }
+            memoryRefreshTask = task
+        }
+
+        let footprint = await task.value
+        guard generation == memoryRefreshGeneration else { return false }
+        memoryRefreshTask = nil
+        guard let footprint else { return false }
+        if memoryFootprint != footprint { memoryFootprint = footprint }
+        return true
+    }
+
+    /// phys_footprint 正常每 5 秒查询；首次失败时每秒重试，直到拿到第一个数值。
     private func startMemoryPolling() {
         stopMemoryPolling()
         memoryTask = Task { [weak self] in
-            // 让隧道启动初期的模式/流量 IPC 先完成。
-            try? await Task.sleep(nanoseconds: 1_000_000_000)
             while !Task.isCancelled {
-                let result = await CoreStateManager.shared.sendMessage(["cmd": "memory"])
+                guard let self else { return }
+                let succeeded = await self.refreshMemory()
                 guard !Task.isCancelled else { return }
-                if case .ok(let data) = result,
-                   let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-                   let footprint = (obj["physFootprint"] as? NSNumber)?.int64Value,
-                   footprint > 0 {
-                    if let self, self.memoryFootprint != footprint {
-                        self.memoryFootprint = footprint
-                    }
-                } else {
-                    if let self, self.memoryFootprint != nil { self.memoryFootprint = nil }
-                }
-                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                let interval: UInt64 = succeeded ? 5_000_000_000 : 1_000_000_000
+                try? await Task.sleep(nanoseconds: interval)
             }
         }
     }
@@ -147,6 +171,9 @@ final class KernelController: ObservableObject {
     private func stopMemoryPolling() {
         memoryTask?.cancel()
         memoryTask = nil
+        memoryRefreshGeneration &+= 1
+        memoryRefreshTask?.cancel()
+        memoryRefreshTask = nil
         if memoryFootprint != nil { memoryFootprint = nil }
     }
 

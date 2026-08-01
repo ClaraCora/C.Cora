@@ -136,7 +136,6 @@ private struct ConfigTextReader: View {
 
     var body: some View {
         MonospacedTextView(text: text)
-            .ignoresSafeArea(edges: .bottom)
             .navigationTitle(title)
             .navigationBarTitleDisplayMode(.inline)
     }

@@ -5,6 +5,8 @@ import Darwin
 import os.log
 import WidgetKit
 
+private let tunnelMaximumGeoAssetBytes: Int64 = 64 * 1_024 * 1_024
+
 /// Network Extension 的 Packet Tunnel 实现（Phase 2：真正接管流量）。
 ///
 /// 流程：
@@ -50,6 +52,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private let pathMonitorQueue = DispatchQueue(label: "com.miclash.tunnel.pathmonitor", qos: .utility)
     private var pendingPathUpdate: DispatchWorkItem?
     private var lastInterfaceName: String?
+    private var hasAppliedPhysicalPath = false
+    private var lastPathWasSatisfied: Bool?
 
     override func startTunnel(options: [String: NSObject]?,
                               completionHandler: @escaping (Error?) -> Void) {
@@ -285,12 +289,14 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         pathMonitor?.cancel()
         pathMonitor = nil
         lastInterfaceName = nil
+        hasAppliedPhysicalPath = false
+        lastPathWasSatisfied = nil
     }
 
     /// 首次立即应用（缩短启动时「出站未绑接口」的窗口）；之后变化用防抖。
     private func schedulePathUpdate(_ path: Network.NWPath) {
         pendingPathUpdate?.cancel()
-        if lastInterfaceName == nil {
+        if !hasAppliedPhysicalPath {
             applyInterface(from: path)
             return
         }
@@ -302,14 +308,52 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     private func applyInterface(from path: Network.NWPath) {
-        guard path.status == .satisfied,
-              let iface = path.availableInterfaces.first(where: { $0.type != .other }) ?? path.availableInterfaces.first else {
+        guard path.status == .satisfied else {
+            if lastPathWasSatisfied != false {
+                FileLog.write("物理网络路径暂时不可用，等待恢复")
+            }
+            lastPathWasSatisfied = false
             return
         }
-        guard iface.name != lastInterfaceName else { return }
+
+        guard let iface = activePhysicalInterface(from: path) else {
+            FileLog.write("物理网络已满足，但未找到实际使用的接口")
+            lastPathWasSatisfied = true
+            return
+        }
+
+        let previous = lastInterfaceName
+        let isInitialPath = !hasAppliedPhysicalPath
         lastInterfaceName = iface.name
-        FileLog.write("出站接口切到 \(iface.name)")
-        MihomoSetDefaultInterface(iface.name)
+        lastPathWasSatisfied = true
+        hasAppliedPhysicalPath = true
+
+        if isInitialPath {
+            FileLog.write("初始出站接口 = \(iface.name)")
+            // 内核启动与首个 NWPath 回调之间可能已经建立了 DNS/健康检查连接；
+            // 首次也执行完整刷新，避免这些连接留在未绑定或错误接口上。
+            MihomoNotifyNetworkChange(iface.name)
+        } else {
+            let transition = previous == iface.name
+                ? "\(iface.name) 路径恢复/属性变化"
+                : "\(previous ?? "未知") -> \(iface.name)"
+            FileLog.write("物理网络变化：\(transition)，重置旧连接")
+            MihomoNotifyNetworkChange(iface.name)
+        }
+    }
+
+    /// `availableInterfaces` 可能同时包含 Wi-Fi、蜂窝和 utun；只选择当前 path 实际使用的
+    /// 物理类型，避免蜂窝切换后仍把新拨号绑定到已不在路径上的 en0。
+    private func activePhysicalInterface(from path: Network.NWPath) -> NWInterface? {
+        let preferredTypes: [NWInterface.InterfaceType] = [
+            .wifi, .cellular, .wiredEthernet
+        ]
+        for type in preferredTypes where path.usesInterfaceType(type) {
+            if let interface = path.availableInterfaces.first(where: { $0.type == type }) {
+                return interface
+            }
+        }
+        return nil
     }
 
     /// 主 App 经 sendProviderMessage 发来的请求（不依赖 App Group 的官方 IPC）。
@@ -719,18 +763,30 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             }
         }
         guard !required.isEmpty else { return nil }
-        let missing = required.filter { name in
+        let sizes = Dictionary(uniqueKeysWithValues: required.map { name in
             let path = (home as NSString).appendingPathComponent(name)
             let attributes = try? FileManager.default.attributesOfItem(atPath: path)
-            return ((attributes?[.size] as? NSNumber)?.int64Value ?? 0) < 1_024
+            return (name, (attributes?[.size] as? NSNumber)?.int64Value ?? 0)
+        })
+        let missing = required.filter { (sizes[$0] ?? 0) < 1_024 }
+        if !missing.isEmpty {
+            return NSError(
+                domain: "MiClashTunnel",
+                code: -4,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "缺少 GEO / ASN 数据文件：\(missing.joined(separator: "、"))。请在主 App 设置中下载后重试。"]
+            )
         }
-        guard !missing.isEmpty else { return nil }
-        return NSError(
-            domain: "MiClashTunnel",
-            code: -4,
-            userInfo: [NSLocalizedDescriptionKey:
-                "缺少 GEO / ASN 数据文件：\(missing.joined(separator: "、"))。请在主 App 设置中下载后重试。"]
-        )
+        let oversized = required.filter { (sizes[$0] ?? 0) > tunnelMaximumGeoAssetBytes }
+        guard oversized.isEmpty else {
+            return NSError(
+                domain: "MiClashTunnel",
+                code: -7,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "GEO / ASN 数据文件超过 64 MB 上限：\(oversized.joined(separator: "、"))"]
+            )
+        }
+        return nil
     }
 
     private static func ipv6Enabled(settingsJSON: String) -> Bool {

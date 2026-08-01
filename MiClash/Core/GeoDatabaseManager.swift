@@ -1,6 +1,8 @@
 import Foundation
 import Mihomo
 
+private let geoMaximumAssetBytes: Int64 = 64 * 1_024 * 1_024
+
 struct GeoInstalledInfo: Sendable {
     let updatedAt: Date
     let size: Int64
@@ -142,13 +144,18 @@ final class GeoDatabaseManager: ObservableObject {
         let assets = requiredAssets(configYAML: configYAML,
                                     geodataMode: SettingsStore.shared.geodataMode)
         try await Task.detached(priority: .utility) {
-            let missing = assets.map(\.fileName).filter { name in
-                let path = home.appendingPathComponent(name).path
+            let sizes = Dictionary(uniqueKeysWithValues: assets.map { asset in
+                let path = home.appendingPathComponent(asset.fileName).path
                 let attributes = try? FileManager.default.attributesOfItem(atPath: path)
-                return ((attributes?[.size] as? NSNumber)?.int64Value ?? 0) < 1_024
-            }
+                let size = (attributes?[.size] as? NSNumber)?.int64Value ?? 0
+                return (asset.fileName, size)
+            })
+            let missing = assets.map(\.fileName).filter { (sizes[$0] ?? 0) < 1_024 }
             if !missing.isEmpty { throw GeoError.missingFiles(missing) }
             for asset in assets {
+                if (sizes[asset.fileName] ?? 0) > geoMaximumAssetBytes {
+                    throw GeoError.tooLarge(asset.fileName, geoMaximumAssetBytes)
+                }
                 let path = home.appendingPathComponent(asset.fileName).path
                 var validationError: NSError?
                 guard MihomoValidateGeoDatabase(path, asset.kind, &validationError) else {
@@ -160,7 +167,10 @@ final class GeoDatabaseManager: ObservableObject {
     }
 
     private func assetsAvailable(home: URL, assets: [AssetDownload]) -> Bool {
-        assets.allSatisfy { (fileSize(home.appendingPathComponent($0.fileName)) ?? 0) >= 1_024 }
+        assets.allSatisfy {
+            let size = fileSize(home.appendingPathComponent($0.fileName)) ?? 0
+            return size >= 1_024 && size <= geoMaximumAssetBytes
+        }
     }
 
     private func assetsAreStale(home: URL, assets: [AssetDownload], intervalHours: Int) -> Bool {
@@ -272,11 +282,6 @@ final class GeoDatabaseManager: ObservableObject {
     nonisolated private static func downloadAndInstall(_ config: DownloadConfiguration) async throws {
         try FileManager.default.createDirectory(at: config.home,
                                                 withIntermediateDirectories: true)
-        let sessionConfig = URLSessionConfiguration.ephemeral
-        sessionConfig.timeoutIntervalForRequest = 60
-        sessionConfig.timeoutIntervalForResource = 180
-        let session = URLSession(configuration: sessionConfig)
-        defer { session.invalidateAndCancel() }
 
         var staged: [StagedAsset] = []
         do {
@@ -285,8 +290,7 @@ final class GeoDatabaseManager: ObservableObject {
                                                    urlString: asset.url,
                                                    fileName: asset.fileName,
                                                    kind: asset.kind,
-                                                   home: config.home,
-                                                   session: session))
+                                                   home: config.home))
             }
             for asset in staged {
                 try install(asset, home: config.home)
@@ -303,8 +307,7 @@ final class GeoDatabaseManager: ObservableObject {
                                               urlString: String,
                                               fileName: String,
                                               kind: String,
-                                              home: URL,
-                                              session: URLSession) async throws -> StagedAsset {
+                                              home: URL) async throws -> StagedAsset {
         let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let url = URL(string: trimmed),
               let scheme = url.scheme?.lowercased(),
@@ -315,10 +318,30 @@ final class GeoDatabaseManager: ObservableObject {
 
         var request = URLRequest(url: url)
         request.setValue("clash-meta", forHTTPHeaderField: "User-Agent")
-        let (temporaryURL, response) = try await session.download(for: request)
-        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            throw GeoError.httpStatus(label, (response as? HTTPURLResponse)?.statusCode ?? -1)
+        request.timeoutInterval = 60
+
+        let download: BoundedHTTPDownload
+        do {
+            download = try await BoundedHTTPDownloader.download(
+                for: request,
+                maxBytes: geoMaximumAssetBytes,
+                resourceTimeout: 180)
+        } catch let error as BoundedHTTPDownloadError {
+            switch error {
+            case .httpStatus(let code):
+                throw GeoError.httpStatus(label, code)
+            case .tooLarge:
+                throw GeoError.tooLarge(label, geoMaximumAssetBytes)
+            default:
+                throw GeoError.downloadFailed(label, error.localizedDescription)
+            }
+        } catch {
+            throw GeoError.downloadFailed(label, error.localizedDescription)
         }
+        defer { try? FileManager.default.removeItem(at: download.fileURL) }
+
+        let temporaryURL = download.fileURL
+        let http = download.response
         if http.mimeType?.lowercased().contains("html") == true {
             throw GeoError.invalidContent(label)
         }
@@ -359,10 +382,12 @@ final class GeoDatabaseManager: ObservableObject {
     }
 }
 
-private enum GeoError: LocalizedError {
+private enum GeoError: LocalizedError, Sendable {
     case appGroupUnavailable
     case invalidURL(String)
     case httpStatus(String, Int)
+    case downloadFailed(String, String)
+    case tooLarge(String, Int64)
     case tooSmall(String)
     case invalidContent(String)
     case validationFailed(String, String?)
@@ -376,6 +401,10 @@ private enum GeoError: LocalizedError {
             return "\(name) 下载地址无效"
         case .httpStatus(let name, let code):
             return "\(name) 下载失败：HTTP \(code)"
+        case .downloadFailed(let name, let reason):
+            return "\(name) 下载失败：\(reason)"
+        case .tooLarge(let name, let limit):
+            return "\(name) 超过 \(limit / 1_048_576) MB 下载上限"
         case .tooSmall(let name):
             return "\(name) 下载内容过小"
         case .invalidContent(let name):
