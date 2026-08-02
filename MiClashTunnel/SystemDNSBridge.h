@@ -10,4 +10,11 @@
 /// Swift 无法导入（头文件本身在 C 侧可用），抓取逻辑只能放在 C 实现。
 int miclash_copy_system_dns(char *out, int stride, int maxCount);
 
+/// Read DNS servers from the scoped resolver associated with interfaceName.
+/// This remains usable after the packet tunnel installs its own default DNS.
+/// Returns the number of addresses written, or 0 when no scoped resolver is
+/// available. The private resolver symbols are loaded dynamically at runtime.
+int miclash_copy_scoped_dns(const char *interfaceName,
+                            char *out, int stride, int maxCount);
+
 #endif /* SYSTEM_DNS_BRIDGE_H */

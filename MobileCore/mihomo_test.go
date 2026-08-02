@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/metacubex/mihomo/component/dialer"
+	mdns "github.com/metacubex/mihomo/dns"
 	"gopkg.in/yaml.v3"
 )
 
@@ -25,14 +26,87 @@ func TestNetworkInterfaceUpdates(t *testing.T) {
 		t.Fatalf("physical interface stored %q, want en0", got)
 	}
 
-	NotifyNetworkChange("pdp_ip0")
+	if err := NotifyNetworkChange("pdp_ip0", ""); err != nil {
+		t.Fatal(err)
+	}
 	if got := dialer.DefaultInterface.Load(); got != "pdp_ip0" {
 		t.Fatalf("NotifyNetworkChange stored %q, want pdp_ip0", got)
 	}
 
-	NotifyNetworkChange("   ")
+	if err := NotifyNetworkChange("   ", ""); err != nil {
+		t.Fatal(err)
+	}
 	if got := dialer.DefaultInterface.Load(); got != "pdp_ip0" {
 		t.Fatalf("empty network update changed interface to %q", got)
+	}
+}
+
+func TestParseSystemDNSJSON(t *testing.T) {
+	got, err := parseSystemDNSJSON(`["192.168.1.1","fe80::1%en0","192.168.1.1"]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"192.168.1.1", "fe80::1%en0"}
+	if !equalStringSlices(got, want) {
+		t.Fatalf("parseSystemDNSJSON = %v, want %v", got, want)
+	}
+	for _, raw := range []string{`{"dns":"1.1.1.1"}`, `["not-an-ip"]`, `["224.0.0.1"]`} {
+		if _, err := parseSystemDNSJSON(raw); err == nil {
+			t.Errorf("parseSystemDNSJSON accepted %s", raw)
+		}
+	}
+}
+
+func TestReplaceSystemNameServers(t *testing.T) {
+	servers := []mdns.NameServer{
+		{Net: "udp", Addr: "10.0.0.1:53"},
+		{Net: "https", Addr: "https://dns.example/dns-query"},
+		{Net: "udp", Addr: "[fe80::1%en0]:53"},
+	}
+	updated, replacements := replaceSystemNameServers(
+		servers,
+		[]string{"10.0.0.1", "fe80::1%en0"},
+		[]string{"192.168.1.1", "fe80::2%en0"})
+	if replacements != 2 {
+		t.Fatalf("replacements = %d, want 2", replacements)
+	}
+	want := []mdns.NameServer{
+		{Net: "udp", Addr: "192.168.1.1:53"},
+		{Net: "udp", Addr: "[fe80::2%en0]:53"},
+		{Net: "https", Addr: "https://dns.example/dns-query"},
+	}
+	if len(updated) != len(want) {
+		t.Fatalf("updated = %+v, want %+v", updated, want)
+	}
+	for index := range want {
+		if !updated[index].Equal(want[index]) {
+			t.Errorf("updated[%d] = %+v, want %+v", index, updated[index], want[index])
+		}
+	}
+}
+
+func TestReplaceUnresolvedSystemNameServer(t *testing.T) {
+	updated, replacements := replaceSystemNameServers(
+		[]mdns.NameServer{{Net: "system"}}, nil, []string{"223.5.5.5"})
+	if replacements != 1 || len(updated) != 1 ||
+		updated[0].Net != "udp" || updated[0].Addr != "223.5.5.5:53" {
+		t.Fatalf("updated = %+v, replacements = %d", updated, replacements)
+	}
+}
+
+func TestDNSConfigUsesSystem(t *testing.T) {
+	if !dnsConfigUsesSystem(map[string]any{
+		"nameserver-policy": map[string]any{
+			"+.qpic.cn": []any{"system"},
+		},
+	}) {
+		t.Fatal("nameserver policy using system was not detected")
+	}
+	if dnsConfigUsesSystem(map[string]any{
+		"nameserver":     []any{"https://223.5.5.5/dns-query"},
+		"fake-ip-filter": []any{"system"},
+	}) {
+		t.Fatal("unrelated DNS field was treated as a system nameserver")
 	}
 }
 

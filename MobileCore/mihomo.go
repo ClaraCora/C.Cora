@@ -13,6 +13,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -22,6 +24,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/metacubex/mihomo/adapter/inbound"
 	"github.com/metacubex/mihomo/adapter/outboundgroup"
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/component/dialer"
@@ -32,6 +35,7 @@ import (
 	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/config"
 	C "github.com/metacubex/mihomo/constant"
+	mdns "github.com/metacubex/mihomo/dns"
 	"github.com/metacubex/mihomo/hub/executor"
 	"github.com/metacubex/mihomo/hub/route"
 	"github.com/metacubex/mihomo/listener"
@@ -67,9 +71,14 @@ var (
 	physicalIface string
 
 	// 最近一次合并配置时收集的：不适用内容提示 + 各节点协议摘要（供主 App 经 IPC 取用）。
-	configNotices   []string
-	proxyDetailsMap = map[string]string{}
-	controllerState = appSettings{ControllerPort: 9090}
+	configNotices        []string
+	proxyDetailsMap      = map[string]string{}
+	controllerState      = appSettings{ControllerPort: 9090}
+	activeDNSConfig      *config.DNS
+	activeGeneralIPv6    bool
+	activeSystemDNS      []string
+	activeUsesSystemDNS  bool
+	pendingUsesSystemDNS bool
 )
 
 // Version 返回「mihomo 内核版本 / Go 运行时版本」。
@@ -537,6 +546,10 @@ func applyRuntimeConfig(fd int, tunnelMTU int, configYAML string, st appSettings
 
 	appendRunLog(operation + " ParseRawConfig 成功，开始 ApplyConfig")
 	executor.ApplyConfig(cfg, true)
+	activeDNSConfig = cfg.DNS
+	activeGeneralIPv6 = cfg.General.IPv6
+	activeSystemDNS = append(activeSystemDNS[:0], st.SystemDNS...)
+	activeUsesSystemDNS = pendingUsesSystemDNS
 	// ApplyConfig 会按 YAML 重写 DefaultInterface；恢复 NWPathMonitor 选出的物理接口，
 	// 否则热重载后新连接可能失去显式出站绑定并回到 utun。
 	if name := currentPhysicalInterface(); name != "" {
@@ -657,6 +670,7 @@ func mergeConfig(subYAML string, st appSettings, tunnelMTU int) ([]byte, error) 
 	dnsCfg["ipv6"] = st.IPv6
 	dnsCfg["fake-ip-range"] = "198.18.0.1/16"
 	dnsCfg["cache-max-size"] = 512
+	pendingUsesSystemDNS = dnsConfigUsesSystem(dnsCfg)
 	rawNameservers, hasNameservers := dnsCfg["nameserver"]
 	nameservers, isList := rawNameservers.([]any)
 	if !hasNameservers || rawNameservers == nil || (isList && len(nameservers) == 0) {
@@ -789,6 +803,41 @@ func replaceSystemNameserver(value any, system []string, field string) any {
 		out = append(out, item)
 	}
 	return out
+}
+
+func dnsConfigUsesSystem(dnsConfig map[string]any) bool {
+	for _, key := range []string{
+		"nameserver", "fallback", "default-nameserver",
+		"proxy-server-nameserver", "direct-nameserver",
+	} {
+		if valueUsesSystemDNS(dnsConfig[key]) {
+			return true
+		}
+	}
+	for _, key := range []string{"nameserver-policy", "proxy-server-nameserver-policy"} {
+		if policies, ok := dnsConfig[key].(map[string]any); ok {
+			for _, value := range policies {
+				if valueUsesSystemDNS(value) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func valueUsesSystemDNS(value any) bool {
+	switch typed := value.(type) {
+	case string:
+		return strings.EqualFold(strings.TrimSpace(typed), "system")
+	case []any:
+		for _, item := range typed {
+			if valueUsesSystemDNS(item) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func stringsToAnyList(ss []string) []any {
@@ -1302,20 +1351,34 @@ func SetDefaultInterface(name string) {
 	appendRunLog("默认出站接口 = " + name)
 }
 
-// NotifyNetworkChange 在 iOS 的物理路径恢复或切换后刷新所有与旧链路绑定的状态。
-// 仅修改 DefaultInterface 只会影响新拨号；微信等长连接仍会停留在失效 socket 上，
-// 因此还需重置 DNS 传输并关闭已跟踪连接，让应用立即在新链路上重连。
-func NotifyNetworkChange(name string) {
+// NotifyNetworkChange refreshes the physical interface and the scoped system
+// DNS servers as one operation. systemDNSJSON is a JSON string array captured
+// by the Network Extension for the new physical interface.
+func NotifyNetworkChange(name string, systemDNSJSON string) error {
 	name = strings.TrimSpace(name)
 	if name == "" {
-		return
+		return nil
 	}
+	newSystemDNS, dnsErr := parseSystemDNSJSON(systemDNSJSON)
 	configApplyMu.Lock()
 	defer configApplyMu.Unlock()
 	storePhysicalInterface(name)
 	previous := dialer.DefaultInterface.Load()
 	dialer.DefaultInterface.Store(name)
 	iface.FlushCache()
+
+	if dnsErr == nil && len(newSystemDNS) > 0 &&
+		!equalStringSlices(newSystemDNS, activeSystemDNS) {
+		updated, replacements := replaceActiveSystemDNSLocked(newSystemDNS)
+		if updated {
+			rebuildDNSResolverLocked(activeDNSConfig, activeGeneralIPv6)
+			appendRunLog(fmt.Sprintf("system DNS 已按接口 %s 更新为 %s（替换 %d 处）",
+				name, strings.Join(newSystemDNS, ","), replacements))
+		} else {
+			appendRunLog(fmt.Sprintf("接口 %s 的 system DNS 已更新为 %s，当前配置未引用 system",
+				name, strings.Join(newSystemDNS, ",")))
+		}
+	}
 	resolver.ResetConnection()
 
 	closed := 0
@@ -1326,6 +1389,206 @@ func NotifyNetworkChange(name string) {
 	})
 	appendRunLog(fmt.Sprintf("网络路径变化：%s -> %s，已关闭 %d 条旧连接",
 		previous, name, closed))
+	if dnsErr != nil {
+		appendRunLog("忽略无效的 scoped system DNS: " + dnsErr.Error())
+	}
+	return dnsErr
+}
+
+func parseSystemDNSJSON(raw string) ([]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	var values []string
+	if err := json.Unmarshal([]byte(raw), &values); err != nil {
+		return nil, fmt.Errorf("system DNS JSON 无效: %w", err)
+	}
+	result := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		address, err := netip.ParseAddr(value)
+		if err != nil || address.IsUnspecified() || address.IsMulticast() {
+			return nil, fmt.Errorf("system DNS 地址无效: %q", value)
+		}
+		if address.Is4In6() {
+			address = address.Unmap()
+		}
+		normalized := address.String()
+		if _, exists := seen[normalized]; exists {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		result = append(result, normalized)
+	}
+	return result, nil
+}
+
+func replaceActiveSystemDNSLocked(newSystemDNS []string) (bool, int) {
+	if activeDNSConfig == nil || !activeUsesSystemDNS {
+		activeSystemDNS = append(activeSystemDNS[:0], newSystemDNS...)
+		return false, 0
+	}
+
+	updated := *activeDNSConfig
+	replacements := 0
+	updated.NameServer, replacements = replaceSystemNameServers(
+		activeDNSConfig.NameServer, activeSystemDNS, newSystemDNS)
+	updated.Fallback, replacements = replaceSystemNameServersAdding(
+		activeDNSConfig.Fallback, activeSystemDNS, newSystemDNS, replacements)
+	updated.DefaultNameserver, replacements = replaceSystemNameServersAdding(
+		activeDNSConfig.DefaultNameserver, activeSystemDNS, newSystemDNS, replacements)
+	updated.ProxyServerNameserver, replacements = replaceSystemNameServersAdding(
+		activeDNSConfig.ProxyServerNameserver, activeSystemDNS, newSystemDNS, replacements)
+	updated.DirectNameServer, replacements = replaceSystemNameServersAdding(
+		activeDNSConfig.DirectNameServer, activeSystemDNS, newSystemDNS, replacements)
+	updated.NameServerPolicy, replacements = replaceSystemPolicies(
+		activeDNSConfig.NameServerPolicy, activeSystemDNS, newSystemDNS, replacements)
+	updated.ProxyServerPolicy, replacements = replaceSystemPolicies(
+		activeDNSConfig.ProxyServerPolicy, activeSystemDNS, newSystemDNS, replacements)
+
+	activeSystemDNS = append(activeSystemDNS[:0], newSystemDNS...)
+	if replacements == 0 {
+		return false, 0
+	}
+	activeDNSConfig = &updated
+	return true, replacements
+}
+
+func replaceSystemNameServersAdding(servers []mdns.NameServer, oldSystemDNS,
+	newSystemDNS []string, count int) ([]mdns.NameServer, int) {
+	updated, added := replaceSystemNameServers(servers, oldSystemDNS, newSystemDNS)
+	return updated, count + added
+}
+
+func replaceSystemPolicies(policies []mdns.Policy, oldSystemDNS, newSystemDNS []string,
+	count int) ([]mdns.Policy, int) {
+	updated := append([]mdns.Policy(nil), policies...)
+	for index := range updated {
+		updated[index].NameServers, count = replaceSystemNameServersAdding(
+			policies[index].NameServers, oldSystemDNS, newSystemDNS, count)
+	}
+	return updated, count
+}
+
+func replaceSystemNameServers(servers []mdns.NameServer, oldSystemDNS,
+	newSystemDNS []string) ([]mdns.NameServer, int) {
+	updated := make([]mdns.NameServer, 0, len(servers)+len(newSystemDNS))
+	replacements := 0
+	inserted := false
+	for _, server := range servers {
+		if !isInjectedSystemNameServer(server, oldSystemDNS) {
+			updated = appendUniqueNameServer(updated, server)
+			continue
+		}
+		replacements++
+		if inserted {
+			continue
+		}
+		inserted = true
+		for _, address := range newSystemDNS {
+			replacement := server
+			replacement.Net = "udp"
+			replacement.Addr = systemNameServerAddress(address)
+			updated = appendUniqueNameServer(updated, replacement)
+		}
+	}
+	return updated, replacements
+}
+
+func isInjectedSystemNameServer(server mdns.NameServer, oldSystemDNS []string) bool {
+	if server.Net == "system" {
+		return true
+	}
+	if server.Net != "udp" {
+		return false
+	}
+	for _, address := range oldSystemDNS {
+		if server.Addr == systemNameServerAddress(address) {
+			return true
+		}
+	}
+	return false
+}
+
+func systemNameServerAddress(address string) string {
+	return net.JoinHostPort(address, "53")
+}
+
+func appendUniqueNameServer(servers []mdns.NameServer,
+	server mdns.NameServer) []mdns.NameServer {
+	for _, existing := range servers {
+		if existing.Equal(server) {
+			return servers
+		}
+	}
+	return append(servers, server)
+}
+
+func equalStringSlices(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func rebuildDNSResolverLocked(c *config.DNS, generalIPv6 bool) {
+	if c == nil || !c.Enable {
+		return
+	}
+	ipv6 := c.IPv6 && generalIPv6
+	dnsResolver := mdns.NewResolver(mdns.Config{
+		Main:                 c.NameServer,
+		Fallback:             c.Fallback,
+		IPv6:                 ipv6,
+		IPv6Timeout:          c.IPv6Timeout,
+		FallbackIPFilter:     c.FallbackIPFilter,
+		FallbackDomainFilter: c.FallbackDomainFilter,
+		FallbackLazyQuery:    c.FallbackLazyQuery,
+		Default:              c.DefaultNameserver,
+		Policy:               c.NameServerPolicy,
+		ProxyServer:          c.ProxyServerNameserver,
+		ProxyServerPolicy:    c.ProxyServerPolicy,
+		DirectServer:         c.DirectNameServer,
+		DirectFollowPolicy:   c.DirectFollowPolicy,
+		CacheAlgorithm:       c.CacheAlgorithm,
+		CacheMaxSize:         c.CacheMaxSize,
+	})
+	enhancer := mdns.NewEnhancer(mdns.EnhancerConfig{
+		IPv6:          ipv6,
+		EnhancedMode:  c.EnhancedMode,
+		FakeIPPool:    c.FakeIPPool,
+		FakeIPPool6:   c.FakeIPPool6,
+		FakeIPSkipper: c.FakeIPSkipper,
+		FakeIPTTL:     c.FakeIPTTL,
+		UseHosts:      c.UseHosts,
+	})
+	if old, ok := resolver.DefaultHostMapper.(*mdns.ResolverEnhancer); ok {
+		enhancer.PatchFrom(old)
+	}
+	service := mdns.NewService(dnsResolver, enhancer)
+	resolver.DefaultResolver = dnsResolver
+	resolver.DefaultHostMapper = enhancer
+	resolver.DefaultService = service
+	resolver.UseSystemHosts = c.UseSystemHosts
+	if dnsResolver.ProxyResolver.Invalid() {
+		resolver.ProxyServerHostResolver = dnsResolver.ProxyResolver
+	} else {
+		resolver.ProxyServerHostResolver = dnsResolver.Resolver
+	}
+	if dnsResolver.DirectResolver.Invalid() {
+		resolver.DirectHostResolver = dnsResolver.DirectResolver
+	} else {
+		resolver.DirectHostResolver = dnsResolver.Resolver
+	}
+	listenConfig := inbound.NewListenConfig()
+	listenConfig.SetRouteMark(c.ListenRoutingMark)
+	mdns.ReCreateServer(c.Listen, listenConfig, service)
 }
 
 // Stop 关闭内核与所有监听器。对应 Swift 侧 `MihomoStop()`。
@@ -1334,6 +1597,10 @@ func Stop() {
 	defer configApplyMu.Unlock()
 	appendRunLog("Stop: 关闭内核")
 	storePhysicalInterface("")
+	activeDNSConfig = nil
+	activeSystemDNS = nil
+	activeGeneralIPv6 = false
+	activeUsesSystemDNS = false
 	executor.Shutdown()
 }
 

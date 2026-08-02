@@ -19,8 +19,30 @@ enum SystemDNS {
     /// 注意时机：隧道建立后系统主解析器会变成隧道自己的 DNS（198.18.0.x），
     /// 所以必须在 setTunnelNetworkSettings 之前抓取；之后的读取请过 excludingTunnel。
     static func currentServers() -> [String] {
+        readServers { buffer in
+            miclash_copy_system_dns(buffer, Int32(stride), Int32(maxCount))
+        }
+    }
+
+    /// DNS servers scoped to a physical interface. Unlike currentServers(),
+    /// this can still see en0/pdp_ip0 after the tunnel becomes the default DNS.
+    static func scopedServers(for interfaceName: String) -> [String] {
+        guard !interfaceName.isEmpty else { return [] }
+        return readServers { buffer in
+            interfaceName.withCString { name in
+                miclash_copy_scoped_dns(name, buffer, Int32(stride), Int32(maxCount))
+            }
+        }
+    }
+
+    private static func readServers(
+        _ copy: (UnsafeMutablePointer<CChar>) -> Int32
+    ) -> [String] {
         var buffer = [CChar](repeating: 0, count: stride * maxCount)
-        let count = miclash_copy_system_dns(&buffer, Int32(stride), Int32(maxCount))
+        let count = buffer.withUnsafeMutableBufferPointer { pointer in
+            guard let baseAddress = pointer.baseAddress else { return 0 }
+            return copy(baseAddress)
+        }
         guard count > 0 else { return [] }
 
         var servers: [String] = []

@@ -34,17 +34,41 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
     /// 隧道建立前抓取的物理网络 DNS，供配置里的 `system` nameserver 替换用。
     private var systemDNSServers: [String] = []
+    private let systemDNSLock = NSLock()
 
     /// 把抓取到的系统 DNS 注入 settings JSON（key: systemDNS），
     /// Go 侧 mergeConfig 据此把 DNS 配置里的 "system" 替换为实际 IP。无可用值时原样返回。
     private func injectingSystemDNS(into settingsJSON: String) -> String {
-        guard !systemDNSServers.isEmpty else { return settingsJSON }
+        let servers = currentSystemDNSServers()
+        guard !servers.isEmpty else { return settingsJSON }
         var dict = ((try? JSONSerialization.jsonObject(with: Data(settingsJSON.utf8)))
                     as? [String: Any]) ?? [:]
-        dict["systemDNS"] = systemDNSServers
+        dict["systemDNS"] = servers
         guard let data = try? JSONSerialization.data(withJSONObject: dict),
               let json = String(data: data, encoding: .utf8) else { return settingsJSON }
         return json
+    }
+
+    private func currentSystemDNSServers() -> [String] {
+        systemDNSLock.lock()
+        defer { systemDNSLock.unlock() }
+        return systemDNSServers
+    }
+
+    private func replaceSystemDNSServers(_ servers: [String]) {
+        systemDNSLock.lock()
+        systemDNSServers = servers
+        systemDNSLock.unlock()
+    }
+
+    @discardableResult
+    private func updateSystemDNSServers(_ servers: [String]) -> Bool {
+        guard !servers.isEmpty else { return false }
+        systemDNSLock.lock()
+        defer { systemDNSLock.unlock() }
+        guard servers != systemDNSServers else { return false }
+        systemDNSServers = servers
+        return true
     }
 
     // 物理接口监控：把真实出站接口（en0/pdp_ip0）显式喂给内核，取代 mihomo 自带的不可靠监控。
@@ -67,8 +91,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // 每次启动清空 ne.log，避免历史残留干扰排查
         // 隧道建立前先抓物理网络 DNS；隧道起来后系统主解析器会变成隧道自己的 DNS。
         FileLog.reset()
-        systemDNSServers = SystemDNS.excludingTunnel(SystemDNS.currentServers())
-        FileLog.write("system DNS = \(systemDNSServers)")
+        let initialSystemDNS = SystemDNS.excludingTunnel(SystemDNS.currentServers())
+        replaceSystemDNSServers(initialSystemDNS)
+        FileLog.write("system DNS = \(initialSystemDNS)")
         FileLog.write("startTunnel：开始配置网络设置")
         log.info("startTunnel：开始配置网络设置")
 
@@ -332,13 +357,33 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             FileLog.write("初始出站接口 = \(iface.name)")
             // 内核启动与首个 NWPath 回调之间可能已经建立了 DNS/健康检查连接；
             // 首次也执行完整刷新，避免这些连接留在未绑定或错误接口上。
-            MihomoNotifyNetworkChange(iface.name)
+            notifyNetworkChange(interfaceName: iface.name)
         } else {
             let transition = previous == iface.name
                 ? "\(iface.name) 路径恢复/属性变化"
                 : "\(previous ?? "未知") -> \(iface.name)"
             FileLog.write("物理网络变化：\(transition)，重置旧连接")
-            MihomoNotifyNetworkChange(iface.name)
+            notifyNetworkChange(interfaceName: iface.name)
+        }
+    }
+
+    private func notifyNetworkChange(interfaceName: String) {
+        let scoped = SystemDNS.excludingTunnel(
+            SystemDNS.scopedServers(for: interfaceName))
+        if updateSystemDNSServers(scoped) {
+            FileLog.write("物理接口 \(interfaceName) scoped DNS = \(scoped)")
+        } else if scoped.isEmpty {
+            FileLog.write("物理接口 \(interfaceName) 未读取到 scoped DNS，沿用现有 system DNS")
+        }
+
+        let servers = currentSystemDNSServers()
+        let data = try? JSONSerialization.data(withJSONObject: servers)
+        let json = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        var updateError: NSError?
+        let ok = MihomoNotifyNetworkChange(interfaceName, json, &updateError)
+        if !ok {
+            FileLog.write("刷新物理接口/DNS 失败："
+                + (updateError?.localizedDescription ?? "未知错误"))
         }
     }
 
