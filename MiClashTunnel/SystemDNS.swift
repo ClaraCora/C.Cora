@@ -41,7 +41,7 @@ enum SystemDNS {
         var buffer = [CChar](repeating: 0, count: stride * maxCount)
         let count = buffer.withUnsafeMutableBufferPointer { pointer in
             guard let baseAddress = pointer.baseAddress else { return 0 }
-            return copy(baseAddress)
+            return Int(copy(baseAddress))
         }
         guard count > 0 else { return [] }
 
