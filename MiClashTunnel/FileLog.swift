@@ -19,6 +19,8 @@ enum FileLog {
 
     private static let formatter: DateFormatter = {
         let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = .autoupdatingCurrent
         f.dateFormat = "HH:mm:ss.SSS"
         return f
     }()

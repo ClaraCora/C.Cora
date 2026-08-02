@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/config"
@@ -686,6 +688,16 @@ func TestRunLogIsBounded(t *testing.T) {
 	}
 	if info.Size() >= maxRunLogBytes {
 		t.Fatalf("run.log size = %d, want less than %d after rotation", info.Size(), maxRunLogBytes)
+	}
+}
+
+func TestLogTimestampIsUTC(t *testing.T) {
+	value := logTimestamp()
+	if !strings.HasSuffix(value, "Z") {
+		t.Fatalf("logTimestamp = %q, want UTC suffix", value)
+	}
+	if _, err := time.Parse("2006-01-02T15:04:05.000Z07:00", value); err != nil {
+		t.Fatalf("logTimestamp = %q: %v", value, err)
 	}
 }
 

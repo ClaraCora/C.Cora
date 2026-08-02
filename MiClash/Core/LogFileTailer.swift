@@ -2,7 +2,8 @@ import Foundation
 
 /// 轮询式 tail：定时从 run.log 上次读到的位置续读新增内容，解析成 LogLine。
 ///
-/// run.log 由 mihomo 封装层（startLogCapture）逐行写入，格式：`15:04:05.000 [info] payload`。
+/// run.log 由 mihomo 封装层（startLogCapture）逐行写入，格式：
+/// `2026-08-02T02:12:30.123Z [info] payload`。
 /// 文件在每次连接时被 O_TRUNC 清空——检测到文件变小即从头重读。
 final class LogFileTailer: @unchecked Sendable {
 
@@ -105,7 +106,7 @@ final class LogFileTailer: @unchecked Sendable {
         return old.starts(with: new)
     }
 
-    /// 解析 `15:04:05.000 [info] payload`；解析不出就整行当 info。
+    /// 解析带时区的新时间戳，并兼容旧版只有 UTC 时分秒的日志。
     private func parse(_ line: String) -> LogLine {
         guard let lb = line.firstIndex(of: "["),
               let rb = line.firstIndex(of: "]"), lb < rb else {
@@ -114,14 +115,24 @@ final class LogFileTailer: @unchecked Sendable {
         let level = line[line.index(after: lb)..<rb].lowercased()
         let payload = line[line.index(after: rb)...].trimmingCharacters(in: .whitespaces)
         let timeToken = line[..<lb].trimmingCharacters(in: .whitespaces)
-        let time = Self.timeFormatter.date(from: timeToken) ?? Date()
+        let time = Self.timestampFormatter.date(from: timeToken)
+            ?? Self.legacyUTCFormatter.date(from: timeToken)
+            ?? Date()
         return LogLine(time: time, type: level, payload: payload)
     }
 
-    /// 解析行首时间（仅时分秒，日期无关——视图只显示时间）。
-    private static let timeFormatter: DateFormatter = {
+    private static let timestampFormatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+
+    /// 旧版 Go/iOS 运行时写出的无时区时间实际为 UTC。
+    private static let legacyUTCFormatter: DateFormatter = {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
+        f.calendar = Calendar(identifier: .gregorian)
+        f.timeZone = TimeZone(secondsFromGMT: 0)
         f.dateFormat = "HH:mm:ss.SSS"
         return f
     }()

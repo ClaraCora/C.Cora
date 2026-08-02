@@ -250,7 +250,7 @@ func startLogCapture() {
 					continue
 				}
 				line := fmt.Sprintf("%s [%s] %s\n",
-					time.Now().Format("15:04:05.000"), elm.Type(), elm.Payload)
+					logTimestamp(), elm.Type(), elm.Payload)
 				logFileMu.Lock()
 				writeRunLogLine(f, line)
 				logFileMu.Unlock()
@@ -1647,8 +1647,11 @@ func appendRunLog(msg string) {
 		return
 	}
 	defer f.Close()
-	writeRunLogLine(f, fmt.Sprintf("%s [WRAP] %s\n",
-		time.Now().Format("15:04:05.000"), msg))
+	writeRunLogLine(f, fmt.Sprintf("%s [WRAP] %s\n", logTimestamp(), msg))
+}
+
+func logTimestamp() string {
+	return time.Now().UTC().Format("2006-01-02T15:04:05.000Z07:00")
 }
 
 func writeRunLogLine(file *os.File, line string) {

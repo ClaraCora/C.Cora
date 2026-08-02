@@ -33,6 +33,7 @@ struct ActiveConnection: Decodable, Identifiable, Sendable {
     let upload: Int64
     let download: Int64
     let start: String
+    let startDate: Date?
     let chains: [String]
     let rule: String
     let rulePayload: String
@@ -49,6 +50,7 @@ struct ActiveConnection: Decodable, Identifiable, Sendable {
         upload = values.lossyInt64(forKey: .upload)
         download = values.lossyInt64(forKey: .download)
         start = values.lossyString(forKey: .start)
+        startDate = Self.parseStartDate(start)
         chains = try values.decodeIfPresent([String].self, forKey: .chains) ?? []
         rule = values.lossyString(forKey: .rule)
         rulePayload = values.lossyString(forKey: .rulePayload)
@@ -68,6 +70,12 @@ struct ActiveConnection: Decodable, Identifiable, Sendable {
         joinedAddress(ip: metadata.sourceIP, port: metadata.sourcePort)
     }
 
+    var endpointText: String {
+        if sourceAddress.isEmpty { return destinationAddress }
+        if destinationAddress.isEmpty { return sourceAddress }
+        return "\(sourceAddress) → \(destinationAddress)"
+    }
+
     var routeText: String {
         chains.isEmpty ? "DIRECT" : chains.joined(separator: " → ")
     }
@@ -75,6 +83,29 @@ struct ActiveConnection: Decodable, Identifiable, Sendable {
     var ruleText: String {
         guard !rule.isEmpty else { return "" }
         return rulePayload.isEmpty ? rule : "\(rule) · \(rulePayload)"
+    }
+
+    var networkKey: String {
+        metadata.network.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    var networkLabel: String {
+        networkKey.isEmpty ? "IP" : networkKey.uppercased()
+    }
+
+    var transferred: Int64 {
+        upload + download
+    }
+
+    var durationText: String {
+        guard let startDate else { return "" }
+        let seconds = max(0, Int(Date().timeIntervalSince(startDate)))
+        if seconds < 60 { return "\(seconds) 秒" }
+        let minutes = seconds / 60
+        if minutes < 60 { return "\(minutes) 分钟" }
+        let hours = minutes / 60
+        if hours < 24 { return "\(hours) 小时 \(minutes % 60) 分" }
+        return "\(hours / 24) 天 \(hours % 24) 小时"
     }
 
     var searchableText: String {
@@ -88,6 +119,15 @@ struct ActiveConnection: Decodable, Identifiable, Sendable {
         guard !ip.isEmpty else { return "" }
         guard !port.isEmpty else { return ip }
         return ip.contains(":") ? "[\(ip)]:\(port)" : "\(ip):\(port)"
+    }
+
+    private static func parseStartDate(_ value: String) -> Date? {
+        guard !value.isEmpty else { return nil }
+        if let date = try? Date.ISO8601FormatStyle(includingFractionalSeconds: true)
+            .parse(value) {
+            return date
+        }
+        return try? Date.ISO8601FormatStyle().parse(value)
     }
 }
 

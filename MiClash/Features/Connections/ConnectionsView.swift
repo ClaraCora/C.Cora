@@ -5,14 +5,19 @@ struct ConnectionsView: View {
     @EnvironmentObject private var core: CoreStateManager
     @StateObject private var controller = ConnectionsController()
     @State private var searchText = ""
+    @State private var networkFilter: ConnectionNetworkFilter = .all
+    @State private var sortOrder: ConnectionSortOrder = .newest
     @State private var showingCloseAllConfirmation = false
 
     var body: some View {
         content
             .navigationTitle("活动连接")
             .navigationBarTitleDisplayMode(.inline)
-            .searchable(text: $searchText, prompt: "搜索目标、规则或链路")
+            .searchable(text: $searchText, prompt: "搜索目标、地址、规则或链路")
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    sortMenu
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         showingCloseAllConfirmation = true
@@ -60,55 +65,92 @@ struct ConnectionsView: View {
                 Button("重试") { Task { await controller.refresh() } }
             }
         } else {
-            connectionList
+            connectionWorkspace
         }
     }
 
-    private var connectionList: some View {
-        let visibleConnections = filteredConnections
-        return List {
-            Section {
-                ConnectionSummary(snapshot: controller.snapshot ?? ConnectionsSnapshot())
-                    .listRowInsets(EdgeInsets(top: 10, leading: 16, bottom: 10, trailing: 16))
+    private var connectionWorkspace: some View {
+        VStack(spacing: 0) {
+            ConnectionSummary(snapshot: controller.snapshot ?? ConnectionsSnapshot())
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+                .background(Color(uiColor: .secondarySystemBackground))
+
+            Divider()
+
+            HStack(spacing: 12) {
+                Picker("协议", selection: $networkFilter) {
+                    ForEach(ConnectionNetworkFilter.allCases) { filter in
+                        Text(filter.title).tag(filter)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                Text("\(filteredConnections.count) / \(connections.count)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .frame(minWidth: 44, alignment: .trailing)
             }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+            .background(Color(uiColor: .systemBackground))
+
+            Divider()
 
             if let error = controller.error {
-                Section {
-                    Label(error, systemImage: "exclamationmark.triangle.fill")
-                        .font(.footnote)
-                        .foregroundStyle(.orange)
-                        .listRowBackground(Color.orange.opacity(0.08))
-                }
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .font(.footnote)
+                    .foregroundStyle(.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+                    .background(Color.orange.opacity(0.08))
             }
 
-            Section {
-                if visibleConnections.isEmpty {
-                    if normalizedSearch.isEmpty {
-                        Label("暂无活动连接", systemImage: "network.slash")
-                            .foregroundStyle(.secondary)
-                    } else {
-                        ContentUnavailableView.search(text: searchText)
-                    }
+            if filteredConnections.isEmpty {
+                if normalizedSearch.isEmpty && networkFilter == .all {
+                    ContentUnavailableView("暂无活动连接", systemImage: "network.slash")
+                } else if !normalizedSearch.isEmpty {
+                    ContentUnavailableView.search(text: searchText)
                 } else {
-                    ForEach(visibleConnections) { connection in
-                        ConnectionRow(
-                            connection: connection,
-                            isClosing: controller.closingIDs.contains(connection.id))
-                            .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                                Button(role: .destructive) {
-                                    Task { await controller.close(connection) }
-                                } label: {
-                                    Label("关闭", systemImage: "xmark")
-                                }
-                            }
-                    }
+                    ContentUnavailableView("没有 \(networkFilter.title) 连接",
+                                           systemImage: "line.3.horizontal.decrease.circle")
                 }
-            } header: {
-                Text("连接 · \(visibleConnections.count)")
+            } else {
+                List(filteredConnections) { connection in
+                    ConnectionRow(
+                        connection: connection,
+                        isClosing: controller.closingIDs.contains(connection.id))
+                        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                            Button(role: .destructive) {
+                                Task { await controller.close(connection) }
+                            } label: {
+                                Label("关闭", systemImage: "xmark")
+                            }
+                        }
+                        .listRowInsets(EdgeInsets(top: 9, leading: 16,
+                                                  bottom: 9, trailing: 16))
+                }
+                .listStyle(.plain)
+                .refreshable { await controller.refresh(showLoading: false) }
             }
         }
-        .listStyle(.insetGrouped)
-        .refreshable { await controller.refresh(showLoading: false) }
+    }
+
+    private var sortMenu: some View {
+        Menu {
+            Picker("排序", selection: $sortOrder) {
+                ForEach(ConnectionSortOrder.allCases) { order in
+                    Label(order.title, systemImage: order.systemImage)
+                        .tag(order)
+                }
+            }
+        } label: {
+            Image(systemName: "arrow.up.arrow.down")
+        }
+        .disabled(connections.isEmpty)
+        .accessibilityLabel("连接排序：\(sortOrder.title)")
+        .help("连接排序")
     }
 
     private var connections: [ActiveConnection] {
@@ -121,26 +163,102 @@ struct ConnectionsView: View {
 
     private var filteredConnections: [ActiveConnection] {
         let query = normalizedSearch
-        let result = query.isEmpty
-            ? connections
-            : connections.filter { $0.searchableText.contains(query) }
-        return result
+        let filtered = connections.filter { connection in
+            networkFilter.matches(connection)
+                && (query.isEmpty || connection.searchableText.contains(query))
+        }
+        return filtered.sorted { lhs, rhs in
+            switch sortOrder {
+            case .newest:
+                return (lhs.startDate ?? .distantPast) > (rhs.startDate ?? .distantPast)
+            case .download:
+                return ordered(lhs.download, before: rhs.download, lhs: lhs, rhs: rhs)
+            case .upload:
+                return ordered(lhs.upload, before: rhs.upload, lhs: lhs, rhs: rhs)
+            case .total:
+                return ordered(lhs.transferred, before: rhs.transferred, lhs: lhs, rhs: rhs)
+            }
+        }
+    }
+
+    private func ordered(_ left: Int64, before right: Int64,
+                         lhs: ActiveConnection, rhs: ActiveConnection) -> Bool {
+        if left == right {
+            return (lhs.startDate ?? .distantPast) > (rhs.startDate ?? .distantPast)
+        }
+        return left > right
+    }
+}
+
+private enum ConnectionNetworkFilter: String, CaseIterable, Identifiable {
+    case all
+    case tcp
+    case udp
+
+    var id: Self { self }
+
+    var title: String {
+        switch self {
+        case .all: return "全部"
+        case .tcp: return "TCP"
+        case .udp: return "UDP"
+        }
+    }
+
+    func matches(_ connection: ActiveConnection) -> Bool {
+        self == .all || connection.networkKey == rawValue
+    }
+}
+
+private enum ConnectionSortOrder: String, CaseIterable, Identifiable {
+    case newest
+    case download
+    case upload
+    case total
+
+    var id: Self { self }
+
+    var title: String {
+        switch self {
+        case .newest: return "最新建立"
+        case .download: return "下载流量"
+        case .upload: return "上传流量"
+        case .total: return "总流量"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .newest: return "clock"
+        case .download: return "arrow.down"
+        case .upload: return "arrow.up"
+        case .total: return "sum"
+        }
     }
 }
 
 private struct ConnectionSummary: View {
     let snapshot: ConnectionsSnapshot
 
+    private var tcpCount: Int {
+        snapshot.connections.lazy.filter { $0.networkKey == "tcp" }.count
+    }
+
+    private var udpCount: Int {
+        snapshot.connections.lazy.filter { $0.networkKey == "udp" }.count
+    }
+
     var body: some View {
         HStack(spacing: 8) {
-            SummaryValue(title: "连接", value: String(snapshot.connections.count),
+            SummaryValue(title: "活动", value: String(snapshot.connections.count),
+                         detail: "TCP \(tcpCount) · UDP \(udpCount)",
                          systemImage: "link", tint: .green)
-            Divider().frame(height: 30)
+            Divider().frame(height: 42)
             SummaryValue(title: "下行", value: ByteFormat.size(snapshot.downloadTotal),
-                         systemImage: "arrow.down", tint: .blue)
-            Divider().frame(height: 30)
+                         detail: "累计", systemImage: "arrow.down", tint: .blue)
+            Divider().frame(height: 42)
             SummaryValue(title: "上行", value: ByteFormat.size(snapshot.uploadTotal),
-                         systemImage: "arrow.up", tint: .orange)
+                         detail: "累计", systemImage: "arrow.up", tint: .orange)
         }
         .accessibilityElement(children: .combine)
     }
@@ -149,28 +267,24 @@ private struct ConnectionSummary: View {
 private struct SummaryValue: View {
     let title: String
     let value: String
+    let detail: String
     let systemImage: String
     let tint: Color
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 5) {
-                Image(systemName: systemImage)
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(tint)
-                    .frame(width: 18, height: 18)
-                    .background(
-                        RoundedRectangle(cornerRadius: 5, style: .continuous)
-                            .fill(tint.opacity(0.12))
-                    )
-                Text(title)
-                    .font(.caption2.weight(.medium))
-                    .foregroundStyle(.secondary)
-            }
+        VStack(alignment: .leading, spacing: 3) {
+            Label(title, systemImage: systemImage)
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(tint)
             Text(value)
                 .font(.subheadline.monospacedDigit().weight(.semibold))
                 .lineLimit(1)
                 .minimumScaleFactor(0.7)
+            Text(detail)
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -181,48 +295,55 @@ private struct ConnectionRow: View {
     let isClosing: Bool
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            Text(connection.metadata.network.uppercased().isEmpty
-                 ? "IP" : connection.metadata.network.uppercased())
-                .font(.caption2.monospaced().weight(.bold))
-                .foregroundStyle(connection.metadata.network.lowercased() == "udp" ? .orange : .blue)
-                .frame(width: 34, height: 20)
-                .background(Capsule().fill(
-                    (connection.metadata.network.lowercased() == "udp" ? Color.orange : Color.blue)
-                        .opacity(0.12)))
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(connection.networkLabel)
+                    .font(.caption2.monospaced().weight(.bold))
+                    .foregroundStyle(networkTint)
+                    .padding(.horizontal, 6)
+                    .frame(height: 20)
+                    .background(Capsule().fill(networkTint.opacity(0.12)))
 
-            VStack(alignment: .leading, spacing: 4) {
                 Text(connection.destinationTitle)
-                    .font(.subheadline.weight(.medium))
+                    .font(.subheadline.weight(.semibold))
                     .lineLimit(1)
 
-                if !connection.destinationAddress.isEmpty,
-                   connection.destinationAddress != connection.destinationTitle {
-                    Text(connection.destinationAddress)
-                        .font(.caption.monospacedDigit())
+                Spacer(minLength: 8)
+
+                if isClosing {
+                    ProgressView().controlSize(.small)
+                } else if !connection.durationText.isEmpty {
+                    Label(connection.durationText, systemImage: "clock")
+                        .font(.caption2.monospacedDigit())
                         .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-
-                Label(connection.routeText, systemImage: "point.3.connected.trianglepath.dotted")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-
-                if !connection.ruleText.isEmpty {
-                    Text(connection.ruleText)
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
                         .lineLimit(1)
                 }
             }
 
-            Spacer(minLength: 6)
+            if !connection.endpointText.isEmpty {
+                Text(connection.endpointText)
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
 
-            if isClosing {
-                ProgressView().controlSize(.small)
-            } else {
-                VStack(alignment: .trailing, spacing: 4) {
+            Label(connection.routeText,
+                  systemImage: "point.3.connected.trianglepath.dotted")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                if !connection.ruleText.isEmpty {
+                    Label(connection.ruleText, systemImage: "arrow.triangle.branch")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 4)
+
+                HStack(spacing: 10) {
                     Label(ByteFormat.size(connection.download), systemImage: "arrow.down")
                         .foregroundStyle(.blue)
                     Label(ByteFormat.size(connection.upload), systemImage: "arrow.up")
@@ -230,9 +351,18 @@ private struct ConnectionRow: View {
                 }
                 .font(.caption2.monospacedDigit())
                 .labelStyle(.titleAndIcon)
+                .fixedSize(horizontal: true, vertical: false)
             }
         }
-        .padding(.vertical, 3)
+        .contentShape(Rectangle())
         .accessibilityElement(children: .combine)
+    }
+
+    private var networkTint: Color {
+        switch connection.networkKey {
+        case "udp": return .orange
+        case "tcp": return .blue
+        default: return .gray
+        }
     }
 }
