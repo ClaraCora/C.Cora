@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/metacubex/mihomo/component/dialer"
+	"github.com/metacubex/mihomo/config"
 	mdns "github.com/metacubex/mihomo/dns"
 	"gopkg.in/yaml.v3"
 )
@@ -58,10 +59,17 @@ func TestParseSystemDNSJSON(t *testing.T) {
 }
 
 func TestReplaceSystemNameServers(t *testing.T) {
-	servers := []mdns.NameServer{
-		{Net: "udp", Addr: "10.0.0.1:53"},
-		{Net: "https", Addr: "https://dns.example/dns-query"},
-		{Net: "udp", Addr: "[fe80::1%en0]:53"},
+	servers, err := mdns.ParseNameServer([]string{
+		"10.0.0.1",
+		"https://dns.example/dns-query",
+		"fe80::1%25en0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if servers[0].Net != "" || servers[2].Net != "" {
+		t.Fatalf("mihomo parsed UDP Net values as %q and %q, want empty strings",
+			servers[0].Net, servers[2].Net)
 	}
 	updated, replacements := replaceSystemNameServers(
 		servers,
@@ -71,9 +79,9 @@ func TestReplaceSystemNameServers(t *testing.T) {
 		t.Fatalf("replacements = %d, want 2", replacements)
 	}
 	want := []mdns.NameServer{
-		{Net: "udp", Addr: "192.168.1.1:53"},
-		{Net: "udp", Addr: "[fe80::2%en0]:53"},
-		{Net: "https", Addr: "https://dns.example/dns-query"},
+		{Addr: "192.168.1.1:53"},
+		{Addr: "[fe80::2%en0]:53"},
+		servers[1],
 	}
 	if len(updated) != len(want) {
 		t.Fatalf("updated = %+v, want %+v", updated, want)
@@ -89,24 +97,58 @@ func TestReplaceUnresolvedSystemNameServer(t *testing.T) {
 	updated, replacements := replaceSystemNameServers(
 		[]mdns.NameServer{{Net: "system"}}, nil, []string{"223.5.5.5"})
 	if replacements != 1 || len(updated) != 1 ||
-		updated[0].Net != "udp" || updated[0].Addr != "223.5.5.5:53" {
+		updated[0].Net != "" || updated[0].Addr != "223.5.5.5:53" {
 		t.Fatalf("updated = %+v, replacements = %d", updated, replacements)
 	}
 }
 
+func TestReplaceActiveSystemDNSKeepsOldDNSOnMismatch(t *testing.T) {
+	previousConfig := activeDNSConfig
+	previousSystemDNS := append([]string(nil), activeSystemDNS...)
+	previousUsesSystemDNS := activeUsesSystemDNS
+	defer func() {
+		activeDNSConfig = previousConfig
+		activeSystemDNS = previousSystemDNS
+		activeUsesSystemDNS = previousUsesSystemDNS
+	}()
+
+	activeDNSConfig = &config.DNS{
+		NameServer: []mdns.NameServer{{Net: "https", Addr: "https://dns.example/dns-query"}},
+	}
+	activeSystemDNS = []string{"10.0.0.1"}
+	activeUsesSystemDNS = true
+
+	updated, replacements := replaceActiveSystemDNSLocked([]string{"192.168.1.1"})
+	if updated || replacements != 0 {
+		t.Fatalf("updated = %v, replacements = %d", updated, replacements)
+	}
+	if !equalStringSlices(activeSystemDNS, []string{"10.0.0.1"}) {
+		t.Fatalf("activeSystemDNS advanced after mismatch: %v", activeSystemDNS)
+	}
+}
+
 func TestDNSConfigUsesSystem(t *testing.T) {
-	if !dnsConfigUsesSystem(map[string]any{
-		"nameserver-policy": map[string]any{
-			"+.qpic.cn": []any{"system"},
-		},
-	}) {
-		t.Fatal("nameserver policy using system was not detected")
+	for _, notation := range []string{"system", "system://", "dhcp://system"} {
+		if !dnsConfigUsesSystem(map[string]any{
+			"nameserver-policy": map[string]any{
+				"+.qpic.cn": []any{notation},
+			},
+		}) {
+			t.Errorf("nameserver policy using %q was not detected", notation)
+		}
 	}
 	if dnsConfigUsesSystem(map[string]any{
 		"nameserver":     []any{"https://223.5.5.5/dns-query"},
 		"fake-ip-filter": []any{"system"},
 	}) {
 		t.Fatal("unrelated DNS field was treated as a system nameserver")
+	}
+}
+
+func TestSystemDNSToAnyListEscapesIPv6Zone(t *testing.T) {
+	values := systemDNSToAnyList([]string{"192.168.1.1", "fe80::1%en0"})
+	if len(values) != 2 || values[0] != "192.168.1.1" || values[1] != "fe80::1%25en0" {
+		t.Fatalf("systemDNSToAnyList = %v", values)
 	}
 }
 

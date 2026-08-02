@@ -783,9 +783,9 @@ func replaceSystemNameserver(value any, system []string, field string) any {
 		return value
 	}
 	if s, ok := value.(string); ok {
-		if strings.EqualFold(strings.TrimSpace(s), "system") {
+		if isSystemDNSValue(s) {
 			appendRunLog("dns." + field + " 的 system 已替换为 " + strings.Join(system, ","))
-			return stringsToAnyList(system)
+			return systemDNSToAnyList(system)
 		}
 		return value
 	}
@@ -795,9 +795,9 @@ func replaceSystemNameserver(value any, system []string, field string) any {
 	}
 	out := make([]any, 0, len(list))
 	for _, item := range list {
-		if s, ok := item.(string); ok && strings.EqualFold(strings.TrimSpace(s), "system") {
+		if s, ok := item.(string); ok && isSystemDNSValue(s) {
 			appendRunLog("dns." + field + " 的 system 已替换为 " + strings.Join(system, ","))
-			out = append(out, stringsToAnyList(system)...)
+			out = append(out, systemDNSToAnyList(system)...)
 			continue
 		}
 		out = append(out, item)
@@ -829,7 +829,7 @@ func dnsConfigUsesSystem(dnsConfig map[string]any) bool {
 func valueUsesSystemDNS(value any) bool {
 	switch typed := value.(type) {
 	case string:
-		return strings.EqualFold(strings.TrimSpace(typed), "system")
+		return isSystemDNSValue(typed)
 	case []any:
 		for _, item := range typed {
 			if valueUsesSystemDNS(item) {
@@ -840,10 +840,21 @@ func valueUsesSystemDNS(value any) bool {
 	return false
 }
 
-func stringsToAnyList(ss []string) []any {
+func isSystemDNSValue(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "system", "system://", "dhcp://system":
+		return true
+	default:
+		return false
+	}
+}
+
+func systemDNSToAnyList(ss []string) []any {
 	out := make([]any, 0, len(ss))
 	for _, s := range ss {
-		out = append(out, s)
+		// mihomo parses nameservers as URLs. Encode the '%' introducing an
+		// IPv6 zone so url.Parse turns %25en0 back into the runtime form %en0.
+		out = append(out, strings.ReplaceAll(s, "%", "%25"))
 	}
 	return out
 }
@@ -1374,6 +1385,9 @@ func NotifyNetworkChange(name string, systemDNSJSON string) error {
 			rebuildDNSResolverLocked(activeDNSConfig, activeGeneralIPv6)
 			appendRunLog(fmt.Sprintf("system DNS 已按接口 %s 更新为 %s（替换 %d 处）",
 				name, strings.Join(newSystemDNS, ","), replacements))
+		} else if activeUsesSystemDNS {
+			appendRunLog(fmt.Sprintf("接口 %s 已读取到新的 system DNS %s，但未匹配到运行中的旧 DNS；保留旧 DNS 等待下次刷新",
+				name, strings.Join(newSystemDNS, ",")))
 		} else {
 			appendRunLog(fmt.Sprintf("接口 %s 的 system DNS 已更新为 %s，当前配置未引用 system",
 				name, strings.Join(newSystemDNS, ",")))
@@ -1447,10 +1461,10 @@ func replaceActiveSystemDNSLocked(newSystemDNS []string) (bool, int) {
 	updated.ProxyServerPolicy, replacements = replaceSystemPolicies(
 		activeDNSConfig.ProxyServerPolicy, activeSystemDNS, newSystemDNS, replacements)
 
-	activeSystemDNS = append(activeSystemDNS[:0], newSystemDNS...)
 	if replacements == 0 {
 		return false, 0
 	}
+	activeSystemDNS = append(activeSystemDNS[:0], newSystemDNS...)
 	activeDNSConfig = &updated
 	return true, replacements
 }
@@ -1488,7 +1502,8 @@ func replaceSystemNameServers(servers []mdns.NameServer, oldSystemDNS,
 		inserted = true
 		for _, address := range newSystemDNS {
 			replacement := server
-			replacement.Net = "udp"
+			// mihomo uses an empty Net value for its canonical UDP nameserver.
+			replacement.Net = ""
 			replacement.Addr = systemNameServerAddress(address)
 			updated = appendUniqueNameServer(updated, replacement)
 		}
@@ -1500,7 +1515,9 @@ func isInjectedSystemNameServer(server mdns.NameServer, oldSystemDNS []string) b
 	if server.Net == "system" {
 		return true
 	}
-	if server.Net != "udp" {
+	// Parsed udp:// nameservers use an empty Net value. Accept "udp" too for
+	// callers that construct NameServer values directly.
+	if server.Net != "" && server.Net != "udp" {
 		return false
 	}
 	for _, address := range oldSystemDNS {
