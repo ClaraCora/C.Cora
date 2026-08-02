@@ -3,6 +3,7 @@
 #include <resolv.h>
 #include <arpa/inet.h>
 #include <dlfcn.h>
+#include <ifaddrs.h>
 #include <net/if.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -199,5 +200,55 @@ int miclash_copy_scoped_dns(const char *interfaceName,
             interfaceIndex, out, stride, maxCount, 0);
     }
     freeConfiguration(configuration);
+    return written;
+}
+
+static int miclash_is_usable_interface_address(const struct sockaddr *address) {
+    if (address == NULL) return 0;
+    if (address->sa_family == AF_INET) {
+        const struct sockaddr_in *v4 = (const struct sockaddr_in *)address;
+        uint32_t value = ntohl(v4->sin_addr.s_addr);
+        return value != INADDR_ANY && !IN_MULTICAST(value) &&
+               (value >> 24) != IN_LOOPBACKNET;
+    }
+    if (address->sa_family == AF_INET6) {
+        const struct sockaddr_in6 *v6 = (const struct sockaddr_in6 *)address;
+        return !IN6_IS_ADDR_UNSPECIFIED(&v6->sin6_addr) &&
+               !IN6_IS_ADDR_MULTICAST(&v6->sin6_addr) &&
+               !IN6_IS_ADDR_LOOPBACK(&v6->sin6_addr) &&
+               !IN6_IS_ADDR_LINKLOCAL(&v6->sin6_addr);
+    }
+    return 0;
+}
+
+int miclash_copy_interface_addresses(const char *interfaceName,
+                                     char *out, int stride, int maxCount) {
+    if (interfaceName == NULL || interfaceName[0] == '\0' || out == NULL ||
+        stride <= 0 || maxCount <= 0) return 0;
+
+    struct ifaddrs *interfaces = NULL;
+    if (getifaddrs(&interfaces) != 0 || interfaces == NULL) return 0;
+
+    unsigned int interfaceIndex = if_nametoindex(interfaceName);
+    int written = 0;
+    for (struct ifaddrs *entry = interfaces;
+         entry != NULL && written < maxCount; entry = entry->ifa_next) {
+        if (entry->ifa_name == NULL ||
+            strcmp(entry->ifa_name, interfaceName) != 0 ||
+            !miclash_is_usable_interface_address(entry->ifa_addr)) {
+            continue;
+        }
+
+        char candidate[128] = {0};
+        if (!miclash_write_sockaddr(entry->ifa_addr, interfaceIndex,
+                                    candidate, (int)sizeof(candidate)) ||
+            miclash_contains_address(out, stride, written, candidate)) {
+            continue;
+        }
+        if (snprintf(out + written * stride, (size_t)stride, "%s", candidate) < stride) {
+            written++;
+        }
+    }
+    freeifaddrs(interfaces);
     return written;
 }

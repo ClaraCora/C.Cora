@@ -12,7 +12,7 @@ import Foundation
 enum SystemDNS {
     /// IPv6 link-local DNS 还需附带 `%en0` 之类的 scope，因此比 INET6_ADDRSTRLEN 更宽。
     private static let stride = 64
-    private static let maxCount = 8
+    private static let maxCount = 16
 
     /// 当前主接口的 DNS 服务器地址（IPv4/IPv6 字面量）。
     ///
@@ -31,6 +31,17 @@ enum SystemDNS {
         return readServers { buffer in
             interfaceName.withCString { name in
                 miclash_copy_scoped_dns(name, buffer, Int32(stride), Int32(maxCount))
+            }
+        }
+    }
+
+    /// 当前物理接口实际持有的单播地址，用于区分重复路径回调和同名接口下的真实换网。
+    static func interfaceAddresses(for interfaceName: String) -> [String] {
+        guard !interfaceName.isEmpty else { return [] }
+        return readServers { buffer in
+            interfaceName.withCString { name in
+                miclash_copy_interface_addresses(
+                    name, buffer, Int32(stride), Int32(maxCount))
             }
         }
     }

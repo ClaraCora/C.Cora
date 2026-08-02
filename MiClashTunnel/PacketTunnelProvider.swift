@@ -66,16 +66,24 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         guard !servers.isEmpty else { return false }
         systemDNSLock.lock()
         defer { systemDNSLock.unlock() }
-        guard servers != systemDNSServers else { return false }
+        // dns_configuration_copy 的 resolver 顺序偶尔会抖动；相同地址集合不算 DNS 变化。
+        guard Set(servers) != Set(systemDNSServers) else { return false }
         systemDNSServers = servers
         return true
     }
 
     // 物理接口监控：把真实出站接口（en0/pdp_ip0）显式喂给内核，取代 mihomo 自带的不可靠监控。
+    private struct PhysicalPathSnapshot {
+        let interfaceName: String
+        let addresses: Set<String>
+        let supportsIPv4: Bool
+        let supportsIPv6: Bool
+    }
+
     private var pathMonitor: NWPathMonitor?
     private let pathMonitorQueue = DispatchQueue(label: "com.miclash.tunnel.pathmonitor", qos: .utility)
     private var pendingPathUpdate: DispatchWorkItem?
-    private var lastInterfaceName: String?
+    private var lastPhysicalPath: PhysicalPathSnapshot?
     private var hasAppliedPhysicalPath = false
     private var lastPathWasSatisfied: Bool?
 
@@ -313,7 +321,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         pendingPathUpdate = nil
         pathMonitor?.cancel()
         pathMonitor = nil
-        lastInterfaceName = nil
+        lastPhysicalPath = nil
         hasAppliedPhysicalPath = false
         lastPathWasSatisfied = nil
     }
@@ -342,14 +350,35 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         }
 
         guard let iface = activePhysicalInterface(from: path) else {
-            FileLog.write("物理网络已满足，但未找到实际使用的接口")
-            lastPathWasSatisfied = true
+            if lastPathWasSatisfied != false {
+                FileLog.write("物理网络已满足，但未找到实际使用的接口，等待下一次路径更新")
+            }
+            lastPathWasSatisfied = false
             return
         }
 
-        let previous = lastInterfaceName
+        let previous = lastPhysicalPath
         let isInitialPath = !hasAppliedPhysicalPath
-        lastInterfaceName = iface.name
+        let wasUnavailable = lastPathWasSatisfied == false
+        let sampledAddresses = Set(SystemDNS.interfaceAddresses(for: iface.name))
+        let addresses = stabilizedAddresses(
+            sampledAddresses, previous: previous, path: path)
+        let snapshot = PhysicalPathSnapshot(
+            interfaceName: iface.name,
+            addresses: addresses,
+            supportsIPv4: path.supportsIPv4,
+            supportsIPv6: path.supportsIPv6)
+
+        let scopedDNS = SystemDNS.excludingTunnel(
+            SystemDNS.scopedServers(for: iface.name))
+        let dnsChanged = updateSystemDNSServers(scopedDNS)
+        if dnsChanged {
+            FileLog.write("物理接口 \(iface.name) scoped DNS = \(scopedDNS)")
+        } else if scopedDNS.isEmpty && (isInitialPath || wasUnavailable) {
+            FileLog.write("物理接口 \(iface.name) 未读取到 scoped DNS，沿用现有 system DNS")
+        }
+
+        lastPhysicalPath = snapshot
         lastPathWasSatisfied = true
         hasAppliedPhysicalPath = true
 
@@ -357,30 +386,95 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             FileLog.write("初始出站接口 = \(iface.name)")
             // 内核启动与首个 NWPath 回调之间可能已经建立了 DNS/健康检查连接；
             // 首次也执行完整刷新，避免这些连接留在未绑定或错误接口上。
-            notifyNetworkChange(interfaceName: iface.name)
-        } else {
-            let transition = previous == iface.name
-                ? "\(iface.name) 路径恢复/属性变化"
-                : "\(previous ?? "未知") -> \(iface.name)"
-            FileLog.write("物理网络变化：\(transition)，重置旧连接")
-            notifyNetworkChange(interfaceName: iface.name)
+            notifyNetworkChange(
+                interfaceName: iface.name,
+                reason: "初始物理路径",
+                resetConnections: true)
+            return
         }
+
+        var reasons: [String] = []
+        var resetConnections = false
+        if previous?.interfaceName != iface.name {
+            reasons.append("出站接口变化")
+            resetConnections = true
+        }
+        if wasUnavailable {
+            reasons.append("网络路径恢复")
+            resetConnections = true
+        }
+        if let previous,
+           addressFamilyWasReplaced(previous.addresses, snapshot.addresses) {
+            reasons.append("接口地址变化")
+            resetConnections = true
+        }
+        if let previous,
+           previous.supportsIPv4 != snapshot.supportsIPv4 ||
+           previous.supportsIPv6 != snapshot.supportsIPv6 {
+            reasons.append("IP 协议可用性变化")
+            resetConnections = true
+        }
+        if dnsChanged {
+            reasons.append("system DNS 变化")
+        }
+
+        // NWPathMonitor 也会为 expensive/constrained 等无关属性发回调。
+        // 没有上述有效差异时不通知内核，更不能关闭仍然可用的连接。
+        guard !reasons.isEmpty else { return }
+        let reason = reasons.joined(separator: "、")
+        FileLog.write(resetConnections
+            ? "物理网络需要刷新：\(reason)"
+            : "物理网络 DNS 刷新：\(reason)，保留活动连接")
+        notifyNetworkChange(
+            interfaceName: iface.name,
+            reason: reason,
+            resetConnections: resetConnections)
     }
 
-    private func notifyNetworkChange(interfaceName: String) {
-        let scoped = SystemDNS.excludingTunnel(
-            SystemDNS.scopedServers(for: interfaceName))
-        if updateSystemDNSServers(scoped) {
-            FileLog.write("物理接口 \(interfaceName) scoped DNS = \(scoped)")
-        } else if scoped.isEmpty {
-            FileLog.write("物理接口 \(interfaceName) 未读取到 scoped DNS，沿用现有 system DNS")
+    private func stabilizedAddresses(
+        _ sampled: Set<String>,
+        previous: PhysicalPathSnapshot?,
+        path: Network.NWPath
+    ) -> Set<String> {
+        guard let previous else { return sampled }
+        var result = sampled
+        let sampledIPv4 = sampled.filter { !$0.contains(":") }
+        let sampledIPv6 = sampled.filter { $0.contains(":") }
+        // getifaddrs 与 NWPath 更新不是原子的。短暂读空时沿用该地址族的上一份值，
+        // 避免先把基线清空、随后又漏掉真正的地址替换。
+        if path.supportsIPv4 && sampledIPv4.isEmpty {
+            result.formUnion(previous.addresses.filter { !$0.contains(":") })
         }
+        if path.supportsIPv6 && sampledIPv6.isEmpty {
+            result.formUnion(previous.addresses.filter { $0.contains(":") })
+        }
+        return result
+    }
 
+    private func addressFamilyWasReplaced(
+        _ previous: Set<String>, _ current: Set<String>
+    ) -> Bool {
+        for isIPv6 in [false, true] {
+            let oldFamily = Set(previous.filter { $0.contains(":") == isIPv6 })
+            let newFamily = Set(current.filter { $0.contains(":") == isIPv6 })
+            if !oldFamily.isEmpty && !newFamily.isEmpty && oldFamily.isDisjoint(with: newFamily) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func notifyNetworkChange(
+        interfaceName: String,
+        reason: String,
+        resetConnections: Bool
+    ) {
         let servers = currentSystemDNSServers()
         let data = try? JSONSerialization.data(withJSONObject: servers)
         let json = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
         var updateError: NSError?
-        let ok = MihomoNotifyNetworkChange(interfaceName, json, &updateError)
+        let ok = MihomoNotifyNetworkChange(
+            interfaceName, json, reason, resetConnections, &updateError)
         if !ok {
             FileLog.write("刷新物理接口/DNS 失败："
                 + (updateError?.localizedDescription ?? "未知错误"))

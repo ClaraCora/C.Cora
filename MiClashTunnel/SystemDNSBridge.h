@@ -17,4 +17,9 @@ int miclash_copy_system_dns(char *out, int stride, int maxCount);
 int miclash_copy_scoped_dns(const char *interfaceName,
                             char *out, int stride, int maxCount);
 
+/// Read routable unicast IPv4/IPv6 addresses assigned to interfaceName.
+/// Returns the number of addresses written.
+int miclash_copy_interface_addresses(const char *interfaceName,
+                                     char *out, int stride, int maxCount);
+
 #endif /* SYSTEM_DNS_BRIDGE_H */

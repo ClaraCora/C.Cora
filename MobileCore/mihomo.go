@@ -1362,13 +1362,18 @@ func SetDefaultInterface(name string) {
 	appendRunLog("默认出站接口 = " + name)
 }
 
-// NotifyNetworkChange refreshes the physical interface and the scoped system
-// DNS servers as one operation. systemDNSJSON is a JSON string array captured
-// by the Network Extension for the new physical interface.
-func NotifyNetworkChange(name string, systemDNSJSON string) error {
+// NotifyNetworkChange refreshes the physical interface and scoped system DNS.
+// resetConnections is true only when the old transport path is no longer safe;
+// a DNS-only refresh rebuilds the resolver without interrupting app connections.
+func NotifyNetworkChange(name string, systemDNSJSON string, reason string,
+	resetConnections bool) error {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return nil
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "网络状态变化"
 	}
 	newSystemDNS, dnsErr := parseSystemDNSJSON(systemDNSJSON)
 	configApplyMu.Lock()
@@ -1376,13 +1381,18 @@ func NotifyNetworkChange(name string, systemDNSJSON string) error {
 	storePhysicalInterface(name)
 	previous := dialer.DefaultInterface.Load()
 	dialer.DefaultInterface.Store(name)
-	iface.FlushCache()
+	resetConnections = networkChangeRequiresReset(previous, name, resetConnections)
+	if resetConnections {
+		iface.FlushCache()
+	}
 
+	resolverUpdated := false
 	if dnsErr == nil && len(newSystemDNS) > 0 &&
 		!equalStringSlices(newSystemDNS, activeSystemDNS) {
 		updated, replacements := replaceActiveSystemDNSLocked(newSystemDNS)
 		if updated {
 			rebuildDNSResolverLocked(activeDNSConfig, activeGeneralIPv6)
+			resolverUpdated = true
 			appendRunLog(fmt.Sprintf("system DNS 已按接口 %s 更新为 %s（替换 %d 处）",
 				name, strings.Join(newSystemDNS, ","), replacements))
 		} else if activeUsesSystemDNS {
@@ -1393,20 +1403,35 @@ func NotifyNetworkChange(name string, systemDNSJSON string) error {
 				name, strings.Join(newSystemDNS, ",")))
 		}
 	}
-	resolver.ResetConnection()
+	if resolverUpdated || resetConnections {
+		resolver.ResetConnection()
+	}
 
-	closed := 0
-	statistic.DefaultManager.Range(func(connection statistic.Tracker) bool {
-		_ = connection.Close()
-		closed++
-		return true
-	})
-	appendRunLog(fmt.Sprintf("网络路径变化：%s -> %s，已关闭 %d 条旧连接",
-		previous, name, closed))
+	if resetConnections {
+		closed := 0
+		statistic.DefaultManager.Range(func(connection statistic.Tracker) bool {
+			_ = connection.Close()
+			closed++
+			return true
+		})
+		path := name
+		if previous != "" && previous != name {
+			path = previous + " -> " + name
+		}
+		appendRunLog(fmt.Sprintf("网络路径刷新（%s）：%s，已关闭 %d 条旧连接",
+			reason, path, closed))
+	} else {
+		appendRunLog(fmt.Sprintf("网络状态刷新（%s）：接口 %s，未关闭活动连接",
+			reason, name))
+	}
 	if dnsErr != nil {
 		appendRunLog("忽略无效的 scoped system DNS: " + dnsErr.Error())
 	}
 	return dnsErr
+}
+
+func networkChangeRequiresReset(previous, current string, requested bool) bool {
+	return requested || previous != current
 }
 
 func parseSystemDNSJSON(raw string) ([]string, error) {

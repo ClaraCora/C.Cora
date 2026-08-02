@@ -29,18 +29,41 @@ func TestNetworkInterfaceUpdates(t *testing.T) {
 		t.Fatalf("physical interface stored %q, want en0", got)
 	}
 
-	if err := NotifyNetworkChange("pdp_ip0", ""); err != nil {
+	if err := NotifyNetworkChange("pdp_ip0", "", "test", true); err != nil {
 		t.Fatal(err)
 	}
 	if got := dialer.DefaultInterface.Load(); got != "pdp_ip0" {
 		t.Fatalf("NotifyNetworkChange stored %q, want pdp_ip0", got)
 	}
 
-	if err := NotifyNetworkChange("   ", ""); err != nil {
+	if err := NotifyNetworkChange("   ", "", "test", false); err != nil {
 		t.Fatal(err)
 	}
 	if got := dialer.DefaultInterface.Load(); got != "pdp_ip0" {
 		t.Fatalf("empty network update changed interface to %q", got)
+	}
+}
+
+func TestNetworkChangeRequiresReset(t *testing.T) {
+	tests := []struct {
+		name      string
+		previous  string
+		current   string
+		requested bool
+		want      bool
+	}{
+		{name: "duplicate path callback", previous: "en0", current: "en0", want: false},
+		{name: "explicit address change", previous: "en0", current: "en0", requested: true, want: true},
+		{name: "interface change", previous: "en0", current: "pdp_ip0", want: true},
+		{name: "initial binding", current: "en0", want: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := networkChangeRequiresReset(
+				test.previous, test.current, test.requested); got != test.want {
+				t.Fatalf("networkChangeRequiresReset() = %v, want %v", got, test.want)
+			}
+		})
 	}
 }
 
