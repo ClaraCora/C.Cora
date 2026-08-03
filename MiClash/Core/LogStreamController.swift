@@ -122,18 +122,25 @@ final class LogStreamController: ObservableObject {
 
     private func append(_ new: [LogLine]) {
         guard !new.isEmpty else { return }
+        let previousCount = rawLines.count
         rawLines.append(contentsOf: new)
-        if rawLines.count > maxLines { rawLines.removeFirst(rawLines.count - maxLines) }
+        let overflow = max(0, rawLines.count - maxLines)
+        let droppedIDs = overflow > 0
+            ? Set(rawLines.prefix(overflow).map(\.id))
+            : Set<UUID>()
+        if overflow > 0 { rawLines.removeFirst(overflow) }
         // 一批数据只修改一次 Published 数组，避免每条日志触发一次整页刷新。
         let minRank = Self.rank(level)
         let q = searchText.trimmingCharacters(in: .whitespaces).lowercased()
-        let accepted = new.filter {
+        let droppedFromNew = max(0, overflow - previousCount)
+        let accepted = new.dropFirst(min(droppedFromNew, new.count)).filter {
             Self.rank($0.type) >= minRank
                 && (q.isEmpty || $0.payload.lowercased().contains(q))
         }
         var updated = display.lines
-        let retainedIDs = Set(rawLines.map(\.id))
-        updated.removeAll { !retainedIDs.contains($0.id) }
+        if !droppedIDs.isEmpty {
+            updated.removeAll { droppedIDs.contains($0.id) }
+        }
         updated.append(contentsOf: accepted)
         if updated.count > maxLines { updated.removeFirst(updated.count - maxLines) }
         display = LogDisplayState(lines: updated, bufferedLineCount: rawLines.count)

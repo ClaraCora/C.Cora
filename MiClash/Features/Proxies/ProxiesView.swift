@@ -319,8 +319,9 @@ struct ProxiesView: View {
     }
 
     private var configurationName: String {
-        guard SubscriptionStore.shared.activeYAML != nil else { return "直连配置" }
-        return SubscriptionStore.shared.selected?.name ?? "当前配置"
+        guard let selected = SubscriptionStore.shared.selected,
+              !selected.yaml.isEmpty else { return "直连配置" }
+        return selected.name
     }
 
     private func reloadConfiguration() async {

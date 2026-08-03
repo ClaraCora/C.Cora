@@ -70,7 +70,10 @@ struct ConnectionsView: View {
     }
 
     private var connectionWorkspace: some View {
-        VStack(spacing: 0) {
+        let visibleConnections = filteredConnections
+        let allConnections = connections
+
+        return VStack(spacing: 0) {
             ConnectionSummary(snapshot: controller.snapshot ?? ConnectionsSnapshot())
                 .padding(.horizontal, 16)
                 .padding(.vertical, 10)
@@ -86,7 +89,7 @@ struct ConnectionsView: View {
                 }
                 .pickerStyle(.segmented)
 
-                Text("\(filteredConnections.count) / \(connections.count)")
+                Text("\(visibleConnections.count) / \(allConnections.count)")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
                     .frame(minWidth: 44, alignment: .trailing)
@@ -107,7 +110,7 @@ struct ConnectionsView: View {
                     .background(Color.orange.opacity(0.08))
             }
 
-            if filteredConnections.isEmpty {
+            if visibleConnections.isEmpty {
                 if normalizedSearch.isEmpty && networkFilter == .all {
                     ContentUnavailableView("暂无活动连接", systemImage: "network.slash")
                 } else if !normalizedSearch.isEmpty {
@@ -117,7 +120,7 @@ struct ConnectionsView: View {
                                            systemImage: "line.3.horizontal.decrease.circle")
                 }
             } else {
-                List(filteredConnections) { connection in
+                List(visibleConnections) { connection in
                     ConnectionRow(
                         connection: connection,
                         isClosing: controller.closingIDs.contains(connection.id))
@@ -167,6 +170,7 @@ struct ConnectionsView: View {
             networkFilter.matches(connection)
                 && (query.isEmpty || connection.searchableText.contains(query))
         }
+        if sortOrder == .newest { return filtered }
         return filtered.sorted { lhs, rhs in
             switch sortOrder {
             case .newest:
@@ -240,18 +244,10 @@ private enum ConnectionSortOrder: String, CaseIterable, Identifiable {
 private struct ConnectionSummary: View {
     let snapshot: ConnectionsSnapshot
 
-    private var tcpCount: Int {
-        snapshot.connections.lazy.filter { $0.networkKey == "tcp" }.count
-    }
-
-    private var udpCount: Int {
-        snapshot.connections.lazy.filter { $0.networkKey == "udp" }.count
-    }
-
     var body: some View {
         HStack(spacing: 8) {
             SummaryValue(title: "活动", value: String(snapshot.connections.count),
-                         detail: "TCP \(tcpCount) · UDP \(udpCount)",
+                         detail: "TCP \(snapshot.tcpCount) · UDP \(snapshot.udpCount)",
                          systemImage: "link", tint: .green)
             Divider().frame(height: 42)
             SummaryValue(title: "下行", value: ByteFormat.size(snapshot.downloadTotal),

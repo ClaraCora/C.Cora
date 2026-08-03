@@ -66,6 +66,8 @@ var (
 	homeDir       string
 	logCaptureMu  sync.Once
 	logFileMu     sync.Mutex
+	runLogFile    *os.File
+	runLogBytes   int64 = -1
 	configApplyMu sync.Mutex
 	interfaceMu   sync.RWMutex
 	physicalIface string
@@ -240,9 +242,26 @@ func startLogCapture() {
 		if err != nil {
 			return
 		}
+		logFileMu.Lock()
+		runLogFile = f
+		if info, statErr := f.Stat(); statErr == nil {
+			runLogBytes = info.Size()
+		} else {
+			runLogBytes = -1
+		}
+		_, _ = f.Seek(0, io.SeekEnd)
+		logFileMu.Unlock()
 		sub := log.Subscribe()
 		go func() {
-			defer f.Close()
+			defer func() {
+				logFileMu.Lock()
+				if runLogFile == f {
+					runLogFile = nil
+					runLogBytes = -1
+				}
+				_ = f.Close()
+				logFileMu.Unlock()
+			}()
 			for elm := range sub {
 				// 总线收所有级别（mihomo 的 logCh 无条件推送），这里按配置级别过滤，
 				// 让 run.log 以「设置里的日志级别」为天花板——复刻 print 的 `< Level()` 逻辑。
@@ -353,15 +372,21 @@ func ResolveGeoDownloadURLs(configYAML string, settingsJSON string) string {
 }
 
 func resolveGeoDownloadURLs(configYAML string, st appSettings) geoDownloadURLs {
+	m := map[string]any{}
+	if strings.TrimSpace(configYAML) != "" {
+		_ = yaml.Unmarshal([]byte(configYAML), &m)
+	}
+	return resolveGeoDownloadURLsFromMap(m, st)
+}
+
+// mergeConfig 已经解析过完整 YAML，复用该映射避免大订阅在一次配置应用中
+// 为 GEO URL 与规则依赖扫描再次执行 yaml.Unmarshal。
+func resolveGeoDownloadURLsFromMap(m map[string]any, st appSettings) geoDownloadURLs {
 	resolved := geoDownloadURLs{
 		GeoIP:   st.GeoIPDatURL,
 		MMDB:    st.GeoMMDBURL,
 		GeoSite: st.GeoSiteURL,
 		ASN:     defaultASNURL,
-	}
-	m := map[string]any{}
-	if strings.TrimSpace(configYAML) != "" {
-		_ = yaml.Unmarshal([]byte(configYAML), &m)
 	}
 	if urls, ok := m["geox-url"].(map[string]any); ok {
 		if value := stringValue(urls["geoip"]); value != "" {
@@ -377,8 +402,9 @@ func resolveGeoDownloadURLs(configYAML string, st appSettings) geoDownloadURLs {
 			resolved.ASN = value
 		}
 	}
-	resolved.GeoRequired = rulesUseGeo(m["rules"]) || rulesUseGeo(m["sub-rules"]) || rulesUseGeo(m["dns"])
-	resolved.ASNRequired = resolved.ASNRequired || rulesUseASN(m["rules"]) || rulesUseASN(m["sub-rules"])
+	requirements := configRuleRequirements(m)
+	resolved.GeoRequired = requirements.geo
+	resolved.ASNRequired = requirements.asn
 	return resolved
 }
 
@@ -388,38 +414,54 @@ func stringValue(value any) string {
 }
 
 func rulesUseASN(value any) bool {
-	switch typed := value.(type) {
-	case string:
-		u := strings.ToUpper(strings.TrimSpace(typed))
-		return strings.Contains(u, "IP-ASN,") || strings.Contains(u, "SRC-IP-ASN,")
-	case []any:
-		for _, item := range typed {
-			if rulesUseASN(item) {
-				return true
-			}
-		}
-	case map[string]any:
-		for _, item := range typed {
-			if rulesUseASN(item) {
-				return true
-			}
-		}
-	}
-	return false
+	return inspectRuleRequirements(value).asn
 }
 
 func rulesUseGeo(value any) bool {
+	return inspectRuleRequirements(value).geo
+}
+
+type ruleRequirements struct {
+	geo bool
+	asn bool
+}
+
+func configRuleRequirements(config map[string]any) ruleRequirements {
+	result := ruleRequirements{}
+	for _, value := range []any{config["rules"], config["sub-rules"]} {
+		result.merge(inspectRuleRequirements(value))
+		if result.geo && result.asn {
+			break
+		}
+	}
+	// DNS 配置只会引用 GEO 数据；ASN 需求保持仅由 rules/sub-rules 决定。
+	if !result.geo {
+		result.geo = inspectRuleRequirements(config["dns"]).geo
+	}
+	return result
+}
+
+func (r *ruleRequirements) merge(other ruleRequirements) {
+	r.geo = r.geo || other.geo
+	r.asn = r.asn || other.asn
+}
+
+// GEO 与 ASN 依赖共享一次递归扫描，避免数千条规则被分别大写化和遍历。
+func inspectRuleRequirements(value any) ruleRequirements {
+	result := ruleRequirements{}
 	switch typed := value.(type) {
 	case string:
 		u := strings.ToUpper(strings.TrimSpace(typed))
-		return strings.Contains(u, "GEOIP,") ||
+		result.geo = strings.Contains(u, "GEOIP,") ||
 			strings.Contains(u, "GEOSITE,") ||
 			strings.Contains(u, "GEODATA,") ||
 			strings.HasPrefix(u, "GEOSITE:")
+		result.asn = strings.Contains(u, "IP-ASN,") || strings.Contains(u, "SRC-IP-ASN,")
 	case []any:
 		for _, item := range typed {
-			if rulesUseGeo(item) {
-				return true
+			result.merge(inspectRuleRequirements(item))
+			if result.geo && result.asn {
+				break
 			}
 		}
 	case map[string]any:
@@ -428,17 +470,19 @@ func rulesUseGeo(value any) bool {
 			switch normalizedKey {
 			case "GEOIP":
 				if enabled, ok := item.(bool); !ok || enabled {
-					return true
+					result.geo = true
 				}
 			case "GEOIP-CODE", "GEOSITE":
-				return true
+				result.geo = true
 			}
-			if rulesUseGeo(key) || rulesUseGeo(item) {
-				return true
+			result.merge(inspectRuleRequirements(key))
+			result.merge(inspectRuleRequirements(item))
+			if result.geo && result.asn {
+				break
 			}
 		}
 	}
-	return false
+	return result
 }
 
 // StartWithConfig 用订阅/自定义 YAML + 设置启动内核：先把订阅配置与「iOS 必需的安全设置」
@@ -464,10 +508,11 @@ func StartWithConfig(fd int, tunnelMTU int, configYAML string, settingsJSON stri
 		appendRunLog("run.log 重置失败: " + resetError.Error())
 	}
 
-	if err := applyRuntimeConfig(fd, tunnelMTU, configYAML, st, "启动", false); err != nil {
+	externalUI, err := applyRuntimeConfig(fd, tunnelMTU, configYAML, st, "启动", false)
+	if err != nil {
 		return err
 	}
-	configureController(configYAML, st)
+	configureController(externalUI, st)
 	return nil
 }
 
@@ -488,15 +533,16 @@ func ReloadConfig(fd int, tunnelMTU int, configYAML string, settingsJSON string)
 	appendRunLog(fmt.Sprintf("ReloadConfig: fd=%d mtu=%d stack=%s ipv6=%v geo=%v(mode=%v,%s,ignoreNegation=%v) log=%s port=%d",
 		fd, tunnelMTU, st.Stack, st.IPv6, st.GeoEnabled, st.GeodataMode, st.GeoLoader,
 		st.IgnoreGeoNegation, st.LogLevel, st.ControllerPort))
-	if err := applyRuntimeConfig(fd, tunnelMTU, configYAML, st, "重载", true); err != nil {
+	externalUI, err := applyRuntimeConfig(fd, tunnelMTU, configYAML, st, "重载", true)
+	if err != nil {
 		return err
 	}
-	configureController(configYAML, st)
+	configureController(externalUI, st)
 	appendRunLog("配置重载完成")
 	return nil
 }
 
-func applyRuntimeConfig(fd int, tunnelMTU int, configYAML string, st appSettings, operation string, preserveTun bool) (err error) {
+func applyRuntimeConfig(fd int, tunnelMTU int, configYAML string, st appSettings, operation string, preserveTun bool) (externalUI string, err error) {
 	previousNotices := append([]string(nil), configNotices...)
 	previousDetails := make(map[string]string, len(proxyDetailsMap))
 	for name, detail := range proxyDetailsMap {
@@ -513,13 +559,13 @@ func applyRuntimeConfig(fd int, tunnelMTU int, configYAML string, st appSettings
 	merged, err := mergeConfig(configYAML, st, tunnelMTU)
 	if err != nil {
 		appendRunLog(operation + "合并配置失败: " + err.Error())
-		return err
+		return "", err
 	}
 
 	rawCfg, err := config.UnmarshalRawConfig(merged)
 	if err != nil {
 		appendRunLog(operation + " UnmarshalRawConfig 失败: " + err.Error())
-		return err
+		return "", err
 	}
 	rawCfg.Tun.Enable = true
 	rawCfg.Tun.FileDescriptor = fd
@@ -533,11 +579,11 @@ func applyRuntimeConfig(fd int, tunnelMTU int, configYAML string, st appSettings
 	cfg, err := config.ParseRawConfig(rawCfg)
 	if err != nil {
 		appendRunLog(operation + " ParseRawConfig 失败: " + err.Error())
-		return err
+		return "", err
 	}
 	if preserveTun {
 		if !listener.LastTunConf.Enable || listener.LastTunConf.FileDescriptor == 0 {
-			return fmt.Errorf("当前 TUN 配置不可用，请重新连接 VPN")
+			return "", fmt.Errorf("当前 TUN 配置不可用，请重新连接 VPN")
 		}
 		// 热重载不能让 ReCreateTun 关闭 iOS 交给扩展的原始 utun fd。
 		// 固定为当前运行配置后，mihomo 会命中 Tun.OnReload，仅更新其余组件。
@@ -572,25 +618,19 @@ func applyRuntimeConfig(fd int, tunnelMTU int, configYAML string, st appSettings
 	}
 	applied = true
 	appendRunLog(operation + " ApplyConfig 返回")
-	return nil
+	return cfg.Controller.ExternalUI, nil
 }
 
 // configureController 让主 App 的控制接口跟随当前设置。NE 内不下载或解压 Web UI，
 // 避免在 Packet Tunnel 的小内存预算内产生不可取消的后台任务。
-func configureController(configYAML string, st appSettings) {
+func configureController(externalUI string, st appSettings) {
 	host := "127.0.0.1"
 	if st.AllowLan && strings.TrimSpace(st.ControllerSecret) != "" {
 		host = "0.0.0.0"
 	}
 	addr := fmt.Sprintf("%s:%d", host, st.ControllerPort)
 
-	// webui：mihomo 在 /ui 同源提供面板（浏览器访问，无 CORS/混合内容问题）。
-	// 优先用配置文件指定的 external-ui；未指定 URL 时使用默认 zashboard。
-	var uiCfg struct {
-		ExternalUI string `yaml:"external-ui"`
-	}
-	_ = yaml.Unmarshal([]byte(configYAML), &uiCfg)
-	externalUI := uiCfg.ExternalUI
+	// ParseRawConfig 已提供 external-ui，避免控制器启动时再次解析整份订阅。
 	if externalUI == "" {
 		externalUI = "ui"
 	}
@@ -737,7 +777,7 @@ func mergeConfig(subYAML string, st appSettings, tunnelMTU int) ([]byte, error) 
 	// 自动下载始终关闭，GEO 文件只允许主 App 管理。
 	m["geo-auto-update"] = false
 	if st.GeoEnabled {
-		resolvedURLs := resolveGeoDownloadURLs(subYAML, st)
+		resolvedURLs := resolveGeoDownloadURLsFromMap(m, st)
 		m["geodata-mode"] = st.GeodataMode
 		m["geodata-loader"] = st.GeoLoader
 		m["geo-update-interval"] = st.GeoUpdateInterval
@@ -774,6 +814,135 @@ func mergeConfig(subYAML string, st appSettings, tunnelMTU int) ([]byte, error) 
 	buildProxyDetails(m)
 
 	return yaml.Marshal(m)
+}
+
+// ApplyConfigOverride 把用户维护的覆写 YAML 合并到原始订阅。
+//
+// 普通映射递归合并，标量和列表替换原值；null 删除字段。映射中的
+// prepend-<key> / append-<key> 可以在不复制原列表的情况下前置或追加项目。
+// 原始订阅始终单独保存，因此刷新订阅不会丢失覆写内容。
+func ApplyConfigOverride(baseYAML string, overrideYAML string) (string, error) {
+	if strings.TrimSpace(overrideYAML) == "" {
+		return baseYAML, nil
+	}
+
+	base, err := yamlMapping(baseYAML, "base config", true)
+	if err != nil {
+		return "", err
+	}
+	override, err := yamlMapping(overrideYAML, "override", false)
+	if err != nil {
+		return "", err
+	}
+	merged, err := mergeOverrideMapping(base, override, "")
+	if err != nil {
+		return "", err
+	}
+	out, err := yaml.Marshal(merged)
+	if err != nil {
+		return "", fmt.Errorf("marshal overridden config: %w", err)
+	}
+	return string(out), nil
+}
+
+func yamlMapping(source string, label string, allowEmpty bool) (map[string]any, error) {
+	if strings.TrimSpace(source) == "" {
+		if allowEmpty {
+			return map[string]any{}, nil
+		}
+		return nil, fmt.Errorf("%s is empty", label)
+	}
+	var root any
+	if err := yaml.Unmarshal([]byte(source), &root); err != nil {
+		return nil, fmt.Errorf("invalid %s YAML: %w", label, err)
+	}
+	mapping, ok := root.(map[string]any)
+	if !ok || mapping == nil {
+		return nil, fmt.Errorf("%s root must be a YAML mapping", label)
+	}
+	return mapping, nil
+}
+
+func mergeOverrideMapping(base map[string]any, override map[string]any, path string) (map[string]any, error) {
+	result := make(map[string]any, len(base)+len(override))
+	for key, value := range base {
+		result[key] = value
+	}
+
+	// 先处理普通覆写，再处理列表操作，使 rules 与 prepend-rules / append-rules
+	// 同时出现时语义稳定：先替换 rules，再在新列表两端添加。
+	for key, value := range override {
+		if overrideListOperation(key) != "" {
+			continue
+		}
+		if value == nil {
+			delete(result, key)
+			continue
+		}
+		if nested, ok := value.(map[string]any); ok {
+			current, _ := result[key].(map[string]any)
+			if current == nil {
+				current = map[string]any{}
+			}
+			merged, err := mergeOverrideMapping(current, nested, overridePath(path, key))
+			if err != nil {
+				return nil, err
+			}
+			result[key] = merged
+			continue
+		}
+		result[key] = value
+	}
+
+	for _, operation := range []string{"prepend-", "append-"} {
+		for key, value := range override {
+			if !strings.HasPrefix(key, operation) {
+				continue
+			}
+			target := strings.TrimPrefix(key, operation)
+			if target == "" {
+				return nil, fmt.Errorf("%s must name a target list", overridePath(path, key))
+			}
+			items, ok := value.([]any)
+			if !ok {
+				return nil, fmt.Errorf("%s must be a YAML list", overridePath(path, key))
+			}
+			current := []any{}
+			if existing, exists := result[target]; exists {
+				var listOK bool
+				current, listOK = existing.([]any)
+				if !listOK {
+					return nil, fmt.Errorf("%s targets non-list field %s", overridePath(path, key), overridePath(path, target))
+				}
+			}
+			combined := make([]any, 0, len(current)+len(items))
+			if operation == "prepend-" {
+				combined = append(combined, items...)
+				combined = append(combined, current...)
+			} else {
+				combined = append(combined, current...)
+				combined = append(combined, items...)
+			}
+			result[target] = combined
+		}
+	}
+	return result, nil
+}
+
+func overrideListOperation(key string) string {
+	for _, prefix := range []string{"prepend-", "append-"} {
+		if strings.HasPrefix(key, prefix) {
+			return prefix
+		}
+	}
+	return ""
+}
+
+func overridePath(parent string, key string) string {
+	if parent == "" {
+		return key
+	}
+	return parent + "." + key
 }
 
 // replaceSystemNameserver 把 DNS 服务器列表（或单字符串值）中的 "system" 展开为
@@ -1666,13 +1835,19 @@ func appendRunLog(msg string) {
 	}
 	logFileMu.Lock()
 	defer logFileMu.Unlock()
+	line := fmt.Sprintf("%s [WRAP] %s\n", logTimestamp(), msg)
+	if runLogFile != nil {
+		writeRunLogLine(runLogFile, line)
+		return
+	}
 	f, err := os.OpenFile(filepath.Join(homeDir, "run.log"),
 		os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return
 	}
 	defer f.Close()
-	writeRunLogLine(f, fmt.Sprintf("%s [WRAP] %s\n", logTimestamp(), msg))
+	_, _ = f.Seek(0, io.SeekEnd)
+	writeRunLogLine(f, line)
 }
 
 func logTimestamp() string {
@@ -1688,14 +1863,21 @@ func writeRunLogLine(file *os.File, line string) {
 		}
 		line = line[:end] + truncationSuffix
 	}
-	seekWhence := io.SeekEnd
-	if info, err := file.Stat(); err == nil && info.Size()+int64(len(line)) > maxRunLogBytes {
-		if err := file.Truncate(0); err == nil {
-			seekWhence = io.SeekStart
+	if runLogBytes < 0 {
+		if info, err := file.Stat(); err == nil {
+			runLogBytes = info.Size()
 		}
 	}
-	_, _ = file.Seek(0, seekWhence)
-	_, _ = file.WriteString(line)
+	if runLogBytes >= 0 && runLogBytes+int64(len(line)) > maxRunLogBytes {
+		if err := file.Truncate(0); err == nil {
+			_, _ = file.Seek(0, io.SeekStart)
+			runLogBytes = 0
+		}
+	}
+	written, _ := file.WriteString(line)
+	if runLogBytes >= 0 {
+		runLogBytes += int64(written)
+	}
 }
 
 // 每次真实启动都开启新的 run.log 会话。日志页在内存中保留上一会话，因此这里截断
@@ -1706,10 +1888,21 @@ func resetRunLog() error {
 	}
 	logFileMu.Lock()
 	defer logFileMu.Unlock()
+	if runLogFile != nil {
+		if err := runLogFile.Truncate(0); err != nil {
+			return err
+		}
+		_, err := runLogFile.Seek(0, io.SeekStart)
+		if err == nil {
+			runLogBytes = 0
+		}
+		return err
+	}
 	f, err := os.OpenFile(filepath.Join(homeDir, "run.log"),
 		os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
 	}
+	runLogBytes = 0
 	return f.Close()
 }

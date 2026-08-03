@@ -116,6 +116,13 @@ struct SubscriptionRow: View {
                             .background(Capsule().fill(Color.orange.opacity(0.12)))
                             .overlay(Capsule().stroke(Color.orange.opacity(0.25), lineWidth: 0.5))
                     }
+                    if sub.hasOverride {
+                        Text("覆写")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.blue)
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(Capsule().fill(Color.blue.opacity(0.10)))
+                    }
                     Spacer()
                     if sub.nodeCount > 0 {
                         Text("\(sub.nodeCount) 节点")

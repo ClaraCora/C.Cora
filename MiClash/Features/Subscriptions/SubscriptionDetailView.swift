@@ -8,6 +8,7 @@ struct SubscriptionDetailView: View {
 
     @State private var showEditor = false
     @State private var showRemoteEditor = false
+    @State private var showOverrideEditor = false
     @State private var refreshing = false
     @State private var refreshOK = false
 
@@ -35,12 +36,18 @@ struct SubscriptionDetailView: View {
         .sheet(isPresented: $showRemoteEditor) {
             if let sub { EditSubscriptionView(sub: sub).environmentObject(store) }
         }
+        .sheet(isPresented: $showOverrideEditor) {
+            if let sub { ConfigOverrideEditorView(subscription: sub).environmentObject(store) }
+        }
     }
 
     @ViewBuilder private func infoSection(_ sub: Subscription) -> some View {
         Section("信息") {
             LabeledContent("类型", value: sub.isLocal ? "本地配置" : "远程订阅")
             LabeledContent("节点数", value: "\(sub.nodeCount)")
+            if sub.hasOverride {
+                LabeledContent("覆写", value: "已启用")
+            }
             if !sub.isLocal {
                 LabeledContent("链接") {
                     Text(sub.url).foregroundStyle(.secondary)
@@ -108,6 +115,13 @@ struct SubscriptionDetailView: View {
                 }
                 .disabled(refreshing)
             }
+
+            Button {
+                showOverrideEditor = true
+            } label: {
+                Label(sub.hasOverride ? "编辑覆写" : "添加覆写",
+                      systemImage: "slider.horizontal.3")
+            }
         }
     }
 
@@ -122,10 +136,38 @@ struct SubscriptionDetailView: View {
                 NavigationLink {
                     ConfigTextReader(title: sub.name, text: sub.yaml)
                 } label: {
-                    Label("查看配置内容（\(sub.yaml.count) 字符）", systemImage: "doc.plaintext")
+                    Label(sub.hasOverride ? "查看原始配置" : "查看配置内容（\(sub.yaml.count) 字符）",
+                          systemImage: "doc.plaintext")
+                }
+                if sub.hasOverride {
+                    NavigationLink {
+                        EffectiveConfigTextReader(title: "\(sub.name) · 覆写后配置",
+                                                  subID: sub.id)
+                    } label: {
+                        Label("查看覆写后配置", systemImage: "doc.badge.gearshape")
+                    }
                 }
             }
         }
+    }
+}
+
+/// 只在进入目标页时生成覆写结果，避免详情页每次 SwiftUI 重绘都解析大型 YAML。
+private struct EffectiveConfigTextReader: View {
+    @EnvironmentObject private var store: SubscriptionStore
+    let title: String
+    let subID: UUID
+
+    var body: some View {
+        Group {
+            if let text = store.effectiveYAML(for: subID) {
+                MonospacedTextView(text: text)
+            } else {
+                ContentUnavailableView("配置不可用", systemImage: "doc.questionmark")
+            }
+        }
+        .navigationTitle(title)
+        .navigationBarTitleDisplayMode(.inline)
     }
 }
 

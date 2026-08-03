@@ -3,6 +3,7 @@ package mihomo
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +15,38 @@ import (
 	mdns "github.com/metacubex/mihomo/dns"
 	"gopkg.in/yaml.v3"
 )
+
+func BenchmarkMergeConfigLarge(b *testing.B) {
+	input := largeBenchmarkConfig(1_000, 4_000)
+	settings := parseSettings("")
+	b.ReportAllocs()
+	b.SetBytes(int64(len(input)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := mergeConfig(input, settings, 1_420); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func largeBenchmarkConfig(proxyCount int, ruleCount int) string {
+	var out strings.Builder
+	out.Grow(proxyCount*120 + ruleCount*40)
+	out.WriteString("external-ui: ui\nmode: rule\ndns:\n  nameserver: [system]\nproxies:\n")
+	for i := 0; i < proxyCount; i++ {
+		fmt.Fprintf(&out, "  - {name: node-%04d, type: ss, server: 192.0.2.1, port: 443, cipher: aes-128-gcm, password: test}\n", i)
+	}
+	out.WriteString("proxy-groups:\n  - name: Proxy\n    type: select\n    proxies:\n")
+	for i := 0; i < proxyCount; i++ {
+		fmt.Fprintf(&out, "      - node-%04d\n", i)
+	}
+	out.WriteString("rules:\n")
+	for i := 0; i < ruleCount; i++ {
+		fmt.Fprintf(&out, "  - DOMAIN,host-%04d.example.com,Proxy\n", i)
+	}
+	out.WriteString("  - MATCH,DIRECT\n")
+	return out.String()
+}
 
 func TestNetworkInterfaceUpdates(t *testing.T) {
 	previous := dialer.DefaultInterface.Load()
@@ -328,6 +361,121 @@ func TestMergeConfigUsesConfiguredOrSystemMTU(t *testing.T) {
 	}
 	if got := nestedMap(t, tooSmallSystemMap, "tun")["mtu"]; got != defaultTunnelMTU {
 		t.Errorf("invalid system tun.mtu = %v, want fallback %d", got, defaultTunnelMTU)
+	}
+}
+
+func TestApplyConfigOverrideDeepMergeAndLists(t *testing.T) {
+	const base = `
+mode: rule
+ipv6: false
+dns:
+  enable: true
+  enhanced-mode: fake-ip
+  nameserver:
+    - https://1.1.1.1/dns-query
+rules:
+  - DOMAIN,base.example,DIRECT
+  - MATCH,Proxy
+`
+	const override = `
+ipv6: true
+dns:
+  enhanced-mode: redir-host
+  append-nameserver:
+    - https://8.8.8.8/dns-query
+prepend-rules:
+  - DOMAIN,first.example,REJECT
+append-rules:
+  - DOMAIN,last.example,DIRECT
+`
+
+	merged, err := ApplyConfigOverride(base, override)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := yaml.Unmarshal([]byte(merged), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["ipv6"] != true || got["mode"] != "rule" {
+		t.Errorf("root fields = %v, want mode preserved and ipv6 overridden", got)
+	}
+	dns := nestedMap(t, got, "dns")
+	if dns["enable"] != true || dns["enhanced-mode"] != "redir-host" {
+		t.Errorf("dns = %v, want recursive merge", dns)
+	}
+	nameservers, ok := dns["nameserver"].([]any)
+	if !ok || len(nameservers) != 2 || nameservers[1] != "https://8.8.8.8/dns-query" {
+		t.Errorf("dns.nameserver = %v, want appended server", dns["nameserver"])
+	}
+	if _, leaked := dns["append-nameserver"]; leaked {
+		t.Error("append-nameserver control key leaked into effective config")
+	}
+	rules, ok := got["rules"].([]any)
+	if !ok || len(rules) != 4 ||
+		rules[0] != "DOMAIN,first.example,REJECT" ||
+		rules[3] != "DOMAIN,last.example,DIRECT" {
+		t.Errorf("rules = %v, want prepend + base + append", got["rules"])
+	}
+}
+
+func TestApplyConfigOverrideReplacesListsAndDeletesNullFields(t *testing.T) {
+	merged, err := ApplyConfigOverride(`
+mixed-port: 7890
+rules:
+  - MATCH,DIRECT
+dns:
+  fallback:
+    - https://1.0.0.1/dns-query
+  nameserver:
+    - https://1.1.1.1/dns-query
+`, `
+mixed-port: null
+rules:
+  - MATCH,Proxy
+dns:
+  fallback: null
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := yaml.Unmarshal([]byte(merged), &got); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := got["mixed-port"]; exists {
+		t.Error("mixed-port should be deleted by null")
+	}
+	rules, ok := got["rules"].([]any)
+	if !ok || len(rules) != 1 || rules[0] != "MATCH,Proxy" {
+		t.Errorf("rules = %v, want replacement list", got["rules"])
+	}
+	dns := nestedMap(t, got, "dns")
+	if _, exists := dns["fallback"]; exists {
+		t.Error("dns.fallback should be deleted by null")
+	}
+	if _, exists := dns["nameserver"]; !exists {
+		t.Error("dns.nameserver should be preserved")
+	}
+}
+
+func TestApplyConfigOverrideRejectsInvalidInputAndListOperations(t *testing.T) {
+	tests := []struct {
+		name     string
+		base     string
+		override string
+	}{
+		{name: "invalid base", base: "rules: [", override: "mode: direct"},
+		{name: "scalar override", base: "rules: []", override: "direct"},
+		{name: "operation is not list", base: "rules: []", override: "append-rules: MATCH,DIRECT"},
+		{name: "target is not list", base: "mode: rule", override: "append-mode: [direct]"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := ApplyConfigOverride(test.base, test.override); err == nil {
+				t.Fatal("ApplyConfigOverride accepted invalid input")
+			}
+		})
 	}
 }
 
@@ -695,6 +843,9 @@ func TestParseSettingsNormalizesPortsAndLANAuthentication(t *testing.T) {
 }
 
 func TestRunLogIsBounded(t *testing.T) {
+	previousBytes := runLogBytes
+	runLogBytes = -1
+	defer func() { runLogBytes = previousBytes }()
 	path := filepath.Join(t.TempDir(), "run.log")
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {

@@ -1,4 +1,5 @@
 import Foundation
+import Mihomo
 
 private let subscriptionMaximumDownloadBytes: Int64 = 10 * 1_024 * 1_024
 
@@ -17,11 +18,13 @@ struct Subscription: Identifiable, Codable, Equatable, Sendable {
     var total: Int64
     var expire: Date?
     var autoNamed: Bool       // 名称是否自动获取（用户没手填时才自动覆盖）
+    var overrideYAML: String  // 独立于订阅原文保存，刷新后仍会应用
 
     init(id: UUID = UUID(), name: String, url: String, yaml: String = "",
          updatedAt: Date? = nil, nodeCount: Int = 0,
          upload: Int64 = 0, download: Int64 = 0, total: Int64 = 0,
-         expire: Date? = nil, autoNamed: Bool = false) {
+         expire: Date? = nil, autoNamed: Bool = false,
+         overrideYAML: String = "") {
         self.id = id
         self.name = name
         self.url = url
@@ -33,11 +36,15 @@ struct Subscription: Identifiable, Codable, Equatable, Sendable {
         self.total = total
         self.expire = expire
         self.autoNamed = autoNamed
+        self.overrideYAML = overrideYAML
     }
 
     var used: Int64 { upload + download }
     var remaining: Int64 { max(0, total - used) }
     var hasUsage: Bool { total > 0 }
+    var hasOverride: Bool {
+        !overrideYAML.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
     /// 本地配置：没有订阅链接，内容由用户手写/粘贴，不可远程刷新。
     var isLocal: Bool { url.isEmpty }
 
@@ -60,6 +67,7 @@ struct Subscription: Identifiable, Codable, Equatable, Sendable {
     // 容错解码：旧版 subscriptions.json 没有新字段，缺失时给默认值，避免整体解码失败丢订阅。
     enum CodingKeys: String, CodingKey {
         case id, name, url, yaml, updatedAt, nodeCount, upload, download, total, expire, autoNamed
+        case overrideYAML
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -74,6 +82,7 @@ struct Subscription: Identifiable, Codable, Equatable, Sendable {
         total = try c.decodeIfPresent(Int64.self, forKey: .total) ?? 0
         expire = try c.decodeIfPresent(Date.self, forKey: .expire)
         autoNamed = try c.decodeIfPresent(Bool.self, forKey: .autoNamed) ?? false
+        overrideYAML = try c.decodeIfPresent(String.self, forKey: .overrideYAML) ?? ""
     }
 }
 
@@ -101,20 +110,33 @@ final class SubscriptionStore: ObservableObject {
     private var refreshGenerations: [UUID: Int] = [:]
     private var activeRefreshes: [UUID: ActiveSubscriptionRefresh] = [:]
     private var activeRefreshCount = 0
+    /// 只保留最近一次覆写结果，避免 SwiftUI 重绘或连接前检查反复解析大型 YAML。
+    private var effectiveYAMLCache: (id: UUID, yaml: String)?
 
     private init() { load() }
 
-    /// 当前选中订阅的配置 YAML（连接时传给 NE）。无选中/无内容返回 nil。
+    /// 当前选中订阅应用覆写后的 YAML（连接时传给 NE）。无选中/无内容返回 nil。
     var activeYAML: String? {
-        guard let id = selectedID,
-              let sub = subscriptions.first(where: { $0.id == id }),
-              !sub.yaml.isEmpty else { return nil }
-        return sub.yaml
+        guard let id = selectedID else { return nil }
+        return effectiveYAML(for: id)
     }
 
     var selected: Subscription? {
         guard let id = selectedID else { return nil }
         return subscriptions.first(where: { $0.id == id })
+    }
+
+    /// 返回指定配置应用覆写后的最终 YAML；原始订阅内容不会被改写。
+    func effectiveYAML(for id: UUID) -> String? {
+        guard let sub = subscriptions.first(where: { $0.id == id }),
+              !sub.yaml.isEmpty else { return nil }
+        guard sub.hasOverride else { return sub.yaml }
+        if let cached = effectiveYAMLCache, cached.id == id { return cached.yaml }
+        guard let merged = try? Self.applyOverride(to: sub.yaml,
+                                                   overrideYAML: sub.overrideYAML)
+        else { return sub.yaml }
+        effectiveYAMLCache = (id: id, yaml: merged)
+        return merged
     }
 
     // MARK: - 增删改
@@ -153,14 +175,47 @@ final class SubscriptionStore: ObservableObject {
     /// 编辑本地配置（名称 + YAML）。
     func updateLocal(_ id: UUID, name: String, yaml: String) {
         guard let i = subscriptions.firstIndex(where: { $0.id == id }) else { return }
+        var merged: String?
+        if subscriptions[i].hasOverride {
+            do {
+                merged = try Self.applyOverride(to: yaml,
+                                                overrideYAML: subscriptions[i].overrideYAML)
+            } catch {
+                lastError = "保存失败：新配置与现有覆写无法合并（\(error.localizedDescription)）"
+                return
+            }
+        }
         let n = name.trimmingCharacters(in: .whitespacesAndNewlines)
         if !n.isEmpty { subscriptions[i].name = n }
         subscriptions[i].yaml = yaml
         subscriptions[i].nodeCount = Self.countProxies(yaml)
         subscriptions[i].updatedAt = Date()
+        effectiveYAMLCache = merged.map { (id: id, yaml: $0) }
         lastError = Self.looksLikeClashYAML(yaml) ? nil
             : "已保存，但内容里没找到 proxies/proxy-groups，连接时可能无效"
         save()
+    }
+
+    /// 保存独立覆写层。空内容表示关闭覆写；非空内容先与当前原文合并校验。
+    /// 返回 nil 表示保存成功，否则返回可直接显示的校验错误。
+    func updateOverride(_ id: UUID, yaml: String) -> String? {
+        guard let i = subscriptions.firstIndex(where: { $0.id == id }) else {
+            return "配置不存在"
+        }
+        let trimmed = yaml.trimmingCharacters(in: .whitespacesAndNewlines)
+        var merged: String?
+        if !trimmed.isEmpty {
+            do {
+                merged = try Self.applyOverride(to: subscriptions[i].yaml,
+                                                overrideYAML: yaml)
+            } catch {
+                return "覆写 YAML 无效：\(error.localizedDescription)"
+            }
+        }
+        subscriptions[i].overrideYAML = trimmed.isEmpty ? "" : yaml
+        effectiveYAMLCache = merged.map { (id: id, yaml: $0) }
+        save()
+        return nil
     }
 
     /// 编辑远程订阅（名称 + 链接）。链接变更时先拉取并校验，成功后再原子替换旧内容；
@@ -195,7 +250,10 @@ final class SubscriptionStore: ObservableObject {
             let payload = try await task.value
             guard isCurrentRefresh(id, generation: generation, url: previousURL),
                   let index = subscriptions.firstIndex(where: { $0.id == id }) else { return }
+            let effective = try Self.validateOverride(subscriptions[index].overrideYAML,
+                                                      for: payload.yaml)
             apply(payload, to: &subscriptions[index], resetMissingUsage: true)
+            effectiveYAMLCache = effective.map { (id: id, yaml: $0) }
             subscriptions[index].url = u
             if !n.isEmpty {
                 subscriptions[index].name = n
@@ -214,6 +272,7 @@ final class SubscriptionStore: ObservableObject {
 
     func remove(_ id: UUID) {
         invalidateRefresh(id)
+        if effectiveYAMLCache?.id == id { effectiveYAMLCache = nil }
         subscriptions.removeAll { $0.id == id }
         if selectedID == id { selectedID = subscriptions.first?.id }
         save()
@@ -243,7 +302,10 @@ final class SubscriptionStore: ObservableObject {
             let payload = try await task.value
             guard isCurrentRefresh(id, generation: generation, url: urlString),
                   let i = subscriptions.firstIndex(where: { $0.id == id }) else { return }
+            let effective = try Self.validateOverride(subscriptions[i].overrideYAML,
+                                                      for: payload.yaml)
             apply(payload, to: &subscriptions[i], resetMissingUsage: false)
+            effectiveYAMLCache = effective.map { (id: id, yaml: $0) }
             if subscriptions[i].autoNamed, let title = payload.title {
                 subscriptions[i].name = title
             }
@@ -405,6 +467,28 @@ final class SubscriptionStore: ObservableObject {
         return count
     }
 
+    private static func applyOverride(to baseYAML: String,
+                                      overrideYAML: String) throws -> String {
+        guard !overrideYAML.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return baseYAML }
+        var mergeError: NSError?
+        let merged = MihomoApplyConfigOverride(baseYAML, overrideYAML, &mergeError)
+        if let mergeError { throw mergeError }
+        return merged
+    }
+
+    private static func validateOverride(_ overrideYAML: String,
+                                         for baseYAML: String) throws -> String? {
+        guard !overrideYAML.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return nil }
+        do {
+            return try applyOverride(to: baseYAML, overrideYAML: overrideYAML)
+        } catch {
+            throw SubscriptionRefreshError.overrideIncompatible(
+                error.localizedDescription)
+        }
+    }
+
     // MARK: - 持久化
 
     private func load() {
@@ -518,6 +602,7 @@ private enum SubscriptionRefreshError: LocalizedError, Sendable {
     case tooLarge
     case notText
     case notClashYAML
+    case overrideIncompatible(String)
 
     var errorDescription: String? {
         switch self {
@@ -525,6 +610,8 @@ private enum SubscriptionRefreshError: LocalizedError, Sendable {
         case .notText: return "订阅内容不是 UTF-8 文本"
         case .notClashYAML:
             return "订阅内容不是 Clash/mihomo YAML（可能是 base64 订阅，暂不支持）"
+        case .overrideIncompatible(let reason):
+            return "新订阅与现有覆写无法合并：\(reason)"
         }
     }
 }

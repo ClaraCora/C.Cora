@@ -5,6 +5,8 @@ struct ConnectionsSnapshot: Decodable, Sendable {
     let downloadTotal: Int64
     let uploadTotal: Int64
     let connections: [ActiveConnection]
+    let tcpCount: Int
+    let udpCount: Int
 
     init(downloadTotal: Int64 = 0,
          uploadTotal: Int64 = 0,
@@ -12,6 +14,9 @@ struct ConnectionsSnapshot: Decodable, Sendable {
         self.downloadTotal = downloadTotal
         self.uploadTotal = uploadTotal
         self.connections = connections
+        let counts = Self.networkCounts(connections)
+        tcpCount = counts.tcp
+        udpCount = counts.udp
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -24,6 +29,16 @@ struct ConnectionsSnapshot: Decodable, Sendable {
         uploadTotal = values.lossyInt64(forKey: .uploadTotal)
         let decoded = try values.decodeIfPresent([ActiveConnection].self, forKey: .connections) ?? []
         connections = decoded.sorted { $0.start > $1.start }
+        let counts = Self.networkCounts(connections)
+        tcpCount = counts.tcp
+        udpCount = counts.udp
+    }
+
+    private static func networkCounts(_ connections: [ActiveConnection]) -> (tcp: Int, udp: Int) {
+        connections.reduce(into: (tcp: 0, udp: 0)) { counts, connection in
+            if connection.networkKey == "tcp" { counts.tcp += 1 }
+            if connection.networkKey == "udp" { counts.udp += 1 }
+        }
     }
 }
 
@@ -37,6 +52,7 @@ struct ActiveConnection: Decodable, Identifiable, Sendable {
     let chains: [String]
     let rule: String
     let rulePayload: String
+    let networkKey: String
 
     private enum CodingKeys: String, CodingKey {
         case id, metadata, upload, download, start, chains, rule, rulePayload
@@ -45,8 +61,11 @@ struct ActiveConnection: Decodable, Identifiable, Sendable {
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         id = values.lossyString(forKey: .id)
-        metadata = try values.decodeIfPresent(ConnectionMetadata.self, forKey: .metadata)
+        let decodedMetadata = try values.decodeIfPresent(ConnectionMetadata.self, forKey: .metadata)
             ?? ConnectionMetadata()
+        metadata = decodedMetadata
+        networkKey = decodedMetadata.network
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         upload = values.lossyInt64(forKey: .upload)
         download = values.lossyInt64(forKey: .download)
         start = values.lossyString(forKey: .start)
@@ -83,10 +102,6 @@ struct ActiveConnection: Decodable, Identifiable, Sendable {
     var ruleText: String {
         guard !rule.isEmpty else { return "" }
         return rulePayload.isEmpty ? rule : "\(rule) · \(rulePayload)"
-    }
-
-    var networkKey: String {
-        metadata.network.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
     var networkLabel: String {
