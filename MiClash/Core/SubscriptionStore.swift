@@ -23,7 +23,7 @@ struct Subscription: Identifiable, Codable, Equatable, Sendable {
          updatedAt: Date? = nil, nodeCount: Int = 0,
          upload: Int64 = 0, download: Int64 = 0, total: Int64 = 0,
          expire: Date? = nil, autoNamed: Bool = false,
-         overrideEnabled: Bool = true) {
+         overrideEnabled: Bool = false) {
         self.id = id
         self.name = name
         self.url = url
@@ -78,7 +78,7 @@ struct Subscription: Identifiable, Codable, Equatable, Sendable {
         total = try c.decodeIfPresent(Int64.self, forKey: .total) ?? 0
         expire = try c.decodeIfPresent(Date.self, forKey: .expire)
         autoNamed = try c.decodeIfPresent(Bool.self, forKey: .autoNamed) ?? false
-        overrideEnabled = try c.decodeIfPresent(Bool.self, forKey: .overrideEnabled) ?? true
+        overrideEnabled = try c.decodeIfPresent(Bool.self, forKey: .overrideEnabled) ?? false
     }
 }
 
@@ -120,7 +120,7 @@ final class SubscriptionStore: ObservableObject {
     }
 
     var activeOverridesEnabled: Bool {
-        selected?.overrideEnabled ?? true
+        selected?.overrideEnabled ?? false
     }
 
     // MARK: - 增删改
