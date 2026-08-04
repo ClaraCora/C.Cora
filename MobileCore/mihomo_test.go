@@ -364,123 +364,11 @@ func TestMergeConfigUsesConfiguredOrSystemMTU(t *testing.T) {
 	}
 }
 
-func TestApplyConfigOverrideDeepMergeAndLists(t *testing.T) {
-	const base = `
-mode: rule
-ipv6: false
-dns:
-  enable: true
-  enhanced-mode: fake-ip
-  nameserver:
-    - https://1.1.1.1/dns-query
-rules:
-  - DOMAIN,base.example,DIRECT
-  - MATCH,Proxy
-`
-	const override = `
-ipv6: true
-dns:
-  enhanced-mode: redir-host
-  append-nameserver:
-    - https://8.8.8.8/dns-query
-prepend-rules:
-  - DOMAIN,first.example,REJECT
-append-rules:
-  - DOMAIN,last.example,DIRECT
-`
-
-	merged, err := ApplyConfigOverride(base, override)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var got map[string]any
-	if err := yaml.Unmarshal([]byte(merged), &got); err != nil {
-		t.Fatal(err)
-	}
-	if got["ipv6"] != true || got["mode"] != "rule" {
-		t.Errorf("root fields = %v, want mode preserved and ipv6 overridden", got)
-	}
-	dns := nestedMap(t, got, "dns")
-	if dns["enable"] != true || dns["enhanced-mode"] != "redir-host" {
-		t.Errorf("dns = %v, want recursive merge", dns)
-	}
-	nameservers, ok := dns["nameserver"].([]any)
-	if !ok || len(nameservers) != 2 || nameservers[1] != "https://8.8.8.8/dns-query" {
-		t.Errorf("dns.nameserver = %v, want appended server", dns["nameserver"])
-	}
-	if _, leaked := dns["append-nameserver"]; leaked {
-		t.Error("append-nameserver control key leaked into effective config")
-	}
-	rules, ok := got["rules"].([]any)
-	if !ok || len(rules) != 4 ||
-		rules[0] != "DOMAIN,first.example,REJECT" ||
-		rules[3] != "DOMAIN,last.example,DIRECT" {
-		t.Errorf("rules = %v, want prepend + base + append", got["rules"])
-	}
-}
-
-func TestApplyConfigOverrideReplacesListsAndDeletesNullFields(t *testing.T) {
-	merged, err := ApplyConfigOverride(`
-mixed-port: 7890
-rules:
-  - MATCH,DIRECT
-dns:
-  fallback:
-    - https://1.0.0.1/dns-query
-  nameserver:
-    - https://1.1.1.1/dns-query
-`, `
-mixed-port: null
-rules:
-  - MATCH,Proxy
-dns:
-  fallback: null
-`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var got map[string]any
-	if err := yaml.Unmarshal([]byte(merged), &got); err != nil {
-		t.Fatal(err)
-	}
-	if _, exists := got["mixed-port"]; exists {
-		t.Error("mixed-port should be deleted by null")
-	}
-	rules, ok := got["rules"].([]any)
-	if !ok || len(rules) != 1 || rules[0] != "MATCH,Proxy" {
-		t.Errorf("rules = %v, want replacement list", got["rules"])
-	}
-	dns := nestedMap(t, got, "dns")
-	if _, exists := dns["fallback"]; exists {
-		t.Error("dns.fallback should be deleted by null")
-	}
-	if _, exists := dns["nameserver"]; !exists {
-		t.Error("dns.nameserver should be preserved")
-	}
-}
-
-func TestApplyConfigOverrideRejectsInvalidInputAndListOperations(t *testing.T) {
-	tests := []struct {
-		name     string
-		base     string
-		override string
-	}{
-		{name: "invalid base", base: "rules: [", override: "mode: direct"},
-		{name: "scalar override", base: "rules: []", override: "direct"},
-		{name: "operation is not list", base: "rules: []", override: "append-rules: MATCH,DIRECT"},
-		{name: "target is not list", base: "mode: rule", override: "append-mode: [direct]"},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			if _, err := ApplyConfigOverride(test.base, test.override); err == nil {
-				t.Fatal("ApplyConfigOverride accepted invalid input")
-			}
-		})
-	}
-}
-
 func TestParseSettingsGeoDefaultsAndOverride(t *testing.T) {
 	defaults := parseSettings("")
+	if !defaults.ApplyOverrides {
+		t.Error("ApplyOverrides default = false, want true for legacy settings")
+	}
 	if !defaults.GeoEnabled {
 		t.Error("GeoEnabled default = false, want true")
 	}
@@ -731,6 +619,24 @@ dns:
 	}
 }
 
+func TestResolveGeoDownloadURLsIncludesVisualDNSOverride(t *testing.T) {
+	settings := appSettings{
+		ApplyOverrides: true,
+		Overrides: configOverrideSettings{DNS: dnsOverrideSettings{
+			Overwrite:           true,
+			FallbackNameservers: []string{"tls://8.8.8.8"},
+			FallbackGeoIP:       true,
+		}},
+	}
+	if got := resolveGeoDownloadURLs("rules: [MATCH,DIRECT]\n", settings); !got.GeoRequired {
+		t.Fatal("visual DNS fallback GeoIP should require GEO assets")
+	}
+	settings.Overrides.DNS.FallbackNameservers = nil
+	if got := resolveGeoDownloadURLs("rules: [MATCH,DIRECT]\n", settings); got.GeoRequired {
+		t.Fatal("empty visual DNS fallback should not require GEO assets")
+	}
+}
+
 func TestResolveGeoDownloadURLsExportsJSON(t *testing.T) {
 	encoded := ResolveGeoDownloadURLs(`
 geox-url:
@@ -839,6 +745,26 @@ func TestParseSettingsNormalizesPortsAndLANAuthentication(t *testing.T) {
 	}
 	if !settings.AllowLan {
 		t.Fatal("authenticated LAN controller should remain enabled")
+	}
+}
+
+func TestParseSettingsVisualOverrides(t *testing.T) {
+	settings := parseSettings(`{
+  "applyOverrides": false,
+  "overrides": {
+    "dns": {"overwrite": true, "enhancedMode": "redir-host", "nameservers": ["9.9.9.9"]},
+    "sniffer": {"overwrite": true, "enable": true, "quic": true},
+    "tun": {"overwrite": true, "dnsHijack": ["any:53"], "icmpForwarding": true}
+  }
+}`)
+	if settings.ApplyOverrides {
+		t.Error("applyOverrides JSON false was not parsed")
+	}
+	if !settings.Overrides.DNS.Overwrite || settings.Overrides.DNS.EnhancedMode != "redir-host" {
+		t.Errorf("DNS override JSON was not parsed: %+v", settings.Overrides.DNS)
+	}
+	if !settings.Overrides.Sniffer.QUIC || !settings.Overrides.Tun.ICMPForwarding {
+		t.Errorf("sniffer/TUN override JSON was not parsed: %+v", settings.Overrides)
 	}
 }
 
@@ -983,6 +909,143 @@ func TestMergeConfigPreservesDNSEnhancedMode(t *testing.T) {
 				t.Errorf("dns.enhanced-mode = %v, want %s preserved", got, mode)
 			}
 		})
+	}
+}
+
+func TestMergeConfigAppliesFixedVisualOverrides(t *testing.T) {
+	settings := appSettings{
+		Stack:          "gvisor",
+		LogLevel:       "info",
+		GeoEnabled:     true,
+		ApplyOverrides: true,
+		Overrides: configOverrideSettings{
+			DNS: dnsOverrideSettings{
+				Overwrite:           true,
+				Listen:              "127.0.0.1:1053",
+				PreferH3:            true,
+				UseSystemHosts:      false,
+				UseHosts:            true,
+				Hosts:               map[string]string{"router.lan": "192.168.1.1"},
+				EnhancedMode:        "redir-host",
+				FakeIPFilterMode:    "whitelist",
+				FakeIPFilter:        []string{"+.example.com"},
+				RespectRules:        true,
+				DefaultNameservers:  []string{"223.5.5.5"},
+				Nameservers:         []string{"https://dns.example/dns-query"},
+				ProxyNameservers:    []string{"1.1.1.1"},
+				DirectNameservers:   []string{"system"},
+				FallbackNameservers: []string{"tls://8.8.8.8"},
+				FallbackGeoIP:       false,
+			},
+			Sniffer: snifferOverrideSettings{
+				Overwrite:           true,
+				Enable:              true,
+				ForceDNSMapping:     true,
+				ParsePureIP:         true,
+				OverrideDestination: false,
+				HTTP:                true,
+				TLS:                 true,
+				ForceDomains:        []string{"+.force.example"},
+				SkipDomains:         []string{"+.skip.example"},
+			},
+			Tun: tunOverrideSettings{
+				Overwrite:      true,
+				DNSHijack:      []string{"tcp://any:53"},
+				StrictRoute:    true,
+				ICMPForwarding: false,
+			},
+		},
+	}
+	m := mergedMapWithSettings(t, `
+dns:
+  enhanced-mode: fake-ip
+  nameserver: [9.9.9.9]
+sniffer:
+  enable: false
+tun:
+  dns-hijack: [any:53]
+  strict-route: false
+`, settings)
+
+	dns := nestedMap(t, m, "dns")
+	if dns["listen"] != "127.0.0.1:1053" || dns["prefer-h3"] != true ||
+		dns["enhanced-mode"] != "redir-host" || dns["fake-ip-filter-mode"] != "whitelist" ||
+		dns["respect-rules"] != true {
+		t.Errorf("visual DNS override not applied: %v", dns)
+	}
+	if got := dns["nameserver"].([]any); len(got) != 1 || got[0] != "https://dns.example/dns-query" {
+		t.Errorf("dns.nameserver = %v", got)
+	}
+	if got := nestedMap(t, m, "hosts")["router.lan"]; got != "192.168.1.1" {
+		t.Errorf("hosts.router.lan = %v", got)
+	}
+	fallback := nestedMap(t, dns, "fallback-filter")
+	if fallback["geoip"] != false || fallback["geoip-code"] != "CN" {
+		t.Errorf("dns.fallback-filter = %v", fallback)
+	}
+
+	sniffer := nestedMap(t, m, "sniffer")
+	if sniffer["enable"] != true || sniffer["override-destination"] != false {
+		t.Errorf("sniffer override not applied: %v", sniffer)
+	}
+	protocols := nestedMap(t, sniffer, "sniff")
+	if _, ok := protocols["HTTP"]; !ok {
+		t.Error("HTTP sniffer missing")
+	}
+	if _, ok := protocols["TLS"]; !ok {
+		t.Error("TLS sniffer missing")
+	}
+	if _, ok := protocols["QUIC"]; ok {
+		t.Error("disabled QUIC sniffer should be omitted")
+	}
+
+	tun := nestedMap(t, m, "tun")
+	if tun["strict-route"] != true || tun["disable-icmp-forwarding"] != true {
+		t.Errorf("TUN override not applied: %v", tun)
+	}
+	if got := tun["dns-hijack"].([]any); len(got) != 1 || got[0] != "tcp://any:53" {
+		t.Errorf("tun.dns-hijack = %v", got)
+	}
+	merged, err := mergeConfig("proxies: []\n", settings, 1420)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := config.UnmarshalRawConfig(merged); err != nil {
+		t.Fatalf("mihomo rejected visual override output: %v", err)
+	}
+}
+
+func TestMergeConfigCanDisableFixedVisualOverrides(t *testing.T) {
+	settings := appSettings{
+		Stack:          "gvisor",
+		LogLevel:       "info",
+		ApplyOverrides: false,
+		Overrides: configOverrideSettings{
+			DNS:     dnsOverrideSettings{Overwrite: true, EnhancedMode: "redir-host"},
+			Sniffer: snifferOverrideSettings{Overwrite: true, Enable: true},
+			Tun:     tunOverrideSettings{Overwrite: true, StrictRoute: true},
+		},
+	}
+	m := mergedMapWithSettings(t, `
+dns:
+  enhanced-mode: fake-ip
+  nameserver: [9.9.9.9]
+sniffer:
+  enable: false
+tun:
+  dns-hijack: [udp://any:53]
+  strict-route: false
+  disable-icmp-forwarding: false
+`, settings)
+	if got := nestedMap(t, m, "dns")["enhanced-mode"]; got != "fake-ip" {
+		t.Errorf("dns.enhanced-mode = %v, want subscription value", got)
+	}
+	if got := nestedMap(t, m, "sniffer")["enable"]; got != false {
+		t.Errorf("sniffer.enable = %v, want subscription value", got)
+	}
+	tun := nestedMap(t, m, "tun")
+	if tun["strict-route"] != false || tun["disable-icmp-forwarding"] != false {
+		t.Errorf("TUN subscription values were not preserved: %v", tun)
 	}
 }
 

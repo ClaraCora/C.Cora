@@ -118,7 +118,8 @@ final class CoreStateManager: ObservableObject {
             try await GeoDatabaseManager.shared.prepareForConnection(configYAML: yaml)
             // App 主动连接时明确下发配置意图：nil=使用内建 DIRECT，不复活旧订阅缓存。
             let settings = SettingsStore.shared.asJSON(
-                geoAvailable: AppGroup.containerURL != nil)
+                geoAvailable: AppGroup.containerURL != nil,
+                applyOverrides: SubscriptionStore.shared.activeOverridesEnabled)
             let s = SettingsStore.shared
             MihomoAPI.configure(port: s.controllerPort, secret: s.controllerSecret)
             let opts = TunnelManager.ProtocolOptions(
@@ -149,7 +150,8 @@ final class CoreStateManager: ObservableObject {
         let yaml = SubscriptionStore.shared.activeYAML
         try await GeoDatabaseManager.shared.prepareForConnection(configYAML: yaml)
         let settings = SettingsStore.shared.asJSON(
-            geoAvailable: AppGroup.containerURL != nil)
+            geoAvailable: AppGroup.containerURL != nil,
+            applyOverrides: SubscriptionStore.shared.activeOverridesEnabled)
         let transfer = await Task.detached(priority: .userInitiated) {
             ReloadTransfer.make(configYAML: yaml ?? "", settingsJSON: settings)
         }.value

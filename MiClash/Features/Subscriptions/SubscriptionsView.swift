@@ -116,7 +116,7 @@ struct SubscriptionRow: View {
                             .background(Capsule().fill(Color.orange.opacity(0.12)))
                             .overlay(Capsule().stroke(Color.orange.opacity(0.25), lineWidth: 0.5))
                     }
-                    if sub.hasOverride {
+                    if sub.overrideEnabled {
                         Text("覆写")
                             .font(.caption2.weight(.semibold))
                             .foregroundStyle(.blue)

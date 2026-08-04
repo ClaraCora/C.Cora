@@ -44,7 +44,10 @@ final class GeoDatabaseManager: ObservableObject {
         let settings = SettingsStore.shared
         guard settings.geoAutoUpdate else { return }
         let configYAML = SubscriptionStore.shared.activeYAML ?? ""
-        let resolved = resolveURLs(configYAML: configYAML, settingsJSON: settings.asJSON())
+        let resolved = resolveURLs(
+            configYAML: configYAML,
+            settingsJSON: settings.asJSON(
+                applyOverrides: SubscriptionStore.shared.activeOverridesEnabled))
         guard settings.geoEnabled && (resolved.geoRequired || resolved.asnRequired) else { return }
         guard AppGroup.containerURL != nil else { return }
         do {
@@ -58,7 +61,10 @@ final class GeoDatabaseManager: ObservableObject {
     func prepareForConnection(configYAML: String?) async throws {
         let yaml = configYAML ?? ""
         let settings = SettingsStore.shared
-        let resolved = resolveURLs(configYAML: yaml, settingsJSON: settings.asJSON())
+        let resolved = resolveURLs(
+            configYAML: yaml,
+            settingsJSON: settings.asJSON(
+                applyOverrides: SubscriptionStore.shared.activeOverridesEnabled))
         guard settings.geoEnabled && (resolved.geoRequired || resolved.asnRequired) else { return }
         // 重签环境可能拿不到 App Group。连接层会把有效 geo 设置降级为关闭，
         // 由配置合并层剔除依赖数据库的规则，不能因此阻断整个 VPN。
@@ -85,7 +91,8 @@ final class GeoDatabaseManager: ObservableObject {
         let config = InstalledInfoConfiguration(
             home: home,
             configYAML: SubscriptionStore.shared.activeYAML ?? "",
-            settingsJSON: settings.asJSON(),
+            settingsJSON: settings.asJSON(
+                applyOverrides: SubscriptionStore.shared.activeOverridesEnabled),
             geoEnabled: settings.geoEnabled,
             geodataMode: geodataMode)
         return await Task.detached(priority: .utility) {
@@ -181,7 +188,10 @@ final class GeoDatabaseManager: ObservableObject {
 
     private func requiredAssets(configYAML: String, geodataMode: Bool) -> [AssetDownload] {
         let settings = SettingsStore.shared
-        let resolved = resolveURLs(configYAML: configYAML, settingsJSON: settings.asJSON())
+        let resolved = resolveURLs(
+            configYAML: configYAML,
+            settingsJSON: settings.asJSON(
+                applyOverrides: SubscriptionStore.shared.activeOverridesEnabled))
         var assets: [AssetDownload] = []
         if settings.geoEnabled && resolved.geoRequired {
             assets.append(AssetDownload(

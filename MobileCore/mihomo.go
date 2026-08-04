@@ -282,29 +282,77 @@ func startLogCapture() {
 
 // appSettings 是主 App 下发的设置（JSON）。零值即各项默认。
 type appSettings struct {
-	Stack             string   `json:"stack"`
-	IPv6              bool     `json:"ipv6"`
-	GeoEnabled        bool     `json:"geoEnabled"`
-	GeoLoader         string   `json:"geoLoader"`
-	GeodataMode       bool     `json:"geodataMode"`
-	GeoIPDatURL       string   `json:"geoIPDatURL"`
-	GeoMMDBURL        string   `json:"geoMMDBURL"`
-	GeoSiteURL        string   `json:"geoSiteURL"`
-	IgnoreGeoNegation bool     `json:"ignoreGeoNegation"`
-	GeoAutoUpdate     bool     `json:"geoAutoUpdate"`
-	GeoUpdateInterval int      `json:"geoUpdateInterval"`
-	LogLevel          string   `json:"logLevel"`
-	ControllerPort    int      `json:"controllerPort"`
-	ControllerSecret  string   `json:"controllerSecret"`
-	AllowLan          bool     `json:"allowLan"`
-	MixedPort         int      `json:"mixedPort"`
-	SystemDNS         []string `json:"systemDNS"`
+	Stack             string                 `json:"stack"`
+	IPv6              bool                   `json:"ipv6"`
+	GeoEnabled        bool                   `json:"geoEnabled"`
+	GeoLoader         string                 `json:"geoLoader"`
+	GeodataMode       bool                   `json:"geodataMode"`
+	GeoIPDatURL       string                 `json:"geoIPDatURL"`
+	GeoMMDBURL        string                 `json:"geoMMDBURL"`
+	GeoSiteURL        string                 `json:"geoSiteURL"`
+	IgnoreGeoNegation bool                   `json:"ignoreGeoNegation"`
+	GeoAutoUpdate     bool                   `json:"geoAutoUpdate"`
+	GeoUpdateInterval int                    `json:"geoUpdateInterval"`
+	LogLevel          string                 `json:"logLevel"`
+	ControllerPort    int                    `json:"controllerPort"`
+	ControllerSecret  string                 `json:"controllerSecret"`
+	AllowLan          bool                   `json:"allowLan"`
+	MixedPort         int                    `json:"mixedPort"`
+	SystemDNS         []string               `json:"systemDNS"`
+	ApplyOverrides    bool                   `json:"applyOverrides"`
+	Overrides         configOverrideSettings `json:"overrides"`
+}
+
+type configOverrideSettings struct {
+	DNS     dnsOverrideSettings     `json:"dns"`
+	Sniffer snifferOverrideSettings `json:"sniffer"`
+	Tun     tunOverrideSettings     `json:"tun"`
+}
+
+type dnsOverrideSettings struct {
+	Overwrite           bool              `json:"overwrite"`
+	Listen              string            `json:"listen"`
+	PreferH3            bool              `json:"preferH3"`
+	UseSystemHosts      bool              `json:"useSystemHosts"`
+	UseHosts            bool              `json:"useHosts"`
+	Hosts               map[string]string `json:"hosts"`
+	EnhancedMode        string            `json:"enhancedMode"`
+	FakeIPFilterMode    string            `json:"fakeIPFilterMode"`
+	FakeIPFilter        []string          `json:"fakeIPFilter"`
+	RespectRules        bool              `json:"respectRules"`
+	DefaultNameservers  []string          `json:"defaultNameservers"`
+	Nameservers         []string          `json:"nameservers"`
+	ProxyNameservers    []string          `json:"proxyNameservers"`
+	DirectNameservers   []string          `json:"directNameservers"`
+	FallbackNameservers []string          `json:"fallbackNameservers"`
+	FallbackGeoIP       bool              `json:"fallbackGeoIP"`
+}
+
+type snifferOverrideSettings struct {
+	Overwrite           bool     `json:"overwrite"`
+	Enable              bool     `json:"enable"`
+	ForceDNSMapping     bool     `json:"forceDNSMapping"`
+	ParsePureIP         bool     `json:"parsePureIP"`
+	OverrideDestination bool     `json:"overrideDestination"`
+	HTTP                bool     `json:"http"`
+	TLS                 bool     `json:"tls"`
+	QUIC                bool     `json:"quic"`
+	ForceDomains        []string `json:"forceDomains"`
+	SkipDomains         []string `json:"skipDomains"`
+}
+
+type tunOverrideSettings struct {
+	Overwrite      bool     `json:"overwrite"`
+	DNSHijack      []string `json:"dnsHijack"`
+	StrictRoute    bool     `json:"strictRoute"`
+	ICMPForwarding bool     `json:"icmpForwarding"`
 }
 
 // parseSettings 解析设置 JSON，缺省值兜底（与主 App SettingsStore 默认一致）。
 func parseSettings(settingsJSON string) appSettings {
 	s := appSettings{Stack: "gvisor", LogLevel: "info", ControllerPort: 9090,
-		GeoEnabled: true, GeoLoader: "memconservative", GeodataMode: true,
+		ApplyOverrides: true,
+		GeoEnabled:     true, GeoLoader: "memconservative", GeodataMode: true,
 		IgnoreGeoNegation: false, GeoUpdateInterval: 24,
 		GeoIPDatURL: "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat",
 		GeoMMDBURL:  "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb",
@@ -402,7 +450,22 @@ func resolveGeoDownloadURLsFromMap(m map[string]any, st appSettings) geoDownload
 			resolved.ASN = value
 		}
 	}
-	requirements := configRuleRequirements(m)
+	scanConfig := m
+	if st.ApplyOverrides && st.Overrides.DNS.Overwrite {
+		scanConfig = make(map[string]any, len(m)+1)
+		for key, value := range m {
+			scanConfig[key] = value
+		}
+		scanDNS := map[string]any{}
+		if sourceDNS, ok := m["dns"].(map[string]any); ok {
+			for key, value := range sourceDNS {
+				scanDNS[key] = value
+			}
+		}
+		applyDNSOverride(scanConfig, scanDNS, st.Overrides.DNS)
+		scanConfig["dns"] = scanDNS
+	}
+	requirements := configRuleRequirements(scanConfig)
 	resolved.GeoRequired = requirements.geo
 	resolved.ASNRequired = requirements.asn
 	return resolved
@@ -678,7 +741,6 @@ func mergeConfig(subYAML string, st appSettings, tunnelMTU int) ([]byte, error) 
 	tunCfg := map[string]any{
 		"enable":        true,
 		"stack":         st.Stack,
-		"dns-hijack":    []any{"any:53"},
 		"inet4-address": []any{"198.18.0.1/16"},
 	}
 	if value, exists := sourceTun["mtu"]; exists && !tunnelMTUIsUnset(value) {
@@ -693,10 +755,21 @@ func mergeConfig(subYAML string, st appSettings, tunnelMTU int) ([]byte, error) 
 	if st.IPv6 {
 		tunCfg["inet6-address"] = []any{"fdfe:dcba:9876::1/126"}
 	}
-	for _, key := range []string{"auto-route", "auto-redirect", "strict-route"} {
+	for _, key := range []string{
+		"auto-route", "auto-redirect", "strict-route", "dns-hijack",
+		"disable-icmp-forwarding",
+	} {
 		if value, exists := sourceTun[key]; exists {
 			tunCfg[key] = value
 		}
+	}
+	if _, exists := tunCfg["dns-hijack"]; !exists {
+		tunCfg["dns-hijack"] = []any{"any:53"}
+	}
+	if st.ApplyOverrides && st.Overrides.Tun.Overwrite {
+		tunCfg["dns-hijack"] = stringsToAny(st.Overrides.Tun.DNSHijack)
+		tunCfg["strict-route"] = st.Overrides.Tun.StrictRoute
+		tunCfg["disable-icmp-forwarding"] = !st.Overrides.Tun.ICMPForwarding
 	}
 	m["tun"] = tunCfg
 	// 保留订阅中的 enhanced-mode、nameserver、nameserver-policy 等 DNS 配置。
@@ -705,6 +778,9 @@ func mergeConfig(subYAML string, st appSettings, tunnelMTU int) ([]byte, error) 
 	dnsCfg, _ := m["dns"].(map[string]any)
 	if dnsCfg == nil {
 		dnsCfg = map[string]any{}
+	}
+	if st.ApplyOverrides && st.Overrides.DNS.Overwrite {
+		applyDNSOverride(m, dnsCfg, st.Overrides.DNS)
 	}
 	dnsCfg["enable"] = true
 	dnsCfg["ipv6"] = st.IPv6
@@ -735,6 +811,9 @@ func mergeConfig(subYAML string, st appSettings, tunnelMTU int) ([]byte, error) 
 		}
 	}
 	m["dns"] = dnsCfg
+	if st.ApplyOverrides && st.Overrides.Sniffer.Overwrite {
+		m["sniffer"] = buildSnifferOverride(st.Overrides.Sniffer)
+	}
 	m["ipv6"] = st.IPv6
 	m["log-level"] = st.LogLevel
 
@@ -816,133 +895,90 @@ func mergeConfig(subYAML string, st appSettings, tunnelMTU int) ([]byte, error) 
 	return yaml.Marshal(m)
 }
 
-// ApplyConfigOverride 把用户维护的覆写 YAML 合并到原始订阅。
-//
-// 普通映射递归合并，标量和列表替换原值；null 删除字段。映射中的
-// prepend-<key> / append-<key> 可以在不复制原列表的情况下前置或追加项目。
-// 原始订阅始终单独保存，因此刷新订阅不会丢失覆写内容。
-func ApplyConfigOverride(baseYAML string, overrideYAML string) (string, error) {
-	if strings.TrimSpace(overrideYAML) == "" {
-		return baseYAML, nil
+func applyDNSOverride(root map[string]any, dns map[string]any, override dnsOverrideSettings) {
+	if listen := strings.TrimSpace(override.Listen); listen != "" {
+		dns["listen"] = listen
+	} else {
+		delete(dns, "listen")
 	}
+	dns["prefer-h3"] = override.PreferH3
+	dns["use-system-hosts"] = override.UseSystemHosts
+	dns["use-hosts"] = override.UseHosts
 
-	base, err := yamlMapping(baseYAML, "base config", true)
-	if err != nil {
-		return "", err
+	hosts := make(map[string]any, len(override.Hosts))
+	for domain, address := range override.Hosts {
+		domain = strings.TrimSpace(domain)
+		address = strings.TrimSpace(address)
+		if domain != "" && address != "" {
+			hosts[domain] = address
+		}
 	}
-	override, err := yamlMapping(overrideYAML, "override", false)
-	if err != nil {
-		return "", err
+	root["hosts"] = hosts
+
+	switch override.EnhancedMode {
+	case "fake-ip", "redir-host":
+		dns["enhanced-mode"] = override.EnhancedMode
+	default:
+		dns["enhanced-mode"] = "fake-ip"
 	}
-	merged, err := mergeOverrideMapping(base, override, "")
-	if err != nil {
-		return "", err
+	switch override.FakeIPFilterMode {
+	case "blacklist", "whitelist", "rule":
+		dns["fake-ip-filter-mode"] = override.FakeIPFilterMode
+	default:
+		dns["fake-ip-filter-mode"] = "blacklist"
 	}
-	out, err := yaml.Marshal(merged)
-	if err != nil {
-		return "", fmt.Errorf("marshal overridden config: %w", err)
+	dns["fake-ip-filter"] = stringsToAny(override.FakeIPFilter)
+	dns["respect-rules"] = override.RespectRules
+	dns["default-nameserver"] = stringsToAny(override.DefaultNameservers)
+	dns["nameserver"] = stringsToAny(override.Nameservers)
+	dns["proxy-server-nameserver"] = stringsToAny(override.ProxyNameservers)
+	dns["direct-nameserver"] = stringsToAny(override.DirectNameservers)
+	fallbackNameservers := stringsToAny(override.FallbackNameservers)
+	dns["fallback"] = fallbackNameservers
+
+	if len(fallbackNameservers) == 0 {
+		delete(dns, "fallback-filter")
+		return
 	}
-	return string(out), nil
+	fallbackFilter, _ := dns["fallback-filter"].(map[string]any)
+	if fallbackFilter == nil {
+		fallbackFilter = map[string]any{}
+	}
+	fallbackFilter["geoip"] = override.FallbackGeoIP
+	fallbackFilter["geoip-code"] = "CN"
+	dns["fallback-filter"] = fallbackFilter
 }
 
-func yamlMapping(source string, label string, allowEmpty bool) (map[string]any, error) {
-	if strings.TrimSpace(source) == "" {
-		if allowEmpty {
-			return map[string]any{}, nil
-		}
-		return nil, fmt.Errorf("%s is empty", label)
+func buildSnifferOverride(override snifferOverrideSettings) map[string]any {
+	protocols := map[string]any{}
+	if override.HTTP {
+		protocols["HTTP"] = map[string]any{"ports": []any{80, "8080-8880"}}
 	}
-	var root any
-	if err := yaml.Unmarshal([]byte(source), &root); err != nil {
-		return nil, fmt.Errorf("invalid %s YAML: %w", label, err)
+	if override.TLS {
+		protocols["TLS"] = map[string]any{"ports": []any{443, 8443}}
 	}
-	mapping, ok := root.(map[string]any)
-	if !ok || mapping == nil {
-		return nil, fmt.Errorf("%s root must be a YAML mapping", label)
+	if override.QUIC {
+		protocols["QUIC"] = map[string]any{"ports": []any{443, 8443}}
 	}
-	return mapping, nil
+	return map[string]any{
+		"enable":               override.Enable,
+		"force-dns-mapping":    override.ForceDNSMapping,
+		"parse-pure-ip":        override.ParsePureIP,
+		"override-destination": override.OverrideDestination,
+		"sniff":                protocols,
+		"force-domain":         stringsToAny(override.ForceDomains),
+		"skip-domain":          stringsToAny(override.SkipDomains),
+	}
 }
 
-func mergeOverrideMapping(base map[string]any, override map[string]any, path string) (map[string]any, error) {
-	result := make(map[string]any, len(base)+len(override))
-	for key, value := range base {
-		result[key] = value
-	}
-
-	// 先处理普通覆写，再处理列表操作，使 rules 与 prepend-rules / append-rules
-	// 同时出现时语义稳定：先替换 rules，再在新列表两端添加。
-	for key, value := range override {
-		if overrideListOperation(key) != "" {
-			continue
-		}
-		if value == nil {
-			delete(result, key)
-			continue
-		}
-		if nested, ok := value.(map[string]any); ok {
-			current, _ := result[key].(map[string]any)
-			if current == nil {
-				current = map[string]any{}
-			}
-			merged, err := mergeOverrideMapping(current, nested, overridePath(path, key))
-			if err != nil {
-				return nil, err
-			}
-			result[key] = merged
-			continue
-		}
-		result[key] = value
-	}
-
-	for _, operation := range []string{"prepend-", "append-"} {
-		for key, value := range override {
-			if !strings.HasPrefix(key, operation) {
-				continue
-			}
-			target := strings.TrimPrefix(key, operation)
-			if target == "" {
-				return nil, fmt.Errorf("%s must name a target list", overridePath(path, key))
-			}
-			items, ok := value.([]any)
-			if !ok {
-				return nil, fmt.Errorf("%s must be a YAML list", overridePath(path, key))
-			}
-			current := []any{}
-			if existing, exists := result[target]; exists {
-				var listOK bool
-				current, listOK = existing.([]any)
-				if !listOK {
-					return nil, fmt.Errorf("%s targets non-list field %s", overridePath(path, key), overridePath(path, target))
-				}
-			}
-			combined := make([]any, 0, len(current)+len(items))
-			if operation == "prepend-" {
-				combined = append(combined, items...)
-				combined = append(combined, current...)
-			} else {
-				combined = append(combined, current...)
-				combined = append(combined, items...)
-			}
-			result[target] = combined
+func stringsToAny(values []string) []any {
+	out := make([]any, 0, len(values))
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			out = append(out, value)
 		}
 	}
-	return result, nil
-}
-
-func overrideListOperation(key string) string {
-	for _, prefix := range []string{"prepend-", "append-"} {
-		if strings.HasPrefix(key, prefix) {
-			return prefix
-		}
-	}
-	return ""
-}
-
-func overridePath(parent string, key string) string {
-	if parent == "" {
-		return key
-	}
-	return parent + "." + key
+	return out
 }
 
 // replaceSystemNameserver 把 DNS 服务器列表（或单字符串值）中的 "system" 展开为

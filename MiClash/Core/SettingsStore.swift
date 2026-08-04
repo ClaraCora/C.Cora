@@ -158,7 +158,7 @@ final class SettingsStore: ObservableObject {
     }
 
     /// 序列化为下发给 NE 的 JSON。
-    func asJSON(geoAvailable: Bool = true) -> String {
+    func asJSON(geoAvailable: Bool = true, applyOverrides: Bool = true) -> String {
         let dict: [String: Any] = [
             "stack": stack,
             "ipv6": ipv6,
@@ -176,6 +176,8 @@ final class SettingsStore: ObservableObject {
             "controllerSecret": controllerSecret,
             "allowLan": allowLan,
             "mixedPort": mixedPort,
+            "applyOverrides": applyOverrides,
+            "overrides": ConfigOverrideStore.shared.asDictionary(),
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: dict),
               let s = String(data: data, encoding: .utf8) else { return "" }

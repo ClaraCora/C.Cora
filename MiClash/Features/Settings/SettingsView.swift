@@ -21,6 +21,18 @@ struct SettingsView: View {
                     Text("TCP/IP 栈固定 gvisor（iOS 隧道扩展里 system 栈 TCP 走不通）。")
                 }
 
+                Section {
+                    NavigationLink {
+                        ConfigOverrideSettingsView()
+                    } label: {
+                        Label("固定覆写设置", systemImage: "slider.horizontal.3")
+                    }
+                } header: {
+                    Text("覆写")
+                } footer: {
+                    Text("配置文件可单独选择是否应用这套固定设置。")
+                }
+
                 GeoSettingsSection(installedInfo: installedGeoInfo)
 
                 Section {

@@ -10,6 +10,8 @@ struct MiClashApp: App {
     @StateObject private var subscriptions = SubscriptionStore.shared
     /// 设置 Store：内核栈/日志/IPv6/geo/外部控制。
     @StateObject private var settings = SettingsStore.shared
+    /// 固定的可视化配置覆写；具体配置文件只保存是否启用。
+    @StateObject private var configOverrides = ConfigOverrideStore.shared
     /// GEO 数据由主 App 下载到 App Group，NE 只负责读取。
     @StateObject private var geoDatabase = GeoDatabaseManager.shared
 
@@ -19,6 +21,7 @@ struct MiClashApp: App {
                 .environmentObject(core)
                 .environmentObject(subscriptions)
                 .environmentObject(settings)
+                .environmentObject(configOverrides)
                 .environmentObject(geoDatabase)
                 // 两者都是全局单例；直接注入可避免高频发布让 App 根视图整体失效。
                 .environmentObject(KernelController.shared)

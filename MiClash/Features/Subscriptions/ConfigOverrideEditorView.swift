@@ -1,79 +1,294 @@
 import SwiftUI
 
-/// 每个配置独立保存的 YAML 覆写层；远程订阅刷新不会改动这里的内容。
-struct ConfigOverrideEditorView: View {
-    @EnvironmentObject private var store: SubscriptionStore
-    @Environment(\.dismiss) private var dismiss
-
-    let subscription: Subscription
-    @State private var yaml: String
-    @State private var validationError: String?
-    @State private var showClearConfirmation = false
-
-    init(subscription: Subscription) {
-        self.subscription = subscription
-        _yaml = State(initialValue: subscription.overrideYAML)
-    }
+struct ConfigOverrideSettingsView: View {
+    @EnvironmentObject private var overrides: ConfigOverrideStore
+    @State private var showRestoreConfirmation = false
 
     var body: some View {
-        NavigationStack {
-            Form {
-                Section {
-                    TextEditor(text: $yaml)
-                        .font(.system(.footnote, design: .monospaced))
-                        .frame(minHeight: 360)
+        Form {
+            Section {
+                NavigationLink {
+                    DNSOverrideSettingsView()
+                } label: {
+                    OverrideCategoryLabel(title: "DNS", systemImage: "network",
+                                          enabled: overrides.overwriteDNS)
+                }
+                NavigationLink {
+                    SnifferOverrideSettingsView()
+                } label: {
+                    OverrideCategoryLabel(title: "嗅探", systemImage: "waveform.path.ecg",
+                                          enabled: overrides.overwriteSniffer)
+                }
+                NavigationLink {
+                    TunOverrideSettingsView()
+                } label: {
+                    OverrideCategoryLabel(title: "TUN", systemImage: "arrow.triangle.branch",
+                                          enabled: overrides.overwriteTun)
+                }
+            }
+
+            Section {
+                Button("恢复默认覆写设置", role: .destructive) {
+                    showRestoreConfirmation = true
+                }
+            }
+        }
+        .navigationTitle("固定覆写")
+        .navigationBarTitleDisplayMode(.inline)
+        .confirmationDialog("恢复所有默认覆写设置？", isPresented: $showRestoreConfirmation) {
+            Button("恢复默认设置", role: .destructive) {
+                overrides.restoreDefaults()
+            }
+        }
+    }
+}
+
+private struct OverrideCategoryLabel: View {
+    let title: String
+    let systemImage: String
+    let enabled: Bool
+
+    var body: some View {
+        Label {
+            HStack {
+                Text(title)
+                Spacer()
+                Text(enabled ? "覆写" : "不覆写")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        } icon: {
+            Image(systemName: systemImage)
+        }
+    }
+}
+
+private struct DNSOverrideSettingsView: View {
+    @EnvironmentObject private var overrides: ConfigOverrideStore
+
+    var body: some View {
+        Form {
+            Section {
+                Toggle("覆写 DNS", isOn: $overrides.overwriteDNS)
+            }
+
+            Section("基础") {
+                HStack {
+                    Text("监听地址")
+                    Spacer()
+                    TextField("0.0.0.0:1053", text: $overrides.dnsListen)
+                        .multilineTextAlignment(.trailing)
                         .autocorrectionDisabled()
                         .textInputAutocapitalization(.never)
-                } header: {
-                    Text("覆写内容（YAML）")
-                } footer: {
-                    Text("字段会递归合并，列表默认替换。prepend-字段名 / append-字段名可在列表前后追加，null 可删除字段。iOS 强制配置仍以应用设置为准。")
                 }
+                Toggle("DoH H3 优先", isOn: $overrides.dnsPreferH3)
+                Toggle("使用系统 Hosts", isOn: $overrides.dnsUseSystemHosts)
+                Toggle("使用 Hosts", isOn: $overrides.dnsUseHosts)
+                NavigationLink("添加 Hosts") {
+                    HostOverridesView()
+                }
+            }
+            .disabled(!overrides.overwriteDNS)
 
-                if subscription.hasOverride {
-                    Section {
-                        Button("清除覆写", role: .destructive) {
-                            showClearConfirmation = true
-                        }
+            Section("解析模式") {
+                Picker("DNS 模式", selection: $overrides.dnsEnhancedMode) {
+                    ForEach(ConfigOverrideStore.dnsModeOptions, id: \.self) { Text($0).tag($0) }
+                }
+                Picker("Fake IP 过滤模式", selection: $overrides.fakeIPFilterMode) {
+                    ForEach(ConfigOverrideStore.fakeIPFilterModeOptions, id: \.self) {
+                        Text($0).tag($0)
                     }
                 }
-            }
-            .navigationTitle("配置覆写")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button("取消") { dismiss() }
+                NavigationLink {
+                    StringListEditorView(title: "Fake IP 过滤内容",
+                                         values: $overrides.fakeIPFilter,
+                                         placeholder: "域名、通配符或规则")
+                } label: {
+                    ListSettingLabel(title: "Fake IP 过滤内容",
+                                     count: overrides.fakeIPFilter.count)
                 }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("保存") { save() }
-                        .disabled(!isDirty)
+                Button("载入常见过滤内容") {
+                    overrides.fakeIPFilter = ConfigOverrideStore.commonFakeIPFilter
+                }
+                Toggle("遵守 Rules 规则", isOn: $overrides.dnsRespectRules)
+            }
+            .disabled(!overrides.overwriteDNS)
+
+            Section("域名解析服务器") {
+                nameserverLink("默认域名解析服务器", values: $overrides.defaultNameservers)
+                nameserverLink("域名解析服务器", values: $overrides.nameservers)
+                nameserverLink("代理域名解析服务器", values: $overrides.proxyNameservers)
+                nameserverLink("直连域名解析服务器", values: $overrides.directNameservers)
+                nameserverLink("Fallback 域名解析服务器", values: $overrides.fallbackNameservers)
+                Toggle("Fallback GeoIP", isOn: $overrides.fallbackGeoIP)
+            }
+            .disabled(!overrides.overwriteDNS)
+        }
+        .navigationTitle("DNS 覆写")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    @ViewBuilder
+    private func nameserverLink(_ title: String, values: Binding<[String]>) -> some View {
+        NavigationLink {
+            StringListEditorView(title: title, values: values, placeholder: "DNS 服务器地址")
+        } label: {
+            ListSettingLabel(title: title, count: values.wrappedValue.count)
+        }
+    }
+}
+
+private struct SnifferOverrideSettingsView: View {
+    @EnvironmentObject private var overrides: ConfigOverrideStore
+
+    var body: some View {
+        Form {
+            Section {
+                Toggle("覆写嗅探", isOn: $overrides.overwriteSniffer)
+                Toggle("启用嗅探", isOn: $overrides.snifferEnabled)
+                    .disabled(!overrides.overwriteSniffer)
+            }
+
+            Section("行为") {
+                Toggle("强制 DNS 映射", isOn: $overrides.snifferForceDNSMapping)
+                Toggle("解析纯 IP 流量", isOn: $overrides.snifferParsePureIP)
+                Toggle("覆写目标地址", isOn: $overrides.snifferOverrideDestination)
+            }
+            .disabled(!overrides.overwriteSniffer || !overrides.snifferEnabled)
+
+            Section("协议") {
+                Toggle("HTTP", isOn: $overrides.sniffHTTP)
+                Toggle("TLS", isOn: $overrides.sniffTLS)
+                Toggle("QUIC", isOn: $overrides.sniffQUIC)
+            }
+            .disabled(!overrides.overwriteSniffer || !overrides.snifferEnabled)
+
+            Section("域名") {
+                NavigationLink {
+                    StringListEditorView(title: "强制嗅探域名",
+                                         values: $overrides.forceSniffDomains,
+                                         placeholder: "域名或通配符")
+                } label: {
+                    ListSettingLabel(title: "强制嗅探域名",
+                                     count: overrides.forceSniffDomains.count)
+                }
+                NavigationLink {
+                    StringListEditorView(title: "跳过嗅探域名",
+                                         values: $overrides.skipSniffDomains,
+                                         placeholder: "域名或通配符")
+                } label: {
+                    ListSettingLabel(title: "跳过嗅探域名",
+                                     count: overrides.skipSniffDomains.count)
                 }
             }
-            .confirmationDialog("清除当前覆写？", isPresented: $showClearConfirmation) {
-                Button("清除覆写", role: .destructive) {
-                    yaml = ""
-                }
+            .disabled(!overrides.overwriteSniffer || !overrides.snifferEnabled)
+        }
+        .navigationTitle("嗅探覆写")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+private struct TunOverrideSettingsView: View {
+    @EnvironmentObject private var overrides: ConfigOverrideStore
+
+    var body: some View {
+        Form {
+            Section {
+                Toggle("覆写 TUN", isOn: $overrides.overwriteTun)
             }
-            .alert("无法保存", isPresented: Binding(
-                get: { validationError != nil },
-                set: { if !$0 { validationError = nil } }
-            )) {
-                Button("好") { validationError = nil }
-            } message: {
-                Text(validationError ?? "")
+            Section {
+                NavigationLink {
+                    StringListEditorView(title: "DNS 劫持",
+                                         values: $overrides.tunDNSHijack,
+                                         placeholder: "如 any:53")
+                } label: {
+                    ListSettingLabel(title: "DNS 劫持", count: overrides.tunDNSHijack.count)
+                }
+                Toggle("严格路由", isOn: $overrides.tunStrictRoute)
+                Toggle("ICMP 转发", isOn: $overrides.tunICMPForwarding)
+            }
+            .disabled(!overrides.overwriteTun)
+        }
+        .navigationTitle("TUN 覆写")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+private struct ListSettingLabel: View {
+    let title: String
+    let count: Int
+
+    var body: some View {
+        HStack {
+            Text(title)
+            Spacer()
+            Text("\(count) 项")
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+private struct StringListEditorView: View {
+    let title: String
+    @Binding var values: [String]
+    let placeholder: String
+
+    var body: some View {
+        List {
+            ForEach(values.indices, id: \.self) { index in
+                TextField(placeholder, text: Binding(
+                    get: { values[index] },
+                    set: { values[index] = $0 }
+                ))
+                .autocorrectionDisabled()
+                .textInputAutocapitalization(.never)
+            }
+            .onDelete { values.remove(atOffsets: $0) }
+        }
+        .navigationTitle(title)
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    values.append("")
+                } label: {
+                    Image(systemName: "plus")
+                }
+                .accessibilityLabel("添加")
             }
         }
     }
+}
 
-    private var isDirty: Bool {
-        yaml != subscription.overrideYAML
-    }
+private struct HostOverridesView: View {
+    @EnvironmentObject private var overrides: ConfigOverrideStore
 
-    private func save() {
-        if let error = store.updateOverride(subscription.id, yaml: yaml) {
-            validationError = error
-            return
+    var body: some View {
+        List {
+            ForEach($overrides.hosts) { $host in
+                VStack(alignment: .leading, spacing: 8) {
+                    TextField("域名或通配符", text: $host.domain)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                    TextField("IP 地址", text: $host.address)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .onDelete { overrides.hosts.remove(atOffsets: $0) }
         }
-        dismiss()
+        .navigationTitle("Hosts")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    overrides.hosts.append(HostOverride())
+                } label: {
+                    Image(systemName: "plus")
+                }
+                .accessibilityLabel("添加 Host")
+            }
+        }
     }
 }
