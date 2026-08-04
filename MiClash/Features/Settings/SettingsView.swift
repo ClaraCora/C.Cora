@@ -25,7 +25,7 @@ struct SettingsView: View {
                     NavigationLink {
                         ConfigOverrideSettingsView()
                     } label: {
-                        Label("固定覆写设置", systemImage: "slider.horizontal.3")
+                        Text("覆写设置")
                     }
                 } header: {
                     Text("覆写")

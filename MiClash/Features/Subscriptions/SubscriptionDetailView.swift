@@ -110,15 +110,11 @@ struct SubscriptionDetailView: View {
                 .disabled(refreshing)
             }
 
-            Toggle("启用固定覆写", isOn: Binding(
+            Toggle(isOn: Binding(
                 get: { sub.overrideEnabled },
                 set: { store.setOverrideEnabled(sub.id, enabled: $0) }
-            ))
-
-            NavigationLink {
-                ConfigOverrideSettingsView()
-            } label: {
-                Label("覆写设置", systemImage: "slider.horizontal.3")
+            )) {
+                Label("启用覆写", systemImage: "slider.horizontal.3")
             }
         }
     }
