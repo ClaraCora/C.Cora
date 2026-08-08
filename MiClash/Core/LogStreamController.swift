@@ -109,8 +109,6 @@ final class LogStreamController: ObservableObject {
     func clear() {
         if !isStreaming { generation &+= 1 }
         searchTask?.cancel()
-        ipcTask?.cancel()
-        ipcTask = nil
         rawLines.removeAll()
         display = .empty
     }

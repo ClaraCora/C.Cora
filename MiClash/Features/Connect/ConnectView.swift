@@ -13,9 +13,10 @@ struct ConnectView: View {
                 VStack(spacing: 16) {
                     ConnectionCard()
                     if core.isActive {
-                        RuntimeMetricsRow(up: kernel.up,
-                                          down: kernel.down,
-                                          memoryFootprint: kernel.memoryFootprint)
+                        RuntimeMetricsGrid(up: kernel.up,
+                                           down: kernel.down,
+                                           memoryFootprint: kernel.memoryFootprint,
+                                           uptime: kernel.uptime)
                         TrafficChart(samples: kernel.samples)
                     }
                     if !core.configNotices.isEmpty {
@@ -153,14 +154,15 @@ private struct NoticesCard: View {
     }
 }
 
-/// 当前运行指标：上下行与内存各自独立，便于快速扫读。
-private struct RuntimeMetricsRow: View {
+/// 当前运行指标：固定两列，避免四项数据在窄屏上挤压。
+private struct RuntimeMetricsGrid: View {
     let up: Int64
     let down: Int64
     let memoryFootprint: Int64?
+    let uptime: Int64
 
     var body: some View {
-        HStack(spacing: 8) {
+        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
             MetricWidget(title: "下行", value: ByteFormat.rate(down),
                          systemImage: "arrow.down", tint: .blue)
             MetricWidget(title: "上行", value: ByteFormat.rate(up),
@@ -168,7 +170,20 @@ private struct RuntimeMetricsRow: View {
             MetricWidget(title: "内存",
                          value: memoryFootprint.map(ByteFormat.size) ?? "—",
                          systemImage: "memorychip", tint: .green)
+            MetricWidget(title: "运行时长",
+                         value: Self.duration(uptime),
+                         systemImage: "timer", tint: .purple)
         }
+    }
+
+    private static func duration(_ seconds: Int64) -> String {
+        let value = max(0, seconds)
+        let days = value / 86_400
+        let hours = (value % 86_400) / 3_600
+        let minutes = (value % 3_600) / 60
+        let remainingSeconds = value % 60
+        let clock = String(format: "%02lld:%02lld:%02lld", hours, minutes, remainingSeconds)
+        return days > 0 ? "\(days)天 \(clock)" : clock
     }
 }
 

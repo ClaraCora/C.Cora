@@ -101,7 +101,9 @@ struct SettingsView: View {
                     Toggle("强制路由", isOn: $settings.enforceRoutes)
                     Toggle("排除蜂窝服务", isOn: $settings.excludeCellularServices)
                     Toggle("排除 APNs 推送", isOn: $settings.excludeAPNs)
-                    Toggle("排除设备间通信", isOn: $settings.excludeDeviceCommunication)
+                    if #available(iOS 17.4, *) {
+                        Toggle("排除设备间通信", isOn: $settings.excludeDeviceCommunication)
+                    }
                 } header: {
                     Text("隧道路由")
                 } footer: {

@@ -295,6 +295,22 @@ func TestConnectionsIPCEmptySnapshotAndMissingClose(t *testing.T) {
 	}
 }
 
+func TestTrafficNowIncludesCoreUptime(t *testing.T) {
+	previousStartedAt := coreStartedAt
+	coreStartedAt = time.Now().Add(-3 * time.Second)
+	defer func() { coreStartedAt = previousStartedAt }()
+
+	var snapshot struct {
+		Uptime int64 `json:"uptime"`
+	}
+	if err := json.Unmarshal([]byte(TrafficNow()), &snapshot); err != nil {
+		t.Fatalf("TrafficNow returned invalid JSON: %v", err)
+	}
+	if snapshot.Uptime < 2 {
+		t.Fatalf("TrafficNow uptime = %d, want at least 2", snapshot.Uptime)
+	}
+}
+
 func mergedMap(t *testing.T, input string) map[string]any {
 	t.Helper()
 	return mergedMapWithSettings(t, input, appSettings{Stack: "gvisor", LogLevel: "info"})

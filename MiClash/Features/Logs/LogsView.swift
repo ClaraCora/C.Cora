@@ -7,6 +7,7 @@ struct LogsView: View {
     @EnvironmentObject private var controller: LogStreamController
 
     @State private var autoScroll = true
+    @State private var pausedAtLineCount = 0
     @State private var isCopyingDiagnostic = false
     @State private var didCopyDiagnostic = false
 
@@ -114,21 +115,18 @@ struct LogsView: View {
 
     private var logList: some View {
         ScrollViewReader { proxy in
-            List(controller.lines) { line in
-                LogRow(line: line)
-                    .id(line.id)
-                    .listRowInsets(EdgeInsets(top: 6, leading: 14, bottom: 6, trailing: 12))
-                    .listRowSeparator(.hidden)
-            }
-            .listStyle(.plain)
-            .overlay(alignment: .bottomTrailing) {
-                scrollControl(proxy)
-            }
-            .onScrollPhaseChange { _, phase in
-                if phase.isScrolling && phase != .animating {
-                    autoScroll = false
+            trackManualScrolling(
+                List(controller.lines) { line in
+                    LogRow(line: line)
+                        .id(line.id)
+                        .listRowInsets(EdgeInsets(top: 6, leading: 14, bottom: 6, trailing: 12))
+                        .listRowSeparator(.hidden)
                 }
-            }
+                .listStyle(.plain)
+                .overlay(alignment: .bottomTrailing) {
+                    scrollControl(proxy)
+                }
+            )
             .onChange(of: controller.lines.last?.id) { _, id in
                 guard autoScroll, let id else { return }
                 proxy.scrollTo(id, anchor: .bottom)
@@ -141,24 +139,57 @@ struct LogsView: View {
         }
     }
 
+    @ViewBuilder
+    private func trackManualScrolling<Content: View>(_ content: Content) -> some View {
+        if #available(iOS 18.0, *) {
+            content.onScrollPhaseChange { _, phase in
+                if phase.isScrolling && phase != .animating {
+                    pauseAutoScroll()
+                }
+            }
+        } else {
+            content.simultaneousGesture(
+                DragGesture(minimumDistance: 4).onChanged { _ in
+                    pauseAutoScroll()
+                }
+            )
+        }
+    }
+
     private func scrollControl(_ proxy: ScrollViewProxy) -> some View {
         HStack(spacing: 8) {
             if !autoScroll {
                 Button {
                     guard let last = controller.lines.last else { return }
+                    pausedAtLineCount = controller.bufferedLineCount
                     withAnimation(.easeOut(duration: 0.18)) {
                         proxy.scrollTo(last.id, anchor: .bottom)
                     }
                 } label: {
-                    Image(systemName: "arrow.down.to.line")
-                        .frame(width: 38, height: 38)
-                        .background(.ultraThinMaterial, in: Circle())
+                    ZStack(alignment: .topTrailing) {
+                        Image(systemName: "arrow.down.to.line")
+                            .frame(width: 38, height: 38)
+                            .background(.ultraThinMaterial, in: Circle())
+                        if pausedLineCount > 0 {
+                            Text(pausedLineCount > 99 ? "99+" : String(pausedLineCount))
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 4)
+                                .frame(minWidth: 16, minHeight: 16)
+                                .background(Color.red, in: Capsule())
+                        }
+                    }
                 }
-                .accessibilityLabel("跳到最新日志")
+                .accessibilityLabel("跳到最新日志，继续暂停自动滚动")
             }
 
             Button {
-                autoScroll.toggle()
+                if autoScroll {
+                    pauseAutoScroll()
+                } else {
+                    autoScroll = true
+                    pausedAtLineCount = controller.bufferedLineCount
+                }
                 if autoScroll, let last = controller.lines.last {
                     proxy.scrollTo(last.id, anchor: .bottom)
                 }
@@ -168,10 +199,20 @@ struct LogsView: View {
                     .frame(width: 40, height: 40)
                     .background(autoScroll ? Color.orange : Color.green, in: Circle())
             }
-            .accessibilityLabel(autoScroll ? "暂停自动滚动" : "恢复自动滚动")
+            .accessibilityLabel(autoScroll ? "暂停自动滚动，日志继续加载" : "恢复自动滚动")
         }
         .padding(.trailing, 14)
         .padding(.bottom, 12)
+    }
+
+    private var pausedLineCount: Int {
+        max(0, controller.bufferedLineCount - pausedAtLineCount)
+    }
+
+    private func pauseAutoScroll() {
+        guard autoScroll else { return }
+        pausedAtLineCount = controller.bufferedLineCount
+        autoScroll = false
     }
 }
 

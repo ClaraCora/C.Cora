@@ -30,9 +30,10 @@ final class KernelController: ObservableObject {
     struct RuntimeSnapshot: Equatable {
         let up: Int64
         let down: Int64
+        let uptime: Int64
         let samples: [TrafficSample]
 
-        static let empty = RuntimeSnapshot(up: 0, down: 0, samples: [])
+        static let empty = RuntimeSnapshot(up: 0, down: 0, uptime: 0, samples: [])
     }
 
     @Published var mode: Mode = .rule
@@ -43,6 +44,7 @@ final class KernelController: ObservableObject {
     /// 最近若干秒的速率采样（曲线图数据）。
     var up: Int64 { runtime.up }
     var down: Int64 { runtime.down }
+    var uptime: Int64 { runtime.uptime }
     var samples: [TrafficSample] { runtime.samples }
 
     private var trafficTask: Task<Void, Never>?
@@ -105,7 +107,8 @@ final class KernelController: ObservableObject {
                    let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
                     let u = (obj["up"] as? NSNumber)?.int64Value ?? 0
                     let d = (obj["down"] as? NSNumber)?.int64Value ?? 0
-                    self?.pushSample(up: u, down: d)
+                    let uptime = (obj["uptime"] as? NSNumber)?.int64Value ?? 0
+                    self?.pushSample(up: u, down: d, uptime: uptime)
                     self?.setReachable(true)
                 } else {
                     self?.setReachable(false)
@@ -177,14 +180,14 @@ final class KernelController: ObservableObject {
         if memoryFootprint != nil { memoryFootprint = nil }
     }
 
-    private func pushSample(up: Int64, down: Int64) {
+    private func pushSample(up: Int64, down: Int64, uptime: Int64) {
         var updatedSamples = runtime.samples
         updatedSamples.append(TrafficSample(id: sampleIndex, up: up, down: down))
         sampleIndex += 1
         if updatedSamples.count > maxSamples {
             updatedSamples.removeFirst(updatedSamples.count - maxSamples)
         }
-        runtime = RuntimeSnapshot(up: up, down: down, samples: updatedSamples)
+        runtime = RuntimeSnapshot(up: up, down: down, uptime: uptime, samples: updatedSamples)
     }
 
     private func setReachable(_ value: Bool) {

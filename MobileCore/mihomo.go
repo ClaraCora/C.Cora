@@ -87,6 +87,7 @@ var (
 	activeSystemDNS      []string
 	activeUsesSystemDNS  bool
 	pendingUsesSystemDNS bool
+	coreStartedAt        time.Time
 )
 
 // Version 返回「mihomo 内核版本 / Go 运行时版本」。
@@ -601,6 +602,7 @@ func StartWithConfig(fd int, tunnelMTU int, configYAML string, settingsJSON stri
 		return err
 	}
 	recordControllerState(st)
+	coreStartedAt = time.Now()
 	return nil
 }
 
@@ -1476,13 +1478,19 @@ func SetMode(mode string) {
 	}
 }
 
-// TrafficNow 返回当前每秒上下行速率（字节）：{"up":..,"down":..}。
+// TrafficNow 返回当前每秒上下行速率与本次内核运行秒数。
 // 取自 mihomo 统计管理器（与 REST /traffic 同源），对应 Swift 侧 `MihomoTrafficNow()`。
 func TrafficNow() string {
+	configApplyMu.RLock()
+	defer configApplyMu.RUnlock()
 	up, down := statistic.DefaultManager.Now()
-	out, err := json.Marshal(map[string]int64{"up": up, "down": down})
+	uptime := int64(0)
+	if !coreStartedAt.IsZero() {
+		uptime = int64(time.Since(coreStartedAt) / time.Second)
+	}
+	out, err := json.Marshal(map[string]int64{"up": up, "down": down, "uptime": uptime})
 	if err != nil {
-		return `{"up":0,"down":0}`
+		return `{"up":0,"down":0,"uptime":0}`
 	}
 	return string(out)
 }
@@ -1959,6 +1967,7 @@ func Stop() {
 	activeSystemDNS = nil
 	activeGeneralIPv6 = false
 	activeUsesSystemDNS = false
+	coreStartedAt = time.Time{}
 	CloseAllConnections()
 	controllerState.ExternalController = false
 	route.ReCreateServer(&route.Config{})
