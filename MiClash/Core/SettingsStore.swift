@@ -149,11 +149,12 @@ final class SettingsStore: ObservableObject {
         let storedControllerPort = Self.normalizedControllerPort(d.integer(forKey: K.port))
         let storedControllerSecret = d.string(forKey: K.secret) ?? ""
         let storedAllowLan = d.object(forKey: K.allowLan) as? Bool ?? false
-        externalControllerEnabled = d.object(forKey: K.externalController) as? Bool
+        let storedExternalController = d.object(forKey: K.externalController) as? Bool
             ?? storedAllowLan
+        externalControllerEnabled = storedExternalController
         controllerPort = storedControllerPort
         controllerSecret = storedControllerSecret
-        allowLan = storedAllowLan && externalControllerEnabled
+        allowLan = storedAllowLan && storedExternalController
             && !storedControllerSecret.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let storedMixedPort = min(max(d.integer(forKey: K.mixedPort), 0), 65_535)
         mixedPort = storedMixedPort == storedControllerPort ? 0 : storedMixedPort
