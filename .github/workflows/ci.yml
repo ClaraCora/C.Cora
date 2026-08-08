@@ -222,6 +222,14 @@ jobs:
           # run there and should not participate in plugin validation/loading.
           rm -rf "$TS_APP/PlugIns/MiClashControl.appex"
 
+          # Mark both processes so only the TrollStore package uses the shared
+          # file IPC fallback. The ordinary IPA keeps official NE messaging.
+          /usr/libexec/PlistBuddy -c \
+            'Add :MiClashTrollStoreBuild bool true' "$TS_APP/Info.plist"
+          /usr/libexec/PlistBuddy -c \
+            'Add :MiClashTrollStoreBuild bool true' \
+            "$TS_APP/PlugIns/MiClashTunnel.appex/Info.plist"
+
           # TrollStore preserves arbitrary entitlements already present in each binary.
           # Both processes need the complete iOS 17 unsandboxing entitlement set
           # while retaining access to their own app data containers.
@@ -238,6 +246,17 @@ jobs:
           codesign -d --entitlements :- \
             "$TS_APP/PlugIns/MiClashTunnel.appex" > "$TUNNEL_ENTITLEMENTS" 2>/dev/null
           test "$(/usr/libexec/PlistBuddy -c \
+            'Print :MiClashTrollStoreBuild' "$TS_APP/Info.plist")" = "true"
+          test "$(/usr/libexec/PlistBuddy -c \
+            'Print :MiClashTrollStoreBuild' \
+            "$TS_APP/PlugIns/MiClashTunnel.appex/Info.plist")" = "true"
+          test "$(/usr/libexec/PlistBuddy -c \
+            'Print :application-identifier' "$MAIN_ENTITLEMENTS")" \
+            = "TROLLTROLL.com.miclash.app"
+          test "$(/usr/libexec/PlistBuddy -c \
+            'Print :application-identifier' "$TUNNEL_ENTITLEMENTS")" \
+            = "TROLLTROLL.com.miclash.app.tunnel"
+          test "$(/usr/libexec/PlistBuddy -c \
             'Print :com.apple.private.security.no-sandbox' "$MAIN_ENTITLEMENTS")" = "true"
           test "$(/usr/libexec/PlistBuddy -c \
             'Print :com.apple.private.security.no-sandbox' "$TUNNEL_ENTITLEMENTS")" = "true"
@@ -247,6 +266,12 @@ jobs:
             test "$(/usr/libexec/PlistBuddy -c \
               'Print :com.apple.private.security.storage.AppDataContainers' \
               "$ENTITLEMENTS")" = "true"
+            test "$(/usr/libexec/PlistBuddy -c \
+              'Print :com.apple.developer.team-identifier' "$ENTITLEMENTS")" \
+              = "TROLLTROLL"
+            test "$(/usr/libexec/PlistBuddy -c \
+              'Print :com.apple.developer.networking.networkextension:0' \
+              "$ENTITLEMENTS")" = "packet-tunnel-provider"
           done
           cd "$TS_ROOT"
           zip -qr "$GITHUB_WORKSPACE/MiClash-TrollStore.ipa" Payload

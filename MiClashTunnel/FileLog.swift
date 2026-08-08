@@ -3,8 +3,8 @@ import Foundation
 /// NE 扩展的运行日志。
 ///
 /// 用户证书来自他人、无法控制开发者账号 → 注册不了 App Group。因此日志**不依赖
-/// App Group 共享文件**，改为：进程内内存缓冲 + 经 `sendProviderMessage`/`handleAppMessage`
-/// 官方 IPC 回传给主 App（见 PacketTunnelProvider.handleAppMessage）。
+/// App Group 共享文件**。日志保留在进程内缓冲，普通签名经系统 IPC 回传；
+/// TrollStore 包经共享目录文件 IPC 调用同一个 handleAppMessage 命令处理器。
 /// 这条通道不需要任何共享容器，只要 NE 在运行即可读取。
 ///
 /// 若 App Group 恰好可用，也会顺带写一份 ne.log 文件（best-effort），但不作为主路径。

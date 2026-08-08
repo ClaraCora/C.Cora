@@ -224,7 +224,7 @@ private struct GeoURLField: View {
     }
 }
 
-/// 内核状态页：验证 App 与 Tunnel 之间的主控制 IPC。
+/// 内核状态页：验证 App 与 Tunnel 之间的主控制通道。
 private struct KernelStatusView: View {
     @State private var text = "探测中…"
 
@@ -244,7 +244,10 @@ private struct KernelStatusView: View {
 
     private func reload() async {
         text = "探测中…"
-        var out = "（请在 VPN 已连接时探测）\n\n【sendProviderMessage IPC】\n"
+        let transport = TrollStoreIPC.isEnabled
+            ? "TrollStore 文件 IPC"
+            : "sendProviderMessage IPC"
+        var out = "（请在 VPN 已连接时探测）\n\n【\(transport)】\n"
         let hello = await CoreStateManager.shared.sendMessage(["cmd": "hello"])
         if case .ok(let data) = hello,
            let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {

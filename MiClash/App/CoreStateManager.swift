@@ -8,7 +8,8 @@ import WidgetKit
 /// 它是 UI 与底层之间唯一的状态来源：视图只读它的 @Published 属性，
 /// 通过它暴露的方法触发动作，数据流单向（动作 → 底层 → 状态变更 → UI 刷新）。
 ///
-/// 运行态控制统一经版本化 Network Extension IPC。
+/// 运行态控制统一经版本化命令协议；普通签名走 Network Extension IPC，
+/// TrollStore 包走共享目录文件 IPC。
 @MainActor
 final class CoreStateManager: ObservableObject {
 
@@ -84,7 +85,7 @@ final class CoreStateManager: ObservableObject {
         }
     }
 
-    /// 向运行中的 NE 索取日志（sendProviderMessage，不依赖 App Group）。
+    /// 向运行中的 NE 索取日志（普通签名走系统 IPC，TrollStore 走文件 IPC）。
     func fetchLogs() async -> String {
         await tunnel.fetchLogs()
     }

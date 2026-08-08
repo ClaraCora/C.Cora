@@ -178,10 +178,61 @@ final class TunnelManager {
         }
     }
 
-    /// 向运行中的 NE 发送一条 sendProviderMessage 请求并取回响应（不依赖 App Group）。
+    /// TrollStore 的 platform/no-sandbox 身份可能无法使用 NetworkExtension XPC，
+    /// 因此该构建优先走共享目录中的原子文件通道。普通签名仍只走官方 IPC。
+    func sendMessage(_ payload: Data, timeout: TimeInterval = 10) async -> IPCResult {
+        if TrollStoreIPC.isEnabled {
+            let fileResult = await sendTrollStoreMessage(payload, timeout: timeout)
+            if case .ok = fileResult { return fileResult }
+
+            // 兼容仍在运行的旧 Tunnel 扩展：更新 App 后尚未断开重连时，旧进程
+            // 还没有文件 IPC server，短暂尝试一次系统通道并合并诊断信息。
+            let systemResult = await sendProviderMessage(payload, timeout: min(timeout, 3))
+            if case .ok = systemResult { return systemResult }
+            if case .failure(let fileReason) = fileResult,
+               case .failure(let systemReason) = systemResult {
+                return .failure("巨魔文件 IPC：\(fileReason)；系统 IPC：\(systemReason)")
+            }
+        }
+        return await sendProviderMessage(payload, timeout: timeout)
+    }
+
+    private func sendTrollStoreMessage(_ payload: Data,
+                                       timeout: TimeInterval) async -> IPCResult {
+        let id = UUID()
+        guard let requestURL = TrollStoreIPC.requestURL(for: id),
+              let responseURL = TrollStoreIPC.responseURL(for: id) else {
+            return .failure("共享控制目录不可用")
+        }
+        defer {
+            try? FileManager.default.removeItem(at: requestURL)
+            try? FileManager.default.removeItem(at: responseURL)
+        }
+
+        do {
+            try payload.write(to: requestURL, options: .atomic)
+        } catch {
+            return .failure("写入请求失败：\(error.localizedDescription)")
+        }
+
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if Task.isCancelled { return .failure("请求已取消") }
+            if FileManager.default.fileExists(atPath: responseURL.path),
+               let response = try? Data(contentsOf: responseURL) {
+                guard !response.isEmpty else { return .failure("Tunnel 回传空响应") }
+                return .ok(response)
+            }
+            try? await Task.sleep(nanoseconds: 25_000_000)
+        }
+        return .failure("超时（\(Int(timeout)) 秒，请断开并重连一次 VPN）")
+    }
+
+    /// 向运行中的 NE 发送一条 sendProviderMessage 请求并取回响应。
     /// 优先复用连接时那个 manager（其 connection 状态可靠）；不强行卡 .connected，
     /// 直接尝试发送，失败/空响应都回传具体原因。
-    func sendMessage(_ payload: Data, timeout: TimeInterval = 10) async -> IPCResult {
+    private func sendProviderMessage(_ payload: Data,
+                                     timeout: TimeInterval) async -> IPCResult {
         let mgr: NETunnelProviderManager
         if let m = manager {
             mgr = m

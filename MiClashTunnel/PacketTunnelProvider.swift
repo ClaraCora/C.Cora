@@ -50,6 +50,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private let ipcQueue = DispatchQueue(label: "com.miclash.tunnel.ipc",
                                          qos: .userInitiated,
                                          attributes: .concurrent)
+    private var trollStoreIPCServer: TrollStoreFileIPCServer?
     private let memoryDiagnostics = MemoryDiagnostics()
 
     /// 隧道建立前抓取的物理网络 DNS，供配置里的 `system` nameserver 替换用。
@@ -119,6 +120,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         reloadStateLock.lock()
         reloadJob = nil
         reloadStateLock.unlock()
+        stopTrollStoreIPC()
         // 每次启动清空 ne.log，避免历史残留干扰排查
         // 隧道建立前先抓物理网络 DNS；隧道起来后系统主解析器会变成隧道自己的 DNS。
         FileLog.reset()
@@ -143,6 +145,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         homeDir = home
         FileLog.write("home dir = \(home)（\(sharedHome != nil ? "App Group 共享" : "NE 沙盒回退")），调用 MihomoSetup")
         MihomoSetup(home)
+        startTrollStoreIPCIfNeeded()
 
         let configYAML = resolveConfig(incoming: incomingConfig,
                                        hasOption: hasConfigOption, home: home)
@@ -305,6 +308,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                             completionHandler: @escaping () -> Void) {
         FileLog.write("stopTunnel，原因 rawValue=\(reason.rawValue)")
         log.info("stopTunnel，原因：\(reason.rawValue, privacy: .public)")
+        stopTrollStoreIPC()
         reloadQueue.sync {
             isStopping = true
             tunnelFileDescriptor = nil
@@ -320,6 +324,28 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             MihomoStop()
         }
         completionHandler()
+    }
+
+    private func startTrollStoreIPCIfNeeded() {
+        guard TrollStoreIPC.isEnabled else { return }
+        let server = TrollStoreFileIPCServer { [weak self] request, reply in
+            guard let self else {
+                reply(nil)
+                return
+            }
+            self.handleAppMessage(request, completionHandler: reply)
+        }
+        guard server.start() else {
+            FileLog.write("TrollStore 文件 IPC 启动失败：共享控制目录不可用")
+            return
+        }
+        trollStoreIPCServer = server
+        FileLog.write("TrollStore 文件 IPC 已启动")
+    }
+
+    private func stopTrollStoreIPC() {
+        trollStoreIPCServer?.stop()
+        trollStoreIPCServer = nil
     }
 
     // MARK: - 物理接口监控
@@ -522,7 +548,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         return nil
     }
 
-    /// 主 App 经 sendProviderMessage 发来的请求（不依赖 App Group 的官方 IPC）。
+    /// 主 App 经系统 IPC 或 TrollStore 文件 IPC 发来的统一控制请求。
     /// JSON 命令协议：{"v":1,"cmd":"hello"|"queryProxies"|"connections"|...}。
     /// 关键：completionHandler 必须**非 nil 回调**，否则主 App 侧 resp 为 nil。
     override func handleAppMessage(_ messageData: Data,

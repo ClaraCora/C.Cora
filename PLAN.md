@@ -22,7 +22,7 @@
 - **MihomoCore.xcframework**：mihomo 经 `gomobile bind` 薄封装编出，被 NE 链接。
 
 进程间数据流：
-- 隧道启停走 `NETunnelProviderManager`；配置、状态、节点/分组、测延迟、流量、日志和连接管理统一走带协议版本与超时的 `sendProviderMessage` IPC。
+- 隧道启停走 `NETunnelProviderManager`；配置、状态、节点/分组、测延迟、流量、日志和连接管理统一使用带协议版本与超时的命令协议，普通签名走 `sendProviderMessage`，TrollStore 包走共享目录文件 IPC。
 - App Group 共享容器承载配置与日志文件；不暴露 mihomo external-controller 或 WebUI，App 运行态控制统一走 Network Extension IPC。
 
 `CoreStateManager`（全局单例 `ObservableObject`）= VPN 控制 + API 客户端封装，向所有 ViewModel 供状态。

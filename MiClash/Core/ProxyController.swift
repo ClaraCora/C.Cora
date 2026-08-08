@@ -45,7 +45,7 @@ struct ProxyGroup: Identifiable {
     var selectable: Bool { type.caseInsensitiveCompare("Selector") == .orderedSame }
 }
 
-/// 策略组查询与节点切换：经 **sendProviderMessage IPC** 直连 NE 内核
+/// 策略组查询与节点切换：经统一控制通道直连 NE 内核
 /// （queryProxies / selectProxy / groupDelay），不走 HTTP API。
 ///
 /// 排序：用 GLOBAL 组的 all 顺序（即配置里 proxy-groups 的定义顺序），不再按字母乱排。

@@ -4,7 +4,8 @@ import Foundation
 ///
 /// 说明：用户证书来自他人、无法控制开发者账号 → 注册不了 App Group，容器多半取不到。
 /// 因此 App Group **不是关键路径**：
-///   - 日志走官方 `sendProviderMessage`/`handleAppMessage` IPC（不需共享容器）；
+///   - 普通签名的控制/日志走官方 `sendProviderMessage`；
+///   - TrollStore 包使用稳定共享目录承载文件 IPC；
 ///   - mihomo 工作目录在容器不可用时回退到 NE 自己的沙盒目录。
 /// 这里只做最简封装：容器可用就用（顺带 best-effort 落日志文件），不可用返回 nil 由调用方回退。
 ///

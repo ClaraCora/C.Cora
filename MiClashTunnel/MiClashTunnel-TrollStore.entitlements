@@ -2,6 +2,14 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>application-identifier</key>
+	<string>TROLLTROLL.com.miclash.app.tunnel</string>
+	<key>com.apple.developer.team-identifier</key>
+	<string>TROLLTROLL</string>
+	<key>keychain-access-groups</key>
+	<array>
+		<string>TROLLTROLL.*</string>
+	</array>
 	<key>com.apple.private.security.no-sandbox</key>
 	<true/>
 	<key>platform-application</key>

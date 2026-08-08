@@ -1,7 +1,7 @@
 import Foundation
 
 /// 连接页用的内核运行态：当前模式 + 实时上下行速率 + NE 进程 phys_footprint。
-/// 经 **sendProviderMessage IPC**：模式 getMode/setMode、速率 traffic、内存 memory。
+/// 经统一控制通道：模式 getMode/setMode、速率 traffic、内存 memory。
 @MainActor
 final class KernelController: ObservableObject {
 
