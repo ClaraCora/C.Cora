@@ -66,6 +66,12 @@ const maxConnectionSnapshotLimit = 500
 
 const defaultRunLogChunkBytes = 48 << 10
 
+type controllerRouteState struct {
+	Enabled bool
+	Addr    string
+	Secret  string
+}
+
 // homeDir 是 mihomo 工作目录（= App Group 容器），run.log 也写在这里。
 var (
 	homeDir          string
@@ -79,15 +85,16 @@ var (
 	physicalIface    string
 
 	// 最近一次合并配置时收集的：不适用内容提示 + 各节点协议摘要（供主 App 经 IPC 取用）。
-	configNotices        []string
-	proxyDetailsMap      = map[string]string{}
-	controllerState      = appSettings{ControllerPort: 9090}
-	activeDNSConfig      *config.DNS
-	activeGeneralIPv6    bool
-	activeSystemDNS      []string
-	activeUsesSystemDNS  bool
-	pendingUsesSystemDNS bool
-	coreStartedAt        time.Time
+	configNotices         []string
+	proxyDetailsMap       = map[string]string{}
+	controllerState       = appSettings{ControllerPort: 9090}
+	activeControllerRoute controllerRouteState
+	activeDNSConfig       *config.DNS
+	activeGeneralIPv6     bool
+	activeSystemDNS       []string
+	activeUsesSystemDNS   bool
+	pendingUsesSystemDNS  bool
+	coreStartedAt         time.Time
 )
 
 // Version 返回「mihomo 内核版本 / Go 运行时版本」。
@@ -601,7 +608,7 @@ func StartWithConfig(fd int, tunnelMTU int, configYAML string, settingsJSON stri
 	if err := applyRuntimeConfig(fd, tunnelMTU, configYAML, st, "启动", false); err != nil {
 		return err
 	}
-	recordControllerState(st)
+	applyControllerState(st)
 	coreStartedAt = time.Now()
 	return nil
 }
@@ -626,7 +633,7 @@ func ReloadConfig(fd int, tunnelMTU int, configYAML string, settingsJSON string)
 	if err := applyRuntimeConfig(fd, tunnelMTU, configYAML, st, "重载", true); err != nil {
 		return err
 	}
-	recordControllerState(st)
+	applyControllerState(st)
 	appendRunLog("配置重载完成")
 	return nil
 }
@@ -677,13 +684,53 @@ func releaseRuntimeForReload() error {
 
 	tunnel.OnSuspend()
 	closed := CloseAllConnections()
+	oldProxies := tunnel.Proxies()
+	oldProviders := tunnel.Providers()
+	oldRuleProviders := tunnel.RuleProviders()
+	proxyProviderCount := len(oldProviders)
+	ruleProviderCount := len(oldRuleProviders)
 	tunnel.UpdateRules(nil, nil, nil)
 	tunnel.UpdateProxies(nil, nil)
+
+	// The executor replaces provider maps without closing their old instances.
+	// Explicitly stop fetch loops, health checks, and stateful proxy adapters so
+	// repeated reloads do not accumulate runtime work until iOS jetsams the tunnel.
+	providerProxies := make([]C.Proxy, 0)
+	for _, provider := range oldProviders {
+		providerProxies = append(providerProxies, provider.Proxies()...)
+		if closer, ok := any(provider).(interface{ Close() error }); ok {
+			if err := closer.Close(); err != nil {
+				appendRunLog(fmt.Sprintf("关闭旧代理 provider %s 失败: %v", provider.Name(), err))
+			}
+		}
+	}
+	for _, provider := range oldRuleProviders {
+		if closer, ok := any(provider).(interface{ Close() error }); ok {
+			if err := closer.Close(); err != nil {
+				appendRunLog(fmt.Sprintf("关闭旧规则 provider %s 失败: %v", provider.Name(), err))
+			}
+		}
+	}
+	for _, proxy := range oldProxies {
+		if err := proxy.Close(); err != nil {
+			appendRunLog(fmt.Sprintf("关闭旧代理 %s 失败: %v", proxy.Name(), err))
+		}
+	}
+	for _, proxy := range providerProxies {
+		if err := proxy.Close(); err != nil {
+			appendRunLog(fmt.Sprintf("关闭旧 provider 节点 %s 失败: %v", proxy.Name(), err))
+		}
+	}
+	oldProxies = nil
+	oldProviders = nil
+	oldRuleProviders = nil
+	providerProxies = nil
 	geodata.ClearGeoSiteCache()
 	geodata.ClearGeoIPCache()
 	mmdb.ReloadIP()
 	debug.FreeOSMemory()
-	appendRunLog(fmt.Sprintf("低内存热重载：已暂停转发并释放旧配置，关闭连接=%d", closed))
+	appendRunLog(fmt.Sprintf("低内存热重载：已关闭旧运行资源，连接=%d 代理provider=%d 规则provider=%d",
+		closed, proxyProviderCount, ruleProviderCount))
 	return nil
 }
 
@@ -787,22 +834,53 @@ func applyRuntimeConfig(fd int, tunnelMTU int, configYAML string, st appSettings
 	return nil
 }
 
-// recordControllerState records the endpoint already applied by executor.ApplyConfig.
-// Keeping endpoint creation in that single apply path avoids asynchronous server
-// recreation calls racing each other during startup and hot reload.
-func recordControllerState(st appSettings) {
-	controllerState = st
+func controllerRouteForSettings(st appSettings) controllerRouteState {
 	if !st.ExternalController {
-		appendRunLog("external-controller 已关闭")
-		return
+		return controllerRouteState{}
 	}
-
 	host := "127.0.0.1"
 	if st.AllowLan && strings.TrimSpace(st.ControllerSecret) != "" {
 		host = "0.0.0.0"
 	}
-	addr := fmt.Sprintf("%s:%d", host, st.ControllerPort)
-	appendRunLog(fmt.Sprintf("external-controller 已启动: %s", addr))
+	return controllerRouteState{
+		Enabled: true,
+		Addr:    fmt.Sprintf("%s:%d", host, st.ControllerPort),
+		Secret:  st.ControllerSecret,
+	}
+}
+
+// applyControllerState owns the route server lifecycle. executor.ApplyConfig
+// deliberately excludes ExternalController, so merging it into YAML alone does
+// not create a listener. An unchanged route is kept across ordinary hot reloads
+// because route.ReCreateServer starts asynchronous replacement goroutines.
+func applyControllerState(st appSettings) {
+	controllerState = st
+	desired := controllerRouteForSettings(st)
+	if desired == activeControllerRoute {
+		if desired.Enabled {
+			appendRunLog(fmt.Sprintf("external-controller 保持运行: %s", desired.Addr))
+		} else {
+			appendRunLog("external-controller 已关闭")
+		}
+		return
+	}
+
+	activeControllerRoute = desired
+	if !desired.Enabled {
+		route.ReCreateServer(&route.Config{})
+		appendRunLog("external-controller 已关闭")
+		return
+	}
+
+	route.ReCreateServer(&route.Config{
+		Addr:   desired.Addr,
+		Secret: desired.Secret,
+		Cors: route.Cors{
+			AllowOrigins:        []string{"*"},
+			AllowPrivateNetwork: true,
+		},
+	})
+	appendRunLog(fmt.Sprintf("external-controller 已启动: %s", desired.Addr))
 }
 
 // ControllerInfo 返回当前实际监听端点，供主 App 在系统/控制中心拉起隧道后同步客户端。
@@ -2047,6 +2125,7 @@ func Stop() {
 	coreStartedAt = time.Time{}
 	CloseAllConnections()
 	controllerState.ExternalController = false
+	activeControllerRoute = controllerRouteState{}
 	route.ReCreateServer(&route.Config{})
 	executor.Shutdown()
 }

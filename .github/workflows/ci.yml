@@ -218,14 +218,16 @@ jobs:
           mkdir -p "$TS_ROOT/Payload"
           ditto "$SOURCE_APP" "$TS_APP"
 
+          # TrollStore targets iOS 14-17. The iOS 18-only ControlWidget cannot
+          # run there and should not participate in plugin validation/loading.
+          rm -rf "$TS_APP/PlugIns/MiClashControl.appex"
+
           # TrollStore preserves arbitrary entitlements already present in each binary.
-          # Both processes need no-sandbox or they still cannot share the fallback path.
+          # Both processes need the complete iOS 17 unsandboxing entitlement set
+          # while retaining access to their own app data containers.
           codesign --force --sign - --generate-entitlement-der \
             --entitlements MiClashTunnel/MiClashTunnel-TrollStore.entitlements \
             "$TS_APP/PlugIns/MiClashTunnel.appex"
-          codesign --force --sign - --generate-entitlement-der \
-            --entitlements MiClashControl/MiClashControl.entitlements \
-            "$TS_APP/PlugIns/MiClashControl.appex"
           codesign --force --sign - --generate-entitlement-der \
             --entitlements MiClash/MiClash-TrollStore.entitlements \
             "$TS_APP"
@@ -239,6 +241,13 @@ jobs:
             'Print :com.apple.private.security.no-sandbox' "$MAIN_ENTITLEMENTS")" = "true"
           test "$(/usr/libexec/PlistBuddy -c \
             'Print :com.apple.private.security.no-sandbox' "$TUNNEL_ENTITLEMENTS")" = "true"
+          for ENTITLEMENTS in "$MAIN_ENTITLEMENTS" "$TUNNEL_ENTITLEMENTS"; do
+            test "$(/usr/libexec/PlistBuddy -c \
+              'Print :platform-application' "$ENTITLEMENTS")" = "true"
+            test "$(/usr/libexec/PlistBuddy -c \
+              'Print :com.apple.private.security.storage.AppDataContainers' \
+              "$ENTITLEMENTS")" = "true"
+          done
           cd "$TS_ROOT"
           zip -qr "$GITHUB_WORKSPACE/MiClash-TrollStore.ipa" Payload
           echo "已生成 MiClash-TrollStore.ipa"

@@ -58,6 +58,54 @@ func TestValidateRuntimeConfig(t *testing.T) {
 	}
 }
 
+func TestControllerRouteForSettings(t *testing.T) {
+	tests := []struct {
+		name     string
+		settings appSettings
+		want     controllerRouteState
+	}{
+		{
+			name:     "disabled",
+			settings: appSettings{ControllerPort: 9090},
+		},
+		{
+			name: "loopback",
+			settings: appSettings{
+				ExternalController: true,
+				ControllerPort:     9090,
+			},
+			want: controllerRouteState{Enabled: true, Addr: "127.0.0.1:9090"},
+		},
+		{
+			name: "lan requires secret",
+			settings: appSettings{
+				ExternalController: true,
+				AllowLan:           true,
+				ControllerPort:     9191,
+			},
+			want: controllerRouteState{Enabled: true, Addr: "127.0.0.1:9191"},
+		},
+		{
+			name: "lan with secret",
+			settings: appSettings{
+				ExternalController: true,
+				AllowLan:           true,
+				ControllerPort:     9191,
+				ControllerSecret:   "token",
+			},
+			want: controllerRouteState{Enabled: true, Addr: "0.0.0.0:9191", Secret: "token"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := controllerRouteForSettings(test.settings); got != test.want {
+				t.Fatalf("controllerRouteForSettings() = %#v, want %#v", got, test.want)
+			}
+		})
+	}
+}
+
 func TestNetworkInterfaceUpdates(t *testing.T) {
 	previous := dialer.DefaultInterface.Load()
 	defer dialer.DefaultInterface.Store(previous)
