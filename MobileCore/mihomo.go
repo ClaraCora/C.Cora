@@ -632,8 +632,9 @@ func ReloadConfig(fd int, tunnelMTU int, configYAML string, settingsJSON string)
 // forwarding and closes active connections, but deliberately keeps the current
 // proxies/rules alive. Swift can then wait for connection goroutines to drain,
 // inspect iOS memory headroom, and either continue or call CancelReload.
-// The bool result is false when the requested runtime is already active.
-func PrepareReload(tunnelMTU int, configYAML string, settingsJSON string) (needed bool, err error) {
+// ReloadPrepared reports whether the requested runtime differs from the active
+// one after this function returns successfully.
+func PrepareReload(tunnelMTU int, configYAML string, settingsJSON string) (err error) {
 	configApplyMu.Lock()
 	defer configApplyMu.Unlock()
 	defer func() {
@@ -641,24 +642,23 @@ func PrepareReload(tunnelMTU int, configYAML string, settingsJSON string) (neede
 			reloadPrepared = false
 			preparedReloadFingerprint = ""
 			tunnel.OnRunning()
-			needed = false
 			err = fmt.Errorf("mihomo reload preparation panic: %v", r)
 		}
 	}()
 
 	if !listener.LastTunConf.Enable || listener.LastTunConf.FileDescriptor == 0 {
-		return false, fmt.Errorf("当前 TUN 配置不可用，请重新连接 VPN")
+		return fmt.Errorf("当前 TUN 配置不可用，请重新连接 VPN")
 	}
 	fingerprint := runtimeConfigFingerprint(tunnelMTU, configYAML, settingsJSON)
 	if activeConfigFingerprint != "" && fingerprint == activeConfigFingerprint {
 		appendRunLog("配置与 GEO 文件均未变化，无需热重载")
-		return false, nil
+		return nil
 	}
 	if reloadPrepared {
 		if fingerprint == preparedReloadFingerprint {
-			return true, nil
+			return nil
 		}
-		return false, fmt.Errorf("已有其他配置正在准备重载")
+		return fmt.Errorf("已有其他配置正在准备重载")
 	}
 
 	tunnel.OnSuspend()
@@ -667,7 +667,15 @@ func PrepareReload(tunnelMTU int, configYAML string, settingsJSON string) (neede
 	preparedReloadFingerprint = fingerprint
 	debug.FreeOSMemory()
 	appendRunLog(fmt.Sprintf("热重载准备完成：已暂停新流量并关闭连接=%d，旧配置仍可恢复", closed))
-	return true, nil
+	return nil
+}
+
+// ReloadPrepared is kept separate from PrepareReload so gomobile exposes a
+// plain BOOL instead of an Objective-C out parameter for a Go (bool, error).
+func ReloadPrepared() bool {
+	configApplyMu.RLock()
+	defer configApplyMu.RUnlock()
+	return reloadPrepared
 }
 
 // CancelReload resumes the untouched old runtime when iOS reports insufficient

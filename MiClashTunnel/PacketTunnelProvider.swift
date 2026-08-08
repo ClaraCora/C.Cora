@@ -710,15 +710,15 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
             let injectedSettings = self.injectingSystemDNS(into: effectiveSettings)
             var prepareError: NSError?
-            let needsReload = MihomoPrepareReload(runtime.mtu, configYAML,
-                                                  injectedSettings, &prepareError)
-            if let prepareError {
-                let message = prepareError.localizedDescription
+            let prepared = MihomoPrepareReload(runtime.mtu, configYAML,
+                                               injectedSettings, &prepareError)
+            guard prepared else {
+                let message = prepareError?.localizedDescription ?? "mihomo 热重载准备失败"
                 FileLog.write("准备热重载失败：\(message)")
                 self.finishReload(token: token, phase: .failed, error: message)
                 return
             }
-            guard needsReload else {
+            guard MihomoReloadPrepared() else {
                 FileLog.write("配置与 GEO 文件均未变化，跳过热重载")
                 self.finishReload(token: token, phase: .succeeded)
                 return
