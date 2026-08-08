@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// mihomo 当前活动会话。页面可见时每秒读取一次 `/connections`。
+/// mihomo 当前活动会话。页面可见时每秒经 NE IPC 读取一次有上限的快照。
 struct ConnectionsView: View {
     @EnvironmentObject private var core: CoreStateManager
     @StateObject private var controller = ConnectionsController()

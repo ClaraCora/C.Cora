@@ -19,7 +19,7 @@ new file mode 100644
 +
 +func osInit() {
 +	// Go 1.25.4 leaves CPU feature detection empty for GOOS=ios. MiClash
-+	// targets iOS 18+ devices, which are expected to provide these instructions.
++	// targets iOS 17+ iPhones (A12+), which provide these instructions.
 +	ARM64.HasAES = true
 +	ARM64.HasPMULL = true
 +}

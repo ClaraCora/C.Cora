@@ -30,6 +30,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private var configuredIPv6: Bool?
     private var isStopping = false
     private let reloadQueue = DispatchQueue(label: "com.miclash.tunnel.reload", qos: .userInitiated)
+    private let ipcQueue = DispatchQueue(label: "com.miclash.tunnel.ipc",
+                                         qos: .userInitiated,
+                                         attributes: .concurrent)
     private let memoryDiagnostics = MemoryDiagnostics()
 
     /// 隧道建立前抓取的物理网络 DNS，供配置里的 `system` nameserver 替换用。
@@ -200,7 +203,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                     self.configuredTunnelMTU = configuredMTU
                     self.configuredIPv6 = ipv6Enabled
                     AppGroupState.vpnConnected = true // 共享给控制中心磁贴显示
-                    ControlCenter.shared.reloadControls(ofKind: ControlWidgetKind.vpn)
+                    if #available(iOS 18.0, *) {
+                        ControlCenter.shared.reloadControls(ofKind: ControlWidgetKind.vpn)
+                    }
                     self.startPathMonitor() // 开始把真实出站接口喂给内核
                 }
                 return ok
@@ -287,7 +292,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             configuredTunnelMTU = nil
             configuredIPv6 = nil
             AppGroupState.vpnConnected = false // 同步给控制中心磁贴
-            ControlCenter.shared.reloadControls(ofKind: ControlWidgetKind.vpn)
+            if #available(iOS 18.0, *) {
+                ControlCenter.shared.reloadControls(ofKind: ControlWidgetKind.vpn)
+            }
             stopPathMonitor()
             memoryDiagnostics.stop(event: "stop")
             MihomoStop()
@@ -496,20 +503,32 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     /// 主 App 经 sendProviderMessage 发来的请求（不依赖 App Group 的官方 IPC）。
-    /// JSON 命令协议：{"cmd":"getLogs"|"queryProxies"|"selectProxy"|"traffic"|"memory",...}。
+    /// JSON 命令协议：{"v":1,"cmd":"hello"|"queryProxies"|"connections"|...}。
     /// 关键：completionHandler 必须**非 nil 回调**，否则主 App 侧 resp 为 nil。
     override func handleAppMessage(_ messageData: Data,
                                   completionHandler: ((Data?) -> Void)?) {
         let obj = (try? JSONSerialization.jsonObject(with: messageData)) as? [String: Any]
         let cmd = (obj?["cmd"] as? String) ?? String(data: messageData, encoding: .utf8) ?? ""
+        let protocolVersion = (obj?["v"] as? NSNumber)?.intValue
+        if let protocolVersion, protocolVersion != 1 {
+            completionHandler?(Self.jsonData([
+                "ok": false,
+                "error": "不支持的控制协议版本：\(protocolVersion)",
+                "supportedVersion": 1,
+            ]))
+            return
+        }
         if cmd != "traffic" && cmd != "memory" {
             FileLog.write("handleAppMessage：cmd=\(cmd)")
         }
 
         switch cmd {
+        case "hello":
+            completionHandler?(Data(MihomoControlInfo().utf8))
         case "queryProxies":
-            // 直接回传 mihomo 的 proxies JSON
-            completionHandler?(Data(MihomoQueryProxies().utf8))
+            ipcQueue.async {
+                completionHandler?(Data(MihomoQueryProxies().utf8))
+            }
         case "selectProxy":
             let group = (obj?["group"] as? String) ?? ""
             let name = (obj?["name"] as? String) ?? ""
@@ -521,8 +540,27 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         case "groupDelay":
             let group = (obj?["group"] as? String) ?? ""
             let url = (obj?["url"] as? String) ?? ""
-            let timeout = (obj?["timeout"] as? Int) ?? 5000
-            completionHandler?(Data(MihomoGroupDelay(group, url, timeout).utf8))
+            let timeout = (obj?["timeout"] as? NSNumber)?.intValue ?? 5000
+            ipcQueue.async {
+                completionHandler?(Data(MihomoGroupDelay(group, url, timeout).utf8))
+            }
+        case "connections":
+            let limit = (obj?["limit"] as? NSNumber)?.intValue ?? 200
+            ipcQueue.async {
+                completionHandler?(Data(MihomoConnectionsSnapshot(limit).utf8))
+            }
+        case "closeConnection":
+            let id = (obj?["id"] as? String) ?? ""
+            var error: NSError?
+            let ok = MihomoCloseConnection(id, &error)
+            completionHandler?(Self.jsonData(ok
+                ? ["ok": true]
+                : ["ok": false, "error": error?.localizedDescription ?? "未知错误"]))
+        case "closeAllConnections":
+            completionHandler?(Self.jsonData([
+                "ok": true,
+                "closed": Int(MihomoCloseAllConnections()),
+            ]))
         case "traffic":
             completionHandler?(Data(MihomoTrafficNow().utf8))
         case "memory":
@@ -540,11 +578,26 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             completionHandler?(Data(#"{"ok":true}"#.utf8))
         case "reloadConfig":
             reloadConfiguration(obj, completionHandler: completionHandler)
-        default: // getLogs 及未知命令都回传日志，便于排查
+        case "runLogChunk":
+            let offset = (obj?["offset"] as? NSNumber)?.intValue ?? -1
+            let generation = (obj?["generation"] as? NSNumber)?.intValue ?? 0
+            ipcQueue.async {
+                completionHandler?(Data(MihomoRunLogChunk(offset, generation).utf8))
+            }
+        case "getLogs":
             // 日志可能很大，IPC 响应有体积上限 → 只回传末尾约 24KB，取最新内容。
             let body = "[cmd=\(cmd)]\n" + collectLogs()
             completionHandler?(Self.tailData(body, maxBytes: 24 * 1024))
+        default:
+            completionHandler?(Self.jsonData([
+                "ok": false,
+                "error": "未知控制命令：\(cmd)",
+            ]))
         }
+    }
+
+    private static func jsonData(_ object: [String: Any]) -> Data {
+        (try? JSONSerialization.data(withJSONObject: object)) ?? Data(#"{"ok":false}"#.utf8)
     }
 
     private func reloadConfiguration(_ object: [String: Any]?,

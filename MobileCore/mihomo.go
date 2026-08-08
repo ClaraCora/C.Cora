@@ -9,6 +9,7 @@
 package mihomo
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -19,6 +20,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -56,21 +58,25 @@ const maxRunLogBytes int64 = 2 << 20
 
 const maxRunLogLineBytes = 64 << 10
 
-// ControllerAddr 是 NE 内 mihomo external-controller 的监听地址。
-// 主 App 经 sendProviderMessage IPC 在重签环境下不投递，改用本地回环 HTTP 直连——
-// 127.0.0.1 是 loopback，不经 tun，跨进程可达，是 clash 类 iOS App 的通用做法。
-const ControllerAddr = "127.0.0.1:9090"
+const controlProtocolVersion = 1
+
+const defaultConnectionSnapshotLimit = 200
+
+const maxConnectionSnapshotLimit = 500
+
+const defaultRunLogChunkBytes = 48 << 10
 
 // homeDir 是 mihomo 工作目录（= App Group 容器），run.log 也写在这里。
 var (
-	homeDir       string
-	logCaptureMu  sync.Once
-	logFileMu     sync.Mutex
-	runLogFile    *os.File
-	runLogBytes   int64 = -1
-	configApplyMu sync.Mutex
-	interfaceMu   sync.RWMutex
-	physicalIface string
+	homeDir          string
+	logCaptureMu     sync.Once
+	logFileMu        sync.Mutex
+	runLogFile       *os.File
+	runLogBytes      int64 = -1
+	runLogGeneration int64
+	configApplyMu    sync.RWMutex
+	interfaceMu      sync.RWMutex
+	physicalIface    string
 
 	// 最近一次合并配置时收集的：不适用内容提示 + 各节点协议摘要（供主 App 经 IPC 取用）。
 	configNotices        []string
@@ -91,6 +97,22 @@ func Version() string {
 		v = "unknown"
 	}
 	return "mihomo " + v + " / " + runtime.Version()
+}
+
+// ControlInfo advertises the app-owned IPC contract. The external controller
+// is intentionally not part of this contract and can remain disabled.
+func ControlInfo() string {
+	out, err := json.Marshal(map[string]any{
+		"protocolVersion": controlProtocolVersion,
+		"coreVersion":     Version(),
+		"capabilities": []string{
+			"connections", "logs", "proxies", "reload", "runtime",
+		},
+	})
+	if err != nil {
+		return `{"protocolVersion":1,"capabilities":[]}`
+	}
+	return string(out)
 }
 
 // ConfiguredTunMTU 返回配置文件显式声明的 tun.mtu。
@@ -282,25 +304,26 @@ func startLogCapture() {
 
 // appSettings 是主 App 下发的设置（JSON）。零值即各项默认。
 type appSettings struct {
-	Stack             string                 `json:"stack"`
-	IPv6              bool                   `json:"ipv6"`
-	GeoEnabled        bool                   `json:"geoEnabled"`
-	GeoLoader         string                 `json:"geoLoader"`
-	GeodataMode       bool                   `json:"geodataMode"`
-	GeoIPDatURL       string                 `json:"geoIPDatURL"`
-	GeoMMDBURL        string                 `json:"geoMMDBURL"`
-	GeoSiteURL        string                 `json:"geoSiteURL"`
-	IgnoreGeoNegation bool                   `json:"ignoreGeoNegation"`
-	GeoAutoUpdate     bool                   `json:"geoAutoUpdate"`
-	GeoUpdateInterval int                    `json:"geoUpdateInterval"`
-	LogLevel          string                 `json:"logLevel"`
-	ControllerPort    int                    `json:"controllerPort"`
-	ControllerSecret  string                 `json:"controllerSecret"`
-	AllowLan          bool                   `json:"allowLan"`
-	MixedPort         int                    `json:"mixedPort"`
-	SystemDNS         []string               `json:"systemDNS"`
-	ApplyOverrides    bool                   `json:"applyOverrides"`
-	Overrides         configOverrideSettings `json:"overrides"`
+	Stack              string                 `json:"stack"`
+	IPv6               bool                   `json:"ipv6"`
+	GeoEnabled         bool                   `json:"geoEnabled"`
+	GeoLoader          string                 `json:"geoLoader"`
+	GeodataMode        bool                   `json:"geodataMode"`
+	GeoIPDatURL        string                 `json:"geoIPDatURL"`
+	GeoMMDBURL         string                 `json:"geoMMDBURL"`
+	GeoSiteURL         string                 `json:"geoSiteURL"`
+	IgnoreGeoNegation  bool                   `json:"ignoreGeoNegation"`
+	GeoAutoUpdate      bool                   `json:"geoAutoUpdate"`
+	GeoUpdateInterval  int                    `json:"geoUpdateInterval"`
+	LogLevel           string                 `json:"logLevel"`
+	ControllerPort     int                    `json:"controllerPort"`
+	ControllerSecret   string                 `json:"controllerSecret"`
+	ExternalController bool                   `json:"externalController"`
+	AllowLan           bool                   `json:"allowLan"`
+	MixedPort          int                    `json:"mixedPort"`
+	SystemDNS          []string               `json:"systemDNS"`
+	ApplyOverrides     bool                   `json:"applyOverrides"`
+	Overrides          configOverrideSettings `json:"overrides"`
 }
 
 type configOverrideSettings struct {
@@ -379,6 +402,9 @@ func parseSettings(settingsJSON string) appSettings {
 		s.MixedPort = 0
 	}
 	if s.AllowLan && strings.TrimSpace(s.ControllerSecret) == "" {
+		s.AllowLan = false
+	}
+	if !s.ExternalController {
 		s.AllowLan = false
 	}
 	if s.GeoLoader == "" {
@@ -549,7 +575,7 @@ func inspectRuleRequirements(value any) ruleRequirements {
 }
 
 // StartWithConfig 用订阅/自定义 YAML + 设置启动内核：先把订阅配置与「iOS 必需的安全设置」
-// 及用户设置合并、按需剔除 geo 规则，再注入 fd 启动，最后起 external-controller。
+// 及用户设置合并、按需剔除 geo 规则，再注入 fd 启动，最后按设置决定是否启动 external-controller。
 // 对应 Swift 侧 `MihomoStartWithConfig(_:_:_:_:error:)`。
 func StartWithConfig(fd int, tunnelMTU int, configYAML string, settingsJSON string) (err error) {
 	defer func() {
@@ -571,11 +597,10 @@ func StartWithConfig(fd int, tunnelMTU int, configYAML string, settingsJSON stri
 		appendRunLog("run.log 重置失败: " + resetError.Error())
 	}
 
-	externalUI, err := applyRuntimeConfig(fd, tunnelMTU, configYAML, st, "启动", false)
-	if err != nil {
+	if err := applyRuntimeConfig(fd, tunnelMTU, configYAML, st, "启动", false); err != nil {
 		return err
 	}
-	configureController(externalUI, st)
+	recordControllerState(st)
 	return nil
 }
 
@@ -596,16 +621,15 @@ func ReloadConfig(fd int, tunnelMTU int, configYAML string, settingsJSON string)
 	appendRunLog(fmt.Sprintf("ReloadConfig: fd=%d mtu=%d stack=%s ipv6=%v geo=%v(mode=%v,%s,ignoreNegation=%v) log=%s port=%d",
 		fd, tunnelMTU, st.Stack, st.IPv6, st.GeoEnabled, st.GeodataMode, st.GeoLoader,
 		st.IgnoreGeoNegation, st.LogLevel, st.ControllerPort))
-	externalUI, err := applyRuntimeConfig(fd, tunnelMTU, configYAML, st, "重载", true)
-	if err != nil {
+	if err := applyRuntimeConfig(fd, tunnelMTU, configYAML, st, "重载", true); err != nil {
 		return err
 	}
-	configureController(externalUI, st)
+	recordControllerState(st)
 	appendRunLog("配置重载完成")
 	return nil
 }
 
-func applyRuntimeConfig(fd int, tunnelMTU int, configYAML string, st appSettings, operation string, preserveTun bool) (externalUI string, err error) {
+func applyRuntimeConfig(fd int, tunnelMTU int, configYAML string, st appSettings, operation string, preserveTun bool) (err error) {
 	previousNotices := append([]string(nil), configNotices...)
 	previousDetails := make(map[string]string, len(proxyDetailsMap))
 	for name, detail := range proxyDetailsMap {
@@ -622,13 +646,13 @@ func applyRuntimeConfig(fd int, tunnelMTU int, configYAML string, st appSettings
 	merged, err := mergeConfig(configYAML, st, tunnelMTU)
 	if err != nil {
 		appendRunLog(operation + "合并配置失败: " + err.Error())
-		return "", err
+		return err
 	}
 
 	rawCfg, err := config.UnmarshalRawConfig(merged)
 	if err != nil {
 		appendRunLog(operation + " UnmarshalRawConfig 失败: " + err.Error())
-		return "", err
+		return err
 	}
 	rawCfg.Tun.Enable = true
 	rawCfg.Tun.FileDescriptor = fd
@@ -642,11 +666,11 @@ func applyRuntimeConfig(fd int, tunnelMTU int, configYAML string, st appSettings
 	cfg, err := config.ParseRawConfig(rawCfg)
 	if err != nil {
 		appendRunLog(operation + " ParseRawConfig 失败: " + err.Error())
-		return "", err
+		return err
 	}
 	if preserveTun {
 		if !listener.LastTunConf.Enable || listener.LastTunConf.FileDescriptor == 0 {
-			return "", fmt.Errorf("当前 TUN 配置不可用，请重新连接 VPN")
+			return fmt.Errorf("当前 TUN 配置不可用，请重新连接 VPN")
 		}
 		// 热重载不能让 ReCreateTun 关闭 iOS 交给扩展的原始 utun fd。
 		// 固定为当前运行配置后，mihomo 会命中 Tun.OnReload，仅更新其余组件。
@@ -681,44 +705,39 @@ func applyRuntimeConfig(fd int, tunnelMTU int, configYAML string, st appSettings
 	}
 	applied = true
 	appendRunLog(operation + " ApplyConfig 返回")
-	return cfg.Controller.ExternalUI, nil
+	return nil
 }
 
-// configureController 让主 App 的控制接口跟随当前设置。NE 内不下载或解压 Web UI，
-// 避免在 Packet Tunnel 的小内存预算内产生不可取消的后台任务。
-func configureController(externalUI string, st appSettings) {
+// recordControllerState records the endpoint already applied by executor.ApplyConfig.
+// Keeping endpoint creation in that single apply path avoids asynchronous server
+// recreation calls racing each other during startup and hot reload.
+func recordControllerState(st appSettings) {
+	controllerState = st
+	if !st.ExternalController {
+		appendRunLog("external-controller 已关闭")
+		return
+	}
+
 	host := "127.0.0.1"
 	if st.AllowLan && strings.TrimSpace(st.ControllerSecret) != "" {
 		host = "0.0.0.0"
 	}
 	addr := fmt.Sprintf("%s:%d", host, st.ControllerPort)
-
-	// ParseRawConfig 已提供 external-ui，避免控制器启动时再次解析整份订阅。
-	if externalUI == "" {
-		externalUI = "ui"
-	}
-	uiPath := C.Path.Resolve(externalUI)
-	route.SetUIPath(uiPath)
-	route.ReCreateServer(&route.Config{
-		Addr:   addr,
-		Secret: st.ControllerSecret,
-		Cors:   route.Cors{AllowOrigins: []string{}, AllowPrivateNetwork: false},
-	})
-	controllerState = st
 	appendRunLog(fmt.Sprintf("external-controller 已启动: %s", addr))
 }
 
 // ControllerInfo 返回当前实际监听端点，供主 App 在系统/控制中心拉起隧道后同步客户端。
 func ControllerInfo() string {
-	configApplyMu.Lock()
-	defer configApplyMu.Unlock()
+	configApplyMu.RLock()
+	defer configApplyMu.RUnlock()
 	out, err := json.Marshal(map[string]any{
+		"enabled":  controllerState.ExternalController,
 		"port":     controllerState.ControllerPort,
 		"secret":   controllerState.ControllerSecret,
 		"allowLan": controllerState.AllowLan,
 	})
 	if err != nil {
-		return `{"port":9090,"secret":"","allowLan":false}`
+		return `{"enabled":false,"port":9090,"secret":"","allowLan":false}`
 	}
 	return string(out)
 }
@@ -816,6 +835,25 @@ func mergeConfig(subYAML string, st appSettings, tunnelMTU int) ([]byte, error) 
 	}
 	m["ipv6"] = st.IPv6
 	m["log-level"] = st.LogLevel
+
+	// The subscription never owns a control endpoint inside the extension. The
+	// app either injects one explicitly or leaves every controller transport off.
+	for _, key := range []string{
+		"external-controller", "external-controller-tls", "external-controller-unix",
+		"external-controller-pipe", "external-controller-routing-mark",
+		"external-controller-cors", "external-doh-server", "secret",
+		"external-ui", "external-ui-url", "external-ui-name",
+	} {
+		delete(m, key)
+	}
+	if st.ExternalController {
+		host := "127.0.0.1"
+		if st.AllowLan && strings.TrimSpace(st.ControllerSecret) != "" {
+			host = "0.0.0.0"
+		}
+		m["external-controller"] = fmt.Sprintf("%s:%d", host, st.ControllerPort)
+		m["secret"] = st.ControllerSecret
+	}
 
 	// 混合代理端口（HTTP+SOCKS，本机回环）。0=不开。
 	for _, key := range []string{"port", "socks-port", "redir-port", "tproxy-port"} {
@@ -1157,8 +1195,8 @@ func summarizeProxy(p map[string]any) string {
 // ConfigNotices 返回最近一次合并配置时的不适用内容提示（JSON 字符串数组）。
 // 对应 Swift 侧 `MihomoConfigNotices()`。
 func ConfigNotices() string {
-	configApplyMu.Lock()
-	defer configApplyMu.Unlock()
+	configApplyMu.RLock()
+	defer configApplyMu.RUnlock()
 	out, err := json.Marshal(configNotices)
 	if err != nil {
 		return "[]"
@@ -1168,8 +1206,8 @@ func ConfigNotices() string {
 
 // ProxyDetails 返回 {节点名: 协议摘要} 的 JSON。对应 Swift 侧 `MihomoProxyDetails()`。
 func ProxyDetails() string {
-	configApplyMu.Lock()
-	defer configApplyMu.Unlock()
+	configApplyMu.RLock()
+	defer configApplyMu.RUnlock()
 	out, err := json.Marshal(proxyDetailsMap)
 	if err != nil {
 		return "{}"
@@ -1321,33 +1359,28 @@ func filterGeoRules(rules []any) ([]any, int) {
 	return out, dropped
 }
 
-// QueryProxies 返回**精简**的策略组 JSON：{"proxies":{<组名>:{type,now,all}}}。
-//
-// 为什么精简：完整 tunnel.Proxies() 含每个节点对象 + 测速 history + GLOBAL 列全部节点，
-// 多节点订阅可达数百 KB，超过 sendProviderMessage IPC 的响应体积上限会被丢成空响应。
-// UI 只需各策略组的 type/当前选中/成员名，这里只保留这三项，体积砍到几十分之一。
-// 实现：先按官方方式整体 Marshal（各代理用自身 MarshalJSON 吐出 all/now/type），
-// 再筛出带 "all" 的（即策略组），只取三字段重新打包。
+// QueryProxies returns only the group fields used by the app. It traverses the
+// group interfaces directly so a large subscription is never serialized into
+// a full external-controller response and decoded again inside the extension.
 func QueryProxies() string {
-	raw, err := json.Marshal(tunnel.Proxies())
-	if err != nil {
-		return `{"proxies":{},"error":"marshal: ` + err.Error() + `"}`
-	}
-	var full map[string]map[string]any
-	if err := json.Unmarshal(raw, &full); err != nil {
-		return `{"proxies":{},"error":"unmarshal: ` + err.Error() + `"}`
-	}
-
+	configApplyMu.RLock()
+	defer configApplyMu.RUnlock()
 	groups := map[string]any{}
-	for name, p := range full {
-		if _, isGroup := p["all"]; !isGroup {
-			continue // 只有策略组带 all
+	for name, proxy := range tunnel.Proxies() {
+		group, isGroup := proxy.Adapter().(outboundgroup.ProxyGroup)
+		if !isGroup {
+			continue
+		}
+		members := group.Proxies()
+		all := make([]string, 0, len(members))
+		for _, member := range members {
+			all = append(all, member.Name())
 		}
 		groups[name] = map[string]any{
-			"type": p["type"],
-			"now":  p["now"],
-			"all":  p["all"],
-			"icon": p["icon"], // 策略组图标 URL（配置里的）
+			"type": proxy.Type().String(),
+			"now":  group.Now(),
+			"all":  all,
+			"icon": group.Icon(),
 		}
 	}
 
@@ -1357,7 +1390,7 @@ func QueryProxies() string {
 		"mode":    tunnel.Mode().String(),
 	})
 	if err != nil {
-		return `{"proxies":{},"error":"repack: ` + err.Error() + `"}`
+		return `{"proxies":{},"error":"marshal: ` + err.Error() + `"}`
 	}
 	return string(out)
 }
@@ -1366,6 +1399,8 @@ func QueryProxies() string {
 // 仅 Selector 类策略组可选；URLTest/Fallback 等自动组不支持。
 // 对应 Swift 侧 `MihomoSelectProxy(_:_:error:)`。
 func SelectProxy(group, name string) error {
+	configApplyMu.RLock()
+	defer configApplyMu.RUnlock()
 	proxies := tunnel.Proxies()
 	p, exist := proxies[group]
 	if !exist {
@@ -1388,6 +1423,8 @@ func SelectProxy(group, name string) error {
 // 返回 {<节点名>: 毫秒} 的 JSON；失败返回 {"error":...}。
 // 对应 Swift 侧 `MihomoGroupDelay(_:_:_:)`。
 func GroupDelay(group, url string, timeoutMs int) string {
+	configApplyMu.RLock()
+	defer configApplyMu.RUnlock()
 	p, exist := tunnel.Proxies()[group]
 	if !exist {
 		return `{"error":"策略组不存在"}`
@@ -1419,12 +1456,16 @@ func GroupDelay(group, url string, timeoutMs int) string {
 
 // Mode 返回当前模式字符串（rule/global/direct）。对应 Swift 侧 `MihomoMode()`。
 func Mode() string {
+	configApplyMu.RLock()
+	defer configApplyMu.RUnlock()
 	return tunnel.Mode().String()
 }
 
 // SetMode 设置模式（rule/global/direct，大小写不敏感，未知按 rule）。
 // 对应 Swift 侧 `MihomoSetMode(_:)`。
 func SetMode(mode string) {
+	configApplyMu.Lock()
+	defer configApplyMu.Unlock()
 	switch strings.ToLower(strings.TrimSpace(mode)) {
 	case "global":
 		tunnel.SetMode(tunnel.Global)
@@ -1444,6 +1485,76 @@ func TrafficNow() string {
 		return `{"up":0,"down":0}`
 	}
 	return string(out)
+}
+
+// ConnectionsSnapshot returns a bounded, newest-first connection list for the
+// app-owned IPC channel. Bounding the list avoids large REST-style snapshots
+// creating avoidable encode/decode peaks in the Network Extension process.
+func ConnectionsSnapshot(limit int) string {
+	if limit <= 0 {
+		limit = defaultConnectionSnapshotLimit
+	} else if limit > maxConnectionSnapshotLimit {
+		limit = maxConnectionSnapshotLimit
+	}
+
+	connections := make([]*statistic.TrackerInfo, 0, limit)
+	statistic.DefaultManager.Range(func(tracker statistic.Tracker) bool {
+		if info := tracker.Info(); info != nil {
+			connections = append(connections, info)
+		}
+		return true
+	})
+	sort.Slice(connections, func(left, right int) bool {
+		return connections[left].Start.After(connections[right].Start)
+	})
+	total := len(connections)
+	if len(connections) > limit {
+		connections = connections[:limit]
+	}
+	uploadTotal, downloadTotal := statistic.DefaultManager.Total()
+	out, err := json.Marshal(struct {
+		DownloadTotal int64                    `json:"downloadTotal"`
+		UploadTotal   int64                    `json:"uploadTotal"`
+		Connections   []*statistic.TrackerInfo `json:"connections"`
+		Total         int                      `json:"total"`
+		Truncated     bool                     `json:"truncated"`
+	}{
+		DownloadTotal: downloadTotal,
+		UploadTotal:   uploadTotal,
+		Connections:   connections,
+		Total:         total,
+		Truncated:     total > len(connections),
+	})
+	if err != nil {
+		return `{"downloadTotal":0,"uploadTotal":0,"connections":[],"total":0,"truncated":false}`
+	}
+	return string(out)
+}
+
+// CloseConnection closes one tracked connection without exposing the full
+// external-controller HTTP server to the main app.
+func CloseConnection(id string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return fmt.Errorf("连接 ID 为空")
+	}
+	tracker := statistic.DefaultManager.Get(id)
+	if tracker == nil {
+		return fmt.Errorf("连接不存在或已结束")
+	}
+	return tracker.Close()
+}
+
+// CloseAllConnections closes every tracked connection and returns the number
+// of close attempts.
+func CloseAllConnections() int {
+	closed := 0
+	statistic.DefaultManager.Range(func(tracker statistic.Tracker) bool {
+		_ = tracker.Close()
+		closed++
+		return true
+	})
+	return closed
 }
 
 // RuntimeStats returns a compact process snapshot for the Network Extension's
@@ -1848,6 +1959,9 @@ func Stop() {
 	activeSystemDNS = nil
 	activeGeneralIPv6 = false
 	activeUsesSystemDNS = false
+	CloseAllConnections()
+	controllerState.ExternalController = false
+	route.ReCreateServer(&route.Config{})
 	executor.Shutdown()
 }
 
@@ -1908,12 +2022,87 @@ func writeRunLogLine(file *os.File, line string) {
 		if err := file.Truncate(0); err == nil {
 			_, _ = file.Seek(0, io.SeekStart)
 			runLogBytes = 0
+			runLogGeneration++
 		}
 	}
 	written, _ := file.WriteString(line)
 	if runLogBytes >= 0 {
 		runLogBytes += int64(written)
 	}
+}
+
+// RunLogChunk returns complete log data after offset together with a generation
+// token. A negative offset requests only the latest bounded tail. The token lets
+// the app detect startup truncation even if the new file has already regrown
+// beyond the previous byte offset.
+func RunLogChunk(offset int, generation int) string {
+	type response struct {
+		Offset     int64  `json:"offset"`
+		Generation int64  `json:"generation"`
+		Reset      bool   `json:"reset"`
+		Text       string `json:"text"`
+		Error      string `json:"error,omitempty"`
+	}
+
+	logFileMu.Lock()
+	defer logFileMu.Unlock()
+	result := response{Generation: runLogGeneration}
+	if homeDir == "" {
+		result.Error = "日志目录尚未初始化"
+		out, _ := json.Marshal(result)
+		return string(out)
+	}
+	f, err := os.Open(filepath.Join(homeDir, "run.log"))
+	if err != nil {
+		result.Error = err.Error()
+		out, _ := json.Marshal(result)
+		return string(out)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		result.Error = err.Error()
+		out, _ := json.Marshal(result)
+		return string(out)
+	}
+
+	start := int64(offset)
+	result.Reset = int64(generation) != runLogGeneration
+	if start < 0 {
+		start = info.Size() - defaultRunLogChunkBytes
+		if start < 0 {
+			start = 0
+		}
+		result.Reset = true
+	} else if result.Reset || start > info.Size() {
+		start = 0
+		result.Reset = true
+	}
+
+	buffer := make([]byte, defaultRunLogChunkBytes)
+	read, readErr := f.ReadAt(buffer, start)
+	if readErr != nil && readErr != io.EOF {
+		result.Error = readErr.Error()
+		result.Offset = start
+		out, _ := json.Marshal(result)
+		return string(out)
+	}
+	data := buffer[:read]
+	if offset < 0 && start > 0 {
+		if newline := bytes.IndexByte(data, '\n'); newline >= 0 {
+			start += int64(newline + 1)
+			data = data[newline+1:]
+		}
+	}
+	if lastNewline := bytes.LastIndexByte(data, '\n'); lastNewline >= 0 {
+		data = data[:lastNewline+1]
+	} else if len(data) < len(buffer) {
+		data = nil
+	}
+	result.Offset = start + int64(len(data))
+	result.Text = string(data)
+	out, _ := json.Marshal(result)
+	return string(out)
 }
 
 // 每次真实启动都开启新的 run.log 会话。日志页在内存中保留上一会话，因此这里截断
@@ -1928,10 +2117,9 @@ func resetRunLog() error {
 		if err := runLogFile.Truncate(0); err != nil {
 			return err
 		}
+		runLogBytes = 0
+		runLogGeneration++
 		_, err := runLogFile.Seek(0, io.SeekStart)
-		if err == nil {
-			runLogBytes = 0
-		}
 		return err
 	}
 	f, err := os.OpenFile(filepath.Join(homeDir, "run.log"),
@@ -1940,5 +2128,6 @@ func resetRunLog() error {
 		return err
 	}
 	runLogBytes = 0
+	runLogGeneration++
 	return f.Close()
 }

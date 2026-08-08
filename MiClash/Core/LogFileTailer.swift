@@ -87,7 +87,7 @@ final class LogFileTailer: @unchecked Sendable {
         }
         let parsed = chunks.compactMap { bytes -> LogLine? in
             guard !bytes.isEmpty else { return nil }
-            return parse(String(decoding: bytes, as: UTF8.self))
+            return Self.parseLine(String(decoding: bytes, as: UTF8.self))
         }
         if fileWasReset || !parsed.isEmpty { onLines?(parsed, fileWasReset) }
     }
@@ -107,7 +107,7 @@ final class LogFileTailer: @unchecked Sendable {
     }
 
     /// 解析带时区的新时间戳，并兼容旧版只有 UTC 时分秒的日志。
-    private func parse(_ line: String) -> LogLine {
+    static func parseLine(_ line: String) -> LogLine {
         guard let lb = line.firstIndex(of: "["),
               let rb = line.firstIndex(of: "]"), lb < rb else {
             return LogLine(time: Date(), type: "info", payload: line)

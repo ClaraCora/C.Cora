@@ -8,8 +8,8 @@ import WidgetKit
 /// 它是 UI 与底层之间唯一的状态来源：视图只读它的 @Published 属性，
 /// 通过它暴露的方法触发动作，数据流单向（动作 → 底层 → 状态变更 → UI 刷新）。
 ///
-/// Phase 0 只聚合 VPN 连接状态；Phase 2+ 会在此挂上 mihomo external-controller
-/// 的 API 客户端（流量、节点、日志等），但对 UI 的接口形态保持不变。
+/// 运行态控制统一经版本化 Network Extension IPC；external-controller 只作为用户
+/// 显式开启的兼容接口，不参与 App 自身控制。
 @MainActor
 final class CoreStateManager: ObservableObject {
 
@@ -65,7 +65,9 @@ final class CoreStateManager: ObservableObject {
                 // 同步给控制中心磁贴（App 在前台时覆盖各种来源的状态变化）
                 AppGroupState.vpnConnected = self.isActive
                 // 主动请求系统刷新磁贴，否则 App 内启停不会同步到控制中心
-                ControlCenter.shared.reloadControls(ofKind: ControlWidgetKind.vpn)
+                if #available(iOS 18.0, *) {
+                    ControlCenter.shared.reloadControls(ofKind: ControlWidgetKind.vpn)
+                }
                 if connection.status == .connected {
                     await self.fetchControllerConfiguration()
                     await self.fetchNotices()
@@ -121,7 +123,6 @@ final class CoreStateManager: ObservableObject {
                 geoAvailable: AppGroup.containerURL != nil,
                 applyOverrides: SubscriptionStore.shared.activeOverridesEnabled)
             let s = SettingsStore.shared
-            MihomoAPI.configure(port: s.controllerPort, secret: s.controllerSecret)
             let opts = TunnelManager.ProtocolOptions(
                 includeAllNetworks: s.includeAllNetworks,
                 excludeCellularServices: s.excludeCellularServices,
@@ -195,22 +196,38 @@ final class CoreStateManager: ObservableObject {
     /// 写共享状态 + 请求刷新控制中心磁贴（乐观，NE 启停后还会再写一次确认）。
     private func syncWidget(_ connected: Bool) {
         AppGroupState.vpnConnected = connected
-        ControlCenter.shared.reloadControls(ofKind: ControlWidgetKind.vpn)
+        if #available(iOS 18.0, *) {
+            ControlCenter.shared.reloadControls(ofKind: ControlWidgetKind.vpn)
+        }
     }
 
     /// 向运行中的 NE 发 JSON 命令并取回响应（策略组查询/切换、日志等共用）。
     /// 返回成功数据或可显示的失败原因。
     func sendMessage(_ object: [String: Any]) async -> TunnelManager.IPCResult {
-        guard let payload = try? JSONSerialization.data(withJSONObject: object) else {
+        var request = object
+        request["v"] = 1
+        guard let payload = try? JSONSerialization.data(withJSONObject: request) else {
             return .failure("命令编码失败")
         }
-        return await tunnel.sendMessage(payload)
+        let command = request["cmd"] as? String ?? ""
+        let timeout: TimeInterval
+        switch command {
+        case "reloadConfig":
+            timeout = 60
+        case "groupDelay":
+            let milliseconds = (request["timeout"] as? NSNumber)?.doubleValue ?? 5_000
+            timeout = max(10, milliseconds / 1_000 + 5)
+        default:
+            timeout = 10
+        }
+        return await tunnel.sendMessage(payload, timeout: timeout)
     }
 
     private func fetchControllerConfiguration() async {
         let result = await sendMessage(["cmd": "controllerInfo"])
         guard case .ok(let data) = result,
               let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              (object["enabled"] as? Bool) == true,
               let port = (object["port"] as? NSNumber)?.intValue,
               (1...65_535).contains(port) else { return }
         MihomoAPI.configure(port: port, secret: object["secret"] as? String ?? "")

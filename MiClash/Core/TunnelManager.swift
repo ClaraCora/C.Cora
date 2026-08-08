@@ -159,10 +159,27 @@ final class TunnelManager {
         case failure(String)
     }
 
+    private final class IPCReplyGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<IPCResult, Never>?
+
+        init(_ continuation: CheckedContinuation<IPCResult, Never>) {
+            self.continuation = continuation
+        }
+
+        func resolve(_ result: IPCResult) {
+            lock.lock()
+            let pending = continuation
+            continuation = nil
+            lock.unlock()
+            pending?.resume(returning: result)
+        }
+    }
+
     /// 向运行中的 NE 发送一条 sendProviderMessage 请求并取回响应（不依赖 App Group）。
     /// 优先复用连接时那个 manager（其 connection 状态可靠）；不强行卡 .connected，
     /// 直接尝试发送，失败/空响应都回传具体原因。
-    func sendMessage(_ payload: Data) async -> IPCResult {
+    func sendMessage(_ payload: Data, timeout: TimeInterval = 10) async -> IPCResult {
         let mgr: NETunnelProviderManager
         if let m = manager {
             mgr = m
@@ -180,23 +197,28 @@ final class TunnelManager {
         let st = session.status.rawValue
 
         return await withCheckedContinuation { cont in
+            let gate = IPCReplyGate(cont)
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout) {
+                gate.resolve(.failure("NE IPC 超时（\(Int(timeout)) 秒，status=\(st)）"))
+            }
             do {
                 try session.sendProviderMessage(payload) { resp in
                     if let resp {
-                        cont.resume(returning: .ok(resp))
+                        gate.resolve(.ok(resp))
                     } else {
-                        cont.resume(returning: .failure("NE 回传空响应（status=\(st)）"))
+                        gate.resolve(.failure("NE 回传空响应（status=\(st)）"))
                     }
                 }
             } catch {
-                cont.resume(returning: .failure("sendProviderMessage 抛错：\(error.localizedDescription)（status=\(st)）"))
+                gate.resolve(.failure(
+                    "sendProviderMessage 抛错：\(error.localizedDescription)（status=\(st)）"))
             }
         }
     }
 
     /// 取 NE/内核日志（getLogs 命令）。
     func fetchLogs() async -> String {
-        let payload = (try? JSONSerialization.data(withJSONObject: ["cmd": "getLogs"]))
+        let payload = (try? JSONSerialization.data(withJSONObject: ["v": 1, "cmd": "getLogs"]))
             ?? Data("getLogs".utf8)
         switch await sendMessage(payload) {
         case .ok(let data):

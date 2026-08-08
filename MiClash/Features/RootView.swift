@@ -29,21 +29,16 @@ struct RootView: View {
 
     private var tabs: some View {
         TabView {
-            Tab("主页", systemImage: "power") {
-                ConnectView()
-            }
-            Tab("配置", systemImage: "doc.text") {
-                SubscriptionsView()
-            }
-            Tab("节点", systemImage: "point.3.connected.trianglepath.dotted") {
-                ProxiesView()
-            }
-            Tab("连接", systemImage: "arrow.left.arrow.right.circle") {
-                ActivityView()
-            }
-            Tab("设置", systemImage: "gearshape") {
-                SettingsView()
-            }
+            ConnectView()
+                .tabItem { Label("主页", systemImage: "power") }
+            SubscriptionsView()
+                .tabItem { Label("配置", systemImage: "doc.text") }
+            ProxiesView()
+                .tabItem { Label("节点", systemImage: "point.3.connected.trianglepath.dotted") }
+            ActivityView()
+                .tabItem { Label("连接", systemImage: "arrow.left.arrow.right.circle") }
+            SettingsView()
+                .tabItem { Label("设置", systemImage: "gearshape") }
         }
     }
 

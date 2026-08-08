@@ -1,11 +1,11 @@
 # XcodeGen 工程定义。由 CI 执行 `xcodegen generate` 生成 MiClash.xcodeproj（不入库）。
-# 双 target：主 App + Network Extension（Packet Tunnel）。部署目标 iOS 18.0。
+# 主 App + Network Extension 支持 iOS 17；控制中心扩展单独要求 iOS 18。
 name: MiClash
 
 options:
   bundleIdPrefix: com.miclash
   deploymentTarget:
-    iOS: "18.0"
+    iOS: "17.0"
   createIntermediateGroups: true
   # CI 不签名，签名由用户自理
   defaultConfig: Release
@@ -85,6 +85,7 @@ targets:
       - path: Shared
     settings:
       base:
+        IPHONEOS_DEPLOYMENT_TARGET: "18.0"
         PRODUCT_BUNDLE_IDENTIFIER: com.miclash.app.control
         GENERATE_INFOPLIST_FILE: NO
         INFOPLIST_FILE: MiClashControl/Info.plist

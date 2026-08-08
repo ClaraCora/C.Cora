@@ -51,6 +51,7 @@ struct SettingsView: View {
                 }
 
                 Section {
+                    Toggle("启用外部控制", isOn: $settings.externalControllerEnabled)
                     HStack {
                         Text("端口")
                         Spacer()
@@ -60,6 +61,7 @@ struct SettingsView: View {
                             .multilineTextAlignment(.trailing)
                             .frame(width: 90)
                     }
+                    .disabled(!settings.externalControllerEnabled)
                     HStack {
                         Text("密钥")
                         Spacer()
@@ -68,13 +70,14 @@ struct SettingsView: View {
                             .autocorrectionDisabled()
                             .textInputAutocapitalization(.never)
                     }
+                    .disabled(!settings.externalControllerEnabled)
                     Toggle("允许局域网访问", isOn: $settings.allowLan)
-                        .disabled(settings.controllerSecret
+                        .disabled(!settings.externalControllerEnabled || settings.controllerSecret
                             .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 } header: {
                     Text("外部控制")
                 } footer: {
-                    Text("供主 App 访问内核 API。局域网访问必须先设置非空密钥；修改后重连生效。")
+                    Text("供第三方 Dashboard 使用；主 App 自身走系统 IPC。局域网访问必须设置密钥，修改后重连生效。")
                 }
 
                 Section {
@@ -244,8 +247,7 @@ private struct GeoURLField: View {
     }
 }
 
-/// 内核状态页：同时探测 external-controller API 与 sendProviderMessage IPC，并排对比可用性。
-/// 用于在自有账号 + App Group 就绪后，验证 IPC 是否已恢复可靠（决定能否把控制从 HTTP 切到 IPC）。
+/// 内核状态页：验证主控制 IPC，并在用户显式启用时附带探测 external-controller。
 private struct KernelStatusView: View {
     @State private var text = "探测中…"
 
@@ -267,20 +269,30 @@ private struct KernelStatusView: View {
         text = "探测中…"
         var out = "目标：\(MihomoAPI.base.absoluteString)\n（请在 VPN 已连接时探测）\n"
 
-        // 1) external-controller API（loopback HTTP）
+        // 1) optional external-controller API（loopback HTTP）
         out += "\n【external-controller API】\n"
-        do {
-            let version = try await MihomoAPI.version()
-            let obj = try await MihomoAPI.proxiesJSON()
-            let proxies = (obj["proxies"] as? [String: Any]) ?? [:]
-            let groupCount = proxies.values.compactMap { ($0 as? [String: Any])?["all"] }.count
-            out += "✅ 可达，版本 \(version)，代理/组 \(proxies.count)，策略组 \(groupCount)\n"
-        } catch {
-            out += "❌ \(error.localizedDescription)\n"
+        if SettingsStore.shared.externalControllerEnabled {
+            do {
+                let version = try await MihomoAPI.version()
+                let obj = try await MihomoAPI.proxiesJSON()
+                let proxies = (obj["proxies"] as? [String: Any]) ?? [:]
+                let groupCount = proxies.values.compactMap { ($0 as? [String: Any])?["all"] }.count
+                out += "✅ 可达，版本 \(version)，代理/组 \(proxies.count)，策略组 \(groupCount)\n"
+            } catch {
+                out += "❌ \(error.localizedDescription)\n"
+            }
+        } else {
+            out += "未启用（主 App 不依赖此接口）\n"
         }
 
         // 2) sendProviderMessage IPC（App↔NE 官方通道）
         out += "\n【sendProviderMessage IPC】\n"
+        let hello = await CoreStateManager.shared.sendMessage(["cmd": "hello"])
+        if case .ok(let data) = hello,
+           let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            out += "协议 v\((object["protocolVersion"] as? NSNumber)?.intValue ?? 0)，"
+                + "内核 \(object["coreVersion"] as? String ?? "?")\n"
+        }
         let ipc = await CoreStateManager.shared.sendMessage(["cmd": "queryProxies"])
         switch ipc {
         case .ok(let data):

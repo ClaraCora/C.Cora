@@ -1,6 +1,6 @@
 import Foundation
 
-/// mihomo `/connections` 的轻量快照，只保留活动连接页实际使用的字段。
+/// 由 Network Extension IPC 返回的轻量连接快照。
 struct ConnectionsSnapshot: Decodable, Sendable {
     let downloadTotal: Int64
     let uploadTotal: Int64
@@ -237,14 +237,24 @@ final class ConnectionsController: ObservableObject {
         if showLoading { isLoading = true }
         defer { if showLoading { isLoading = false } }
 
-        do {
-            let latest = try await MihomoAPI.connectionsSnapshot()
+        let result = await CoreStateManager.shared.sendMessage([
+            "cmd": "connections",
+            "limit": 200,
+        ])
+        switch result {
+        case .ok(let data):
+            do {
+                let latest = try JSONDecoder().decode(ConnectionsSnapshot.self, from: data)
+                guard !Task.isCancelled, generation == currentGeneration else { return }
+                snapshot = latest
+                error = nil
+            } catch {
+                guard !Task.isCancelled, generation == currentGeneration else { return }
+                self.error = "连接快照无法解析：\(error.localizedDescription)"
+            }
+        case .failure(let reason):
             guard !Task.isCancelled, generation == currentGeneration else { return }
-            snapshot = latest
-            error = nil
-        } catch {
-            guard !Task.isCancelled, generation == currentGeneration else { return }
-            self.error = error.localizedDescription
+            self.error = reason
         }
     }
 
@@ -254,8 +264,12 @@ final class ConnectionsController: ObservableObject {
         closingIDs.insert(connection.id)
         defer { closingIDs.remove(connection.id) }
 
-        do {
-            try await MihomoAPI.closeConnection(id: connection.id)
+        let result = await CoreStateManager.shared.sendMessage([
+            "cmd": "closeConnection",
+            "id": connection.id,
+        ])
+        switch Self.commandError(result) {
+        case nil:
             guard generation == currentGeneration else { return }
             if let current = snapshot {
                 snapshot = ConnectionsSnapshot(
@@ -264,9 +278,9 @@ final class ConnectionsController: ObservableObject {
                     connections: current.connections.filter { $0.id != connection.id })
             }
             error = nil
-        } catch {
+        case .some(let reason):
             guard generation == currentGeneration else { return }
-            self.error = "关闭连接失败：\(error.localizedDescription)"
+            self.error = "关闭连接失败：\(reason)"
         }
     }
 
@@ -276,8 +290,9 @@ final class ConnectionsController: ObservableObject {
         isClosingAll = true
         defer { isClosingAll = false }
 
-        do {
-            try await MihomoAPI.closeAllConnections()
+        let result = await CoreStateManager.shared.sendMessage(["cmd": "closeAllConnections"])
+        switch Self.commandError(result) {
+        case nil:
             guard generation == currentGeneration else { return }
             if let current = snapshot {
                 snapshot = ConnectionsSnapshot(
@@ -285,9 +300,23 @@ final class ConnectionsController: ObservableObject {
                     uploadTotal: current.uploadTotal)
             }
             error = nil
-        } catch {
+        case .some(let reason):
             guard generation == currentGeneration else { return }
-            self.error = "关闭全部连接失败：\(error.localizedDescription)"
+            self.error = "关闭全部连接失败：\(reason)"
+        }
+    }
+
+    private static func commandError(_ result: TunnelManager.IPCResult) -> String? {
+        switch result {
+        case .failure(let reason):
+            return reason
+        case .ok(let data):
+            guard let response = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            else { return "Tunnel 返回了无法识别的响应" }
+            guard (response["ok"] as? Bool) == true else {
+                return (response["error"] as? String) ?? "未知错误"
+            }
+            return nil
         }
     }
 }

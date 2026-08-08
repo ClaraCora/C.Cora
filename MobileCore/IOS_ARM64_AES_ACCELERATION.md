@@ -12,7 +12,7 @@ The patch enables only the AES and PMULL flags for `ios && arm64`. The original
 
 ## Safety checks
 
-- The workflow is pinned to Go 1.25.4 and iOS 18.0.
+- The workflow is pinned to Go 1.25.4 and iOS 17.0.
 - The unmodified and patched Go source files are verified by SHA-256.
 - CI verifies that the iOS-specific initializer is selected and compiles the
   standard-library AES packages before running `gomobile bind`.
@@ -20,7 +20,7 @@ The patch enables only the AES and PMULL flags for `ios && arm64`. The original
   XCFramework.
 
 ARM crypto extensions cannot be probed by this Go version on iOS. The patch
-therefore relies on the project's iOS 18 iPhone hardware floor. Before a
+therefore relies on the project's iOS 17 iPhone hardware floor (A12 or newer). Before a
 release, test the oldest supported device for `EXC_BAD_INSTRUCTION` and compare
 SS2022 throughput and memory with 1, 4, and 8 concurrent streams.
 

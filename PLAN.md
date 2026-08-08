@@ -6,7 +6,7 @@
 - 开发机为 Windows，无本地 Mac；全程靠 GitHub Actions（macos-15 / Xcode 16）构建。
 - CI 只产出**未签名 ipa**；签名由用户用自有开发者证书自理，工程内不放证书/描述文件/Secrets。
 - 工程用 XcodeGen（`project.yml` 生成 `.xcodeproj`，不入库）。
-- 部署目标 **iOS 18.0**（ShipSwift 要求）。
+- 主 App 与 Packet Tunnel 部署目标 **iOS 17.0**；Control Widget 扩展保持 iOS 18.0。
 
 ## 标识
 | 项 | 值 |
@@ -21,9 +21,9 @@
 - **MiClashTunnel**：`NEPacketTunnelProvider` 扩展，接管系统流量，宿主 mihomo 核心。
 - **MihomoCore.xcframework**：mihomo 经 `gomobile bind` 薄封装编出，被 NE 链接。
 
-进程间数据流（复用 mihomo 自带能力，不自造 IPC）：
-- 控制类（启停、传配置、查状态）→ `NETunnelProviderManager` / `sendProviderMessage` + App Group 共享容器。
-- 数据类（节点/分组/测延迟/流量/日志/连接）→ mihomo 内置 external-controller REST/WebSocket，NE 内监听 `127.0.0.1:9090`，主 App 当客户端连它（yacd/clash-dashboard 同款）。
+进程间数据流：
+- 隧道启停走 `NETunnelProviderManager`；配置、状态、节点/分组、测延迟、流量、日志和连接管理统一走带协议版本与超时的 `sendProviderMessage` IPC。
+- App Group 共享容器承载配置与日志文件；mihomo external-controller 默认关闭，仅在用户为第三方 Dashboard/局域网客户端显式启用时监听。
 
 `CoreStateManager`（全局单例 `ObservableObject`）= VPN 控制 + API 客户端封装，向所有 ViewModel 供状态。
 
@@ -46,4 +46,4 @@ NE 内 `tun.enable=true`，取真实 utun fd 交 mihomo（`stack=gvisor`——iO
 订阅更新（下载→解析→存 App Group→热重载）、日志持久化、Profile 管理、后台保活（`NEOnDemandRule`+重连）、前后台状态同步。
 
 ## ShipSwift 备注
-不是 SPM 依赖，而是复制粘贴式 + MCP 配方库（`signerlabs/ShipSwift`，MIT，iOS 18+）。集成 = 拷自包含组件文件，或 `claude mcp add --transport http shipswift https://api.shipswift.app/mcp`。
+不是 SPM 依赖，而是复制粘贴式 + MCP 配方库（`signerlabs/ShipSwift`，MIT，原组件要求 iOS 18+）。当前 iOS 17 主目标不集成其受限组件。

@@ -250,6 +250,51 @@ func TestRuntimeStatsReturnsDiagnosticSnapshot(t *testing.T) {
 	}
 }
 
+func TestControlInfoAdvertisesVersionedIPC(t *testing.T) {
+	var info struct {
+		ProtocolVersion int      `json:"protocolVersion"`
+		CoreVersion     string   `json:"coreVersion"`
+		Capabilities    []string `json:"capabilities"`
+	}
+	if err := json.Unmarshal([]byte(ControlInfo()), &info); err != nil {
+		t.Fatalf("ControlInfo returned invalid JSON: %v", err)
+	}
+	if info.ProtocolVersion != controlProtocolVersion || info.CoreVersion == "" {
+		t.Fatalf("ControlInfo = %+v", info)
+	}
+	want := map[string]bool{"connections": false, "logs": false, "proxies": false}
+	for _, capability := range info.Capabilities {
+		if _, exists := want[capability]; exists {
+			want[capability] = true
+		}
+	}
+	for capability, present := range want {
+		if !present {
+			t.Errorf("ControlInfo omitted %q", capability)
+		}
+	}
+}
+
+func TestConnectionsIPCEmptySnapshotAndMissingClose(t *testing.T) {
+	var snapshot struct {
+		Connections []json.RawMessage `json:"connections"`
+		Total       int               `json:"total"`
+		Truncated   bool              `json:"truncated"`
+	}
+	if err := json.Unmarshal([]byte(ConnectionsSnapshot(1)), &snapshot); err != nil {
+		t.Fatalf("ConnectionsSnapshot returned invalid JSON: %v", err)
+	}
+	if snapshot.Total < len(snapshot.Connections) {
+		t.Fatalf("snapshot total %d < returned %d", snapshot.Total, len(snapshot.Connections))
+	}
+	if err := CloseConnection(""); err == nil {
+		t.Fatal("CloseConnection accepted an empty ID")
+	}
+	if err := CloseConnection("00000000-0000-0000-0000-000000000000"); err == nil {
+		t.Fatal("CloseConnection accepted an unknown ID")
+	}
+}
+
 func mergedMap(t *testing.T, input string) map[string]any {
 	t.Helper()
 	return mergedMapWithSettings(t, input, appSettings{Stack: "gvisor", LogLevel: "info"})
@@ -730,12 +775,16 @@ func TestParseSettingsNormalizesPortsAndLANAuthentication(t *testing.T) {
 	if settings.AllowLan {
 		t.Fatal("allowLan should be disabled without a secret")
 	}
+	if settings.ExternalController {
+		t.Fatal("external controller should be disabled by default")
+	}
 	if settings.MixedPort != 0 {
 		t.Fatalf("mixed port = %d, want 0", settings.MixedPort)
 	}
 
 	settings = parseSettings(`{
-  "controllerPort": 9090,
+	  "externalController": true,
+	  "controllerPort": 9090,
   "controllerSecret": "secret",
   "allowLan": true,
   "mixedPort": 9090
@@ -745,6 +794,61 @@ func TestParseSettingsNormalizesPortsAndLANAuthentication(t *testing.T) {
 	}
 	if !settings.AllowLan {
 		t.Fatal("authenticated LAN controller should remain enabled")
+	}
+}
+
+func TestRunLogChunkTracksOffsetAndGeneration(t *testing.T) {
+	previousHome := homeDir
+	previousGeneration := runLogGeneration
+	previousBytes := runLogBytes
+	previousFile := runLogFile
+	defer func() {
+		homeDir = previousHome
+		runLogGeneration = previousGeneration
+		runLogBytes = previousBytes
+		runLogFile = previousFile
+	}()
+
+	homeDir = t.TempDir()
+	runLogGeneration = 7
+	runLogFile = nil
+	path := filepath.Join(homeDir, "run.log")
+	if err := os.WriteFile(path, []byte("first\nsecond\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var first struct {
+		Offset     int64  `json:"offset"`
+		Generation int64  `json:"generation"`
+		Reset      bool   `json:"reset"`
+		Text       string `json:"text"`
+	}
+	if err := json.Unmarshal([]byte(RunLogChunk(-1, 0)), &first); err != nil {
+		t.Fatal(err)
+	}
+	if !first.Reset || first.Generation != 7 || first.Text != "first\nsecond\n" {
+		t.Fatalf("initial chunk = %+v", first)
+	}
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("third\n"); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	var next struct {
+		Offset int64  `json:"offset"`
+		Reset  bool   `json:"reset"`
+		Text   string `json:"text"`
+	}
+	if err := json.Unmarshal([]byte(RunLogChunk(int(first.Offset), 7)), &next); err != nil {
+		t.Fatal(err)
+	}
+	if next.Reset || next.Text != "third\n" || next.Offset <= first.Offset {
+		t.Fatalf("incremental chunk = %+v, first offset = %d", next, first.Offset)
 	}
 }
 
@@ -770,8 +874,12 @@ func TestParseSettingsVisualOverrides(t *testing.T) {
 
 func TestRunLogIsBounded(t *testing.T) {
 	previousBytes := runLogBytes
+	previousGeneration := runLogGeneration
 	runLogBytes = -1
-	defer func() { runLogBytes = previousBytes }()
+	defer func() {
+		runLogBytes = previousBytes
+		runLogGeneration = previousGeneration
+	}()
 	path := filepath.Join(t.TempDir(), "run.log")
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
@@ -810,8 +918,11 @@ func nestedMap(t *testing.T, m map[string]any, key string) map[string]any {
 	return v
 }
 
-func TestMergeConfigLowMemoryOverridesAndWebUI(t *testing.T) {
+func TestMergeConfigLowMemoryOverridesAndControllerIsolation(t *testing.T) {
 	m := mergedMap(t, `
+external-controller: 0.0.0.0:9999
+external-controller-tls: 0.0.0.0:9443
+secret: subscription-secret
 external-ui: ui
 external-ui-url: https://example.com/ui.zip
 external-ui-name: panel
@@ -832,14 +943,12 @@ dns:
       - https://dns.google/dns-query#Ai
 `)
 
-	wantUI := map[string]any{
-		"external-ui":      "ui",
-		"external-ui-url":  "https://example.com/ui.zip",
-		"external-ui-name": "panel",
-	}
-	for key, want := range wantUI {
-		if got := m[key]; got != want {
-			t.Errorf("%s = %v, want preserved %v", key, got, want)
+	for _, key := range []string{
+		"external-controller", "external-controller-tls", "secret",
+		"external-ui", "external-ui-url", "external-ui-name",
+	} {
+		if _, exists := m[key]; exists {
+			t.Errorf("subscription-owned %s should be removed", key)
 		}
 	}
 	profile := nestedMap(t, m, "profile")
@@ -872,6 +981,23 @@ dns:
 	ai, ok := policy["rule-set:Ai"].([]any)
 	if !ok || len(ai) != 1 || ai[0] != "https://dns.google/dns-query#Ai" {
 		t.Errorf("dns.nameserver-policy[rule-set:Ai] = %v, want subscription value preserved", policy["rule-set:Ai"])
+	}
+}
+
+func TestMergeConfigInjectsExplicitExternalController(t *testing.T) {
+	m := mergedMapWithSettings(t, "", appSettings{
+		Stack:              "gvisor",
+		LogLevel:           "info",
+		ExternalController: true,
+		ControllerPort:     9091,
+		ControllerSecret:   "app-secret",
+		AllowLan:           true,
+	})
+	if got := m["external-controller"]; got != "0.0.0.0:9091" {
+		t.Fatalf("external-controller = %v", got)
+	}
+	if got := m["secret"]; got != "app-secret" {
+		t.Fatalf("secret = %v", got)
 	}
 }
 

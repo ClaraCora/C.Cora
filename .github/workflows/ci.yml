@@ -155,7 +155,7 @@ jobs:
           # 交叉编译 mihomo 为 iOS 框架（含 device arm64 + simulator 切片）。
           # with_gvisor：iOS NE 的 system 栈 TCP 不通；with_low_memory：转发缓冲减半，降低峰值。
           gomobile bind \
-            -iosversion=18.0 \
+            -iosversion=17.0 \
             -tags "with_gvisor,with_low_memory" \
             -ldflags="-X github.com/metacubex/mihomo/constant.Version=${MIHOMO_VERSION}" \
             -target=ios -o ../Vendor/Mihomo.xcframework .

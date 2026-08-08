@@ -14,9 +14,9 @@ private struct LogDisplayState {
     static let empty = LogDisplayState(lines: [], bufferedLineCount: 0)
 }
 
-/// 日志页数据源：**优先读 App Group 共享的 run.log（文件 tail），否则退回 /logs WebSocket**。
+/// 日志页数据源：优先读 App Group 共享的 run.log；不可用时经版本化 NE IPC 增量读取。
 ///
-/// 天花板是「设置里的日志级别」：文件源(run.log)由内核按该级别过滤后落盘，WS 源以该级别订阅。
+/// 天花板是「设置里的日志级别」：run.log 由内核按该级别过滤后落盘。
 /// 视图里的级别只在这个天花板内**客户端再筛**：原始日志全存 rawLines，展示用的 lines = rawLines
 /// 按 level + 搜索词过滤。切级别/改搜索只是重过滤，**绝不清空、绝不重连**——修了「切级别再切回来
 /// 日志就没了」。所以设 info 时最多到 info；想看 debug 要把设置里的日志级别调到 debug。
@@ -40,11 +40,11 @@ final class LogStreamController: ObservableObject {
     var hasBufferedLines: Bool { display.bufferedLineCount > 0 }
     var bufferedLineCount: Int { display.bufferedLineCount }
 
-    private let stream = MihomoStream()
     private var tailer: LogFileTailer?
     private var rawLines: [LogLine] = []     // 所有收到的原始日志
-    private var pendingSocketLines: [LogLine] = []
-    private var socketFlushTask: Task<Void, Never>?
+    private var ipcTask: Task<Void, Never>?
+    private var ipcOffset = -1
+    private var ipcLogGeneration = 0
     private var searchTask: Task<Void, Never>?
     private var generation = 0
     private let maxLines = 1000
@@ -67,17 +67,21 @@ final class LogStreamController: ObservableObject {
         isStreaming = true
         isAwaitingNewSession = awaitingNewSession
         error = nil
-        socketFlushTask?.cancel()
-        pendingSocketLines.removeAll(keepingCapacity: true)
+        ipcTask?.cancel()
         searchTask?.cancel()
-        // connecting 阶段先保留上一会话，检测到 run.log 截断（或第一帧 WS）再切换。
+        // connecting 阶段先保留上一会话，检测到 run.log 截断或新会话标记后再切换。
         if !awaitingNewSession { beginNewSession() }
 
         if let url = Self.sharedLogURL {
             startFileTail(url, expectFileReset: awaitingNewSession,
                           generation: currentGeneration)
         } else {
-            startSocket(generation: currentGeneration)
+            if !awaitingNewSession {
+                ipcOffset = -1
+                ipcLogGeneration = 0
+            }
+            startIPCPoll(generation: currentGeneration,
+                         needsBaseline: awaitingNewSession && ipcLogGeneration == 0)
         }
     }
 
@@ -86,16 +90,10 @@ final class LogStreamController: ObservableObject {
             // 秒断时可能尚未来得及轮询截断；重读当前文件后再做最后一次 flush。
             restartWithCurrentSession()
         }
-        stream.stop()
         tailer?.stop(flushRemaining: true)
         tailer = nil
-        socketFlushTask?.cancel()
-        socketFlushTask = nil
-        if !pendingSocketLines.isEmpty {
-            let pending = pendingSocketLines
-            pendingSocketLines.removeAll(keepingCapacity: true)
-            append(pending)
-        }
+        ipcTask?.cancel()
+        ipcTask = nil
         isStreaming = false
         isAwaitingNewSession = false
     }
@@ -111,9 +109,8 @@ final class LogStreamController: ObservableObject {
     func clear() {
         if !isStreaming { generation &+= 1 }
         searchTask?.cancel()
-        socketFlushTask?.cancel()
-        socketFlushTask = nil
-        pendingSocketLines.removeAll(keepingCapacity: true)
+        ipcTask?.cancel()
+        ipcTask = nil
         rawLines.removeAll()
         display = .empty
     }
@@ -176,19 +173,19 @@ final class LogStreamController: ObservableObject {
     private func restartWithCurrentSession() {
         generation &+= 1
         let currentGeneration = generation
-        stream.stop()
         tailer?.stop()
         tailer = nil
-        socketFlushTask?.cancel()
-        socketFlushTask = nil
-        pendingSocketLines.removeAll(keepingCapacity: true)
+        ipcTask?.cancel()
+        ipcTask = nil
         error = nil
         beginNewSession()
 
         if let url = Self.sharedLogURL {
             startFileTail(url, expectFileReset: false, generation: currentGeneration)
         } else {
-            startSocket(generation: currentGeneration)
+            ipcOffset = -1
+            ipcLogGeneration = 0
+            startIPCPoll(generation: currentGeneration, needsBaseline: false)
         }
     }
 
@@ -231,46 +228,65 @@ final class LogStreamController: ObservableObject {
         t.start(expectFileReset: expectFileReset)
     }
 
-    // MARK: - WebSocket 源（以 debug 全量订阅，客户端再筛）
+    // MARK: - IPC 增量源
 
-    private func startSocket(generation: Int) {
-        stream.onObject = { [weak self] obj in
-            let line = LogLine(
-                time: Date(),
-                type: obj["type"] as? String ?? "info",
-                payload: obj["payload"] as? String ?? "")
-            Task { @MainActor in
+    private func startIPCPoll(generation: Int, needsBaseline initialBaseline: Bool) {
+        ipcTask = Task { [weak self] in
+            var needsBaseline = initialBaseline
+            while !Task.isCancelled {
                 guard let self, self.generation == generation else { return }
-                self.enqueueSocketLine(line)
+                let result = await CoreStateManager.shared.sendMessage([
+                    "cmd": "runLogChunk",
+                    "offset": self.ipcOffset,
+                    "generation": self.ipcLogGeneration,
+                ])
+                guard !Task.isCancelled, self.generation == generation else { return }
+                switch result {
+                case .failure(let reason):
+                    if self.rawLines.isEmpty { self.error = reason }
+                case .ok(let data):
+                    guard let object = (try? JSONSerialization.jsonObject(with: data))
+                            as? [String: Any],
+                          let offset = (object["offset"] as? NSNumber)?.intValue,
+                          let logGeneration = (object["generation"] as? NSNumber)?.intValue
+                    else {
+                        if self.rawLines.isEmpty { self.error = "日志 IPC 响应无法解析" }
+                        break
+                    }
+                    if let reason = object["error"] as? String, !reason.isEmpty {
+                        if self.rawLines.isEmpty { self.error = reason }
+                        break
+                    }
+                    self.ipcOffset = offset
+                    self.ipcLogGeneration = logGeneration
+                    let text = object["text"] as? String ?? ""
+                    let lines = text.split(separator: "\n").map {
+                        LogFileTailer.parseLine(String($0))
+                    }
+                    if needsBaseline {
+                        needsBaseline = false
+                        if let marker = lines.lastIndex(where: {
+                            $0.type.lowercased() == "wrap"
+                                && $0.payload.hasPrefix("StartWithConfig:")
+                        }) {
+                            self.beginNewSession()
+                            self.append(Array(lines[marker...]))
+                            self.error = nil
+                        }
+                        break
+                    }
+                    if (object["reset"] as? Bool) == true {
+                        self.beginNewSession()
+                    }
+                    self.append(lines)
+                    self.error = nil
+                }
+                do {
+                    try await Task.sleep(nanoseconds: 800_000_000)
+                } catch {
+                    return
+                }
             }
-        }
-        stream.onClose = { [weak self] _ in
-            Task { @MainActor in
-                guard let self, self.generation == generation else { return }
-                if self.rawLines.isEmpty { self.error = "未连接内核（请先连接 VPN）" }
-            }
-        }
-        // 以「设置里的日志级别」为天花板订阅（不再固定 debug），与文件源/设置语义一致；
-        // 视图里切级别只在此天花板内客户端再筛。
-        stream.start(path: "logs", query: [URLQueryItem(name: "level", value: SettingsStore.shared.logLevel)])
-    }
-
-    /// App Group 不可用时 WS 可能逐帧回调；合并 150ms 后再发布到 UI。
-    private func enqueueSocketLine(_ line: LogLine) {
-        if isAwaitingNewSession { beginNewSession() }
-        pendingSocketLines.append(line)
-        guard socketFlushTask == nil else { return }
-        socketFlushTask = Task { [weak self] in
-            do {
-                try await Task.sleep(nanoseconds: 150_000_000)
-            } catch {
-                return
-            }
-            guard let self else { return }
-            let pending = self.pendingSocketLines
-            self.pendingSocketLines.removeAll(keepingCapacity: true)
-            self.socketFlushTask = nil
-            self.append(pending)
         }
     }
 }
