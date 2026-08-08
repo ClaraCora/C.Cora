@@ -8,10 +8,14 @@ readonly EXPECTED_SING_VERSION="v0.5.7"
 readonly PATCHED_SING_DIR="${PATCHED_SING_DIR:?Run prepare-ios-sing.sh first and pass its output as PATCHED_SING_DIR}"
 readonly SOURCE_REL="common/pool/alloc.go"
 readonly TEST_REL="common/pool/oversize_pool_test.go"
+readonly CONFIG_REL="config/config.go"
 readonly EXPECTED_SOURCE_SHA="acfdffbbd6050aa0481fe4ea60f0f73a10bca6ed7a6cfbca108e2c1acb0a78f5"
 readonly EXPECTED_PATCHED_SHA="743d8bd6d5990bffc6c4e3bcca85b076f57d5065032495d335d65f02d10fdb44"
 readonly EXPECTED_TEST_SHA="89c8f16770938f8ee4f7503df39e6139620fdacfdcf9a52a5b7eef0977dcb0df"
+readonly EXPECTED_CONFIG_SHA="7f5d6202bc741985ba2c05d2dbafb3e284cb0e51960b9e407033bd9b2eb3207f"
+readonly EXPECTED_CONFIG_PATCHED_SHA="be0c65c04f0a97e3efc57527b6c3e3affadd7dfc752587ac6b8f371caf0b6ae0"
 readonly PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/mihomo-v1.19.29-oversize-buffer-pool.patch"
+readonly CONFIG_PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/mihomo-v1.19.29-progressive-config-parse.patch"
 readonly PATCHED_DIR="${RUNNER_TEMP:?}/mihomo-v1.19.29-ios-oversize-pool-v1"
 
 check_sha256() {
@@ -56,6 +60,7 @@ if [[ -z "$SOURCE_DIR" || ! -d "$SOURCE_DIR" ]]; then
   exit 1
 fi
 check_sha256 "$EXPECTED_SOURCE_SHA" "$SOURCE_DIR/$SOURCE_REL"
+check_sha256 "$EXPECTED_CONFIG_SHA" "$SOURCE_DIR/$CONFIG_REL"
 
 case "$PATCHED_DIR" in
   "$RUNNER_TEMP"/*) ;;
@@ -72,8 +77,13 @@ git -c core.autocrlf=false -C "$PATCHED_DIR" \
   apply --check --whitespace=error-all "$PATCH_FILE"
 git -c core.autocrlf=false -C "$PATCHED_DIR" \
   apply --whitespace=error-all "$PATCH_FILE"
+git -c core.autocrlf=false -C "$PATCHED_DIR" \
+  apply --check --whitespace=error-all "$CONFIG_PATCH_FILE"
+git -c core.autocrlf=false -C "$PATCHED_DIR" \
+  apply --whitespace=error-all "$CONFIG_PATCH_FILE"
 check_sha256 "$EXPECTED_PATCHED_SHA" "$PATCHED_DIR/$SOURCE_REL"
 check_sha256 "$EXPECTED_TEST_SHA" "$PATCHED_DIR/$TEST_REL"
+check_sha256 "$EXPECTED_CONFIG_PATCHED_SHA" "$PATCHED_DIR/$CONFIG_REL"
 
 go -C "$PATCHED_DIR" mod edit -require="$SING_MODULE@$EXPECTED_SING_VERSION"
 go -C "$PATCHED_DIR" mod edit -replace="$SING_MODULE@$EXPECTED_SING_VERSION=$PATCHED_SING_DIR"

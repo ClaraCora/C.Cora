@@ -1,0 +1,86 @@
+diff --git a/config/config.go b/config/config.go
+index 7f5d6202..be0c65c0 100644
+--- a/config/config.go
++++ b/config/config.go
+@@ -7,6 +7,7 @@ import (
+ 	"net/netip"
+ 	"net/url"
+ 	"path/filepath"
++	"runtime"
+ 	"strings"
+ 	"time"
+ 	_ "unsafe"
+@@ -26,6 +27,7 @@ import (
+ 	"github.com/metacubex/mihomo/component/sniffer"
+ 	"github.com/metacubex/mihomo/component/trie"
+ 	C "github.com/metacubex/mihomo/constant"
++	"github.com/metacubex/mihomo/constant/features"
+ 	P "github.com/metacubex/mihomo/constant/provider"
+ 	snifferTypes "github.com/metacubex/mihomo/constant/sniffer"
+ 	"github.com/metacubex/mihomo/dns"
+@@ -668,12 +670,21 @@ func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
+ 	}
+ 	config.Proxies = proxies
+ 	config.Providers = providers
++	if features.WithLowMemory {
++		rawCfg.ProxyProvider = nil
++		rawCfg.Proxy = nil
++		rawCfg.ProxyGroup = nil
++		runtime.GC()
++	}
+ 
+ 	listeners, err := parseListeners(rawCfg)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 	config.Listeners = listeners
++	if features.WithLowMemory {
++		rawCfg.Listeners = nil
++	}
+ 
+ 	log.Infoln("Geodata Loader mode: %s", geodata.LoaderName())
+ 	log.Infoln("Geosite Matcher implementation: %s", geodata.SiteMatcherName())
+@@ -682,6 +693,10 @@ func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
+ 		return nil, err
+ 	}
+ 	config.RuleProviders = ruleProviders
++	if features.WithLowMemory {
++		rawCfg.RuleProvider = nil
++		runtime.GC()
++	}
+ 
+ 	subRules, err := parseSubRules(rawCfg, proxies, ruleProviders)
+ 	if err != nil {
+@@ -694,12 +709,21 @@ func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
+ 		return nil, err
+ 	}
+ 	config.Rules = rules
++	if features.WithLowMemory {
++		rawCfg.SubRules = nil
++		rawCfg.Rule = nil
++		runtime.GC()
++	}
+ 
+ 	hosts, err := parseHosts(rawCfg)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 	config.Hosts = hosts
++	if features.WithLowMemory {
++		rawCfg.Hosts = nil
++		runtime.GC()
++	}
+ 
+ 	parseIPV6(rawCfg) // must before DNS and Tun
+ 
+@@ -708,6 +732,10 @@ func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
+ 		return nil, err
+ 	}
+ 	config.DNS = dnsCfg
++	if features.WithLowMemory {
++		rawCfg.DNS = RawDNS{}
++		runtime.GC()
++	}
+ 
+ 	err = parseTun(rawCfg.Tun, dnsCfg, config.General)
+ 	if err != nil {

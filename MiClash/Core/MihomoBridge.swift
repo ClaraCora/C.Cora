@@ -13,4 +13,21 @@ enum MihomoCore {
     static func version() -> String {
         MihomoVersion()
     }
+
+    /// 在主 App 进程完整解析一次配置。成功后 Tunnel 才会释放旧运行配置，
+    /// 避免低内存分阶段热重载在坏配置上失去可回滚的旧状态。
+    static func runtimeConfigValidationError(home: URL,
+                                             tunnelMTU: Int,
+                                             configYAML: String,
+                                             settingsJSON: String) -> String? {
+        var validationError: NSError?
+        guard MihomoValidateRuntimeConfig(home.path,
+                                          tunnelMTU,
+                                          configYAML,
+                                          settingsJSON,
+                                          &validationError) else {
+            return validationError?.localizedDescription ?? "mihomo 配置预检失败"
+        }
+        return nil
+    }
 }

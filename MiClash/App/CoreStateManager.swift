@@ -154,6 +154,21 @@ final class CoreStateManager: ObservableObject {
             let settings = SettingsStore.shared.asJSON(
                 geoAvailable: AppGroup.containerURL != nil,
                 applyOverrides: SubscriptionStore.shared.activeOverridesEnabled)
+            let validationHome = AppGroup.containerURL
+                ?? FileManager.default.temporaryDirectory
+                    .appendingPathComponent("MiClashValidation", isDirectory: true)
+            try FileManager.default.createDirectory(at: validationHome,
+                                                    withIntermediateDirectories: true)
+            let validationError = await Task.detached(priority: .userInitiated) {
+                MihomoCore.runtimeConfigValidationError(
+                    home: validationHome,
+                    tunnelMTU: 1_500,
+                    configYAML: yaml ?? "",
+                    settingsJSON: settings)
+            }.value
+            if let validationError {
+                throw Self.reloadError(validationError)
+            }
             let transfer = await Task.detached(priority: .userInitiated) {
                 ReloadTransfer.make(configYAML: yaml ?? "", settingsJSON: settings)
             }.value

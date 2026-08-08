@@ -118,8 +118,8 @@ jobs:
       - name: Verify patched Mihomo allocator
         run: |
           set -euxo pipefail
-          go -C "$PATCHED_MIHOMO" test ./common/pool
-          go -C "$PATCHED_MIHOMO" test -tags "with_low_memory" ./common/pool
+          go -C "$PATCHED_MIHOMO" test ./common/pool ./config
+          go -C "$PATCHED_MIHOMO" test -tags "with_low_memory" ./common/pool ./config
 
       - name: Verify patched gVisor TCP
         run: |
@@ -208,9 +208,51 @@ jobs:
           zip -qr MiClash-unsigned.ipa Payload
           echo "已生成 MiClash-unsigned.ipa"
 
+      - name: Package TrollStore IPA
+        run: |
+          set -euo pipefail
+          SOURCE_APP="build/Build/Products/Release-iphoneos/MiClash.app"
+          TS_ROOT="$RUNNER_TEMP/miclash-trollstore"
+          TS_APP="$TS_ROOT/Payload/MiClash.app"
+          rm -rf "$TS_ROOT"
+          mkdir -p "$TS_ROOT/Payload"
+          ditto "$SOURCE_APP" "$TS_APP"
+
+          # TrollStore preserves arbitrary entitlements already present in each binary.
+          # Both processes need no-sandbox or they still cannot share the fallback path.
+          codesign --force --sign - --generate-entitlement-der \
+            --entitlements MiClashTunnel/MiClashTunnel-TrollStore.entitlements \
+            "$TS_APP/PlugIns/MiClashTunnel.appex"
+          codesign --force --sign - --generate-entitlement-der \
+            --entitlements MiClashControl/MiClashControl.entitlements \
+            "$TS_APP/PlugIns/MiClashControl.appex"
+          codesign --force --sign - --generate-entitlement-der \
+            --entitlements MiClash/MiClash-TrollStore.entitlements \
+            "$TS_APP"
+
+          MAIN_ENTITLEMENTS="$RUNNER_TEMP/miclash-main-entitlements.plist"
+          TUNNEL_ENTITLEMENTS="$RUNNER_TEMP/miclash-tunnel-entitlements.plist"
+          codesign -d --entitlements :- "$TS_APP" > "$MAIN_ENTITLEMENTS" 2>/dev/null
+          codesign -d --entitlements :- \
+            "$TS_APP/PlugIns/MiClashTunnel.appex" > "$TUNNEL_ENTITLEMENTS" 2>/dev/null
+          test "$(/usr/libexec/PlistBuddy -c \
+            'Print :com.apple.private.security.no-sandbox' "$MAIN_ENTITLEMENTS")" = "true"
+          test "$(/usr/libexec/PlistBuddy -c \
+            'Print :com.apple.private.security.no-sandbox' "$TUNNEL_ENTITLEMENTS")" = "true"
+          cd "$TS_ROOT"
+          zip -qr "$GITHUB_WORKSPACE/MiClash-TrollStore.ipa" Payload
+          echo "已生成 MiClash-TrollStore.ipa"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: MiClash-unsigned-ipa
           path: MiClash-unsigned.ipa
+          if-no-files-found: error
+
+      - name: Upload TrollStore artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MiClash-trollstore-ipa
+          path: MiClash-TrollStore.ipa
           if-no-files-found: error

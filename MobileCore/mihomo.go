@@ -631,6 +631,62 @@ func ReloadConfig(fd int, tunnelMTU int, configYAML string, settingsJSON string)
 	return nil
 }
 
+// ValidateRuntimeConfig performs the same merge and full mihomo parse in the main App
+// process before the memory-constrained Packet Tunnel releases its current runtime.
+// It intentionally does not ApplyConfig or start any listeners.
+func ValidateRuntimeConfig(home string, tunnelMTU int, configYAML string, settingsJSON string) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("mihomo config validation panic: %v", r)
+		}
+		debug.FreeOSMemory()
+	}()
+	configApplyMu.Lock()
+	defer configApplyMu.Unlock()
+
+	if strings.TrimSpace(home) == "" {
+		return fmt.Errorf("validation home directory is empty")
+	}
+	C.SetHomeDir(filepath.Clean(home))
+	st := parseSettings(settingsJSON)
+	merged, err := mergeConfig(configYAML, st, tunnelMTU)
+	if err != nil {
+		return fmt.Errorf("合并配置失败: %w", err)
+	}
+	configYAML = ""
+	rawCfg, err := config.UnmarshalRawConfig(merged)
+	if err != nil {
+		return fmt.Errorf("解析原始配置失败: %w", err)
+	}
+	rawCfg.Tun.Enable = true
+	rawCfg.Tun.FileDescriptor = 1
+	merged = nil
+	geodata.ClearGeoSiteCache()
+	geodata.ClearGeoIPCache()
+	mmdb.ReloadIP()
+	if _, err = config.ParseRawConfig(rawCfg); err != nil {
+		return fmt.Errorf("解析运行配置失败: %w", err)
+	}
+	return nil
+}
+
+func releaseRuntimeForReload() error {
+	if !listener.LastTunConf.Enable || listener.LastTunConf.FileDescriptor == 0 {
+		return fmt.Errorf("当前 TUN 配置不可用，请重新连接 VPN")
+	}
+
+	tunnel.OnSuspend()
+	closed := CloseAllConnections()
+	tunnel.UpdateRules(nil, nil, nil)
+	tunnel.UpdateProxies(nil, nil)
+	geodata.ClearGeoSiteCache()
+	geodata.ClearGeoIPCache()
+	mmdb.ReloadIP()
+	debug.FreeOSMemory()
+	appendRunLog(fmt.Sprintf("低内存热重载：已暂停转发并释放旧配置，关闭连接=%d", closed))
+	return nil
+}
+
 func applyRuntimeConfig(fd int, tunnelMTU int, configYAML string, st appSettings, operation string, preserveTun bool) (err error) {
 	previousNotices := append([]string(nil), configNotices...)
 	previousDetails := make(map[string]string, len(proxyDetailsMap))
@@ -638,23 +694,35 @@ func applyRuntimeConfig(fd int, tunnelMTU int, configYAML string, st appSettings
 		previousDetails[name] = detail
 	}
 	applied := false
+	runtimeReleased := false
 	defer func() {
 		if !applied {
 			configNotices = previousNotices
 			proxyDetailsMap = previousDetails
+			if runtimeReleased && err != nil {
+				debug.FreeOSMemory()
+				appendRunLog("热重载失败，转发保持暂停以避免流量绕过代理")
+				err = fmt.Errorf("%w；转发已安全暂停，请重新连接 VPN", err)
+			}
 		}
 	}()
 
 	if preserveTun {
-		// iOS Packet Tunnel 的内存上限很低。先归还上一轮解析留下的空闲页，
-		// 再同时持有旧运行配置和待解析配置，降低热重载的峰值。
-		debug.FreeOSMemory()
+		// 新配置已由主 App 完整预检。这里先暂停新流量并释放旧代理/规则，
+		// 避免旧运行配置和 RawConfig/Config 同时顶到 iOS NE 的 jetsam 线。
+		if err := releaseRuntimeForReload(); err != nil {
+			return err
+		}
+		runtimeReleased = true
 	}
 
 	merged, err := mergeConfig(configYAML, st, tunnelMTU)
 	if err != nil {
 		appendRunLog(operation + "合并配置失败: " + err.Error())
 		return err
+	}
+	if preserveTun {
+		configYAML = ""
 	}
 
 	rawCfg, err := config.UnmarshalRawConfig(merged)
@@ -664,6 +732,7 @@ func applyRuntimeConfig(fd int, tunnelMTU int, configYAML string, st appSettings
 	}
 	rawCfg.Tun.Enable = true
 	rawCfg.Tun.FileDescriptor = fd
+	merged = nil
 
 	// 主 App 可能已替换 GEO 文件；清掉上次连接遗留的 matcher/MMDB 缓存后再解析。
 	geodata.ClearGeoSiteCache()

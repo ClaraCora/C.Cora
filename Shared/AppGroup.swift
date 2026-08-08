@@ -25,24 +25,32 @@ enum AppGroup {
     private static let resolution: (url: URL?, kind: ContainerKind) = {
         let fileManager = FileManager.default
         if let url = fileManager.containerURL(
-            forSecurityApplicationGroupIdentifier: identifier) {
+            forSecurityApplicationGroupIdentifier: identifier),
+           isWritableDirectory(url, fileManager: fileManager) {
             return (url, .appGroup)
         }
 
         // TrollStore/no-sandbox builds can share a stable path between the App and NE.
         // The write probe keeps regular sandboxed builds on the existing nil fallback.
+        if isWritableDirectory(trollStoreURL, fileManager: fileManager) {
+            return (trollStoreURL, .trollStore)
+        }
+        return (nil, .unavailable)
+    }()
+
+    private static func isWritableDirectory(_ url: URL,
+                                            fileManager: FileManager) -> Bool {
         do {
-            try fileManager.createDirectory(at: trollStoreURL,
-                                            withIntermediateDirectories: true)
-            let probe = trollStoreURL.appendingPathComponent(
+            try fileManager.createDirectory(at: url, withIntermediateDirectories: true)
+            let probe = url.appendingPathComponent(
                 ".miclash-write-probe-\(UUID().uuidString)")
             try Data("ok".utf8).write(to: probe, options: .atomic)
             try fileManager.removeItem(at: probe)
-            return (trollStoreURL, .trollStore)
+            return true
         } catch {
-            return (nil, .unavailable)
+            return false
         }
-    }()
+    }
 
     static var containerURL: URL? {
         resolution.url

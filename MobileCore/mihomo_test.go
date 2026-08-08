@@ -48,6 +48,16 @@ func largeBenchmarkConfig(proxyCount int, ruleCount int) string {
 	return out.String()
 }
 
+func TestValidateRuntimeConfig(t *testing.T) {
+	valid := "mode: direct\nrules:\n  - MATCH,DIRECT\n"
+	if err := ValidateRuntimeConfig(t.TempDir(), 1_500, valid, `{}`); err != nil {
+		t.Fatalf("ValidateRuntimeConfig(valid) failed: %v", err)
+	}
+	if err := ValidateRuntimeConfig(t.TempDir(), 1_500, "proxies: [", `{}`); err == nil {
+		t.Fatal("ValidateRuntimeConfig accepted malformed YAML")
+	}
+}
+
 func TestNetworkInterfaceUpdates(t *testing.T) {
 	previous := dialer.DefaultInterface.Load()
 	defer dialer.DefaultInterface.Store(previous)
