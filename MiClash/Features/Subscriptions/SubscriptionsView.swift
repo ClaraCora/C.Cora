@@ -49,6 +49,20 @@ struct SubscriptionsView: View {
             }
             .navigationTitle("配置")
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button {
+                        Task { await store.refreshRemoteSubscriptions() }
+                    } label: {
+                        if store.isBusy {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Image(systemName: "arrow.clockwise")
+                        }
+                    }
+                    .disabled(store.isBusy || !store.hasRemoteSubscriptions)
+                    .accessibilityLabel("刷新全部远程订阅")
+                    .help("刷新全部远程订阅")
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {
                         Button { showAddRemote = true } label: {

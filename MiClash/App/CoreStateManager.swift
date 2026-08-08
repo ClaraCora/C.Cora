@@ -8,8 +8,7 @@ import WidgetKit
 /// 它是 UI 与底层之间唯一的状态来源：视图只读它的 @Published 属性，
 /// 通过它暴露的方法触发动作，数据流单向（动作 → 底层 → 状态变更 → UI 刷新）。
 ///
-/// 运行态控制统一经版本化 Network Extension IPC；external-controller 只作为用户
-/// 显式开启的兼容接口，不参与 App 自身控制。
+/// 运行态控制统一经版本化 Network Extension IPC。
 @MainActor
 final class CoreStateManager: ObservableObject {
 
@@ -69,7 +68,6 @@ final class CoreStateManager: ObservableObject {
                     ControlCenter.shared.reloadControls(ofKind: ControlWidgetKind.vpn)
                 }
                 if connection.status == .connected {
-                    await self.fetchControllerConfiguration()
                     await self.fetchNotices()
                 }
                 else if connection.status == .disconnected { self.configNotices = [] }
@@ -81,9 +79,7 @@ final class CoreStateManager: ObservableObject {
     func refreshStatus() async {
         status = await tunnel.currentStatus()
         AppGroupState.vpnConnected = isActive
-        if status == .connected {
-            await fetchControllerConfiguration()
-        } else if status == .disconnected || status == .invalid {
+        if status == .disconnected || status == .invalid {
             configNotices = []
         }
     }
@@ -192,7 +188,6 @@ final class CoreStateManager: ObservableObject {
         }
         lastError = nil
         syncWidget(true)
-        await fetchControllerConfiguration()
         await fetchNotices()
     }
 
@@ -305,16 +300,6 @@ final class CoreStateManager: ObservableObject {
             timeout = 10
         }
         return await tunnel.sendMessage(payload, timeout: timeout)
-    }
-
-    private func fetchControllerConfiguration() async {
-        let result = await sendMessage(["cmd": "controllerInfo"])
-        guard case .ok(let data) = result,
-              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              (object["enabled"] as? Bool) == true,
-              let port = (object["port"] as? NSNumber)?.intValue,
-              (1...65_535).contains(port) else { return }
-        MihomoAPI.configure(port: port, secret: object["secret"] as? String ?? "")
     }
 
     private static func reloadError(_ message: String) -> NSError {

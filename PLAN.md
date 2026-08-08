@@ -23,7 +23,7 @@
 
 进程间数据流：
 - 隧道启停走 `NETunnelProviderManager`；配置、状态、节点/分组、测延迟、流量、日志和连接管理统一走带协议版本与超时的 `sendProviderMessage` IPC。
-- App Group 共享容器承载配置与日志文件；mihomo external-controller 默认关闭，仅在用户为第三方 Dashboard/局域网客户端显式启用时监听。
+- App Group 共享容器承载配置与日志文件；不暴露 mihomo external-controller 或 WebUI，App 运行态控制统一走 Network Extension IPC。
 
 `CoreStateManager`（全局单例 `ObservableObject`）= VPN 控制 + API 客户端封装，向所有 ViewModel 供状态。
 

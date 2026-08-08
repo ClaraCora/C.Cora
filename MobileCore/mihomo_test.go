@@ -58,51 +58,35 @@ func TestValidateRuntimeConfig(t *testing.T) {
 	}
 }
 
-func TestControllerRouteForSettings(t *testing.T) {
-	tests := []struct {
-		name     string
-		settings appSettings
-		want     controllerRouteState
-	}{
-		{
-			name:     "disabled",
-			settings: appSettings{ControllerPort: 9090},
-		},
-		{
-			name: "loopback",
-			settings: appSettings{
-				ExternalController: true,
-				ControllerPort:     9090,
-			},
-			want: controllerRouteState{Enabled: true, Addr: "127.0.0.1:9090"},
-		},
-		{
-			name: "lan requires secret",
-			settings: appSettings{
-				ExternalController: true,
-				AllowLan:           true,
-				ControllerPort:     9191,
-			},
-			want: controllerRouteState{Enabled: true, Addr: "127.0.0.1:9191"},
-		},
-		{
-			name: "lan with secret",
-			settings: appSettings{
-				ExternalController: true,
-				AllowLan:           true,
-				ControllerPort:     9191,
-				ControllerSecret:   "token",
-			},
-			want: controllerRouteState{Enabled: true, Addr: "0.0.0.0:9191", Secret: "token"},
-		},
+func TestRuntimeConfigFingerprintTracksInputsAndGeoAssets(t *testing.T) {
+	previousHome := homeDir
+	homeDir = t.TempDir()
+	defer func() { homeDir = previousHome }()
+
+	base := runtimeConfigFingerprint(1_500, "mode: rule", `{"ipv6":false}`)
+	if same := runtimeConfigFingerprint(1_500, "mode: rule", `{"ipv6":false}`); same != base {
+		t.Fatal("identical runtime input produced a different fingerprint")
+	}
+	if canonical := runtimeConfigFingerprint(1_500, "mode: rule",
+		`{"logLevel":"info","ipv6":false}`); canonical != base {
+		t.Fatal("semantically identical settings JSON produced a different fingerprint")
+	}
+	if changed := runtimeConfigFingerprint(1_400, "mode: rule", `{"ipv6":false}`); changed == base {
+		t.Fatal("MTU change was not reflected in fingerprint")
+	}
+	if changed := runtimeConfigFingerprint(1_500, "mode: direct", `{"ipv6":false}`); changed == base {
+		t.Fatal("config change was not reflected in fingerprint")
+	}
+	if changed := runtimeConfigFingerprint(1_500, "mode: rule", `{"ipv6":true}`); changed == base {
+		t.Fatal("settings change was not reflected in fingerprint")
 	}
 
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			if got := controllerRouteForSettings(test.settings); got != test.want {
-				t.Fatalf("controllerRouteForSettings() = %#v, want %#v", got, test.want)
-			}
-		})
+	geoPath := filepath.Join(homeDir, "GeoSite.dat")
+	if err := os.WriteFile(geoPath, []byte("geo-v1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if changed := runtimeConfigFingerprint(1_500, "mode: rule", `{"ipv6":false}`); changed == base {
+		t.Fatal("GEO asset change was not reflected in fingerprint")
 	}
 }
 
@@ -836,38 +820,17 @@ sub-rules:
 	}
 }
 
-func TestParseSettingsNormalizesPortsAndLANAuthentication(t *testing.T) {
+func TestParseSettingsNormalizesMixedPort(t *testing.T) {
 	settings := parseSettings(`{
-  "controllerPort": 99999,
-  "controllerSecret": "",
-  "allowLan": true,
   "mixedPort": -1
 }`)
-	if settings.ControllerPort != 9090 {
-		t.Fatalf("controller port = %d, want 9090", settings.ControllerPort)
-	}
-	if settings.AllowLan {
-		t.Fatal("allowLan should be disabled without a secret")
-	}
-	if settings.ExternalController {
-		t.Fatal("external controller should be disabled by default")
-	}
 	if settings.MixedPort != 0 {
 		t.Fatalf("mixed port = %d, want 0", settings.MixedPort)
 	}
 
-	settings = parseSettings(`{
-	  "externalController": true,
-	  "controllerPort": 9090,
-  "controllerSecret": "secret",
-  "allowLan": true,
-  "mixedPort": 9090
-}`)
-	if settings.MixedPort != 0 {
-		t.Fatalf("conflicting mixed port = %d, want disabled", settings.MixedPort)
-	}
-	if !settings.AllowLan {
-		t.Fatal("authenticated LAN controller should remain enabled")
+	settings = parseSettings(`{"mixedPort": 9090}`)
+	if settings.MixedPort != 9090 {
+		t.Fatalf("mixed port = %d, want 9090", settings.MixedPort)
 	}
 }
 
@@ -1055,23 +1018,6 @@ dns:
 	ai, ok := policy["rule-set:Ai"].([]any)
 	if !ok || len(ai) != 1 || ai[0] != "https://dns.google/dns-query#Ai" {
 		t.Errorf("dns.nameserver-policy[rule-set:Ai] = %v, want subscription value preserved", policy["rule-set:Ai"])
-	}
-}
-
-func TestMergeConfigInjectsExplicitExternalController(t *testing.T) {
-	m := mergedMapWithSettings(t, "", appSettings{
-		Stack:              "gvisor",
-		LogLevel:           "info",
-		ExternalController: true,
-		ControllerPort:     9091,
-		ControllerSecret:   "app-secret",
-		AllowLan:           true,
-	})
-	if got := m["external-controller"]; got != "0.0.0.0:9091" {
-		t.Fatalf("external-controller = %v", got)
-	}
-	if got := m["secret"]; got != "app-secret" {
-		t.Fatalf("secret = %v", got)
 	}
 }
 

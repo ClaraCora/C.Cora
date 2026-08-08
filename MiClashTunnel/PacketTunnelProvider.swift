@@ -6,6 +6,7 @@ import os.log
 import WidgetKit
 
 private let tunnelMaximumGeoAssetBytes: Int64 = 64 * 1_024 * 1_024
+private let minimumHotReloadAvailableMemory: UInt64 = 28 * 1_024 * 1_024
 
 /// Network Extension 的 Packet Tunnel 实现（Phase 2：真正接管流量）。
 ///
@@ -588,8 +589,6 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             completionHandler?(Data(MihomoProxyDetails().utf8))
         case "configNotices":
             completionHandler?(Data(MihomoConfigNotices().utf8))
-        case "controllerInfo":
-            completionHandler?(Data(MihomoControllerInfo().utf8))
         case "getMode":
             completionHandler?(Data(MihomoMode().utf8))
         case "setMode":
@@ -709,11 +708,47 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 return
             }
 
+            let injectedSettings = self.injectingSystemDNS(into: effectiveSettings)
+            var prepareError: NSError?
+            let needsReload = MihomoPrepareReload(runtime.mtu, configYAML,
+                                                  injectedSettings, &prepareError)
+            if let prepareError {
+                let message = prepareError.localizedDescription
+                FileLog.write("准备热重载失败：\(message)")
+                self.finishReload(token: token, phase: .failed, error: message)
+                return
+            }
+            guard needsReload else {
+                FileLog.write("配置与 GEO 文件均未变化，跳过热重载")
+                self.finishReload(token: token, phase: .succeeded)
+                return
+            }
+
+            self.memoryDiagnostics.record(event: "reloadPrepared")
+            // Close() removes trackers synchronously, but their socket/provider
+            // goroutines finish asynchronously. Let those stacks unwind before
+            // allocating RawConfig and the replacement runtime together.
+            Thread.sleep(forTimeInterval: 0.5)
+            MihomoForceGC()
+            Thread.sleep(forTimeInterval: 0.15)
+            self.memoryDiagnostics.record(event: "reloadDrained")
+
+            let availableMemory = UInt64(os_proc_available_memory())
+            guard availableMemory >= minimumHotReloadAvailableMemory else {
+                MihomoCancelReload()
+                self.memoryDiagnostics.record(event: "reloadCancelledLowMemory")
+                let availableMiB = availableMemory / (1_024 * 1_024)
+                let message = "热重载可用内存仅 \(availableMiB) MB，已保留旧配置和 VPN 连接"
+                FileLog.write(message)
+                self.finishReload(token: token, phase: .failed, error: message)
+                return
+            }
+
             FileLog.write("调用 MihomoReloadConfig（config=\(configYAML.count) 字节）…")
             self.memoryDiagnostics.record(event: "reloadBefore")
             var reloadError: NSError?
             let ok = MihomoReloadConfig(Int(runtime.fd), runtime.mtu, configYAML,
-                                        self.injectingSystemDNS(into: effectiveSettings),
+                                        injectedSettings,
                                         &reloadError)
             self.memoryDiagnostics.record(event: ok ? "reloadAfter" : "reloadFailed")
             guard ok else {

@@ -3,7 +3,7 @@ import Foundation
 /// 内核相关设置（持久化到 UserDefaults）。
 ///
 /// 这些影响 NE 内 mihomo 的启动配置：连接时序列化为 JSON 经 startVPNTunnel(options) 下发，
-/// Go 侧 StartWithConfig 据此覆盖 tun.stack / ipv6 / geo / log-level / external-controller。
+/// Go 侧 StartWithConfig 据此覆盖 tun.stack / ipv6 / geo / log-level。
 /// 因此**修改后需重新连接才生效**。
 @MainActor
 final class SettingsStore: ObservableObject {
@@ -32,55 +32,13 @@ final class SettingsStore: ObservableObject {
     @Published var geoUpdateInterval: Int { didSet { d.set(geoUpdateInterval, forKey: K.geoInterval) } }
     /// 日志等级：silent / error / warning / info / debug。
     @Published var logLevel: String { didSet { d.set(logLevel, forKey: K.logLevel) } }
-    /// 是否为第三方 Dashboard/局域网客户端启动 mihomo external-controller。
-    @Published var externalControllerEnabled: Bool {
-        didSet {
-            d.set(externalControllerEnabled, forKey: K.externalController)
-            if !externalControllerEnabled && allowLan { allowLan = false }
-        }
-    }
-    /// external-controller 端口。
-    @Published var controllerPort: Int {
-        didSet {
-            let normalized = Self.normalizedControllerPort(controllerPort)
-            if controllerPort != normalized {
-                controllerPort = normalized
-                d.set(normalized, forKey: K.port)
-                return
-            }
-            d.set(controllerPort, forKey: K.port)
-            if mixedPort == controllerPort { mixedPort = 0 }
-        }
-    }
-    /// external-controller 密钥（空=无鉴权）。
-    @Published var controllerSecret: String {
-        didSet {
-            d.set(controllerSecret, forKey: K.secret)
-            if controllerSecret.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-               allowLan {
-                allowLan = false
-            }
-        }
-    }
-    /// 允许局域网访问控制接口（绑 0.0.0.0 而非仅 127.0.0.1）。
-    @Published var allowLan: Bool {
-        didSet {
-            if allowLan && controllerSecret.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                allowLan = false
-                d.set(false, forKey: K.allowLan)
-                return
-            }
-            d.set(allowLan, forKey: K.allowLan)
-        }
-    }
     /// 混合代理端口（HTTP+SOCKS，本机回环）。0=不开。下发给内核 mixed-port。
     @Published var mixedPort: Int {
         didSet {
             let normalized = min(max(mixedPort, 0), 65_535)
-            let effective = normalized == controllerPort ? 0 : normalized
-            if mixedPort != effective {
-                mixedPort = effective
-                d.set(effective, forKey: K.mixedPort)
+            if mixedPort != normalized {
+                mixedPort = normalized
+                d.set(normalized, forKey: K.mixedPort)
                 return
             }
             d.set(mixedPort, forKey: K.mixedPort)
@@ -124,8 +82,7 @@ final class SettingsStore: ObservableObject {
         static let geoSiteURL = "set.geoSiteURL"
         static let ignoreGeoNegation = "set.ignoreGeoNegation"
         static let geoAuto = "set.geoAuto", geoInterval = "set.geoInterval"
-        static let logLevel = "set.logLevel", externalController = "set.externalController"
-        static let port = "set.port", secret = "set.secret", allowLan = "set.allowLan"
+        static let logLevel = "set.logLevel"
         static let mixedPort = "set.mixedPort"
         static let inclAll = "set.inclAll", exCell = "set.exCell", exAPNs = "set.exAPNs"
         static let exDev = "set.exDev", enforce = "set.enforce"
@@ -146,28 +103,13 @@ final class SettingsStore: ObservableObject {
         let gi = d.integer(forKey: K.geoInterval)
         geoUpdateInterval = gi == 0 ? 24 : gi
         logLevel = d.string(forKey: K.logLevel) ?? "info"
-        let storedControllerPort = Self.normalizedControllerPort(d.integer(forKey: K.port))
-        let storedControllerSecret = d.string(forKey: K.secret) ?? ""
-        let storedAllowLan = d.object(forKey: K.allowLan) as? Bool ?? false
-        let storedExternalController = d.object(forKey: K.externalController) as? Bool
-            ?? storedAllowLan
-        externalControllerEnabled = storedExternalController
-        controllerPort = storedControllerPort
-        controllerSecret = storedControllerSecret
-        allowLan = storedAllowLan && storedExternalController
-            && !storedControllerSecret.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        let storedMixedPort = min(max(d.integer(forKey: K.mixedPort), 0), 65_535)
-        mixedPort = storedMixedPort == storedControllerPort ? 0 : storedMixedPort
+        mixedPort = min(max(d.integer(forKey: K.mixedPort), 0), 65_535)
         includeAllNetworks = d.object(forKey: K.inclAll) as? Bool ?? false
         excludeCellularServices = d.object(forKey: K.exCell) as? Bool ?? true
         excludeAPNs = d.object(forKey: K.exAPNs) as? Bool ?? true
         excludeDeviceCommunication = d.object(forKey: K.exDev) as? Bool ?? true
         enforceRoutes = d.object(forKey: K.enforce) as? Bool ?? false
         subscriptionUA = d.string(forKey: K.subUA) ?? "clash-meta"
-
-        if externalControllerEnabled {
-            MihomoAPI.configure(port: controllerPort, secret: controllerSecret)
-        }
     }
 
     /// 序列化为下发给 NE 的 JSON。
@@ -185,10 +127,6 @@ final class SettingsStore: ObservableObject {
             "geoAutoUpdate": geoAutoUpdate,
             "geoUpdateInterval": geoUpdateInterval,
             "logLevel": logLevel,
-            "externalController": externalControllerEnabled,
-            "controllerPort": controllerPort,
-            "controllerSecret": controllerSecret,
-            "allowLan": allowLan,
             "mixedPort": mixedPort,
             "applyOverrides": applyOverrides,
             "overrides": ConfigOverrideStore.shared.asDictionary(),
@@ -196,9 +134,5 @@ final class SettingsStore: ObservableObject {
         guard let data = try? JSONSerialization.data(withJSONObject: dict),
               let s = String(data: data, encoding: .utf8) else { return "" }
         return s
-    }
-
-    private static func normalizedControllerPort(_ value: Int) -> Int {
-        (1...65_535).contains(value) ? value : 9090
     }
 }

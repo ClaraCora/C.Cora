@@ -123,6 +123,10 @@ final class SubscriptionStore: ObservableObject {
         selected?.overrideEnabled ?? false
     }
 
+    var hasRemoteSubscriptions: Bool {
+        subscriptions.contains { !$0.isLocal }
+    }
+
     // MARK: - 增删改
 
     /// 添加订阅并立即拉取。
@@ -267,6 +271,21 @@ final class SubscriptionStore: ObservableObject {
             guard isCurrentRefresh(id, generation: generation, url: urlString) else { return }
             lastError = "拉取失败：\(error.localizedDescription)"
         }
+    }
+
+    /// 依次重新下载全部远程订阅。本地手写配置没有外部来源，保持原内容不变。
+    func refreshRemoteSubscriptions() async {
+        let remotes = subscriptions.filter { !$0.isLocal }.map { ($0.id, $0.name) }
+        guard !remotes.isEmpty else { return }
+
+        var failures: [String] = []
+        for (id, name) in remotes {
+            await refresh(id)
+            if let error = lastError {
+                failures.append("\(name)：\(error)")
+            }
+        }
+        lastError = failures.isEmpty ? nil : failures.joined(separator: "\n")
     }
 
     // MARK: - 校验/统计

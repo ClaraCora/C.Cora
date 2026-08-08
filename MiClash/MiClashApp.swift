@@ -8,7 +8,7 @@ struct MiClashApp: App {
     @StateObject private var core = CoreStateManager.shared
     /// 订阅 Store：存取/拉取订阅，连接时提供当前配置。
     @StateObject private var subscriptions = SubscriptionStore.shared
-    /// 设置 Store：内核栈/日志/IPv6/geo/外部控制。
+    /// 设置 Store：内核栈/日志/IPv6/geo。
     @StateObject private var settings = SettingsStore.shared
     /// 固定的可视化配置覆写；具体配置文件只保存是否启用。
     @StateObject private var configOverrides = ConfigOverrideStore.shared

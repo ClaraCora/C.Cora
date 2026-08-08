@@ -11,6 +11,7 @@ package mihomo
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -39,7 +40,6 @@ import (
 	C "github.com/metacubex/mihomo/constant"
 	mdns "github.com/metacubex/mihomo/dns"
 	"github.com/metacubex/mihomo/hub/executor"
-	"github.com/metacubex/mihomo/hub/route"
 	"github.com/metacubex/mihomo/listener"
 	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/tunnel"
@@ -66,12 +66,6 @@ const maxConnectionSnapshotLimit = 500
 
 const defaultRunLogChunkBytes = 48 << 10
 
-type controllerRouteState struct {
-	Enabled bool
-	Addr    string
-	Secret  string
-}
-
 // homeDir 是 mihomo 工作目录（= App Group 容器），run.log 也写在这里。
 var (
 	homeDir          string
@@ -85,16 +79,17 @@ var (
 	physicalIface    string
 
 	// 最近一次合并配置时收集的：不适用内容提示 + 各节点协议摘要（供主 App 经 IPC 取用）。
-	configNotices         []string
-	proxyDetailsMap       = map[string]string{}
-	controllerState       = appSettings{ControllerPort: 9090}
-	activeControllerRoute controllerRouteState
-	activeDNSConfig       *config.DNS
-	activeGeneralIPv6     bool
-	activeSystemDNS       []string
-	activeUsesSystemDNS   bool
-	pendingUsesSystemDNS  bool
-	coreStartedAt         time.Time
+	configNotices             []string
+	proxyDetailsMap           = map[string]string{}
+	activeConfigFingerprint   string
+	preparedReloadFingerprint string
+	reloadPrepared            bool
+	activeDNSConfig           *config.DNS
+	activeGeneralIPv6         bool
+	activeSystemDNS           []string
+	activeUsesSystemDNS       bool
+	pendingUsesSystemDNS      bool
+	coreStartedAt             time.Time
 )
 
 // Version 返回「mihomo 内核版本 / Go 运行时版本」。
@@ -107,8 +102,7 @@ func Version() string {
 	return "mihomo " + v + " / " + runtime.Version()
 }
 
-// ControlInfo advertises the app-owned IPC contract. The external controller
-// is intentionally not part of this contract and can remain disabled.
+// ControlInfo advertises the app-owned IPC contract.
 func ControlInfo() string {
 	out, err := json.Marshal(map[string]any{
 		"protocolVersion": controlProtocolVersion,
@@ -312,26 +306,22 @@ func startLogCapture() {
 
 // appSettings 是主 App 下发的设置（JSON）。零值即各项默认。
 type appSettings struct {
-	Stack              string                 `json:"stack"`
-	IPv6               bool                   `json:"ipv6"`
-	GeoEnabled         bool                   `json:"geoEnabled"`
-	GeoLoader          string                 `json:"geoLoader"`
-	GeodataMode        bool                   `json:"geodataMode"`
-	GeoIPDatURL        string                 `json:"geoIPDatURL"`
-	GeoMMDBURL         string                 `json:"geoMMDBURL"`
-	GeoSiteURL         string                 `json:"geoSiteURL"`
-	IgnoreGeoNegation  bool                   `json:"ignoreGeoNegation"`
-	GeoAutoUpdate      bool                   `json:"geoAutoUpdate"`
-	GeoUpdateInterval  int                    `json:"geoUpdateInterval"`
-	LogLevel           string                 `json:"logLevel"`
-	ControllerPort     int                    `json:"controllerPort"`
-	ControllerSecret   string                 `json:"controllerSecret"`
-	ExternalController bool                   `json:"externalController"`
-	AllowLan           bool                   `json:"allowLan"`
-	MixedPort          int                    `json:"mixedPort"`
-	SystemDNS          []string               `json:"systemDNS"`
-	ApplyOverrides     bool                   `json:"applyOverrides"`
-	Overrides          configOverrideSettings `json:"overrides"`
+	Stack             string                 `json:"stack"`
+	IPv6              bool                   `json:"ipv6"`
+	GeoEnabled        bool                   `json:"geoEnabled"`
+	GeoLoader         string                 `json:"geoLoader"`
+	GeodataMode       bool                   `json:"geodataMode"`
+	GeoIPDatURL       string                 `json:"geoIPDatURL"`
+	GeoMMDBURL        string                 `json:"geoMMDBURL"`
+	GeoSiteURL        string                 `json:"geoSiteURL"`
+	IgnoreGeoNegation bool                   `json:"ignoreGeoNegation"`
+	GeoAutoUpdate     bool                   `json:"geoAutoUpdate"`
+	GeoUpdateInterval int                    `json:"geoUpdateInterval"`
+	LogLevel          string                 `json:"logLevel"`
+	MixedPort         int                    `json:"mixedPort"`
+	SystemDNS         []string               `json:"systemDNS"`
+	ApplyOverrides    bool                   `json:"applyOverrides"`
+	Overrides         configOverrideSettings `json:"overrides"`
 }
 
 type configOverrideSettings struct {
@@ -381,7 +371,7 @@ type tunOverrideSettings struct {
 
 // parseSettings 解析设置 JSON，缺省值兜底（与主 App SettingsStore 默认一致）。
 func parseSettings(settingsJSON string) appSettings {
-	s := appSettings{Stack: "gvisor", LogLevel: "info", ControllerPort: 9090,
+	s := appSettings{Stack: "gvisor", LogLevel: "info",
 		ApplyOverrides: true,
 		GeoEnabled:     true, GeoLoader: "memconservative", GeodataMode: true,
 		IgnoreGeoNegation: false, GeoUpdateInterval: 24,
@@ -397,23 +387,8 @@ func parseSettings(settingsJSON string) appSettings {
 	if s.LogLevel == "" {
 		s.LogLevel = "info"
 	}
-	if s.ControllerPort == 0 {
-		s.ControllerPort = 9090
-	}
-	if s.ControllerPort < 1 || s.ControllerPort > 65535 {
-		s.ControllerPort = 9090
-	}
 	if s.MixedPort < 0 || s.MixedPort > 65535 {
 		s.MixedPort = 0
-	}
-	if s.MixedPort == s.ControllerPort {
-		s.MixedPort = 0
-	}
-	if s.AllowLan && strings.TrimSpace(s.ControllerSecret) == "" {
-		s.AllowLan = false
-	}
-	if !s.ExternalController {
-		s.AllowLan = false
 	}
 	if s.GeoLoader == "" {
 		s.GeoLoader = "memconservative"
@@ -583,7 +558,7 @@ func inspectRuleRequirements(value any) ruleRequirements {
 }
 
 // StartWithConfig 用订阅/自定义 YAML + 设置启动内核：先把订阅配置与「iOS 必需的安全设置」
-// 及用户设置合并、按需剔除 geo 规则，再注入 fd 启动，最后按设置决定是否启动 external-controller。
+// 及用户设置合并、按需剔除 geo 规则，再注入 fd 启动。
 // 对应 Swift 侧 `MihomoStartWithConfig(_:_:_:_:error:)`。
 func StartWithConfig(fd int, tunnelMTU int, configYAML string, settingsJSON string) (err error) {
 	defer func() {
@@ -598,9 +573,9 @@ func StartWithConfig(fd int, tunnelMTU int, configYAML string, settingsJSON stri
 
 	resetError := resetRunLog()
 	st := parseSettings(settingsJSON)
-	appendRunLog(fmt.Sprintf("StartWithConfig: fd=%d mtu=%d stack=%s ipv6=%v geo=%v(mode=%v,%s,ignoreNegation=%v) log=%s port=%d",
+	appendRunLog(fmt.Sprintf("StartWithConfig: fd=%d mtu=%d stack=%s ipv6=%v geo=%v(mode=%v,%s,ignoreNegation=%v) log=%s",
 		fd, tunnelMTU, st.Stack, st.IPv6, st.GeoEnabled, st.GeodataMode, st.GeoLoader,
-		st.IgnoreGeoNegation, st.LogLevel, st.ControllerPort))
+		st.IgnoreGeoNegation, st.LogLevel))
 	if resetError != nil {
 		appendRunLog("run.log 重置失败: " + resetError.Error())
 	}
@@ -608,13 +583,15 @@ func StartWithConfig(fd int, tunnelMTU int, configYAML string, settingsJSON stri
 	if err := applyRuntimeConfig(fd, tunnelMTU, configYAML, st, "启动", false); err != nil {
 		return err
 	}
-	applyControllerState(st)
+	activeConfigFingerprint = runtimeConfigFingerprint(tunnelMTU, configYAML, settingsJSON)
+	reloadPrepared = false
+	preparedReloadFingerprint = ""
 	coreStartedAt = time.Now()
 	return nil
 }
 
 // ReloadConfig 在当前 utun 上重新合并并应用主 App 下发的配置。
-// 与 StartWithConfig 共用同一条 iOS 配置处理路径，但不会清空现有日志或重复下载 Web UI。
+// 与 StartWithConfig 共用同一条 iOS 配置处理路径，但不会清空现有日志。
 func ReloadConfig(fd int, tunnelMTU int, configYAML string, settingsJSON string) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -625,17 +602,104 @@ func ReloadConfig(fd int, tunnelMTU int, configYAML string, settingsJSON string)
 	}()
 	configApplyMu.Lock()
 	defer configApplyMu.Unlock()
+	defer func() {
+		reloadPrepared = false
+		preparedReloadFingerprint = ""
+	}()
 
 	st := parseSettings(settingsJSON)
-	appendRunLog(fmt.Sprintf("ReloadConfig: fd=%d mtu=%d stack=%s ipv6=%v geo=%v(mode=%v,%s,ignoreNegation=%v) log=%s port=%d",
+	fingerprint := runtimeConfigFingerprint(tunnelMTU, configYAML, settingsJSON)
+	if !reloadPrepared && activeConfigFingerprint != "" && fingerprint == activeConfigFingerprint {
+		appendRunLog("配置与 GEO 文件均未变化，跳过热重载")
+		return nil
+	}
+	if reloadPrepared && fingerprint != preparedReloadFingerprint {
+		tunnel.OnRunning()
+		return fmt.Errorf("重载配置在准备后发生变化，请重新操作")
+	}
+	appendRunLog(fmt.Sprintf("ReloadConfig: fd=%d mtu=%d stack=%s ipv6=%v geo=%v(mode=%v,%s,ignoreNegation=%v) log=%s",
 		fd, tunnelMTU, st.Stack, st.IPv6, st.GeoEnabled, st.GeodataMode, st.GeoLoader,
-		st.IgnoreGeoNegation, st.LogLevel, st.ControllerPort))
+		st.IgnoreGeoNegation, st.LogLevel))
 	if err := applyRuntimeConfig(fd, tunnelMTU, configYAML, st, "重载", true); err != nil {
 		return err
 	}
-	applyControllerState(st)
+	activeConfigFingerprint = fingerprint
 	appendRunLog("配置重载完成")
 	return nil
+}
+
+// PrepareReload performs the reversible half of a hot reload. It suspends new
+// forwarding and closes active connections, but deliberately keeps the current
+// proxies/rules alive. Swift can then wait for connection goroutines to drain,
+// inspect iOS memory headroom, and either continue or call CancelReload.
+// The bool result is false when the requested runtime is already active.
+func PrepareReload(tunnelMTU int, configYAML string, settingsJSON string) (needed bool, err error) {
+	configApplyMu.Lock()
+	defer configApplyMu.Unlock()
+	defer func() {
+		if r := recover(); r != nil {
+			reloadPrepared = false
+			preparedReloadFingerprint = ""
+			tunnel.OnRunning()
+			needed = false
+			err = fmt.Errorf("mihomo reload preparation panic: %v", r)
+		}
+	}()
+
+	if !listener.LastTunConf.Enable || listener.LastTunConf.FileDescriptor == 0 {
+		return false, fmt.Errorf("当前 TUN 配置不可用，请重新连接 VPN")
+	}
+	fingerprint := runtimeConfigFingerprint(tunnelMTU, configYAML, settingsJSON)
+	if activeConfigFingerprint != "" && fingerprint == activeConfigFingerprint {
+		appendRunLog("配置与 GEO 文件均未变化，无需热重载")
+		return false, nil
+	}
+	if reloadPrepared {
+		if fingerprint == preparedReloadFingerprint {
+			return true, nil
+		}
+		return false, fmt.Errorf("已有其他配置正在准备重载")
+	}
+
+	tunnel.OnSuspend()
+	closed := CloseAllConnections()
+	reloadPrepared = true
+	preparedReloadFingerprint = fingerprint
+	debug.FreeOSMemory()
+	appendRunLog(fmt.Sprintf("热重载准备完成：已暂停新流量并关闭连接=%d，旧配置仍可恢复", closed))
+	return true, nil
+}
+
+// CancelReload resumes the untouched old runtime when iOS reports insufficient
+// memory after the reversible preparation phase.
+func CancelReload() {
+	configApplyMu.Lock()
+	defer configApplyMu.Unlock()
+	if !reloadPrepared {
+		return
+	}
+	reloadPrepared = false
+	preparedReloadFingerprint = ""
+	tunnel.OnRunning()
+	appendRunLog("热重载已取消，继续使用旧配置")
+}
+
+func runtimeConfigFingerprint(tunnelMTU int, configYAML string, settingsJSON string) string {
+	hash := sha256.New()
+	_, _ = fmt.Fprintf(hash, "mtu:%d\nconfig:%d\n", normalizedTunnelMTU(tunnelMTU), len(configYAML))
+	_, _ = io.WriteString(hash, configYAML)
+	canonicalSettings, _ := json.Marshal(parseSettings(settingsJSON))
+	_, _ = fmt.Fprintf(hash, "\nsettings:%d\n", len(canonicalSettings))
+	_, _ = hash.Write(canonicalSettings)
+	for _, name := range []string{"GeoIP.dat", "geoip.metadb", "GeoSite.dat", "ASN.mmdb"} {
+		info, statErr := os.Stat(filepath.Join(homeDir, name))
+		if statErr != nil {
+			_, _ = fmt.Fprintf(hash, "\n%s:missing", name)
+			continue
+		}
+		_, _ = fmt.Fprintf(hash, "\n%s:%d:%d", name, info.Size(), info.ModTime().UnixNano())
+	}
+	return fmt.Sprintf("%x", hash.Sum(nil))
 }
 
 // ValidateRuntimeConfig performs the same merge and full mihomo parse in the main App
@@ -725,9 +789,15 @@ func releaseRuntimeForReload() error {
 	oldProviders = nil
 	oldRuleProviders = nil
 	providerProxies = nil
+	activeConfigFingerprint = ""
 	geodata.ClearGeoSiteCache()
 	geodata.ClearGeoIPCache()
 	mmdb.ReloadIP()
+	if closed > 0 || proxyProviderCount > 0 || ruleProviderCount > 0 {
+		// Connection handlers and stateful adapters finish teardown asynchronously.
+		// Give them a short drain window before allocating the replacement config.
+		time.Sleep(250 * time.Millisecond)
+	}
 	debug.FreeOSMemory()
 	appendRunLog(fmt.Sprintf("低内存热重载：已关闭旧运行资源，连接=%d 代理provider=%d 规则provider=%d",
 		closed, proxyProviderCount, ruleProviderCount))
@@ -834,71 +904,6 @@ func applyRuntimeConfig(fd int, tunnelMTU int, configYAML string, st appSettings
 	return nil
 }
 
-func controllerRouteForSettings(st appSettings) controllerRouteState {
-	if !st.ExternalController {
-		return controllerRouteState{}
-	}
-	host := "127.0.0.1"
-	if st.AllowLan && strings.TrimSpace(st.ControllerSecret) != "" {
-		host = "0.0.0.0"
-	}
-	return controllerRouteState{
-		Enabled: true,
-		Addr:    fmt.Sprintf("%s:%d", host, st.ControllerPort),
-		Secret:  st.ControllerSecret,
-	}
-}
-
-// applyControllerState owns the route server lifecycle. executor.ApplyConfig
-// deliberately excludes ExternalController, so merging it into YAML alone does
-// not create a listener. An unchanged route is kept across ordinary hot reloads
-// because route.ReCreateServer starts asynchronous replacement goroutines.
-func applyControllerState(st appSettings) {
-	controllerState = st
-	desired := controllerRouteForSettings(st)
-	if desired == activeControllerRoute {
-		if desired.Enabled {
-			appendRunLog(fmt.Sprintf("external-controller 保持运行: %s", desired.Addr))
-		} else {
-			appendRunLog("external-controller 已关闭")
-		}
-		return
-	}
-
-	activeControllerRoute = desired
-	if !desired.Enabled {
-		route.ReCreateServer(&route.Config{})
-		appendRunLog("external-controller 已关闭")
-		return
-	}
-
-	route.ReCreateServer(&route.Config{
-		Addr:   desired.Addr,
-		Secret: desired.Secret,
-		Cors: route.Cors{
-			AllowOrigins:        []string{"*"},
-			AllowPrivateNetwork: true,
-		},
-	})
-	appendRunLog(fmt.Sprintf("external-controller 已启动: %s", desired.Addr))
-}
-
-// ControllerInfo 返回当前实际监听端点，供主 App 在系统/控制中心拉起隧道后同步客户端。
-func ControllerInfo() string {
-	configApplyMu.RLock()
-	defer configApplyMu.RUnlock()
-	out, err := json.Marshal(map[string]any{
-		"enabled":  controllerState.ExternalController,
-		"port":     controllerState.ControllerPort,
-		"secret":   controllerState.ControllerSecret,
-		"allowLan": controllerState.AllowLan,
-	})
-	if err != nil {
-		return `{"enabled":false,"port":9090,"secret":"","allowLan":false}`
-	}
-	return string(out)
-}
-
 // mergeConfig 把订阅 YAML 与 iOS 必需设置 + 用户设置合并。
 // 强制 iOS TUN 与 DNS 接管所需参数；DNS enhanced-mode 保留配置值，未配置时使用 Mihomo 默认值。
 // fd 不在此写入（运行期值）；MTU 优先使用配置值，缺省时使用 iOS utun 的实际值。
@@ -993,8 +998,8 @@ func mergeConfig(subYAML string, st appSettings, tunnelMTU int) ([]byte, error) 
 	m["ipv6"] = st.IPv6
 	m["log-level"] = st.LogLevel
 
-	// The subscription never owns a control endpoint inside the extension. The
-	// app either injects one explicitly or leaves every controller transport off.
+	// WebUI/external-controller is intentionally unavailable in the extension.
+	// Strip subscription-owned endpoints so no HTTP control listener is exposed.
 	for _, key := range []string{
 		"external-controller", "external-controller-tls", "external-controller-unix",
 		"external-controller-pipe", "external-controller-routing-mark",
@@ -1002,14 +1007,6 @@ func mergeConfig(subYAML string, st appSettings, tunnelMTU int) ([]byte, error) 
 		"external-ui", "external-ui-url", "external-ui-name",
 	} {
 		delete(m, key)
-	}
-	if st.ExternalController {
-		host := "127.0.0.1"
-		if st.AllowLan && strings.TrimSpace(st.ControllerSecret) != "" {
-			host = "0.0.0.0"
-		}
-		m["external-controller"] = fmt.Sprintf("%s:%d", host, st.ControllerPort)
-		m["secret"] = st.ControllerSecret
 	}
 
 	// 混合代理端口（HTTP+SOCKS，本机回环）。0=不开。
@@ -1517,8 +1514,8 @@ func filterGeoRules(rules []any) ([]any, int) {
 }
 
 // QueryProxies returns only the group fields used by the app. It traverses the
-// group interfaces directly so a large subscription is never serialized into
-// a full external-controller response and decoded again inside the extension.
+// group interfaces directly so a large subscription is never fully serialized
+// and decoded again inside the extension.
 func QueryProxies() string {
 	configApplyMu.RLock()
 	defer configApplyMu.RUnlock()
@@ -1694,8 +1691,7 @@ func ConnectionsSnapshot(limit int) string {
 	return string(out)
 }
 
-// CloseConnection closes one tracked connection without exposing the full
-// external-controller HTTP server to the main app.
+// CloseConnection closes one tracked connection through the app-owned IPC.
 func CloseConnection(id string) error {
 	id = strings.TrimSpace(id)
 	if id == "" {
@@ -2123,10 +2119,10 @@ func Stop() {
 	activeGeneralIPv6 = false
 	activeUsesSystemDNS = false
 	coreStartedAt = time.Time{}
+	activeConfigFingerprint = ""
+	preparedReloadFingerprint = ""
+	reloadPrepared = false
 	CloseAllConnections()
-	controllerState.ExternalController = false
-	activeControllerRoute = controllerRouteState{}
-	route.ReCreateServer(&route.Config{})
 	executor.Shutdown()
 }
 
