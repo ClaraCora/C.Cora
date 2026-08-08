@@ -157,18 +157,19 @@ struct LogsView: View {
     }
 
     private func scrollControl(_ proxy: ScrollViewProxy) -> some View {
-        HStack(spacing: 8) {
+        Group {
             if !autoScroll {
                 Button {
-                    guard let last = controller.lines.last else { return }
+                    autoScroll = true
                     pausedAtLineCount = controller.bufferedLineCount
+                    guard let last = controller.lines.last else { return }
                     withAnimation(.easeOut(duration: 0.18)) {
                         proxy.scrollTo(last.id, anchor: .bottom)
                     }
                 } label: {
                     ZStack(alignment: .topTrailing) {
                         Image(systemName: "arrow.down.to.line")
-                            .frame(width: 38, height: 38)
+                            .frame(width: 40, height: 40)
                             .background(.ultraThinMaterial, in: Circle())
                         if pausedLineCount > 0 {
                             Text(pausedLineCount > 99 ? "99+" : String(pausedLineCount))
@@ -180,26 +181,8 @@ struct LogsView: View {
                         }
                     }
                 }
-                .accessibilityLabel("跳到最新日志，继续暂停自动滚动")
+                .accessibilityLabel("跳到最新日志并恢复自动滚动")
             }
-
-            Button {
-                if autoScroll {
-                    pauseAutoScroll()
-                } else {
-                    autoScroll = true
-                    pausedAtLineCount = controller.bufferedLineCount
-                }
-                if autoScroll, let last = controller.lines.last {
-                    proxy.scrollTo(last.id, anchor: .bottom)
-                }
-            } label: {
-                Image(systemName: autoScroll ? "pause.fill" : "play.fill")
-                    .foregroundStyle(.white)
-                    .frame(width: 40, height: 40)
-                    .background(autoScroll ? Color.orange : Color.green, in: Circle())
-            }
-            .accessibilityLabel(autoScroll ? "暂停自动滚动，日志继续加载" : "恢复自动滚动")
         }
         .padding(.trailing, 14)
         .padding(.bottom, 12)

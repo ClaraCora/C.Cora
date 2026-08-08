@@ -645,6 +645,12 @@ func applyRuntimeConfig(fd int, tunnelMTU int, configYAML string, st appSettings
 		}
 	}()
 
+	if preserveTun {
+		// iOS Packet Tunnel 的内存上限很低。先归还上一轮解析留下的空闲页，
+		// 再同时持有旧运行配置和待解析配置，降低热重载的峰值。
+		debug.FreeOSMemory()
+	}
+
 	merged, err := mergeConfig(configYAML, st, tunnelMTU)
 	if err != nil {
 		appendRunLog(operation + "合并配置失败: " + err.Error())
@@ -680,7 +686,9 @@ func applyRuntimeConfig(fd int, tunnelMTU int, configYAML string, st appSettings
 	}
 
 	appendRunLog(operation + " ParseRawConfig 成功，开始 ApplyConfig")
-	executor.ApplyConfig(cfg, true)
+	// mihomo PUT /configs 的热重载默认 force=false；只有冷启动才需要强制
+	// 重建 HTTP/SOCKS/Mixed 等入站监听。TUN 在上面固定为现有 utun 配置。
+	executor.ApplyConfig(cfg, !preserveTun)
 	activeDNSConfig = cfg.DNS
 	activeGeneralIPv6 = cfg.General.IPv6
 	activeSystemDNS = append(activeSystemDNS[:0], st.SystemDNS...)

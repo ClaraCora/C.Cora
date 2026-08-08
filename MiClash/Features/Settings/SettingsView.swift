@@ -161,10 +161,15 @@ private struct GeoSettingsSection: View {
             Toggle("启用 geo 规则", isOn: $settings.geoEnabled)
             if settings.geoEnabled {
                 if AppGroup.containerURL == nil {
-                    Label("当前签名没有可用的 App Group，连接时会自动忽略 GEO/ASN 规则。",
+                    Label("共享目录不可用，连接时会自动忽略 GEO/ASN 规则。",
                           systemImage: "exclamationmark.triangle")
                         .font(.caption)
                         .foregroundStyle(.orange)
+                } else if AppGroup.usesTrollStoreFallback {
+                    Label("正在使用 TrollStore 共享目录",
+                          systemImage: "checkmark.shield")
+                        .font(.caption)
+                        .foregroundStyle(.green)
                 }
                 Picker("加载器", selection: $settings.geoLoader) {
                     ForEach(SettingsStore.geoLoaderOptions, id: \.self) { Text($0).tag($0) }
@@ -191,7 +196,7 @@ private struct GeoSettingsSection: View {
                         if geoDatabase.isUpdating { ProgressView() }
                     }
                 }
-                .disabled(geoDatabase.isUpdating || AppGroup.containerURL == nil)
+                .disabled(geoDatabase.isUpdating)
                 if let installedInfo {
                     HStack {
                         Text("本地数据")
@@ -216,7 +221,7 @@ private struct GeoSettingsSection: View {
                + "“忽略 GEO 取反规则”可单独控制 geolocation-!cn / NOT(GEOIP) 等规则。"
                + "主 App 优先读取当前配置的 geox-url 下载数据库，设置中的地址仅在配置缺少对应地址时使用。"
                + "ASN 优先使用配置中的 geox-url.asn，缺少时使用内置备用地址。"
-               + "更新后需重新连接。")
+               + "更新后需热重载配置或重新连接。")
         }
     }
 

@@ -34,27 +34,27 @@ struct ConnectView: View {
     }
 }
 
-/// 连接卡片：大圆形电源开关 + 状态文案 + 代理模式，集中在一张卡里。
+/// 连接卡片：电源开关 + 状态文案 + 代理模式，集中在一张卡里。
 private struct ConnectionCard: View {
     @EnvironmentObject private var core: CoreStateManager
     @EnvironmentObject private var kernel: KernelController
 
     var body: some View {
-        VStack(spacing: 14) {
+        VStack(spacing: 10) {
             Button {
                 Task { await core.toggleConnection() }
             } label: {
                 ZStack {
                     Circle()
                         .fill(buttonGradient)
-                        .frame(width: 124, height: 124)
-                        .shadow(color: glowColor.opacity(0.38), radius: 14, x: 0, y: 6)
+                        .frame(width: 98, height: 98)
+                        .shadow(color: glowColor.opacity(0.34), radius: 10, x: 0, y: 4)
                     if core.isBusy {
                         ProgressView()
                             .tint(.white)
                     } else {
                         Image(systemName: "power")
-                            .font(.system(size: 42, weight: .bold))
+                            .font(.system(size: 34, weight: .bold))
                             .foregroundStyle(.white)
                     }
                 }
@@ -62,7 +62,7 @@ private struct ConnectionCard: View {
             .buttonStyle(.plain)
             .disabled(core.isBusy)
 
-            VStack(spacing: 6) {
+            VStack(spacing: 4) {
                 HStack(spacing: 7) {
                     Circle()
                         .fill(glowColor)
@@ -71,7 +71,7 @@ private struct ConnectionCard: View {
                         .font(.subheadline.weight(.semibold))
                 }
                 .padding(.horizontal, 12)
-                .padding(.vertical, 6)
+                .padding(.vertical, 4)
                 .background(Capsule().fill(glowColor.opacity(0.12)))
 
                 Text(core.isActive ? "点按断开" : "点按连接")
@@ -104,7 +104,7 @@ private struct ConnectionCard: View {
             .pickerStyle(.segmented)
             .disabled(!core.isActive)
         }
-        .padding(18)
+        .padding(14)
         .background(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .fill(Color(uiColor: .secondarySystemGroupedBackground))

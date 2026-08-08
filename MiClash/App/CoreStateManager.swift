@@ -136,7 +136,7 @@ final class CoreStateManager: ObservableObject {
         }
     }
 
-    /// 重新应用当前配置。使用受控重连释放旧内核，避免 iOS NE 热重载的内存峰值。
+    /// 在现有 utun 上热重载当前配置；提交与执行分离，避免长耗时 IPC 空响应。
     func reloadConfiguration() async throws {
         guard status == .connected else {
             throw Self.reloadError("VPN 尚未连接")
@@ -148,22 +148,29 @@ final class CoreStateManager: ObservableObject {
         isBusy = true
         defer { isBusy = false }
 
-        let yaml = SubscriptionStore.shared.activeYAML
-        try await GeoDatabaseManager.shared.prepareForConnection(configYAML: yaml)
-        let settings = SettingsStore.shared.asJSON(
-            geoAvailable: AppGroup.containerURL != nil,
-            applyOverrides: SubscriptionStore.shared.activeOverridesEnabled)
-        let s = SettingsStore.shared
-        let options = TunnelManager.ProtocolOptions(
-            includeAllNetworks: s.includeAllNetworks,
-            excludeCellularServices: s.excludeCellularServices,
-            excludeAPNs: s.excludeAPNs,
-            excludeDeviceCommunication: s.excludeDeviceCommunication,
-            enforceRoutes: s.enforceRoutes)
         do {
-            try await tunnel.restart(configYAML: yaml,
-                                     settingsJSON: settings,
-                                     protocolOptions: options)
+            let yaml = SubscriptionStore.shared.activeYAML
+            try await GeoDatabaseManager.shared.prepareForConnection(configYAML: yaml)
+            let settings = SettingsStore.shared.asJSON(
+                geoAvailable: AppGroup.containerURL != nil,
+                applyOverrides: SubscriptionStore.shared.activeOverridesEnabled)
+            let transfer = await Task.detached(priority: .userInitiated) {
+                ReloadTransfer.make(configYAML: yaml ?? "", settingsJSON: settings)
+            }.value
+            defer {
+                for url in transfer.temporaryFiles {
+                    try? FileManager.default.removeItem(at: url)
+                }
+            }
+
+            var submission = await sendMessage(transfer.command)
+            if case .ok(let data) = submission,
+               let response = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+               response["code"] as? String == "reloadTransferUnavailable",
+               let fallback = transfer.fallbackCommand {
+                submission = await sendMessage(fallback)
+            }
+            try await awaitReloadSubmission(submission, token: transfer.token)
         } catch {
             lastError = error.localizedDescription
             throw error
@@ -172,6 +179,78 @@ final class CoreStateManager: ObservableObject {
         syncWidget(true)
         await fetchControllerConfiguration()
         await fetchNotices()
+    }
+
+    private func awaitReloadSubmission(_ submission: TunnelManager.IPCResult,
+                                       token: String) async throws {
+        var submissionFailure: String?
+        switch submission {
+        case .failure(let reason):
+            // The provider may already have accepted the job even if iOS dropped its reply.
+            // Querying the known token makes a single empty response recoverable.
+            submissionFailure = reason
+        case .ok(let data):
+            guard let response = (try? JSONSerialization.jsonObject(with: data))
+                    as? [String: Any] else {
+                submissionFailure = "Tunnel 返回了无法识别的受理响应"
+                break
+            }
+            guard (response["ok"] as? Bool) == true else {
+                throw Self.reloadError((response["error"] as? String) ?? "mihomo 重载未被受理")
+            }
+            // Compatibility with an extension still running the old synchronous protocol.
+            guard (response["accepted"] as? Bool) == true else { return }
+        }
+
+        let deadline = Date().addingTimeInterval(90)
+        var consecutiveFailures = 0
+        var notFoundCount = 0
+        while Date() < deadline {
+            guard status == .connected || status == .reasserting else {
+                throw Self.reloadError("热重载期间 VPN 已断开，请查看日志确认是否发生内存终止")
+            }
+
+            switch await sendMessage(["cmd": "reloadStatus", "token": token]) {
+            case .failure(let reason):
+                consecutiveFailures += 1
+                if consecutiveFailures >= 6 {
+                    throw Self.reloadError(
+                        submissionFailure ?? "查询热重载状态失败：\(reason)")
+                }
+            case .ok(let data):
+                guard let response = (try? JSONSerialization.jsonObject(with: data))
+                        as? [String: Any] else {
+                    consecutiveFailures += 1
+                    break
+                }
+                if (response["ok"] as? Bool) != true {
+                    notFoundCount += 1
+                    if notFoundCount >= 4 {
+                        throw Self.reloadError(
+                            submissionFailure
+                                ?? (response["error"] as? String)
+                                ?? "没有找到热重载任务")
+                    }
+                    break
+                }
+
+                consecutiveFailures = 0
+                notFoundCount = 0
+                switch response["status"] as? String {
+                case "queued", "running":
+                    break
+                case "succeeded":
+                    return
+                case "failed":
+                    throw Self.reloadError(
+                        (response["error"] as? String) ?? "mihomo 热重载失败")
+                default:
+                    throw Self.reloadError("Tunnel 返回了未知的热重载状态")
+                }
+            }
+            try await Task.sleep(nanoseconds: 400_000_000)
+        }
+        throw Self.reloadError("mihomo 热重载超过 90 秒仍未完成")
     }
 
     /// 显式断开（UI / 快捷指令共用）。断开后同步磁贴状态。
@@ -201,7 +280,9 @@ final class CoreStateManager: ObservableObject {
         let timeout: TimeInterval
         switch command {
         case "reloadConfig":
-            timeout = 60
+            timeout = 10
+        case "reloadStatus":
+            timeout = 3
         case "groupDelay":
             let milliseconds = (request["timeout"] as? NSNumber)?.doubleValue ?? 5_000
             timeout = max(10, milliseconds / 1_000 + 5)
@@ -242,5 +323,50 @@ final class CoreStateManager: ObservableObject {
     /// 是否处于「已连接/连接中」语义（用于按钮样式）。
     var isActive: Bool {
         status == .connected || status == .connecting || status == .reasserting
+    }
+}
+
+private struct ReloadTransfer: @unchecked Sendable {
+    let token: String
+    let command: [String: Any]
+    let fallbackCommand: [String: Any]?
+    let temporaryFiles: [URL]
+
+    static func make(configYAML: String, settingsJSON: String) -> ReloadTransfer {
+        let token = UUID().uuidString
+        let inline: [String: Any] = [
+            "cmd": "reloadConfig",
+            "token": token,
+            "config": configYAML,
+            "settings": settingsJSON,
+        ]
+        guard let container = AppGroup.containerURL else {
+            return ReloadTransfer(token: token,
+                                  command: inline,
+                                  fallbackCommand: nil,
+                                  temporaryFiles: [])
+        }
+
+        let directory = container.appendingPathComponent("ReloadRequests", isDirectory: true)
+        let configURL = directory.appendingPathComponent("\(token).yaml")
+        let settingsURL = directory.appendingPathComponent("\(token).json")
+        do {
+            try FileManager.default.createDirectory(at: directory,
+                                                    withIntermediateDirectories: true)
+            try configYAML.write(to: configURL, atomically: true, encoding: .utf8)
+            try settingsJSON.write(to: settingsURL, atomically: true, encoding: .utf8)
+            return ReloadTransfer(
+                token: token,
+                command: ["cmd": "reloadConfig", "transfer": "appGroup", "token": token],
+                fallbackCommand: inline,
+                temporaryFiles: [configURL, settingsURL])
+        } catch {
+            try? FileManager.default.removeItem(at: configURL)
+            try? FileManager.default.removeItem(at: settingsURL)
+            return ReloadTransfer(token: token,
+                                  command: inline,
+                                  fallbackCommand: nil,
+                                  temporaryFiles: [])
+        }
     }
 }

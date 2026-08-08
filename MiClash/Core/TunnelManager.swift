@@ -146,42 +146,6 @@ final class TunnelManager {
         manager?.connection.stopVPNTunnel()
     }
 
-    /// 配置重载采用受控重连，避免 NE 小内存环境里同时持有新旧配置导致热重载被系统终止。
-    func restart(configYAML: String?, settingsJSON: String,
-                 protocolOptions: ProtocolOptions) async throws {
-        if manager == nil { _ = try await loadSavedManager() }
-        guard let oldConnection = manager?.connection else {
-            throw Self.startupError("未找到需要重载的 VPN 连接")
-        }
-        oldConnection.stopVPNTunnel()
-        for _ in 0..<Self.startupPollCount {
-            if oldConnection.status == .disconnected || oldConnection.status == .invalid { break }
-            try? await Task.sleep(nanoseconds: Self.startupPollNanoseconds)
-        }
-        guard oldConnection.status == .disconnected || oldConnection.status == .invalid else {
-            throw Self.startupError("旧隧道未能及时停止，请稍后重试")
-        }
-
-        try await start(configYAML: configYAML,
-                        settingsJSON: settingsJSON,
-                        protocolOptions: protocolOptions)
-        guard let connection = manager?.connection else {
-            throw Self.startupError("重连后未找到 VPN 连接")
-        }
-        for _ in 0..<(Self.startupPollCount * 2) {
-            switch connection.status {
-            case .connected:
-                return
-            case .disconnected, .disconnecting, .invalid:
-                if let error = await lastDisconnectError(connection) { throw error }
-                throw Self.startupError("配置重载后的隧道未能连接")
-            default:
-                try? await Task.sleep(nanoseconds: Self.startupPollNanoseconds)
-            }
-        }
-        throw Self.startupError("配置已提交，但 VPN 连接超时")
-    }
-
     /// 读取当前连接状态（用于 UI 初始化时同步）。
     func currentStatus() async -> NEVPNStatus {
         if let manager, Self.isMiClashManager(manager) {

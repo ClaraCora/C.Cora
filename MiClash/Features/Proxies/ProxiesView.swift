@@ -35,7 +35,7 @@ struct ProxiesView: View {
                     }
                     Button("取消", role: .cancel) {}
                 } message: {
-                    Text("将通过短暂重连应用「\(configurationName)」，连接恢复后自动刷新节点。")
+                    Text("将在当前 VPN 隧道内热重载「\(configurationName)」，完成后自动刷新节点。")
                 }
                 .alert(item: $configurationReloadFailure) { failure in
                     Alert(title: Text("重载配置失败"),
@@ -51,10 +51,6 @@ struct ProxiesView: View {
                     searchText = ""
                     expanded.removeAll()
                     showingReloadConfirmation = false
-                    if isReloadingConfiguration {
-                        controller.resetSession()
-                        return
-                    }
                     configurationReloadState = .idle
                     controller.resetSession()
                 }

@@ -78,10 +78,17 @@ final class GeoDatabaseManager: ObservableObject {
         }
     }
 
-    /// 设置页手动下载/更新当前配置需要的 GEO / ASN 数据。
+    /// 设置页手动更新全部启用的 GEO / ASN 数据，不依赖当前配置是否恰好引用它们。
     func updateManually() async throws {
-        try await updateIfNeeded(force: true,
-                                 configYAML: SubscriptionStore.shared.activeYAML ?? "")
+        do {
+            guard SettingsStore.shared.geoEnabled else { throw GeoError.geoDisabled }
+            try await updateIfNeeded(force: true,
+                                     includeAll: true,
+                                     configYAML: SubscriptionStore.shared.activeYAML ?? "")
+        } catch {
+            publish(error: error)
+            throw error
+        }
     }
 
     /// 设置页只在相关状态变化时调用一次；配置解析和文件读取均放到后台。
@@ -100,7 +107,9 @@ final class GeoDatabaseManager: ObservableObject {
         }.value
     }
 
-    private func updateIfNeeded(force: Bool, configYAML: String) async throws {
+    private func updateIfNeeded(force: Bool,
+                                includeAll: Bool = false,
+                                configYAML: String) async throws {
         if let activeUpdate {
             try await activeUpdate.value
             return
@@ -111,7 +120,9 @@ final class GeoDatabaseManager: ObservableObject {
         let geodataMode = settings.geodataMode
         let autoUpdate = settings.geoAutoUpdate
         let updateInterval = settings.geoUpdateInterval
-        let assets = requiredAssets(configYAML: configYAML, geodataMode: geodataMode)
+        let assets = requiredAssets(configYAML: configYAML,
+                                    geodataMode: geodataMode,
+                                    includeAll: includeAll)
         guard !assets.isEmpty else { return }
         let config = DownloadConfiguration(
             home: home,
@@ -128,7 +139,7 @@ final class GeoDatabaseManager: ObservableObject {
         }
         activeUpdate = task
         isUpdating = true
-        statusText = nil
+        statusText = "正在下载并校验 \(assets.count) 个数据库…"
         statusIsError = false
         defer {
             activeUpdate = nil
@@ -186,14 +197,16 @@ final class GeoDatabaseManager: ObservableObject {
         return Date().timeIntervalSince(oldest) >= TimeInterval(max(intervalHours, 1) * 3_600)
     }
 
-    private func requiredAssets(configYAML: String, geodataMode: Bool) -> [AssetDownload] {
+    private func requiredAssets(configYAML: String,
+                                geodataMode: Bool,
+                                includeAll: Bool = false) -> [AssetDownload] {
         let settings = SettingsStore.shared
         let resolved = resolveURLs(
             configYAML: configYAML,
             settingsJSON: settings.asJSON(
                 applyOverrides: SubscriptionStore.shared.activeOverridesEnabled))
         var assets: [AssetDownload] = []
-        if settings.geoEnabled && resolved.geoRequired {
+        if settings.geoEnabled && (includeAll || resolved.geoRequired) {
             assets.append(AssetDownload(
                 label: geodataMode ? "GeoIP.dat" : "geoip.metadb",
                 url: geodataMode ? resolved.geoip : resolved.mmdb,
@@ -202,7 +215,7 @@ final class GeoDatabaseManager: ObservableObject {
             assets.append(AssetDownload(label: "GeoSite.dat", url: resolved.geosite,
                                         fileName: "GeoSite.dat", kind: "geosite"))
         }
-        if settings.geoEnabled && resolved.asnRequired {
+        if settings.geoEnabled && (includeAll || resolved.asnRequired) {
             assets.append(AssetDownload(label: "ASN.mmdb", url: resolved.asn,
                                         fileName: "ASN.mmdb", kind: "asn"))
         }
@@ -242,11 +255,11 @@ final class GeoDatabaseManager: ObservableObject {
         let resolved = resolvedJSON.data(using: .utf8).flatMap {
             try? JSONDecoder().decode(ResolvedGeoURLs.self, from: $0)
         }
-        var names: [String] = []
-        if config.geoEnabled && resolved?.geoRequired == true {
-            names = [config.geodataMode ? "GeoIP.dat" : "geoip.metadb", "GeoSite.dat"]
-        }
-        if config.geoEnabled && resolved?.asnRequired == true {
+        guard config.geoEnabled else { return nil }
+        var names = [config.geodataMode ? "GeoIP.dat" : "geoip.metadb", "GeoSite.dat"]
+        if resolved?.asnRequired == true
+            || FileManager.default.fileExists(
+                atPath: config.home.appendingPathComponent("ASN.mmdb").path) {
             names.append("ASN.mmdb")
         }
         guard !names.isEmpty else { return nil }
@@ -332,10 +345,7 @@ final class GeoDatabaseManager: ObservableObject {
 
         let download: BoundedHTTPDownload
         do {
-            download = try await BoundedHTTPDownloader.download(
-                for: request,
-                maxBytes: geoMaximumAssetBytes,
-                resourceTimeout: 180)
+            download = try await downloadWithRetry(request: request)
         } catch let error as BoundedHTTPDownloadError {
             switch error {
             case .httpStatus(let code):
@@ -380,6 +390,50 @@ final class GeoDatabaseManager: ObservableObject {
         return StagedAsset(url: stagedURL, fileName: fileName)
     }
 
+    nonisolated private static func downloadWithRetry(
+        request: URLRequest
+    ) async throws -> BoundedHTTPDownload {
+        var lastError: Error?
+        for attempt in 1...3 {
+            do {
+                return try await BoundedHTTPDownloader.download(
+                    for: request,
+                    maxBytes: geoMaximumAssetBytes,
+                    resourceTimeout: 180)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                lastError = error
+                guard attempt < 3, isRetryableDownloadError(error) else { throw error }
+                try await Task.sleep(nanoseconds: UInt64(attempt) * 1_000_000_000)
+            }
+        }
+        throw lastError ?? BoundedHTTPDownloadError.invalidResponse
+    }
+
+    nonisolated private static func isRetryableDownloadError(_ error: Error) -> Bool {
+        if let error = error as? BoundedHTTPDownloadError {
+            switch error {
+            case .invalidResponse:
+                return true
+            case .httpStatus(let code):
+                return code == 408 || code == 425 || code == 429 || (500...599).contains(code)
+            case .invalidURL, .tooLarge:
+                return false
+            }
+        }
+        if let error = error as? URLError {
+            switch error.code {
+            case .cancelled, .badURL, .unsupportedURL, .fileDoesNotExist,
+                 .noPermissionsToReadFile, .dataLengthExceedsMaximum:
+                return false
+            default:
+                return true
+            }
+        }
+        return true
+    }
+
     nonisolated private static func install(_ asset: StagedAsset, home: URL) throws {
         let fileManager = FileManager.default
         let target = home.appendingPathComponent(asset.fileName)
@@ -394,6 +448,7 @@ final class GeoDatabaseManager: ObservableObject {
 
 private enum GeoError: LocalizedError, Sendable {
     case appGroupUnavailable
+    case geoDisabled
     case invalidURL(String)
     case httpStatus(String, Int)
     case downloadFailed(String, String)
@@ -406,7 +461,9 @@ private enum GeoError: LocalizedError, Sendable {
     var errorDescription: String? {
         switch self {
         case .appGroupUnavailable:
-            return "App Group 不可用，主 App 无法把 GEO / ASN 数据共享给隧道扩展"
+            return "共享目录不可用，主 App 无法把 GEO / ASN 数据交给隧道扩展"
+        case .geoDisabled:
+            return "请先启用 GEO 规则"
         case .invalidURL(let name):
             return "\(name) 下载地址无效"
         case .httpStatus(let name, let code):

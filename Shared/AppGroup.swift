@@ -11,9 +11,43 @@ import Foundation
 /// 注：iOS SDK 不公开 SecTask 系列 API（那是 macOS 的），无法在运行时读 entitlements
 /// 动态解析被授予的 group，故直接用约定的固定标识。
 enum AppGroup {
+    enum ContainerKind {
+        case appGroup
+        case trollStore
+        case unavailable
+    }
+
     static let identifier = "group.com.miclash.app"
+    private static let trollStoreURL = URL(
+        fileURLWithPath: "/var/mobile/Library/Application Support/MiClash",
+        isDirectory: true)
+
+    private static let resolution: (url: URL?, kind: ContainerKind) = {
+        let fileManager = FileManager.default
+        if let url = fileManager.containerURL(
+            forSecurityApplicationGroupIdentifier: identifier) {
+            return (url, .appGroup)
+        }
+
+        // TrollStore/no-sandbox builds can share a stable path between the App and NE.
+        // The write probe keeps regular sandboxed builds on the existing nil fallback.
+        do {
+            try fileManager.createDirectory(at: trollStoreURL,
+                                            withIntermediateDirectories: true)
+            let probe = trollStoreURL.appendingPathComponent(
+                ".miclash-write-probe-\(UUID().uuidString)")
+            try Data("ok".utf8).write(to: probe, options: .atomic)
+            try fileManager.removeItem(at: probe)
+            return (trollStoreURL, .trollStore)
+        } catch {
+            return (nil, .unavailable)
+        }
+    }()
 
     static var containerURL: URL? {
-        FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: identifier)
+        resolution.url
     }
+
+    static var containerKind: ContainerKind { resolution.kind }
+    static var usesTrollStoreFallback: Bool { resolution.kind == .trollStore }
 }
