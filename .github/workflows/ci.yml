@@ -145,29 +145,7 @@ jobs:
           go test -tags "with_gvisor,with_low_memory" ./...
 
       - name: Build Mihomo.xcframework (gomobile bind)
-        run: |
-          set -euxo pipefail
-          cd MobileCore
-          # 取出真实 mihomo 版本，用 ldflags 注入 constant.Version
-          # （源码默认值是陈旧占位串，官方靠 ldflags 注入真实版本，这里照做）
-          MIHOMO_VERSION=$(go list -m -f '{{.Version}}' github.com/metacubex/mihomo)
-          echo "注入 mihomo 版本：${MIHOMO_VERSION}"
-          # 交叉编译 mihomo 为 iOS 框架（含 device arm64 + simulator 切片）。
-          # with_gvisor：iOS NE 的 system 栈 TCP 不通；with_low_memory：转发缓冲减半，降低峰值。
-          gomobile bind \
-            -iosversion=17.0 \
-            -tags "with_gvisor,with_low_memory" \
-            -ldflags="-X github.com/metacubex/mihomo/constant.Version=${MIHOMO_VERSION}" \
-            -target=ios -o ../Vendor/Mihomo.xcframework .
-          DEVICE_BINARY="../Vendor/Mihomo.xcframework/ios-arm64/Mihomo.framework/Mihomo"
-          SIMULATOR_BINARY="../Vendor/Mihomo.xcframework/ios-arm64_x86_64-simulator/Mihomo.framework/Mihomo"
-          plutil -lint ../Vendor/Mihomo.xcframework/Info.plist
-          test "$(xcrun lipo -archs "$DEVICE_BINARY")" = "arm64"
-          xcrun lipo "$SIMULATOR_BINARY" -verify_arch arm64 x86_64
-          echo "===== Mihomo.xcframework 切片 ====="
-          ls -R ../Vendor/Mihomo.xcframework | head -40
-          echo "===== Info.plist ====="
-          cat ../Vendor/Mihomo.xcframework/Info.plist
+        run: bash MobileCore/scripts/build-ios-xcframework.sh
 
       # ───────────── 生成工程并构建 App ─────────────
       - name: Install XcodeGen

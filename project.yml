@@ -2,6 +2,11 @@
 # 主 App + Network Extension 支持 iOS 17；控制中心扩展单独要求 iOS 18。
 name: MiClash
 
+configs:
+  Debug: debug
+  Release: release
+  InternalTestFlight: release
+
 options:
   bundleIdPrefix: com.miclash
   deploymentTarget:
@@ -16,9 +21,9 @@ settings:
     MARKETING_VERSION: "0.1.0"
     CURRENT_PROJECT_VERSION: "1"
     SWIFT_VERSION: "5.0"
-    # 手动签名占位；CI 用 CODE_SIGNING_ALLOWED=NO 跳过，用户本地用自有证书签
-    CODE_SIGN_STYLE: Manual
-    DEVELOPMENT_TEAM: ""
+    # 本地 Xcode / TestFlight 使用自动签名；CI 仍用命令行参数显式关闭签名。
+    # Team 不写入仓库，首次在 Xcode 的 Signing & Capabilities 中为三个 target 选择同一团队。
+    CODE_SIGN_STYLE: Automatic
     TARGETED_DEVICE_FAMILY: "1"   # 1=iPhone
     # mihomo（Go 运行时）的 net 包在 Darwin 上引用 libresolv 的 res_9_* 符号，
     # 精简的 NE 扩展不会隐式链接它，需显式补链，否则报 undefined symbols。
@@ -98,6 +103,6 @@ schemes:
       targets:
         MiClash: all
     run:
-      config: Release
+      config: Debug
     archive:
-      config: Release
+      config: InternalTestFlight
