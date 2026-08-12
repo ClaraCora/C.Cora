@@ -9,7 +9,9 @@ struct ProxiesView: View {
     @State private var expanded: Set<String> = []
     @State private var searchText = ""
     @State private var isSearchPresented = false
+    @State private var groupGradients: [String: Int] = [:]
     @AppStorage("proxyNodeLayout") private var layoutRawValue = ProxyNodeLayout.list.rawValue
+    @AppStorage("proxyGroupGradients") private var gradientStorage = "{}"
 
     var body: some View {
         NavigationStack {
@@ -38,13 +40,17 @@ struct ProxiesView: View {
                                       subscriptionID: subscriptions.selectedID,
                                       configurationUpdatedAt: subscriptions.selected?.updatedAt,
                                       providerRevision: subscriptions.providerCacheRevision)) {
+                    loadGroupGradients()
                     await reload()
+                }
+                .onChange(of: isSearchPresented) { _, presented in
+                    if !presented { searchText = "" }
                 }
         }
     }
 
     @ViewBuilder private var navigationContent: some View {
-        if showsSearch {
+        if showsSearch && isSearchPresented {
             content
                 .searchable(text: $searchText,
                             isPresented: $isSearchPresented,
@@ -122,7 +128,15 @@ struct ProxiesView: View {
         .frame(width: 44, height: 44)
     }
 
-    private var groupList: some View {
+    @ViewBuilder private var groupList: some View {
+        if nodeLayout == .grid {
+            gridGroupList
+        } else {
+            listGroupList
+        }
+    }
+
+    private var listGroupList: some View {
         let results = displayedGroups
 
         return List {
@@ -168,10 +182,12 @@ struct ProxiesView: View {
                             canTest: controller.isRuntimeAvailable,
                             isRuntimeAvailable: controller.isRuntimeAvailable,
                             canToggle: normalizedSearch.isEmpty,
+                            gradientIndex: groupGradients[result.group.name] ?? 0,
                             onToggle: { openGroup(result.group.name) },
                             onTest: {
                                 Task { await controller.testGroup(result.group.name) }
-                            })
+                            },
+                            onGradient: { setGradient($0, for: result.group.name) })
                         .listRowInsets(EdgeInsets(top: 8, leading: 14, bottom: 8, trailing: 8))
                         .listRowSeparator(.hidden)
 
@@ -182,7 +198,7 @@ struct ProxiesView: View {
                                 .frame(maxWidth: .infinity, minHeight: 40, alignment: .leading)
                                 .listRowInsets(EdgeInsets(top: 4, leading: 46, bottom: 4, trailing: 14))
                                 .listRowSeparator(.hidden)
-                        } else if nodeLayout == .list {
+                        } else {
                             ForEach(result.nodes) { item in
                                 let selectingNode = controller.selecting[result.group.name]
                                 ProxyNodeListRow(
@@ -218,32 +234,6 @@ struct ProxiesView: View {
                                     }
                                 }
                             }
-                        } else if result.isExpanded {
-                            LazyVGrid(columns: [
-                                GridItem(.flexible(), spacing: 10),
-                                GridItem(.flexible(), spacing: 10),
-                            ], spacing: 10) {
-                                ForEach(result.nodes) { item in
-                                    let selectingNode = controller.selecting[result.group.name]
-                                    ProxyNodeGridCell(
-                                        node: item.name,
-                                        isCurrent: item.name == result.group.now,
-                                        isSelecting: selectingNode == item.name,
-                                        isSelectionBlocked: selectingNode != nil,
-                                        selectable: result.group.selectable,
-                                        delay: controller.delays[item.name],
-                                        detail: controller.details[item.name],
-                                        onSelect: {
-                                            Task {
-                                                await controller.select(group: result.group.name,
-                                                                        name: item.name)
-                                            }
-                                        })
-                                }
-                            }
-                            .padding(.vertical, 4)
-                            .listRowInsets(EdgeInsets(top: 4, leading: 14, bottom: 10, trailing: 14))
-                            .listRowSeparator(.hidden)
                         }
                     }
                 }
@@ -252,6 +242,65 @@ struct ProxiesView: View {
         .listStyle(.insetGrouped)
         .listSectionSpacing(6)
         .scrollContentBackground(.hidden)
+        .background(Color(uiColor: .systemGroupedBackground))
+        .refreshable { await reload() }
+    }
+
+    private var gridGroupList: some View {
+        let results = displayedGroups
+        return ScrollView {
+            LazyVStack(alignment: .leading, spacing: 14) {
+                if !controller.isRuntimeAvailable {
+                    Label("VPN 未连接。选择会保存，并在下次连接时生效；测速需连接后使用。",
+                          systemImage: "checkmark.circle")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 16)
+                }
+                if let error = controller.error {
+                    Label(error, systemImage: "exclamationmark.triangle.fill")
+                        .font(.footnote)
+                        .foregroundStyle(.orange)
+                        .padding(.horizontal, 16)
+                }
+                if results.isEmpty {
+                    ContentUnavailableView.search(text: searchText)
+                } else {
+                    ProxyOverviewRow(
+                        mode: controller.mode,
+                        visibleGroupCount: results.count,
+                        totalGroupCount: controller.groups.count,
+                        nodeCount: controller.uniqueNodeCount,
+                        isSearching: !normalizedSearch.isEmpty)
+                        .padding(.horizontal, 16)
+                    LazyVGrid(columns: [
+                        GridItem(.flexible(), spacing: 12),
+                        GridItem(.flexible(), spacing: 12),
+                    ], spacing: 12) {
+                        ForEach(results) { result in
+                            GroupGridCard(
+                                group: result.group,
+                                isExpanded: result.isExpanded,
+                                isTesting: controller.testing.contains(result.group.name),
+                                currentDelay: controller.delays[result.group.now],
+                                canTest: controller.isRuntimeAvailable,
+                                selecting: controller.selecting[result.group.name],
+                                delays: controller.delays,
+                                details: controller.details,
+                                gradientIndex: groupGradients[result.group.name] ?? 0,
+                                onToggle: { openGroup(result.group.name) },
+                                onTest: { Task { await controller.testGroup(result.group.name) } },
+                                onGradient: { setGradient($0, for: result.group.name) },
+                                onSelect: { name in
+                                    Task { await controller.select(group: result.group.name, name: name) }
+                                })
+                        }
+                    }
+                    .padding(.horizontal, 14)
+                }
+            }
+            .padding(.vertical, 10)
+        }
         .background(Color(uiColor: .systemGroupedBackground))
         .refreshable { await reload() }
     }
@@ -308,6 +357,19 @@ struct ProxiesView: View {
 
     private func reload() async {
         await controller.load()
+    }
+
+    private func loadGroupGradients() {
+        guard let data = gradientStorage.data(using: .utf8),
+              let values = try? JSONDecoder().decode([String: Int].self, from: data) else { return }
+        groupGradients = values
+    }
+
+    private func setGradient(_ value: Int, for group: String) {
+        groupGradients[group] = value
+        guard let data = try? JSONEncoder().encode(groupGradients),
+              let raw = String(data: data, encoding: .utf8) else { return }
+        gradientStorage = raw
     }
 }
 
@@ -389,21 +451,31 @@ private struct GroupHeaderRow: View {
     let canTest: Bool
     let isRuntimeAvailable: Bool
     let canToggle: Bool
+    let gradientIndex: Int
     let onToggle: () -> Void
     let onTest: () -> Void
+    let onGradient: (Int) -> Void
 
     @ViewBuilder
     var body: some View {
         if dynamicTypeSize.isAccessibilitySize {
             VStack(alignment: .trailing, spacing: 6) {
                 toggleButton
-                testButton
+                if isExpanded { testButton }
             }
+            .padding(.horizontal, 10)
+            .background(GroupGradient.background(for: gradientIndex))
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         } else {
             HStack(spacing: 4) {
                 toggleButton
-                testButton
+                if isExpanded {
+                    testButton
+                }
             }
+            .padding(.horizontal, 10)
+            .background(GroupGradient.background(for: gradientIndex))
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         }
     }
 
@@ -423,6 +495,19 @@ private struct GroupHeaderRow: View {
                     .animation(.easeInOut(duration: 0.16), value: isExpanded)
             }
             .contentShape(Rectangle())
+            .padding(.vertical, 8)
+            .contextMenu {
+                Menu("分组背景") {
+                    ForEach(Array(GroupGradient.presets.enumerated()), id: \.offset) { index, _ in
+                        Button {
+                            onGradient(index)
+                        } label: {
+                            Label(index == 0 ? "默认" : "渐变 \(index)",
+                                  systemImage: index == gradientIndex ? "checkmark" : "paintpalette")
+                        }
+                    }
+                }
+            }
         }
         .buttonStyle(.plain)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -441,22 +526,15 @@ private struct GroupHeaderRow: View {
                     .font(.headline)
                     .foregroundStyle(.primary)
                     .lineLimit(2)
-                metadata
             } else {
-                HStack(spacing: 5) {
-                    Text(group.name)
-                        .font(.headline)
-                        .foregroundStyle(.primary)
-                        .lineLimit(1)
-                        .layoutPriority(1)
-                    metadata
-                }
+                Text(group.name)
+                    .font(.headline)
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .layoutPriority(1)
             }
 
             HStack(spacing: 5) {
-                Image(systemName: group.selectable ? "hand.tap" : "gearshape")
-                    .font(.caption2.weight(.medium))
-                    .foregroundStyle(Color.accentColor)
                 Text(group.now.isEmpty ? "未选择" : group.now)
                     .lineLimit(dynamicTypeSize.isAccessibilitySize ? 2 : 1)
             }
@@ -464,16 +542,6 @@ private struct GroupHeaderRow: View {
             .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    private var metadata: some View {
-        Text("\(group.displayType) · \(group.all.count)")
-            .font(.caption2.weight(.medium))
-            .foregroundStyle(.secondary)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
-            .background(Capsule().fill(Color.accentColor.opacity(0.08)))
-            .lineLimit(1)
     }
 
     private var testButton: some View {
@@ -489,38 +557,11 @@ private struct GroupHeaderRow: View {
     }
 
     private var testLabel: some View {
-        HStack(spacing: 5) {
-            if isTesting {
-                ProgressView()
-                    .controlSize(.mini)
-                    .tint(testTint)
-            } else {
-                Image(systemName: "speedometer")
-                    .font(.system(size: 11, weight: .semibold))
-            }
-
-            Text(testStatusText)
-                .font(.caption.monospacedDigit().weight(.semibold))
-                .lineLimit(1)
-                .minimumScaleFactor(0.8)
-        }
-        .foregroundStyle(testTint)
-        .frame(width: testButtonWidth, height: 28)
-        .background(Capsule().fill(testTint.opacity(0.12)))
-        .overlay(Capsule().stroke(testTint.opacity(0.22), lineWidth: 0.5))
-        .frame(width: testButtonWidth, height: 44)
-        .contentShape(Rectangle())
-    }
-
-    private var testButtonWidth: CGFloat {
-        if dynamicTypeSize.isAccessibilitySize { return 124 }
-        if dynamicTypeSize == .xxLarge || dynamicTypeSize == .xxxLarge { return 96 }
-        return 84
-    }
-
-    private var testStatusText: String {
-        if isTesting { return "测速中" }
-        return currentDelay == nil ? "测速" : DelayBadge.shortText(currentDelay)
+        Image(systemName: isTesting ? "hourglass" : "speedometer")
+            .font(.system(size: 14, weight: .semibold))
+            .foregroundStyle(testTint)
+            .frame(width: 44, height: 44)
+            .contentShape(Rectangle())
     }
 
     private var testTint: Color {
@@ -532,6 +573,21 @@ private struct GroupHeaderRow: View {
         let current = group.now.isEmpty ? "未选择节点" : "当前节点 \(group.now)"
         let state = canToggle ? (isExpanded ? "已展开" : "已折叠") : "搜索结果"
         return "\(group.displayType)，\(group.all.count) 个节点，\(current)，\(DelayBadge.accessibilityText(currentDelay))，\(state)"
+    }
+}
+
+private enum GroupGradient {
+    static let presets: [[Color]] = [
+        [.clear, .clear],
+        [Color.blue.opacity(0.18), Color.cyan.opacity(0.05)],
+        [Color.purple.opacity(0.18), Color.pink.opacity(0.06)],
+        [Color.orange.opacity(0.18), Color.yellow.opacity(0.06)],
+        [Color.green.opacity(0.18), Color.mint.opacity(0.06)],
+    ]
+
+    static func background(for index: Int) -> LinearGradient {
+        let colors = presets.indices.contains(index) ? presets[index] : presets[0]
+        return LinearGradient(colors: colors, startPoint: .topLeading, endPoint: .bottomTrailing)
     }
 }
 
@@ -644,64 +700,84 @@ private struct ProxyNodeListRow: View {
     }
 }
 
-private struct ProxyNodeGridCell: View {
-    let node: String
-    let isCurrent: Bool
-    let isSelecting: Bool
-    let isSelectionBlocked: Bool
-    let selectable: Bool
-    let delay: Int?
-    let detail: String?
-    let onSelect: () -> Void
+private struct GroupGridCard: View {
+    let group: ProxyGroup
+    let isExpanded: Bool
+    let isTesting: Bool
+    let currentDelay: Int?
+    let canTest: Bool
+    let selecting: String?
+    let delays: [String: Int]
+    let details: [String: String]
+    let gradientIndex: Int
+    let onToggle: () -> Void
+    let onTest: () -> Void
+    let onGradient: (Int) -> Void
+    let onSelect: (String) -> Void
 
     var body: some View {
-        Button(action: onSelect) {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(alignment: .top, spacing: 6) {
-                    Text(node)
-                        .font(.subheadline.weight(isCurrent ? .semibold : .medium))
-                        .foregroundStyle(.primary)
-                        .lineLimit(2)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-
-                    if isSelecting {
-                        ProgressView().controlSize(.mini)
-                    } else if isCurrent {
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundStyle(Color.accentColor)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Button(action: onToggle) {
+                    HStack(spacing: 8) {
+                        GroupIcon(url: group.icon)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(group.name).font(.headline).lineLimit(1)
+                            Text(group.now.isEmpty ? "未选择" : group.now)
+                                .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        }
                     }
                 }
+                .buttonStyle(.plain)
+                .frame(maxWidth: .infinity, alignment: .leading)
 
-                if let detail, !detail.isEmpty {
-                    Text(detail)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                if isExpanded {
+                    Button(action: onTest) {
+                        Image(systemName: isTesting ? "hourglass" : "speedometer")
+                            .frame(width: 36, height: 36)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(Color.accentColor)
+                    .disabled(isTesting || !canTest)
+                    .accessibilityLabel("测试\(group.name)延迟")
                 }
+            }
 
-                DelayBadge(delay: delay)
+            if isExpanded {
+                ForEach(group.nodes) { item in
+                    Button { onSelect(item.name) } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: item.name == group.now ? "checkmark.circle.fill" : "circle")
+                                .foregroundStyle(item.name == group.now ? Color.accentColor : .secondary)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(item.name).font(.subheadline).lineLimit(1)
+                                Text(details[item.name] ?? "未知协议")
+                                    .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                            }
+                            Spacer(minLength: 4)
+                            DelayBadge(delay: delays[item.name])
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(!group.selectable || item.name == group.now || selecting != nil)
+                }
             }
-            .frame(maxWidth: .infinity, minHeight: 76, alignment: .topLeading)
-            .padding(10)
-            .background(isCurrent ? Color.accentColor.opacity(0.09) : Color(uiColor: .secondarySystemGroupedBackground))
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .stroke(isCurrent ? Color.accentColor.opacity(0.3) : Color.secondary.opacity(0.12),
-                            lineWidth: 1)
-            }
-            .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
-        .disabled(!selectable || isCurrent || isSelectionBlocked)
-        .accessibilityLabel(node)
-        .accessibilityValue([
-            isCurrent ? "当前节点" : nil,
-            detail?.isEmpty == false ? detail : nil,
-            DelayBadge.accessibilityText(delay),
-            selectable ? nil : "由策略组自动选择",
-        ].compactMap { $0 }.joined(separator: "，"))
-        .accessibilityAddTraits(isCurrent ? .isSelected : [])
+        .padding(12)
+        .background(GroupGradient.background(for: gradientIndex))
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .contextMenu {
+            Menu("分组背景") {
+                ForEach(Array(GroupGradient.presets.enumerated()), id: \.offset) { index, _ in
+                    Button {
+                        onGradient(index)
+                    } label: {
+                        Label(index == 0 ? "默认" : "渐变 \(index)",
+                              systemImage: index == gradientIndex ? "checkmark" : "paintpalette")
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -719,10 +795,7 @@ private struct ProxyNodeRow: View {
         if dynamicTypeSize.isAccessibilitySize {
             HStack(alignment: .top, spacing: 10) {
                 marker
-                VStack(alignment: .leading, spacing: 5) {
-                    labels
-                    DelayBadge(delay: delay)
-                }
+                labels
             }
             .frame(minHeight: 44)
             .contentShape(Rectangle())
@@ -730,8 +803,6 @@ private struct ProxyNodeRow: View {
             HStack(spacing: 10) {
                 marker
                 labels
-                Spacer(minLength: 8)
-                DelayBadge(delay: delay)
             }
             .frame(minHeight: 44)
             .contentShape(Rectangle())
@@ -763,13 +834,16 @@ private struct ProxyNodeRow: View {
                 .foregroundStyle(.primary)
                 .lineLimit(dynamicTypeSize.isAccessibilitySize ? 3 : 2)
                 .fixedSize(horizontal: false, vertical: true)
-            if let detail, !detail.isEmpty {
-                Text(detail)
+            HStack(spacing: 8) {
+                Text(detail?.isEmpty == false ? detail! : "未知协议")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .lineLimit(dynamicTypeSize.isAccessibilitySize ? 2 : 1)
+                Spacer(minLength: 4)
+                DelayBadge(delay: delay)
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 

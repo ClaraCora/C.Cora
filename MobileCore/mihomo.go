@@ -18,7 +18,6 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"runtime/debug"
 	"sort"
@@ -27,6 +26,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/dlclark/regexp2"
 	"github.com/metacubex/mihomo/adapter/inbound"
 	"github.com/metacubex/mihomo/adapter/outboundgroup"
 	"github.com/metacubex/mihomo/common/utils"
@@ -1494,7 +1494,15 @@ func OfflineProxySnapshot(configYAML, providerPayloadsJSON, selectionsJSON strin
 			continue
 		}
 		explicitMembers := stringList(group["proxies"])
-		members := append([]string{}, explicitMembers...)
+		members := make([]string, 0, len(explicitMembers))
+		for _, member := range explicitMembers {
+			if providerMembers, isProvider := providerNodes[member]; isProvider {
+				members = append(members,
+					filterOfflineNames(providerMembers, group, inlineTypes, providerNodeTypes)...)
+				continue
+			}
+			members = append(members, member)
+		}
 		uses := stringList(group["use"])
 		if include, _ := group["include-all"].(bool); include {
 			group["include-all-proxies"] = true
@@ -1511,8 +1519,7 @@ func OfflineProxySnapshot(configYAML, providerPayloadsJSON, selectionsJSON strin
 		for _, providerName := range uses {
 			providerMembers = append(providerMembers, providerNodes[providerName]...)
 		}
-		members = append(members,
-			filterOfflineNames(providerMembers, group, inlineTypes, providerNodeTypes)...)
+		members = append(members, filterOfflineNames(providerMembers, group, inlineTypes, providerNodeTypes)...)
 		members = uniqueStrings(members)
 		typ, _ := group["type"].(string)
 		icon, _ := group["icon"].(string)
@@ -1590,7 +1597,7 @@ func filterOfflineProxies(proxies []map[string]any, definition map[string]any) [
 		name, _ := proxy["name"].(string)
 		typ, _ := proxy["type"].(string)
 		lowerType := strings.ToLower(typ)
-		if include != nil && !include.MatchString(name) || exclude != nil && exclude.MatchString(name) {
+		if len(include) > 0 && !matchesAnyRegex(include, name) || matchesAnyRegex(exclude, name) {
 			continue
 		}
 		if len(includeTypes) > 0 && !includeTypes[lowerType] || excludeTypes[lowerType] {
@@ -1612,7 +1619,7 @@ func filterOfflineNames(names []string, group map[string]any, inlineTypes, provi
 		if typ == "" {
 			typ = strings.ToLower(providerTypes[name])
 		}
-		if include != nil && !include.MatchString(name) || exclude != nil && exclude.MatchString(name) {
+		if len(include) > 0 && !matchesAnyRegex(include, name) || matchesAnyRegex(exclude, name) {
 			continue
 		}
 		if len(includeTypes) > 0 && typ != "" && !includeTypes[typ] || (typ != "" && excludeTypes[typ]) {
@@ -1623,14 +1630,30 @@ func filterOfflineNames(names []string, group map[string]any, inlineTypes, provi
 	return out
 }
 
-func compileOptionalRegex(value any) *regexp.Regexp {
+func compileOptionalRegex(value any) []*regexp2.Regexp {
 	pattern, _ := value.(string)
 	if strings.TrimSpace(pattern) == "" {
 		return nil
 	}
-	pattern = strings.ReplaceAll(pattern, "`", "|")
-	compiled, _ := regexp.Compile(pattern)
+	patterns := strings.Split(pattern, "`")
+	compiled := make([]*regexp2.Regexp, 0, len(patterns))
+	for _, part := range patterns {
+		regex, err := regexp2.Compile(part, regexp2.None)
+		if err != nil {
+			return nil
+		}
+		compiled = append(compiled, regex)
+	}
 	return compiled
+}
+
+func matchesAnyRegex(patterns []*regexp2.Regexp, value string) bool {
+	for _, pattern := range patterns {
+		if matched, _ := pattern.MatchString(value); matched {
+			return true
+		}
+	}
+	return false
 }
 
 func lowerStringSet(value any) map[string]bool {

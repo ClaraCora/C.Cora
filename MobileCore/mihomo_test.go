@@ -121,6 +121,70 @@ rules:
 	}
 }
 
+func TestOfflineProxySnapshotExpandsProviderNamedInProxies(t *testing.T) {
+	configYAML := `
+proxy-providers:
+  airport:
+    type: http
+    url: https://example.com/provider.yaml
+proxy-groups:
+  - name: HK
+    type: select
+    proxies: [airport]
+    filter: HK
+  - name: US
+    type: select
+    proxies: [airport]
+    filter: US
+`
+	payloads, _ := json.Marshal(map[string]string{
+		"airport": `proxies:
+  - {name: HK One, type: ss, server: hk.example, port: 443, cipher: aes-128-gcm, password: test}
+  - {name: US One, type: ss, server: us.example, port: 443, cipher: aes-128-gcm, password: test}
+`,
+	})
+	var got struct {
+		Proxies map[string]map[string]any `json:"proxies"`
+	}
+	if err := json.Unmarshal([]byte(OfflineProxySnapshot(configYAML, string(payloads), "{}")), &got); err != nil {
+		t.Fatal(err)
+	}
+	for group, want := range map[string]string{"HK": "HK One", "US": "US One"} {
+		all, _ := got.Proxies[group]["all"].([]any)
+		if fmt.Sprint(all) != fmt.Sprintf("[%s]", want) {
+			t.Fatalf("%s members = %v, want [%s]", group, all, want)
+		}
+	}
+}
+
+func TestOfflineProxySnapshotUsesMihomoRegexSyntax(t *testing.T) {
+	configYAML := `
+proxy-providers:
+  airport: {type: http, url: https://example.com/provider.yaml}
+proxy-groups:
+  - name: HK
+    type: select
+    use: [airport]
+    filter: "(?<=HK )One"
+`
+	payloads, _ := json.Marshal(map[string]string{
+		"airport": `proxies:
+  - {name: HK One, type: ss, server: hk.example, port: 443, cipher: aes-128-gcm, password: test}
+  - {name: HK Two, type: ss, server: hk2.example, port: 443, cipher: aes-128-gcm, password: test}
+`,
+	})
+	var got struct {
+		Proxies map[string]map[string]any `json:"proxies"`
+	}
+	if err := json.Unmarshal([]byte(OfflineProxySnapshot(configYAML, string(payloads), "{}")), &got); err != nil {
+		t.Fatal(err)
+	}
+	all, _ := got.Proxies["HK"]["all"].([]any)
+	if fmt.Sprint(all) != "[HK One]" {
+		t.Fatalf("members = %v, want [HK One]", all)
+	}
+}
+
 func TestMergeConfigBlocksKnownSTUNWithoutBlockingDirectUDP(t *testing.T) {
 	settings := appSettings{Stack: "gvisor", LogLevel: "info", BlockDirectSTUN: true}
 	m := mergedMapWithSettings(t, `
