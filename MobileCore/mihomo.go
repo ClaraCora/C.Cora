@@ -320,6 +320,7 @@ type appSettings struct {
 	SystemDNS         []string               `json:"systemDNS"`
 	ApplyOverrides    bool                   `json:"applyOverrides"`
 	Overrides         configOverrideSettings `json:"overrides"`
+	ProxySelections   map[string]string      `json:"proxySelections"`
 }
 
 type configOverrideSettings struct {
@@ -577,6 +578,11 @@ func StartWithConfig(fd int, tunnelMTU int, configYAML string, settingsJSON stri
 	if resetError != nil {
 		appendRunLog("run.log 重置失败: " + resetError.Error())
 	}
+	for group, name := range st.ProxySelections {
+		if strings.TrimSpace(group) != "" && strings.TrimSpace(name) != "" {
+			cachefile.Cache().SetSelected(group, name)
+		}
+	}
 
 	if err := applyRuntimeConfig(fd, tunnelMTU, configYAML, st); err != nil {
 		return err
@@ -615,6 +621,22 @@ func applyRuntimeConfig(fd int, tunnelMTU int, configYAML string, st appSettings
 
 	appendRunLog("启动 ParseRawConfig 成功，开始 ApplyConfig")
 	executor.ApplyConfig(cfg, true)
+	for group, name := range st.ProxySelections {
+		proxy, exists := tunnel.Proxies()[group]
+		if !exists {
+			appendRunLog(fmt.Sprintf("跳过已失效的离线选择：%s -> %s（策略组不存在）", group, name))
+			continue
+		}
+		selector, ok := proxy.Adapter().(outboundgroup.SelectAble)
+		if !ok {
+			continue
+		}
+		if err := selector.Set(name); err != nil {
+			appendRunLog(fmt.Sprintf("跳过已失效的离线选择：%s -> %s（%v）", group, name, err))
+			continue
+		}
+		cachefile.Cache().SetSelected(group, name)
+	}
 	activeDNSConfig = cfg.DNS
 	activeGeneralIPv6 = cfg.General.IPv6
 	activeSystemDNS = append(activeSystemDNS[:0], st.SystemDNS...)
@@ -1401,7 +1423,7 @@ func UpdateProxyProviders() string {
 // OfflineProxySnapshot builds the subset of /proxies consumed by the App from
 // saved YAML and cached provider payloads. It is safe in the main App process:
 // no config.ParseRawConfig, provider initialization or network access occurs.
-func OfflineProxySnapshot(configYAML, providerPayloadsJSON string) string {
+func OfflineProxySnapshot(configYAML, providerPayloadsJSON, selectionsJSON string) string {
 	var raw map[string]any
 	if err := yaml.Unmarshal([]byte(configYAML), &raw); err != nil {
 		return marshalJSON(map[string]any{"proxies": map[string]any{}, "details": map[string]string{}, "mode": "rule", "error": err.Error()})
@@ -1425,6 +1447,8 @@ func OfflineProxySnapshot(configYAML, providerPayloadsJSON string) string {
 
 	providerPayloads := map[string]string{}
 	_ = json.Unmarshal([]byte(providerPayloadsJSON), &providerPayloads)
+	selections := map[string]string{}
+	_ = json.Unmarshal([]byte(selectionsJSON), &selections)
 	providerDefinitions, _ := raw["proxy-providers"].(map[string]any)
 	providerNames := make([]string, 0, len(providerDefinitions))
 	for name := range providerDefinitions {
@@ -1492,8 +1516,14 @@ func OfflineProxySnapshot(configYAML, providerPayloadsJSON string) string {
 		members = uniqueStrings(members)
 		typ, _ := group["type"].(string)
 		icon, _ := group["icon"].(string)
+		now := ""
+		if selected := selections[name]; strings.EqualFold(typ, "select") && containsString(members, selected) {
+			now = selected
+		} else if strings.EqualFold(typ, "select") && len(members) > 0 {
+			now = members[0]
+		}
 		groups[name] = map[string]any{
-			"type": offlineGroupType(typ), "now": "", "all": members, "icon": icon,
+			"type": offlineGroupType(typ), "now": now, "all": members, "icon": icon,
 		}
 		groupNames = append(groupNames, name)
 	}
@@ -1504,8 +1534,14 @@ func OfflineProxySnapshot(configYAML, providerPayloadsJSON string) string {
 		globalMembers = append(globalMembers, providerNodes[providerName]...)
 	}
 	globalMembers = uniqueStrings(globalMembers)
+	globalNow := ""
+	if selected := selections["GLOBAL"]; containsString(globalMembers, selected) {
+		globalNow = selected
+	} else if len(globalMembers) > 0 {
+		globalNow = globalMembers[0]
+	}
 	groups["GLOBAL"] = map[string]any{
-		"type": "Selector", "now": "", "all": globalMembers, "icon": "",
+		"type": "Selector", "now": globalNow, "all": globalMembers, "icon": "",
 	}
 	mode, _ := raw["mode"].(string)
 	if mode == "" {
@@ -1513,8 +1549,17 @@ func OfflineProxySnapshot(configYAML, providerPayloadsJSON string) string {
 	}
 	return marshalJSON(map[string]any{
 		"proxies": groups, "details": details, "mode": strings.ToLower(mode),
-		"missingProviders": missingProviders,
+		"missingProviders": missingProviders, "nodeCount": len(details),
 	})
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 func parseProviderPayload(payload string) ([]map[string]any, error) {

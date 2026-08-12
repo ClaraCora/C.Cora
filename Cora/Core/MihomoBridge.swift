@@ -27,8 +27,9 @@ enum MihomoCore {
     }
 
     static func offlineProxySnapshot(configYAML: String,
-                                     providerPayloadsJSON: String) -> Data {
-        Data(MihomoOfflineProxySnapshot(configYAML, providerPayloadsJSON).utf8)
+                                     providerPayloadsJSON: String,
+                                     selectionsJSON: String) -> Data {
+        Data(MihomoOfflineProxySnapshot(configYAML, providerPayloadsJSON, selectionsJSON).utf8)
     }
 
 }

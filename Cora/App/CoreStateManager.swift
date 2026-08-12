@@ -118,7 +118,8 @@ final class CoreStateManager: ObservableObject {
             // App 主动连接时明确下发配置意图：nil=使用内建 DIRECT，不复活旧订阅缓存。
             let settings = SettingsStore.shared.asJSON(
                 geoAvailable: AppGroup.containerURL != nil,
-                applyOverrides: SubscriptionStore.shared.activeOverridesEnabled)
+                applyOverrides: SubscriptionStore.shared.activeOverridesEnabled,
+                proxySelections: SubscriptionStore.shared.activeProxySelections)
             let s = SettingsStore.shared
             let opts = TunnelManager.ProtocolOptions(
                 includeAllNetworks: s.includeAllNetworks,

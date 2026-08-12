@@ -119,7 +119,9 @@ final class SettingsStore: ObservableObject {
     }
 
     /// 序列化为下发给 NE 的 JSON。
-    func asJSON(geoAvailable: Bool = true, applyOverrides: Bool = true) -> String {
+    func asJSON(geoAvailable: Bool = true,
+                applyOverrides: Bool = true,
+                proxySelections: [String: String] = [:]) -> String {
         let dict: [String: Any] = [
             "stack": stack,
             "ipv6": ipv6,
@@ -135,6 +137,7 @@ final class SettingsStore: ObservableObject {
             "logLevel": logLevel,
             "mixedPort": mixedPort,
             "blockDirectSTUN": blockDirectSTUN,
+            "proxySelections": proxySelections,
             "applyOverrides": applyOverrides,
             "overrides": ConfigOverrideStore.shared.asDictionary(),
         ]

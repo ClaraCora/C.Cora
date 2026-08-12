@@ -19,12 +19,14 @@ struct Subscription: Identifiable, Codable, Equatable, Sendable {
     var expire: Date?
     var autoNamed: Bool       // 名称是否自动获取（用户没手填时才自动覆盖）
     var overrideEnabled: Bool // 是否应用全局固定覆写设置
+    var proxySelections: [String: String] // 离线选择，下次连接时恢复
 
     init(id: UUID = UUID(), name: String, url: String, yaml: String = "",
          updatedAt: Date? = nil, nodeCount: Int = 0,
          upload: Int64 = 0, download: Int64 = 0, total: Int64 = 0,
          expire: Date? = nil, autoNamed: Bool = false,
-         overrideEnabled: Bool = false) {
+         overrideEnabled: Bool = false,
+         proxySelections: [String: String] = [:]) {
         self.id = id
         self.name = name
         self.url = url
@@ -37,6 +39,7 @@ struct Subscription: Identifiable, Codable, Equatable, Sendable {
         self.expire = expire
         self.autoNamed = autoNamed
         self.overrideEnabled = overrideEnabled
+        self.proxySelections = proxySelections
     }
 
     var used: Int64 { upload + download }
@@ -64,7 +67,7 @@ struct Subscription: Identifiable, Codable, Equatable, Sendable {
     // 容错解码：旧版 subscriptions.json 没有新字段，缺失时给默认值，避免整体解码失败丢订阅。
     enum CodingKeys: String, CodingKey {
         case id, name, url, yaml, updatedAt, nodeCount, upload, download, total, expire, autoNamed
-        case overrideEnabled
+        case overrideEnabled, proxySelections
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -80,6 +83,8 @@ struct Subscription: Identifiable, Codable, Equatable, Sendable {
         expire = try c.decodeIfPresent(Date.self, forKey: .expire)
         autoNamed = try c.decodeIfPresent(Bool.self, forKey: .autoNamed) ?? false
         overrideEnabled = try c.decodeIfPresent(Bool.self, forKey: .overrideEnabled) ?? false
+        proxySelections = try c.decodeIfPresent([String: String].self,
+                                                forKey: .proxySelections) ?? [:]
     }
 }
 
@@ -128,6 +133,10 @@ final class SubscriptionStore: ObservableObject {
 
     var activeOverridesEnabled: Bool {
         selected?.overrideEnabled ?? false
+    }
+
+    var activeProxySelections: [String: String] {
+        selected?.proxySelections ?? [:]
     }
 
     var hasRemoteSubscriptions: Bool {
@@ -253,6 +262,13 @@ final class SubscriptionStore: ObservableObject {
         save()
     }
 
+    func selectProxyOffline(subscriptionID: UUID, group: String, name: String) {
+        guard let index = subscriptions.firstIndex(where: { $0.id == subscriptionID }),
+              subscriptions[index].proxySelections[group] != name else { return }
+        subscriptions[index].proxySelections[group] = name
+        save()
+    }
+
     /// 重新拉取某订阅的配置 YAML。
     func refresh(_ id: UUID) async {
         guard let idx = subscriptions.firstIndex(where: { $0.id == id }) else { return }
@@ -366,6 +382,7 @@ final class SubscriptionStore: ObservableObject {
             }
             if downloaded > 0 {
                 try Self.saveProviderCache(cached, id: id)
+                updateNodeCount(id, providerPayloads: cached)
                 providerCacheRevision &+= 1
             }
         } catch {
@@ -379,6 +396,22 @@ final class SubscriptionStore: ObservableObject {
         guard let data = try? JSONEncoder().encode(cache),
               let json = String(data: data, encoding: .utf8) else { return "{}" }
         return json
+    }
+
+    private func updateNodeCount(_ id: UUID, providerPayloads: [String: String]) {
+        guard let index = subscriptions.firstIndex(where: { $0.id == id }),
+              let payloadData = try? JSONEncoder().encode(providerPayloads),
+              let payloadJSON = String(data: payloadData, encoding: .utf8),
+              let selectionData = try? JSONEncoder().encode(subscriptions[index].proxySelections),
+              let selectionJSON = String(data: selectionData, encoding: .utf8) else { return }
+        let data = MihomoCore.offlineProxySnapshot(configYAML: subscriptions[index].yaml,
+                                                   providerPayloadsJSON: payloadJSON,
+                                                   selectionsJSON: selectionJSON)
+        guard let response = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              response["error"] == nil,
+              let count = response["nodeCount"] as? Int else { return }
+        subscriptions[index].nodeCount = count
+        save()
     }
 
     // MARK: - 校验/统计

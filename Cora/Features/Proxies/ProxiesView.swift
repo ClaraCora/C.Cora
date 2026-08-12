@@ -8,14 +8,28 @@ struct ProxiesView: View {
     @StateObject private var controller = ProxyController()
     @State private var expanded: Set<String> = []
     @State private var searchText = ""
+    @State private var isSearchPresented = false
+    @AppStorage("proxyNodeLayout") private var layoutRawValue = ProxyNodeLayout.list.rawValue
 
     var body: some View {
         NavigationStack {
             navigationContent
-                .navigationTitle("节点")
+                .navigationTitle("")
+                .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
-                    if canRefresh {
-                        ToolbarItem(placement: .topBarTrailing) {
+                    if showsSearch || canRefresh {
+                        ToolbarItemGroup(placement: .topBarTrailing) {
+                            if showsSearch {
+                                layoutMenu
+
+                                Button {
+                                    isSearchPresented = true
+                                } label: {
+                                    Image(systemName: "magnifyingglass")
+                                }
+                                .accessibilityLabel("搜索节点")
+                                .help("搜索节点")
+                            }
                             refreshControl
                         }
                     }
@@ -33,7 +47,8 @@ struct ProxiesView: View {
         if showsSearch {
             content
                 .searchable(text: $searchText,
-                            placement: .navigationBarDrawer(displayMode: .always),
+                            isPresented: $isSearchPresented,
+                            placement: .navigationBarDrawer(displayMode: .automatic),
                             prompt: "搜索策略组或节点")
         } else {
             content
@@ -46,6 +61,23 @@ struct ProxiesView: View {
 
     private var showsSearch: Bool {
         canRefresh && !controller.groups.isEmpty
+    }
+
+    private var nodeLayout: ProxyNodeLayout {
+        ProxyNodeLayout(rawValue: layoutRawValue) ?? .list
+    }
+
+    private var layoutMenu: some View {
+        Menu {
+            Picker("节点布局", selection: $layoutRawValue) {
+                Label("列表", systemImage: "list.bullet").tag(ProxyNodeLayout.list.rawValue)
+                Label("网格", systemImage: "square.grid.2x2").tag(ProxyNodeLayout.grid.rawValue)
+            }
+        } label: {
+            Image(systemName: nodeLayout.systemImage)
+        }
+        .accessibilityLabel("切换节点布局")
+        .help("切换节点布局")
     }
 
     @ViewBuilder private var content: some View {
@@ -96,8 +128,8 @@ struct ProxiesView: View {
         return List {
             if !controller.isRuntimeAvailable {
                 Section {
-                    Label("VPN 未连接，当前显示已保存配置；节点切换和测速暂不可用。",
-                          systemImage: "eye")
+                    Label("VPN 未连接。选择会保存，并在下次连接时生效；测速需连接后使用。",
+                          systemImage: "checkmark.circle")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -150,7 +182,7 @@ struct ProxiesView: View {
                                 .frame(maxWidth: .infinity, minHeight: 40, alignment: .leading)
                                 .listRowInsets(EdgeInsets(top: 4, leading: 46, bottom: 4, trailing: 14))
                                 .listRowSeparator(.hidden)
-                        } else {
+                        } else if nodeLayout == .list {
                             ForEach(result.nodes) { item in
                                 let selectingNode = controller.selecting[result.group.name]
                                 ProxyNodeListRow(
@@ -158,8 +190,8 @@ struct ProxiesView: View {
                                     isCurrent: item.name == result.group.now,
                                     isSelecting: selectingNode == item.name,
                                     isSelectionBlocked: selectingNode != nil,
-                                    selectable: controller.isRuntimeAvailable && result.group.selectable,
-                                    isReadOnly: !controller.isRuntimeAvailable,
+                                    selectable: result.group.selectable,
+                                    isReadOnly: !controller.isRuntimeAvailable && !result.group.selectable,
                                     delay: controller.delays[item.name],
                                     detail: controller.details[item.name],
                                     onSelect: {
@@ -186,6 +218,32 @@ struct ProxiesView: View {
                                     }
                                 }
                             }
+                        } else if result.isExpanded {
+                            LazyVGrid(columns: [
+                                GridItem(.flexible(), spacing: 10),
+                                GridItem(.flexible(), spacing: 10),
+                            ], spacing: 10) {
+                                ForEach(result.nodes) { item in
+                                    let selectingNode = controller.selecting[result.group.name]
+                                    ProxyNodeGridCell(
+                                        node: item.name,
+                                        isCurrent: item.name == result.group.now,
+                                        isSelecting: selectingNode == item.name,
+                                        isSelectionBlocked: selectingNode != nil,
+                                        selectable: result.group.selectable,
+                                        delay: controller.delays[item.name],
+                                        detail: controller.details[item.name],
+                                        onSelect: {
+                                            Task {
+                                                await controller.select(group: result.group.name,
+                                                                        name: item.name)
+                                            }
+                                        })
+                                }
+                            }
+                            .padding(.vertical, 4)
+                            .listRowInsets(EdgeInsets(top: 4, leading: 14, bottom: 10, trailing: 14))
+                            .listRowSeparator(.hidden)
                         }
                     }
                 }
@@ -250,6 +308,15 @@ struct ProxiesView: View {
 
     private func reload() async {
         await controller.load()
+    }
+}
+
+private enum ProxyNodeLayout: String {
+    case list
+    case grid
+
+    var systemImage: String {
+        self == .list ? "list.bullet" : "square.grid.2x2"
     }
 }
 
@@ -387,7 +454,7 @@ private struct GroupHeaderRow: View {
             }
 
             HStack(spacing: 5) {
-                Image(systemName: isRuntimeAvailable && group.selectable ? "hand.tap" : "gearshape")
+                Image(systemName: group.selectable ? "hand.tap" : "gearshape")
                     .font(.caption2.weight(.medium))
                     .foregroundStyle(Color.accentColor)
                 Text(group.now.isEmpty ? "未选择" : group.now)
@@ -574,6 +641,67 @@ private struct ProxyNodeListRow: View {
         ]
         .compactMap { $0 }
         .joined(separator: "，")
+    }
+}
+
+private struct ProxyNodeGridCell: View {
+    let node: String
+    let isCurrent: Bool
+    let isSelecting: Bool
+    let isSelectionBlocked: Bool
+    let selectable: Bool
+    let delay: Int?
+    let detail: String?
+    let onSelect: () -> Void
+
+    var body: some View {
+        Button(action: onSelect) {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(alignment: .top, spacing: 6) {
+                    Text(node)
+                        .font(.subheadline.weight(isCurrent ? .semibold : .medium))
+                        .foregroundStyle(.primary)
+                        .lineLimit(2)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+
+                    if isSelecting {
+                        ProgressView().controlSize(.mini)
+                    } else if isCurrent {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(Color.accentColor)
+                    }
+                }
+
+                if let detail, !detail.isEmpty {
+                    Text(detail)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
+                DelayBadge(delay: delay)
+            }
+            .frame(maxWidth: .infinity, minHeight: 76, alignment: .topLeading)
+            .padding(10)
+            .background(isCurrent ? Color.accentColor.opacity(0.09) : Color(uiColor: .secondarySystemGroupedBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(isCurrent ? Color.accentColor.opacity(0.3) : Color.secondary.opacity(0.12),
+                            lineWidth: 1)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!selectable || isCurrent || isSelectionBlocked)
+        .accessibilityLabel(node)
+        .accessibilityValue([
+            isCurrent ? "当前节点" : nil,
+            detail?.isEmpty == false ? detail : nil,
+            DelayBadge.accessibilityText(delay),
+            selectable ? nil : "由策略组自动选择",
+        ].compactMap { $0 }.joined(separator: "，"))
+        .accessibilityAddTraits(isCurrent ? .isSelected : [])
     }
 }
 

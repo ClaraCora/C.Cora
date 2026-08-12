@@ -112,9 +112,11 @@ final class ProxyController: ObservableObject {
         } else if let subscription = SubscriptionStore.shared.selected,
                   !subscription.yaml.isEmpty {
             let providerJSON = SubscriptionStore.shared.providerPayloadsJSON(for: subscription.id)
+            let selectionJSON = Self.jsonString(subscription.proxySelections)
             let data = await Task.detached(priority: .userInitiated) {
                 MihomoCore.offlineProxySnapshot(configYAML: subscription.yaml,
-                                                providerPayloadsJSON: providerJSON)
+                                                providerPayloadsJSON: providerJSON,
+                                                selectionsJSON: selectionJSON)
             }.value
             result = .ok(data)
         } else {
@@ -236,9 +238,20 @@ final class ProxyController: ObservableObject {
         selecting = [:]
     }
 
-    /// 在某策略组选定节点（IPC selectProxy）。
+    /// 在某策略组选定节点。连接中走 IPC；断开时保存到订阅，下次连接恢复。
     func select(group: String, name: String) async {
-        guard isRuntimeAvailable, selecting[group] == nil else { return }
+        guard selecting[group] == nil else { return }
+        if !isRuntimeAvailable {
+            guard let subscriptionID = SubscriptionStore.shared.selectedID,
+                  let proxyGroup = groups.first(where: { $0.name == group }),
+                  proxyGroup.selectable,
+                  proxyGroup.all.contains(name) else { return }
+            SubscriptionStore.shared.selectProxyOffline(subscriptionID: subscriptionID,
+                                                        group: group,
+                                                        name: name)
+            await load()
+            return
+        }
         let session = sessionGeneration
         error = nil
         selecting[group] = name
@@ -255,6 +268,11 @@ final class ProxyController: ObservableObject {
         case .ok(let data):
             let resp = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
             if (resp?["ok"] as? Bool) == true {
+                if let subscriptionID = SubscriptionStore.shared.selectedID {
+                    SubscriptionStore.shared.selectProxyOffline(subscriptionID: subscriptionID,
+                                                                group: group,
+                                                                name: name)
+                }
                 await load()
             } else {
                 self.error = "切换失败：\((resp?["error"] as? String) ?? "未知错误")"
@@ -262,6 +280,12 @@ final class ProxyController: ObservableObject {
         case .failure(let reason):
             self.error = "切换失败：\(reason)"
         }
+    }
+
+    nonisolated private static func jsonString(_ value: [String: String]) -> String {
+        guard let data = try? JSONEncoder().encode(value),
+              let json = String(data: data, encoding: .utf8) else { return "{}" }
+        return json
     }
 
     /// 对某策略组做延迟测试（IPC groupDelay），结果并入 delays。

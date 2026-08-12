@@ -96,11 +96,12 @@ rules:
 `,
 	})
 	var got struct {
-		Mode    string                    `json:"mode"`
-		Proxies map[string]map[string]any `json:"proxies"`
-		Details map[string]string         `json:"details"`
+		Mode      string                    `json:"mode"`
+		Proxies   map[string]map[string]any `json:"proxies"`
+		Details   map[string]string         `json:"details"`
+		NodeCount int                       `json:"nodeCount"`
 	}
-	if err := json.Unmarshal([]byte(OfflineProxySnapshot(configYAML, string(payloads))), &got); err != nil {
+	if err := json.Unmarshal([]byte(OfflineProxySnapshot(configYAML, string(payloads), `{"Select":"SG One"}`)), &got); err != nil {
 		t.Fatal(err)
 	}
 	group := got.Proxies["Select"]
@@ -109,8 +110,11 @@ rules:
 	if fmt.Sprint(members) != fmt.Sprint(want) {
 		t.Fatalf("members = %v, want %v", members, want)
 	}
-	if group["now"] != "" {
-		t.Fatalf("offline now = %v, want empty", group["now"])
+	if group["now"] != "SG One" {
+		t.Fatalf("offline now = %v, want SG One", group["now"])
+	}
+	if got.NodeCount != 3 {
+		t.Fatalf("nodeCount = %v, want 3", got.NodeCount)
 	}
 	if !strings.Contains(got.Details["HK One"], "VLESS") || got.Mode != "rule" {
 		t.Fatalf("snapshot details/mode = %+v / %q", got.Details, got.Mode)
@@ -905,6 +909,13 @@ func TestParseSettingsNormalizesMixedPort(t *testing.T) {
 	settings = parseSettings(`{"mixedPort": 9090}`)
 	if settings.MixedPort != 9090 {
 		t.Fatalf("mixed port = %d, want 9090", settings.MixedPort)
+	}
+}
+
+func TestParseSettingsIncludesOfflineProxySelections(t *testing.T) {
+	settings := parseSettings(`{"proxySelections":{"Proxy":"HK One"}}`)
+	if got := settings.ProxySelections["Proxy"]; got != "HK One" {
+		t.Fatalf("proxy selection = %q, want HK One", got)
 	}
 }
 
