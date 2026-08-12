@@ -170,7 +170,7 @@ the patch there, and adds a version-qualified temporary `replace` directive.
 An unexpected dependency upgrade or source change fails the build instead of
 silently applying an outdated patch.
 
-On initial startup, MiClash also calls `debug.FreeOSMemory()` after Mihomo
+On initial startup, Cora also calls `debug.FreeOSMemory()` after Mihomo
 applies the configuration. This returns parser and GEO-loading scratch pages.
 Live reloads first drain active connections and force a collection before
 parsing the replacement, then defer the post-apply collection until traffic is

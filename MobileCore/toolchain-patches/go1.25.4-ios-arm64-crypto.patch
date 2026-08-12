@@ -18,7 +18,7 @@ new file mode 100644
 +package cpu
 +
 +func osInit() {
-+	// Go 1.25.4 leaves CPU feature detection empty for GOOS=ios. MiClash
++	// Go 1.25.4 leaves CPU feature detection empty for GOOS=ios. Cora
 +	// targets iOS 17+ iPhones (A12+), which provide these instructions.
 +	ARM64.HasAES = true
 +	ARM64.HasPMULL = true

@@ -1,6 +1,6 @@
 # iOS ARM64 AES-GCM acceleration
 
-MiClash uses Shadowsocks 2022 with ciphers such as
+Cora uses Shadowsocks 2022 with ciphers such as
 `2022-blake3-aes-256-gcm`. Go 1.25.4 does not probe ARM64 CPU features on
 iOS, so its standard-library AES-GCM implementation otherwise falls back to
 generic AES and GHASH code.

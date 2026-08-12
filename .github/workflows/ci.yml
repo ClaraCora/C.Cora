@@ -162,8 +162,8 @@ jobs:
           BUILD_NUMBER="${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
           echo "CFBundleVersion: ${BUILD_NUMBER}"
           xcodebuild \
-            -project MiClash.xcodeproj \
-            -scheme MiClash \
+            -project Cora.xcodeproj \
+            -scheme Cora \
             -configuration Release \
             -destination 'generic/platform=iOS' \
             -derivedDataPath build \
@@ -176,64 +176,64 @@ jobs:
       - name: Package into .ipa (unsigned)
         run: |
           set -euo pipefail
-          APP_PATH="build/Build/Products/Release-iphoneos/MiClash.app"
+          APP_PATH="build/Build/Products/Release-iphoneos/Cora.app"
           if [ ! -d "$APP_PATH" ]; then
             echo "未找到 $APP_PATH"; exit 1
           fi
           rm -rf Payload
           mkdir -p Payload
           cp -R "$APP_PATH" Payload/
-          zip -qr MiClash-unsigned.ipa Payload
-          echo "已生成 MiClash-unsigned.ipa"
+          zip -qr Cora-unsigned.ipa Payload
+          echo "已生成 Cora-unsigned.ipa"
 
       - name: Package TrollStore IPA
         run: |
           set -euo pipefail
-          SOURCE_APP="build/Build/Products/Release-iphoneos/MiClash.app"
-          TS_ROOT="$RUNNER_TEMP/miclash-trollstore"
-          TS_APP="$TS_ROOT/Payload/MiClash.app"
+          SOURCE_APP="build/Build/Products/Release-iphoneos/Cora.app"
+          TS_ROOT="$RUNNER_TEMP/cora-trollstore"
+          TS_APP="$TS_ROOT/Payload/Cora.app"
           rm -rf "$TS_ROOT"
           mkdir -p "$TS_ROOT/Payload"
           ditto "$SOURCE_APP" "$TS_APP"
 
           # TrollStore targets iOS 14-17. The iOS 18-only ControlWidget cannot
           # run there and should not participate in plugin validation/loading.
-          rm -rf "$TS_APP/PlugIns/MiClashControl.appex"
+          rm -rf "$TS_APP/PlugIns/CoraControl.appex"
 
           # Mark both processes so only the TrollStore package uses the shared
           # file IPC fallback. The ordinary IPA keeps official NE messaging.
           /usr/libexec/PlistBuddy -c \
-            'Add :MiClashTrollStoreBuild bool true' "$TS_APP/Info.plist"
+            'Add :CoraTrollStoreBuild bool true' "$TS_APP/Info.plist"
           /usr/libexec/PlistBuddy -c \
-            'Add :MiClashTrollStoreBuild bool true' \
-            "$TS_APP/PlugIns/MiClashTunnel.appex/Info.plist"
+            'Add :CoraTrollStoreBuild bool true' \
+            "$TS_APP/PlugIns/CoraTunnel.appex/Info.plist"
 
           # TrollStore preserves arbitrary entitlements already present in each binary.
           # Both processes need the complete iOS 17 unsandboxing entitlement set
           # while retaining access to their own app data containers.
           codesign --force --sign - --generate-entitlement-der \
-            --entitlements MiClashTunnel/MiClashTunnel-TrollStore.entitlements \
-            "$TS_APP/PlugIns/MiClashTunnel.appex"
+            --entitlements CoraTunnel/CoraTunnel-TrollStore.entitlements \
+            "$TS_APP/PlugIns/CoraTunnel.appex"
           codesign --force --sign - --generate-entitlement-der \
-            --entitlements MiClash/MiClash-TrollStore.entitlements \
+            --entitlements Cora/Cora-TrollStore.entitlements \
             "$TS_APP"
 
-          MAIN_ENTITLEMENTS="$RUNNER_TEMP/miclash-main-entitlements.plist"
-          TUNNEL_ENTITLEMENTS="$RUNNER_TEMP/miclash-tunnel-entitlements.plist"
+          MAIN_ENTITLEMENTS="$RUNNER_TEMP/cora-main-entitlements.plist"
+          TUNNEL_ENTITLEMENTS="$RUNNER_TEMP/cora-tunnel-entitlements.plist"
           codesign -d --entitlements :- "$TS_APP" > "$MAIN_ENTITLEMENTS" 2>/dev/null
           codesign -d --entitlements :- \
-            "$TS_APP/PlugIns/MiClashTunnel.appex" > "$TUNNEL_ENTITLEMENTS" 2>/dev/null
+            "$TS_APP/PlugIns/CoraTunnel.appex" > "$TUNNEL_ENTITLEMENTS" 2>/dev/null
           test "$(/usr/libexec/PlistBuddy -c \
-            'Print :MiClashTrollStoreBuild' "$TS_APP/Info.plist")" = "true"
+            'Print :CoraTrollStoreBuild' "$TS_APP/Info.plist")" = "true"
           test "$(/usr/libexec/PlistBuddy -c \
-            'Print :MiClashTrollStoreBuild' \
-            "$TS_APP/PlugIns/MiClashTunnel.appex/Info.plist")" = "true"
+            'Print :CoraTrollStoreBuild' \
+            "$TS_APP/PlugIns/CoraTunnel.appex/Info.plist")" = "true"
           test "$(/usr/libexec/PlistBuddy -c \
             'Print :application-identifier' "$MAIN_ENTITLEMENTS")" \
-            = "TROLLTROLL.com.miclash.app"
+            = "TROLLTROLL.com.cora.app"
           test "$(/usr/libexec/PlistBuddy -c \
             'Print :application-identifier' "$TUNNEL_ENTITLEMENTS")" \
-            = "TROLLTROLL.com.miclash.app.tunnel"
+            = "TROLLTROLL.com.cora.app.tunnel"
           test "$(/usr/libexec/PlistBuddy -c \
             'Print :com.apple.private.security.no-sandbox' "$MAIN_ENTITLEMENTS")" = "true"
           test "$(/usr/libexec/PlistBuddy -c \
@@ -252,19 +252,19 @@ jobs:
               "$ENTITLEMENTS")" = "packet-tunnel-provider"
           done
           cd "$TS_ROOT"
-          zip -qr "$GITHUB_WORKSPACE/MiClash-TrollStore.ipa" Payload
-          echo "已生成 MiClash-TrollStore.ipa"
+          zip -qr "$GITHUB_WORKSPACE/Cora-TrollStore.ipa" Payload
+          echo "已生成 Cora-TrollStore.ipa"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MiClash-unsigned-ipa
-          path: MiClash-unsigned.ipa
+          name: Cora-unsigned-ipa
+          path: Cora-unsigned.ipa
           if-no-files-found: error
 
       - name: Upload TrollStore artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MiClash-trollstore-ipa
-          path: MiClash-TrollStore.ipa
+          name: Cora-trollstore-ipa
+          path: Cora-TrollStore.ipa
           if-no-files-found: error

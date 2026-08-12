@@ -1,4 +1,4 @@
-module miclash/mobilecore
+module cora/mobilecore
 
 go 1.25.0
 

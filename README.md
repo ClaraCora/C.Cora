@@ -1,4 +1,4 @@
-# MiClash
+# Cora
 
 基于 [mihomo](https://github.com/MetaCubeX/mihomo) 内核的 iOS 代理客户端，SwiftUI + MVVM，个人自签自用。
 
@@ -9,7 +9,7 @@
 工程用 [XcodeGen](https://github.com/yonsm/XcodeGen) 管理，`.xcodeproj` 不入库。开发机为 Windows，靠 GitHub Actions（macos-26 / Xcode 26）构建未签名 ipa。
 
 - 推送到 `main` 或手动触发 `Build unsigned IPA` 工作流。
-- 产物 `MiClash-unsigned-ipa` 在 Actions artifact 中下载。
+- 产物 `Cora-unsigned-ipa` 在 Actions artifact 中下载。
 - 用自有 Apple 开发者证书自行签名后安装（工程内不含任何证书/描述文件/Secrets）。
 
 本地有 Mac 时，先准备 mihomo 框架并生成工程：
@@ -17,13 +17,13 @@
 ```bash
 brew install xcodegen
 bash scripts/prepare-xcode.sh
-open MiClash.xcodeproj
+open Cora.xcodeproj
 ```
 
-首次构建前，在 Xcode 的 `Signing & Capabilities` 中为 `MiClash`、
-`MiClashTunnel`、`MiClashControl` 三个 target 选择同一个开发者团队。
+首次构建前，在 Xcode 的 `Signing & Capabilities` 中为 `Cora`、
+`CoraTunnel`、`CoraControl` 三个 target 选择同一个开发者团队。
 工程使用自动签名，不需要手动创建或下载 provisioning profile；App Group
-`group.com.miclash.app` 和三个 Bundle ID 仍需属于该团队。
+`group.com.cora.app` 和三个 Bundle ID 仍需属于该团队。
 
 `prepare-xcode.sh` 要求 macOS、Xcode 和 XcodeGen。首次构建内核时还需要 Go 1.25.4，
 脚本会下载 Go 依赖并生成 `Vendor/Mihomo.xcframework`；后续直接复用。MobileCore 或依赖变化后运行：
@@ -34,9 +34,9 @@ bash scripts/prepare-xcode.sh --rebuild-core
 
 ## 内部 TestFlight
 
-工程的 `MiClash` scheme 使用 `InternalTestFlight` Release 配置进行 Archive：
+工程的 `Cora` scheme 使用 `InternalTestFlight` Release 配置进行 Archive：
 
-1. 在 App Store Connect 创建与 `com.miclash.app` 对应的 App 记录。
+1. 在 App Store Connect 创建与 `com.cora.app` 对应的 App 记录。
 2. 在 Xcode 选择 `Any iOS Device (arm64)`，执行 `Product > Archive`。
 3. 在 Organizer 中选择 `Distribute App`，然后选择 `TestFlight Internal Only` 上传。
 4. 每次上传使用新的 Build Number，并在 App Store Connect 添加内部测试成员。
@@ -48,9 +48,9 @@ bash scripts/prepare-xcode.sh --rebuild-core
 
 | 项 | 值 |
 |---|---|
-| 主 App | `com.miclash.app` |
-| NE 扩展 | `com.miclash.app.tunnel` |
-| App Group | `group.com.miclash.app` |
+| 主 App | `com.cora.app` |
+| NE 扩展 | `com.cora.app.tunnel` |
+| App Group | `group.com.cora.app` |
 
 ## 进度
 

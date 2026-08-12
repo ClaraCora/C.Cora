@@ -1,4 +1,4 @@
-# MiClash 实施方案
+# Cora 实施方案
 
 基于 mihomo 内核的 iOS 代理客户端，SwiftUI + MVVM，个人自签自用。
 
@@ -11,14 +11,14 @@
 ## 标识
 | 项 | 值 |
 |---|---|
-| 主 App | `com.miclash.app` |
-| NE 扩展 | `com.miclash.app.tunnel` |
-| App Group | `group.com.miclash.app` |
+| 主 App | `com.cora.app` |
+| NE 扩展 | `com.cora.app.tunnel` |
+| App Group | `group.com.cora.app` |
 
 ## 架构
 三个产物：
-- **MiClash**：主 App，SwiftUI + MVVM，UI 与控制面。
-- **MiClashTunnel**：`NEPacketTunnelProvider` 扩展，接管系统流量，宿主 mihomo 核心。
+- **Cora**：主 App，SwiftUI + MVVM，UI 与控制面。
+- **CoraTunnel**：`NEPacketTunnelProvider` 扩展，接管系统流量，宿主 mihomo 核心。
 - **MihomoCore.xcframework**：mihomo 经 `gomobile bind` 薄封装编出，被 NE 链接。
 
 进程间数据流：

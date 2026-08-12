@@ -5,7 +5,7 @@ import Foundation
 /// The build marker is injected only into the TrollStore package. Regular
 /// signed builds continue to use NetworkExtension's sendProviderMessage API.
 enum TrollStoreIPC {
-    static let buildMarkerKey = "MiClashTrollStoreBuild"
+    static let buildMarkerKey = "CoraTrollStoreBuild"
 
     static var isEnabled: Bool {
         (Bundle.main.object(forInfoDictionaryKey: buildMarkerKey) as? NSNumber)?.boolValue

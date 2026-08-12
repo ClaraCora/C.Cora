@@ -18,9 +18,9 @@ enum AppGroup {
         case unavailable
     }
 
-    static let identifier = "group.com.miclash.app"
+    static let identifier = "group.com.cora.app"
     private static let trollStoreURL = URL(
-        fileURLWithPath: "/var/mobile/Library/Application Support/MiClash",
+        fileURLWithPath: "/var/mobile/Library/Application Support/Cora",
         isDirectory: true)
 
     private static let resolution: (url: URL?, kind: ContainerKind) = {
@@ -44,7 +44,7 @@ enum AppGroup {
         do {
             try fileManager.createDirectory(at: url, withIntermediateDirectories: true)
             let probe = url.appendingPathComponent(
-                ".miclash-write-probe-\(UUID().uuidString)")
+                ".cora-write-probe-\(UUID().uuidString)")
             try Data("ok".utf8).write(to: probe, options: .atomic)
             try fileManager.removeItem(at: probe)
             return true

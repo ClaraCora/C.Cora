@@ -42,7 +42,7 @@ if [[ "$build_core" == "true" ]]; then
     fi
   done
 
-  readonly TEMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/miclash-xcode.XXXXXX")"
+  readonly TEMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/cora-xcode.XXXXXX")"
   readonly GO_MOD_BACKUP="$TEMP_ROOT/go.mod"
   readonly GO_SUM_BACKUP="$TEMP_ROOT/go.sum"
 
@@ -53,7 +53,7 @@ if [[ "$build_core" == "true" ]]; then
     cp "$GO_MOD_BACKUP" "$MOBILE_ROOT/go.mod"
     cp "$GO_SUM_BACKUP" "$MOBILE_ROOT/go.sum"
     case "$TEMP_ROOT" in
-      "${TMPDIR:-/tmp}"/miclash-xcode.*) rm -rf "$TEMP_ROOT" ;;
+      "${TMPDIR:-/tmp}"/cora-xcode.*) rm -rf "$TEMP_ROOT" ;;
       *) echo "Refusing unexpected temporary path: $TEMP_ROOT" >&2 ;;
     esac
   }
@@ -91,5 +91,5 @@ cd "$REPO_ROOT"
 xcodegen generate
 
 echo
-echo "Xcode project is ready: $REPO_ROOT/MiClash.xcodeproj"
-echo "Open it and select the same development team for MiClash, MiClashTunnel, and MiClashControl."
+echo "Xcode project is ready: $REPO_ROOT/Cora.xcodeproj"
+echo "Open it and select the same development team for Cora, CoraTunnel, and CoraControl."

@@ -11,8 +11,17 @@ Payload/
 
 # macOS / Xcode
 .DS_Store
+._*
 xcuserdata/
 *.xcuserstate
+*.xcscmblueprint
+*.xccheckout
+
+# Swift / Xcode 本地缓存
+.build/
+.swiftpm/
+*.xcarchive
+*.dSYM
 
 # Go（Phase 1 起）
 MobileCore/*.a
@@ -20,7 +29,7 @@ MobileCore/*.h
 
 # Claude Code 本地设置
 .claude/
-miclash_old/
+cora_old/
 Everywhere/
 
 # 本地参考源码（不入库）
