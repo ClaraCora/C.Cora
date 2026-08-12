@@ -23,7 +23,7 @@ open Cora.xcodeproj
 首次构建前，在 Xcode 的 `Signing & Capabilities` 中为 `Cora`、
 `CoraTunnel`、`CoraControl` 三个 target 选择同一个开发者团队。
 工程使用自动签名，不需要手动创建或下载 provisioning profile；App Group
-`group.com.cora.app` 和三个 Bundle ID 仍需属于该团队。
+`group.com.miclash.app` 和三个 Bundle ID 仍需属于该团队。
 
 `prepare-xcode.sh` 要求 macOS、Xcode 和 XcodeGen。首次构建内核时还需要 Go 1.25.4，
 脚本会下载 Go 依赖并生成 `Vendor/Mihomo.xcframework`；后续直接复用。MobileCore 或依赖变化后运行：
@@ -36,7 +36,7 @@ bash scripts/prepare-xcode.sh --rebuild-core
 
 工程的 `Cora` scheme 使用 `InternalTestFlight` Release 配置进行 Archive：
 
-1. 在 App Store Connect 创建与 `com.cora.app` 对应的 App 记录。
+1. 在 App Store Connect 创建与 `com.miclash.app` 对应的 App 记录。
 2. 在 Xcode 选择 `Any iOS Device (arm64)`，执行 `Product > Archive`。
 3. 在 Organizer 中选择 `Distribute App`，然后选择 `TestFlight Internal Only` 上传。
 4. 每次上传使用新的 Build Number，并在 App Store Connect 添加内部测试成员。
@@ -48,9 +48,9 @@ bash scripts/prepare-xcode.sh --rebuild-core
 
 | 项 | 值 |
 |---|---|
-| 主 App | `com.cora.app` |
-| NE 扩展 | `com.cora.app.tunnel` |
-| App Group | `group.com.cora.app` |
+| 主 App | `com.miclash.app` |
+| NE 扩展 | `com.miclash.app.tunnel` |
+| App Group | `group.com.miclash.app` |
 
 ## 进度
 

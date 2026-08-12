@@ -18,7 +18,7 @@ struct CoraControlBundle: WidgetBundle {
 }
 
 /// NE 隧道的 providerBundleIdentifier，用来在多个 VPN 配置里认出我们自己的那个。
-private let tunnelBundleID = "com.cora.app.tunnel"
+private let tunnelBundleID = "com.miclash.app.tunnel"
 
 /// 找到 Cora 自己的 VPN 管理对象，不能退回其它陈旧配置。
 private func coraManager() async throws -> NETunnelProviderManager? {

@@ -23,6 +23,16 @@ xcuserdata/
 *.xcarchive
 *.dSYM
 
+# Apple 签名材料（仅限本地，严禁入库）
+*.p12
+*.pfx
+*.cer
+*.crt
+*.key
+*.pem
+*.mobileprovision
+*.provisionprofile
+
 # Go（Phase 1 起）
 MobileCore/*.a
 MobileCore/*.h

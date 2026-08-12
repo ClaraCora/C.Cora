@@ -18,7 +18,7 @@ enum AppGroup {
         case unavailable
     }
 
-    static let identifier = "group.com.cora.app"
+    static let identifier = "group.com.miclash.app"
     private static let trollStoreURL = URL(
         fileURLWithPath: "/var/mobile/Library/Application Support/Cora",
         isDirectory: true)

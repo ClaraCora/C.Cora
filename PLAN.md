@@ -11,9 +11,9 @@
 ## 标识
 | 项 | 值 |
 |---|---|
-| 主 App | `com.cora.app` |
-| NE 扩展 | `com.cora.app.tunnel` |
-| App Group | `group.com.cora.app` |
+| 主 App | `com.miclash.app` |
+| NE 扩展 | `com.miclash.app.tunnel` |
+| App Group | `group.com.miclash.app` |
 
 ## 架构
 三个产物：

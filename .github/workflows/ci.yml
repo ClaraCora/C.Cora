@@ -230,10 +230,10 @@ jobs:
             "$TS_APP/PlugIns/CoraTunnel.appex/Info.plist")" = "true"
           test "$(/usr/libexec/PlistBuddy -c \
             'Print :application-identifier' "$MAIN_ENTITLEMENTS")" \
-            = "TROLLTROLL.com.cora.app"
+            = "TROLLTROLL.com.miclash.app"
           test "$(/usr/libexec/PlistBuddy -c \
             'Print :application-identifier' "$TUNNEL_ENTITLEMENTS")" \
-            = "TROLLTROLL.com.cora.app.tunnel"
+            = "TROLLTROLL.com.miclash.app.tunnel"
           test "$(/usr/libexec/PlistBuddy -c \
             'Print :com.apple.private.security.no-sandbox' "$MAIN_ENTITLEMENTS")" = "true"
           test "$(/usr/libexec/PlistBuddy -c \

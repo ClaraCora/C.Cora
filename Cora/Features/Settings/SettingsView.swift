@@ -131,7 +131,7 @@ private struct GeoSettingsSection: View {
             Toggle("启用 geo 规则", isOn: $settings.geoEnabled)
             if settings.geoEnabled {
                 if AppGroup.containerURL == nil {
-                    Label("共享目录不可用，连接时会自动忽略 GEO/ASN 规则。",
+                    Label("签名未授予 \(AppGroup.identifier)，连接时会自动忽略 GEO/ASN 规则。",
                           systemImage: "exclamationmark.triangle")
                         .font(.caption)
                         .foregroundStyle(.orange)

@@ -183,7 +183,9 @@ final class TunnelManager {
     func sendMessage(_ payload: Data, timeout: TimeInterval = 10) async -> IPCResult {
         if TrollStoreIPC.isEnabled {
             let fileResult = await sendTrollStoreMessage(payload, timeout: timeout)
-            if case .ok = fileResult { return fileResult }
+            if case .ok(let data) = fileResult {
+                return await expandChunkedFileResponse(data, timeout: timeout)
+            }
 
             // 兼容仍在运行的旧 Tunnel 扩展：更新 App 后尚未断开重连时，旧进程
             // 还没有文件 IPC server，短暂尝试一次系统通道并合并诊断信息。
@@ -195,6 +197,44 @@ final class TunnelManager {
             }
         }
         return await sendProviderMessage(payload, timeout: timeout)
+    }
+
+    private func expandChunkedFileResponse(_ initial: Data,
+                                           timeout: TimeInterval) async -> IPCResult {
+        guard let descriptor = (try? JSONSerialization.jsonObject(with: initial))
+                as? [String: Any],
+              descriptor["_coraTransfer"] as? String == "chunked-v1" else {
+            return .ok(initial)
+        }
+        guard let token = descriptor["token"] as? String,
+              UUID(uuidString: token) != nil,
+              let total = (descriptor["total"] as? NSNumber)?.intValue,
+              total > 0, total <= 8 * 1_024 * 1_024 else {
+            return .failure("Tunnel 返回了无效的分块响应描述")
+        }
+
+        var response = Data()
+        response.reserveCapacity(total)
+        while response.count < total {
+            guard let request = try? JSONSerialization.data(withJSONObject: [
+                "v": 1,
+                "cmd": "readResponseChunk",
+                "token": token,
+                "offset": response.count,
+            ]) else {
+                return .failure("分块响应请求编码失败")
+            }
+            switch await sendTrollStoreMessage(request, timeout: timeout) {
+            case .failure(let reason):
+                return .failure("读取 Tunnel 分块响应失败：\(reason)")
+            case .ok(let chunk):
+                guard !chunk.isEmpty, response.count + chunk.count <= total else {
+                    return .failure("Tunnel 分块响应不完整")
+                }
+                response.append(chunk)
+            }
+        }
+        return response.count == total ? .ok(response) : .failure("Tunnel 分块响应长度不匹配")
     }
 
     private func sendTrollStoreMessage(_ payload: Data,
@@ -247,6 +287,14 @@ final class TunnelManager {
         guard let session = mgr.connection as? NETunnelProviderSession else {
             return .failure("连接对象不是 NETunnelProviderSession（status=\(mgr.connection.status.rawValue)）")
         }
+        let initial = await sendRawProviderMessage(payload, session: session, timeout: timeout)
+        guard case .ok(let data) = initial else { return initial }
+        return await expandChunkedResponse(data, session: session, timeout: timeout)
+    }
+
+    private func sendRawProviderMessage(_ payload: Data,
+                                        session: NETunnelProviderSession,
+                                        timeout: TimeInterval) async -> IPCResult {
         let st = session.status.rawValue
 
         return await withCheckedContinuation { cont in
@@ -267,6 +315,45 @@ final class TunnelManager {
                     "sendProviderMessage 抛错：\(error.localizedDescription)（status=\(st)）"))
             }
         }
+    }
+
+    private func expandChunkedResponse(_ initial: Data,
+                                       session: NETunnelProviderSession,
+                                       timeout: TimeInterval) async -> IPCResult {
+        guard let descriptor = (try? JSONSerialization.jsonObject(with: initial))
+                as? [String: Any],
+              descriptor["_coraTransfer"] as? String == "chunked-v1" else {
+            return .ok(initial)
+        }
+        guard let token = descriptor["token"] as? String,
+              UUID(uuidString: token) != nil,
+              let total = (descriptor["total"] as? NSNumber)?.intValue,
+              total > 0, total <= 8 * 1_024 * 1_024 else {
+            return .failure("NE 返回了无效的分块响应描述")
+        }
+
+        var response = Data()
+        response.reserveCapacity(total)
+        while response.count < total {
+            guard let request = try? JSONSerialization.data(withJSONObject: [
+                "v": 1,
+                "cmd": "readResponseChunk",
+                "token": token,
+                "offset": response.count,
+            ]) else {
+                return .failure("分块响应请求编码失败")
+            }
+            switch await sendRawProviderMessage(request, session: session, timeout: timeout) {
+            case .failure(let reason):
+                return .failure("读取 NE 分块响应失败：\(reason)")
+            case .ok(let chunk):
+                guard !chunk.isEmpty, response.count + chunk.count <= total else {
+                    return .failure("NE 分块响应不完整")
+                }
+                response.append(chunk)
+            }
+        }
+        return response.count == total ? .ok(response) : .failure("NE 分块响应长度不匹配")
     }
 
     /// 取 NE/内核日志（getLogs 命令）。

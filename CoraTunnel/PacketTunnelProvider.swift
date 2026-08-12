@@ -19,7 +19,7 @@ private let minimumHotReloadAvailableMemory: UInt64 = 28 * 1_024 * 1_024
 /// 严禁加载 geo 数据库（DIRECT 测试用 MATCH 规则），否则极易 OOM 被系统杀。
 class PacketTunnelProvider: NEPacketTunnelProvider {
 
-    private let log = Logger(subsystem: "com.cora.app.tunnel", category: "PacketTunnel")
+    private let log = Logger(subsystem: "com.miclash.app.tunnel", category: "PacketTunnel")
 
     /// 当前 mihomo 工作目录（含 run.log）。供 handleAppMessage 回传内核日志用。
     private var homeDir: String?
@@ -50,6 +50,16 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private let ipcQueue = DispatchQueue(label: "com.cora.tunnel.ipc",
                                          qos: .userInitiated,
                                          attributes: .concurrent)
+    private struct StoredIPCResponse {
+        let data: Data
+        let expiresAt: Date
+    }
+    private let ipcResponseLock = NSLock()
+    private var storedIPCResponses: [String: StoredIPCResponse] = [:]
+    private static let ipcInlineResponseLimit = 16 * 1_024
+    private static let ipcResponseChunkSize = 12 * 1_024
+    private static let ipcMaximumResponseSize = 8 * 1_024 * 1_024
+    private static let ipcResponseLifetime: TimeInterval = 30
     private var trollStoreIPCServer: TrollStoreFileIPCServer?
     private let memoryDiagnostics = MemoryDiagnostics()
 
@@ -555,9 +565,16 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                                   completionHandler: ((Data?) -> Void)?) {
         let obj = (try? JSONSerialization.jsonObject(with: messageData)) as? [String: Any]
         let cmd = (obj?["cmd"] as? String) ?? String(data: messageData, encoding: .utf8) ?? ""
+        let reply: (Data?) -> Void = { [weak self] data in
+            guard let self, let data else {
+                completionHandler?(data)
+                return
+            }
+            self.completeAppMessage(data, completionHandler: completionHandler)
+        }
         let protocolVersion = (obj?["v"] as? NSNumber)?.intValue
         if let protocolVersion, protocolVersion != 1 {
-            completionHandler?(Self.jsonData([
+            reply(Self.jsonData([
                 "ok": false,
                 "error": "不支持的控制协议版本：\(protocolVersion)",
                 "supportedVersion": 1,
@@ -570,10 +587,10 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
         switch cmd {
         case "hello":
-            completionHandler?(Data(MihomoControlInfo().utf8))
+            reply(Data(MihomoControlInfo().utf8))
         case "queryProxies":
             ipcQueue.async {
-                completionHandler?(Data(MihomoQueryProxies().utf8))
+                reply(Data(MihomoQueryProxies().utf8))
             }
         case "selectProxy":
             let group = (obj?["group"] as? String) ?? ""
@@ -582,64 +599,121 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             let ok = MihomoSelectProxy(group, name, &err)
             let resp: [String: Any] = ok ? ["ok": true]
                                          : ["ok": false, "error": err?.localizedDescription ?? "未知错误"]
-            completionHandler?((try? JSONSerialization.data(withJSONObject: resp)) ?? Data())
+            reply((try? JSONSerialization.data(withJSONObject: resp)) ?? Data())
         case "groupDelay":
             let group = (obj?["group"] as? String) ?? ""
             let url = (obj?["url"] as? String) ?? ""
             let timeout = (obj?["timeout"] as? NSNumber)?.intValue ?? 5000
             ipcQueue.async {
-                completionHandler?(Data(MihomoGroupDelay(group, url, timeout).utf8))
+                reply(Data(MihomoGroupDelay(group, url, timeout).utf8))
             }
         case "connections":
             let limit = (obj?["limit"] as? NSNumber)?.intValue ?? 200
             ipcQueue.async {
-                completionHandler?(Data(MihomoConnectionsSnapshot(limit).utf8))
+                reply(Data(MihomoConnectionsSnapshot(limit).utf8))
             }
         case "closeConnection":
             let id = (obj?["id"] as? String) ?? ""
             var error: NSError?
             let ok = MihomoCloseConnection(id, &error)
-            completionHandler?(Self.jsonData(ok
+            reply(Self.jsonData(ok
                 ? ["ok": true]
                 : ["ok": false, "error": error?.localizedDescription ?? "未知错误"]))
         case "closeAllConnections":
-            completionHandler?(Self.jsonData([
+            reply(Self.jsonData([
                 "ok": true,
                 "closed": Int(MihomoCloseAllConnections()),
             ]))
         case "traffic":
-            completionHandler?(Data(MihomoTrafficNow().utf8))
+            reply(Data(MihomoTrafficNow().utf8))
         case "memory":
-            completionHandler?(Self.memoryFootprintData())
+            reply(Self.memoryFootprintData())
         case "proxyDetails":
-            completionHandler?(Data(MihomoProxyDetails().utf8))
+            reply(Data(MihomoProxyDetails().utf8))
         case "configNotices":
-            completionHandler?(Data(MihomoConfigNotices().utf8))
+            reply(Data(MihomoConfigNotices().utf8))
         case "getMode":
-            completionHandler?(Data(MihomoMode().utf8))
+            reply(Data(MihomoMode().utf8))
         case "setMode":
             MihomoSetMode((obj?["mode"] as? String) ?? "rule")
-            completionHandler?(Data(#"{"ok":true}"#.utf8))
+            reply(Data(#"{"ok":true}"#.utf8))
         case "reloadConfig":
-            reloadConfiguration(obj, completionHandler: completionHandler)
+            reloadConfiguration(obj, completionHandler: reply)
         case "reloadStatus":
-            completionHandler?(reloadStatusResponse(token: obj?["token"] as? String))
+            reply(reloadStatusResponse(token: obj?["token"] as? String))
         case "runLogChunk":
             let offset = (obj?["offset"] as? NSNumber)?.intValue ?? -1
             let generation = (obj?["generation"] as? NSNumber)?.intValue ?? 0
             ipcQueue.async {
-                completionHandler?(Data(MihomoRunLogChunk(offset, generation).utf8))
+                reply(Data(MihomoRunLogChunk(offset, generation).utf8))
             }
+        case "readResponseChunk":
+            completionHandler?(responseChunk(token: obj?["token"] as? String,
+                                              offset: (obj?["offset"] as? NSNumber)?.intValue))
         case "getLogs":
             // 日志可能很大，IPC 响应有体积上限 → 只回传末尾约 24KB，取最新内容。
             let body = "[cmd=\(cmd)]\n" + collectLogs()
-            completionHandler?(Self.tailData(body, maxBytes: 24 * 1024))
+            reply(Self.tailData(body, maxBytes: 24 * 1024))
         default:
-            completionHandler?(Self.jsonData([
+            reply(Self.jsonData([
                 "ok": false,
                 "error": "未知控制命令：\(cmd)",
             ]))
         }
+    }
+
+    /// NetworkExtension may turn an oversized provider reply into nil. Large
+    /// replies are retained briefly and fetched by the app in bounded chunks.
+    private func completeAppMessage(_ data: Data,
+                                    completionHandler: ((Data?) -> Void)?) {
+        guard data.count > Self.ipcInlineResponseLimit else {
+            completionHandler?(data)
+            return
+        }
+        guard data.count <= Self.ipcMaximumResponseSize else {
+            completionHandler?(Self.jsonData([
+                "ok": false,
+                "error": "控制响应超过 \(Self.ipcMaximumResponseSize / 1_048_576) MB 上限",
+            ]))
+            return
+        }
+
+        let token = UUID().uuidString
+        let now = Date()
+        ipcResponseLock.lock()
+        storedIPCResponses = storedIPCResponses.filter { $0.value.expiresAt > now }
+        storedIPCResponses[token] = StoredIPCResponse(
+            data: data,
+            expiresAt: now.addingTimeInterval(Self.ipcResponseLifetime))
+        ipcResponseLock.unlock()
+
+        completionHandler?(Self.jsonData([
+            "_coraTransfer": "chunked-v1",
+            "token": token,
+            "total": data.count,
+            "chunkSize": Self.ipcResponseChunkSize,
+        ]))
+    }
+
+    private func responseChunk(token: String?, offset: Int?) -> Data {
+        guard let token, UUID(uuidString: token) != nil,
+              let offset, offset >= 0 else {
+            return Self.jsonData(["ok": false, "error": "分块响应参数无效"])
+        }
+
+        ipcResponseLock.lock()
+        defer { ipcResponseLock.unlock() }
+        guard let stored = storedIPCResponses[token], stored.expiresAt > Date(),
+              offset < stored.data.count else {
+            storedIPCResponses.removeValue(forKey: token)
+            return Data()
+        }
+        let end = min(offset + Self.ipcResponseChunkSize, stored.data.count)
+        let chunk = stored.data.subdata(in: offset..<end)
+        if end == stored.data.count {
+            storedIPCResponses.removeValue(forKey: token)
+        }
+        return chunk
     }
 
     private static func jsonData(_ object: [String: Any]) -> Data {
