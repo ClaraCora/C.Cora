@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// 根视图：原生 TabView 五页（主页 / 配置 / 节点 / 连接 / 设置）。
+/// 根视图：原生 TabView 四页（总览 / 策略 / 记录 / 设置）。
 /// iOS 26 由系统提供悬浮液态玻璃外观；底栏保持完整形态，不随滚动收缩。
 /// 在这里（始终存在的容器）按连接状态驱动内核速率与日志流的启停，切走再回来数据不清零。
 struct RootView: View {
@@ -10,12 +10,15 @@ struct RootView: View {
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
-        Group {
-            if #available(iOS 26.0, *) {
-                tabs
-                    .tabBarMinimizeBehavior(.never)
-            } else {
-                tabs
+        ZStack {
+            AppAmbientBackground()
+            Group {
+                if #available(iOS 26.0, *) {
+                    tabs
+                        .tabBarMinimizeBehavior(.never)
+                } else {
+                    tabs
+                }
             }
         }
         .onChange(of: core.status) { _, _ in
@@ -30,13 +33,11 @@ struct RootView: View {
     private var tabs: some View {
         TabView {
             ConnectView()
-                .tabItem { Label("主页", systemImage: "power") }
-            SubscriptionsView()
-                .tabItem { Label("配置", systemImage: "doc.text") }
+                .tabItem { Label("总览", systemImage: "gauge.with.dots.needle.67percent") }
             ProxiesView()
-                .tabItem { Label("节点", systemImage: "point.3.connected.trianglepath.dotted") }
+                .tabItem { Label("策略", systemImage: "slider.horizontal.3") }
             ActivityView()
-                .tabItem { Label("连接", systemImage: "arrow.left.arrow.right.circle") }
+                .tabItem { Label("记录", systemImage: "clock.arrow.circlepath") }
             SettingsView()
                 .tabItem { Label("设置", systemImage: "gearshape") }
         }

@@ -123,6 +123,8 @@ struct LogsView: View {
                         .listRowSeparator(.hidden)
                 }
                 .listStyle(.plain)
+                .scrollContentBackground(.hidden)
+                .background(Color.clear)
                 .overlay(alignment: .bottomTrailing) {
                     scrollControl(proxy)
                 }

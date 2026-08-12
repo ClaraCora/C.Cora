@@ -41,6 +41,8 @@ final class KernelController: ObservableObject {
     @Published private(set) var reachable = false
     /// Packet Tunnel Extension 进程的物理内存占用（task_vm_info.phys_footprint，字节）。
     @Published private(set) var memoryFootprint: Int64?
+    @Published private(set) var totalDownload: Int64 = 0
+    @Published private(set) var totalUpload: Int64 = 0
     /// 最近若干秒的速率采样（曲线图数据）。
     var up: Int64 { runtime.up }
     var down: Int64 { runtime.down }
@@ -52,6 +54,7 @@ final class KernelController: ObservableObject {
     private var memoryRefreshTask: Task<Int64?, Never>?
     private var memoryRefreshGeneration = 0
     private var modeTask: Task<Void, Never>?
+    private var totalsTask: Task<Void, Never>?
     private var sampleIndex = 0
     private let maxSamples = 60
 
@@ -62,6 +65,7 @@ final class KernelController: ObservableObject {
         }
         if trafficTask == nil { startTraffic() }
         if memoryTask == nil { startMemoryPolling() }
+        if totalsTask == nil { startTotalsPolling() }
     }
 
     /// 断开后调用：停止采样。
@@ -70,6 +74,7 @@ final class KernelController: ObservableObject {
         modeTask = nil
         stopTraffic()
         stopMemoryPolling()
+        stopTotalsPolling()
         setReachable(false)
     }
 
@@ -178,6 +183,28 @@ final class KernelController: ObservableObject {
         memoryRefreshTask?.cancel()
         memoryRefreshTask = nil
         if memoryFootprint != nil { memoryFootprint = nil }
+    }
+
+    private func startTotalsPolling() {
+        totalsTask = Task { [weak self] in
+            while !Task.isCancelled {
+                let result = await CoreStateManager.shared.sendMessage(["cmd": "connections", "limit": 0])
+                guard !Task.isCancelled else { return }
+                if case .ok(let data) = result,
+                   let snapshot = try? JSONDecoder().decode(ConnectionsSnapshot.self, from: data) {
+                    self?.totalDownload = snapshot.downloadTotal
+                    self?.totalUpload = snapshot.uploadTotal
+                }
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+            }
+        }
+    }
+
+    private func stopTotalsPolling() {
+        totalsTask?.cancel()
+        totalsTask = nil
+        totalDownload = 0
+        totalUpload = 0
     }
 
     private func pushSample(up: Int64, down: Int64, uptime: Int64) {

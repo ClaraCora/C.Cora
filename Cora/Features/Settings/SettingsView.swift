@@ -11,6 +11,14 @@ struct SettingsView: View {
         NavigationStack {
             Form {
                 Section {
+                    NavigationLink {
+                        SubscriptionsView()
+                    } label: {
+                        Label("配置", systemImage: "doc.text")
+                    }
+                }
+
+                Section {
                     Picker("日志级别", selection: $settings.logLevel) {
                         ForEach(SettingsStore.logLevelOptions, id: \.self) { Text($0).tag($0) }
                     }
@@ -104,6 +112,8 @@ struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 }
             }
+            .scrollContentBackground(.hidden)
+            .background(Color.clear)
             .navigationTitle("设置")
             .task(id: geoInfoRefreshID) {
                 guard settings.geoEnabled else {

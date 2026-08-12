@@ -8,6 +8,7 @@ struct ProxyGroupNode: Identifiable {
 
     let id: ID
     let name: String
+    let detail: String
     let normalizedSearchText: String
 }
 
@@ -37,6 +38,7 @@ struct ProxyGroup: Identifiable {
             return ProxyGroupNode(
                 id: .init(group: name, index: index),
                 name: node,
+                detail: detail,
                 normalizedSearchText: "\(node) \(detail)".lowercased())
         }
     }

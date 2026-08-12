@@ -8,91 +8,91 @@ struct SubscriptionsView: View {
     @State private var editingSub: Subscription?
 
     var body: some View {
-        NavigationStack {
-            List {
-                if store.subscriptions.isEmpty {
-                    ContentUnavailableView("还没有配置",
-                        systemImage: "tray",
-                        description: Text("点右上角 + 添加订阅链接，或新建一个本地配置"))
-                }
+        List {
+            if store.subscriptions.isEmpty {
+                ContentUnavailableView("还没有配置",
+                    systemImage: "tray",
+                    description: Text("点右上角 + 添加订阅链接，或新建一个本地配置"))
+            }
 
-                ForEach(store.subscriptions) { sub in
-                    NavigationLink {
-                        SubscriptionDetailView(subID: sub.id)
-                    } label: {
-                        SubscriptionRow(sub: sub, isSelected: sub.id == store.selectedID)
+            ForEach(store.subscriptions) { sub in
+                NavigationLink {
+                    SubscriptionDetailView(subID: sub.id)
+                } label: {
+                    SubscriptionRow(sub: sub, isSelected: sub.id == store.selectedID)
+                }
+                .swipeActions(edge: .trailing) {
+                    Button(role: .destructive) {
+                        store.remove(sub.id)
+                    } label: { Label("删除", systemImage: "trash") }
+                    if !sub.isLocal {
+                        Button {
+                            Task { await store.refresh(sub.id) }
+                        } label: { Label("刷新", systemImage: "arrow.clockwise") }
+                        .tint(.blue)
+                        Button {
+                            editingSub = sub
+                        } label: { Label("编辑", systemImage: "pencil") }
+                        .tint(.orange)
                     }
-                    .swipeActions(edge: .trailing) {
-                        Button(role: .destructive) {
-                            store.remove(sub.id)
-                        } label: { Label("删除", systemImage: "trash") }
-                        if !sub.isLocal {
-                            Button {
-                                Task { await store.refresh(sub.id) }
-                            } label: { Label("刷新", systemImage: "arrow.clockwise") }
-                            .tint(.blue)
-                            Button {
-                                editingSub = sub
-                            } label: { Label("编辑", systemImage: "pencil") }
-                            .tint(.orange)
-                        }
-                    }
-                    .swipeActions(edge: .leading) {
-                        if sub.id != store.selectedID {
-                            Button {
-                                store.select(sub.id)
-                            } label: { Label("设为当前", systemImage: "checkmark.circle") }
-                            .tint(.green)
-                        }
+                }
+                .swipeActions(edge: .leading) {
+                    if sub.id != store.selectedID {
+                        Button {
+                            store.select(sub.id)
+                        } label: { Label("设为当前", systemImage: "checkmark.circle") }
+                        .tint(.green)
                     }
                 }
             }
-            .navigationTitle("配置")
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button {
-                        Task { await store.refreshRemoteSubscriptions() }
-                    } label: {
-                        if store.isBusy {
-                            ProgressView().controlSize(.small)
-                        } else {
-                            Image(systemName: "arrow.clockwise")
-                        }
-                    }
-                    .disabled(store.isBusy || !store.hasRemoteSubscriptions)
-                    .accessibilityLabel("刷新全部远程订阅")
-                    .help("刷新全部远程订阅")
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Menu {
-                        Button { showAddRemote = true } label: {
-                            Label("添加订阅链接", systemImage: "link")
-                        }
-                        Button { showAddLocal = true } label: {
-                            Label("新建本地配置", systemImage: "doc.badge.plus")
-                        }
-                    } label: {
-                        Image(systemName: "plus")
+        }
+        .scrollContentBackground(.hidden)
+        .background(Color.clear)
+        .navigationTitle("配置")
+        .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                Button {
+                    Task { await store.refreshRemoteSubscriptions() }
+                } label: {
+                    if store.isBusy {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Image(systemName: "arrow.clockwise")
                     }
                 }
+                .disabled(store.isBusy || !store.hasRemoteSubscriptions)
+                .accessibilityLabel("刷新全部远程订阅")
+                .help("刷新全部远程订阅")
             }
-            .overlay {
-                if store.isBusy { ProgressView().controlSize(.large) }
+            ToolbarItem(placement: .topBarTrailing) {
+                Menu {
+                    Button { showAddRemote = true } label: {
+                        Label("添加订阅链接", systemImage: "link")
+                    }
+                    Button { showAddLocal = true } label: {
+                        Label("新建本地配置", systemImage: "doc.badge.plus")
+                    }
+                } label: {
+                    Image(systemName: "plus")
+                }
             }
-            .sheet(isPresented: $showAddRemote) {
-                AddSubscriptionView().environmentObject(store)
-            }
-            .sheet(isPresented: $showAddLocal) {
-                LocalConfigEditorView(editing: nil).environmentObject(store)
-            }
-            .sheet(item: $editingSub) { sub in
-                EditSubscriptionView(sub: sub).environmentObject(store)
-            }
-            .alert("出错了", isPresented: .constant(store.lastError != nil)) {
-                Button("好") { store.lastError = nil }
-            } message: {
-                Text(store.lastError ?? "")
-            }
+        }
+        .overlay {
+            if store.isBusy { ProgressView().controlSize(.large) }
+        }
+        .sheet(isPresented: $showAddRemote) {
+            AddSubscriptionView().environmentObject(store)
+        }
+        .sheet(isPresented: $showAddLocal) {
+            LocalConfigEditorView(editing: nil).environmentObject(store)
+        }
+        .sheet(item: $editingSub) { sub in
+            EditSubscriptionView(sub: sub).environmentObject(store)
+        }
+        .alert("出错了", isPresented: .constant(store.lastError != nil)) {
+            Button("好") { store.lastError = nil }
+        } message: {
+            Text(store.lastError ?? "")
         }
     }
 }

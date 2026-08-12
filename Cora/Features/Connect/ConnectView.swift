@@ -16,7 +16,9 @@ struct ConnectView: View {
                         RuntimeMetricsGrid(up: kernel.up,
                                            down: kernel.down,
                                            memoryFootprint: kernel.memoryFootprint,
-                                           uptime: kernel.uptime)
+                                           uptime: kernel.uptime,
+                                           totalDownload: kernel.totalDownload,
+                                           totalUpload: kernel.totalUpload)
                         TrafficChart(samples: kernel.samples)
                     }
                     if !core.configNotices.isEmpty {
@@ -27,8 +29,8 @@ struct ConnectView: View {
                 .padding(.top, 8)
             }
             .scrollIndicators(.hidden)
-            .background(Color(uiColor: .systemGroupedBackground))
-            .navigationTitle("Cora")
+            .background(Color.clear)
+            .navigationTitle("总览")
             .task { await core.refreshStatus() }
         }
     }
@@ -63,12 +65,14 @@ private struct ConnectionCard: View {
             .disabled(core.isBusy)
 
             VStack(spacing: 4) {
-                HStack(spacing: 7) {
-                    Circle()
-                        .fill(glowColor)
-                        .frame(width: 8, height: 8)
-                    Text(core.statusText)
-                        .font(.subheadline.weight(.semibold))
+                ViewThatFits(in: .horizontal) {
+                    statusLine
+                    VStack(spacing: 4) {
+                        statusIdentity
+                        RuntimeInlineMetric(title: "运行",
+                                            value: RuntimeMetricsGrid.duration(kernel.uptime),
+                                            systemImage: "timer")
+                    }
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 4)
@@ -109,6 +113,25 @@ private struct ConnectionCard: View {
             RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .fill(Color(uiColor: .secondarySystemGroupedBackground))
         )
+    }
+
+    private var statusLine: some View {
+        HStack(spacing: 7) {
+            statusIdentity
+            RuntimeInlineMetric(title: "运行",
+                                value: RuntimeMetricsGrid.duration(kernel.uptime),
+                                systemImage: "timer")
+        }
+    }
+
+    private var statusIdentity: some View {
+        HStack(spacing: 7) {
+            RuntimeInlineMetric(title: "内存",
+                                value: kernel.memoryFootprint.map(ByteFormat.size) ?? "—",
+                                systemImage: "memorychip")
+            Circle().fill(glowColor).frame(width: 8, height: 8)
+            Text(core.statusText).font(.subheadline.weight(.semibold))
+        }
     }
 
     private var glowColor: Color {
@@ -160,6 +183,8 @@ private struct RuntimeMetricsGrid: View {
     let down: Int64
     let memoryFootprint: Int64?
     let uptime: Int64
+    let totalDownload: Int64
+    let totalUpload: Int64
 
     var body: some View {
         LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
@@ -167,16 +192,14 @@ private struct RuntimeMetricsGrid: View {
                          systemImage: "arrow.down", tint: .blue)
             MetricWidget(title: "上行", value: ByteFormat.rate(up),
                          systemImage: "arrow.up", tint: .orange)
-            MetricWidget(title: "内存",
-                         value: memoryFootprint.map(ByteFormat.size) ?? "—",
-                         systemImage: "memorychip", tint: .green)
-            MetricWidget(title: "运行时长",
-                         value: Self.duration(uptime),
-                         systemImage: "timer", tint: .purple)
+            MetricWidget(title: "累计下行", value: ByteFormat.size(totalDownload),
+                         systemImage: "arrow.down.circle", tint: .blue)
+            MetricWidget(title: "累计上行", value: ByteFormat.size(totalUpload),
+                         systemImage: "arrow.up.circle", tint: .orange)
         }
     }
 
-    private static func duration(_ seconds: Int64) -> String {
+    static func duration(_ seconds: Int64) -> String {
         let value = max(0, seconds)
         let days = value / 86_400
         let hours = (value % 86_400) / 3_600
@@ -184,6 +207,19 @@ private struct RuntimeMetricsGrid: View {
         let remainingSeconds = value % 60
         let clock = String(format: "%02lld:%02lld:%02lld", hours, minutes, remainingSeconds)
         return days > 0 ? "\(days)天 \(clock)" : clock
+    }
+}
+
+private struct RuntimeInlineMetric: View {
+    let title: String
+    let value: String
+    let systemImage: String
+
+    var body: some View {
+        Label("\(title) \(value)", systemImage: systemImage)
+            .font(.caption2.monospacedDigit().weight(.medium))
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
     }
 }
 

@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// App 入口。SwiftUI App 生命周期（无 Storyboard）。
 /// 全局状态机 CoreStateManager 以 @StateObject 注入环境，供所有视图单向绑定。
@@ -27,6 +28,12 @@ struct CoraApp: App {
                 .environmentObject(KernelController.shared)
                 .environmentObject(LogStreamController.shared)
                 .task { await geoDatabase.updateOnLaunch() }
+                .onAppear { Self.configureSurfaceAppearance() }
         }
+    }
+
+    private static func configureSurfaceAppearance() {
+        UITableView.appearance().backgroundColor = .clear
+        UICollectionView.appearance().backgroundColor = .clear
     }
 }

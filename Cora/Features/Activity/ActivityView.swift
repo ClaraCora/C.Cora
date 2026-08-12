@@ -17,7 +17,7 @@ struct ActivityView: View {
                 .labelsHidden()
                 .padding(.horizontal, 16)
                 .padding(.vertical, 8)
-                .background(Color(uiColor: .systemGroupedBackground))
+                .background(.ultraThinMaterial)
 
                 Group {
                     switch selection {
@@ -41,7 +41,7 @@ private enum ActivitySection: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .connections: return "活动连接"
+        case .connections: return "连接记录"
         case .logs: return "日志"
         }
     }

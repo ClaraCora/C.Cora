@@ -11,7 +11,7 @@ struct ConnectionsView: View {
 
     var body: some View {
         content
-            .navigationTitle("活动连接")
+            .navigationTitle("连接记录")
             .navigationBarTitleDisplayMode(.inline)
             .searchable(text: $searchText, prompt: "搜索目标、地址、规则或链路")
             .toolbar {
@@ -135,6 +135,8 @@ struct ConnectionsView: View {
                                                   bottom: 9, trailing: 16))
                 }
                 .listStyle(.plain)
+                .scrollContentBackground(.hidden)
+                .background(Color.clear)
                 .refreshable { await controller.refresh(showLoading: false) }
             }
         }
