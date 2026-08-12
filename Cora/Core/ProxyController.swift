@@ -58,6 +58,7 @@ final class ProxyController: ObservableObject {
     @Published private(set) var mode: String = "rule"
     @Published var isLoading = false
     @Published private(set) var hasLoaded = false
+    @Published private(set) var isRuntimeAvailable = false
     @Published var error: String?
 
     /// 节点延迟（毫秒），node 名 → ms。0/缺失表示未测或超时。
@@ -102,7 +103,23 @@ final class ProxyController: ObservableObject {
             }
         }
 
-        let result = await CoreStateManager.shared.sendMessage(["cmd": "queryProxies"])
+        let status = CoreStateManager.shared.status
+        let runtimeAvailable = status == .connected || status == .reasserting
+        isRuntimeAvailable = runtimeAvailable
+        let result: TunnelManager.IPCResult
+        if runtimeAvailable {
+            result = await CoreStateManager.shared.sendMessage(["cmd": "queryProxies"])
+        } else if let subscription = SubscriptionStore.shared.selected,
+                  !subscription.yaml.isEmpty {
+            let providerJSON = SubscriptionStore.shared.providerPayloadsJSON(for: subscription.id)
+            let data = await Task.detached(priority: .userInitiated) {
+                MihomoCore.offlineProxySnapshot(configYAML: subscription.yaml,
+                                                providerPayloadsJSON: providerJSON)
+            }.value
+            result = .ok(data)
+        } else {
+            result = .failure("当前配置为空，请先添加或刷新订阅")
+        }
         guard generation == loadGeneration else { return }
         switch result {
         case .failure(let reason):
@@ -122,9 +139,14 @@ final class ProxyController: ObservableObject {
                 return
             }
             mode = ((obj["mode"] as? String) ?? "rule").lowercased()
+            if let snapshotError = obj["error"] as? String {
+                error = "解析已保存配置失败：\(snapshotError)"
+            } else if let missing = obj["missingProviders"] as? [String], !missing.isEmpty {
+                error = "远程 Provider 尚未缓存：\(missing.joined(separator: "、"))。请在订阅详情中刷新。"
+            }
 
             // 直连模式没有节点页数据，不再额外请求协议详情。
-            if mode == "direct" {
+            if runtimeAvailable && mode == "direct" {
                 groups = []
                 uniqueNodeCount = 0
                 details = [:]
@@ -139,14 +161,18 @@ final class ProxyController: ObservableObject {
                 return
             }
 
-            // 协议摘要（按配置走，随列表一起刷新）。
-            let det = await CoreStateManager.shared.sendMessage(["cmd": "proxyDetails"])
-            guard generation == loadGeneration else { return }
-            if case .ok(let d) = det,
-               let map = (try? JSONSerialization.jsonObject(with: d)) as? [String: String] {
-                details = map
+            if runtimeAvailable {
+                // 在线协议摘要来自当前运行配置。
+                let det = await CoreStateManager.shared.sendMessage(["cmd": "proxyDetails"])
+                guard generation == loadGeneration else { return }
+                if case .ok(let d) = det,
+                   let map = (try? JSONSerialization.jsonObject(with: d)) as? [String: String] {
+                    details = map
+                } else {
+                    details = [:]
+                }
             } else {
-                details = [:]
+                details = obj["details"] as? [String: String] ?? [:]
             }
 
             // 用 GLOBAL.all 的顺序还原配置定义顺序
@@ -168,7 +194,7 @@ final class ProxyController: ObservableObject {
             case "global":
                 // 全局模式：只看 GLOBAL 组（在它里面选全局出口）
                 groups = makeGroup("GLOBAL").map { [$0] } ?? []
-            case "direct":
+            case "direct" where runtimeAvailable:
                 groups = []
             default: // rule
                 // 按 GLOBAL.all 顺序取出其中是「策略组」的项，排除 GLOBAL 自身
@@ -202,6 +228,7 @@ final class ProxyController: ObservableObject {
         mode = "rule"
         isLoading = false
         hasLoaded = false
+        isRuntimeAvailable = false
         error = nil
         // delays 保留：缓存跨会话生效，下一次测速或 load 修剪时更新
         details = [:]
@@ -211,7 +238,7 @@ final class ProxyController: ObservableObject {
 
     /// 在某策略组选定节点（IPC selectProxy）。
     func select(group: String, name: String) async {
-        guard selecting[group] == nil else { return }
+        guard isRuntimeAvailable, selecting[group] == nil else { return }
         let session = sessionGeneration
         error = nil
         selecting[group] = name
@@ -239,7 +266,7 @@ final class ProxyController: ObservableObject {
 
     /// 对某策略组做延迟测试（IPC groupDelay），结果并入 delays。
     func testGroup(_ name: String) async {
-        guard !testing.contains(name) else { return }
+        guard isRuntimeAvailable, !testing.contains(name) else { return }
         let session = sessionGeneration
         error = nil
         testing.insert(name)

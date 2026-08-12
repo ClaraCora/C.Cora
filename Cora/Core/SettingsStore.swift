@@ -44,6 +44,10 @@ final class SettingsStore: ObservableObject {
             d.set(mixedPort, forKey: K.mixedPort)
         }
     }
+    /// 仅拒绝已知公网 WebRTC/STUN 探测端点，不按端口封锁通用 ICE 流量。
+    @Published var blockDirectSTUN: Bool {
+        didSet { d.set(blockDirectSTUN, forKey: K.blockDirectSTUN) }
+    }
     /// 拉取订阅时用的 User-Agent（机场常按 UA 返回不同格式）。默认 clash-meta。
     /// 仅主 App 下载订阅用，不经内核。
     @Published var subscriptionUA: String { didSet { d.set(subscriptionUA, forKey: K.subUA) } }
@@ -84,6 +88,7 @@ final class SettingsStore: ObservableObject {
         static let geoAuto = "set.geoAuto", geoInterval = "set.geoInterval"
         static let logLevel = "set.logLevel"
         static let mixedPort = "set.mixedPort"
+        static let blockDirectSTUN = "set.blockDirectSTUN"
         static let inclAll = "set.inclAll", exCell = "set.exCell", exAPNs = "set.exAPNs"
         static let exDev = "set.exDev", enforce = "set.enforce"
         static let subUA = "set.subUA"
@@ -104,6 +109,7 @@ final class SettingsStore: ObservableObject {
         geoUpdateInterval = gi == 0 ? 24 : gi
         logLevel = d.string(forKey: K.logLevel) ?? "info"
         mixedPort = min(max(d.integer(forKey: K.mixedPort), 0), 65_535)
+        blockDirectSTUN = d.object(forKey: K.blockDirectSTUN) as? Bool ?? false
         includeAllNetworks = d.object(forKey: K.inclAll) as? Bool ?? false
         excludeCellularServices = d.object(forKey: K.exCell) as? Bool ?? true
         excludeAPNs = d.object(forKey: K.exAPNs) as? Bool ?? true
@@ -128,6 +134,7 @@ final class SettingsStore: ObservableObject {
             "geoUpdateInterval": geoUpdateInterval,
             "logLevel": logLevel,
             "mixedPort": mixedPort,
+            "blockDirectSTUN": blockDirectSTUN,
             "applyOverrides": applyOverrides,
             "overrides": ConfigOverrideStore.shared.asDictionary(),
         ]

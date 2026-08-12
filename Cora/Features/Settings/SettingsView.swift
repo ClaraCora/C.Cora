@@ -69,6 +69,7 @@ struct SettingsView: View {
                 Section {
                     Toggle("接管所有网络", isOn: $settings.includeAllNetworks)
                     Toggle("强制路由", isOn: $settings.enforceRoutes)
+                    Toggle("阻止常见 WebRTC STUN 直连", isOn: $settings.blockDirectSTUN)
                     Toggle("排除蜂窝服务", isOn: $settings.excludeCellularServices)
                     Toggle("排除 APNs 推送", isOn: $settings.excludeAPNs)
                     if #available(iOS 17.4, *) {
@@ -78,7 +79,8 @@ struct SettingsView: View {
                     Text("隧道路由")
                 } footer: {
                     Text("系统隧道(NETunnelProvider)开关。「接管所有网络」会连系统默认排除的流量也走隧道；"
-                       + "排除项默认开启（蜂窝服务/推送/隔空投送等不走代理，避免异常）。改后需重连。")
+                       + "STUN 防泄露仅拒绝常见公网探测端点，不封锁 UDP 3478/5349，普通 DIRECT 语音、视频和 P2P 不受影响；"
+                       + "使用这些公网端点的通话可能受限。排除项默认开启。改后需重连。")
                 }
 
                 Section {
@@ -191,7 +193,7 @@ private struct GeoSettingsSection: View {
                + "“忽略 GEO 取反规则”可单独控制 geolocation-!cn / NOT(GEOIP) 等规则。"
                + "主 App 优先读取当前配置的 geox-url 下载数据库，设置中的地址仅在配置缺少对应地址时使用。"
                + "ASN 优先使用配置中的 geox-url.asn，缺少时使用内置备用地址。"
-               + "更新后需热重载配置或重新连接。")
+               + "更新后需重新连接。")
         }
     }
 

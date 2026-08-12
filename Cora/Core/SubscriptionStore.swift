@@ -1,6 +1,7 @@
 import Foundation
 
 private let subscriptionMaximumDownloadBytes: Int64 = 10 * 1_024 * 1_024
+private let proxyProviderMaximumDownloadBytes: Int64 = 10 * 1_024 * 1_024
 
 /// 一条订阅。
 struct Subscription: Identifiable, Codable, Equatable, Sendable {
@@ -95,10 +96,16 @@ final class SubscriptionStore: ObservableObject {
     @Published var selectedID: UUID?
     @Published var lastError: String?
     @Published private(set) var isBusy = false
+    @Published private(set) var refreshingProviderIDs: Set<UUID> = []
+    @Published private(set) var providerCacheRevision = 0
 
     private static let fileURL: URL = {
         let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         return dir.appendingPathComponent("subscriptions.json")
+    }()
+    private static let providerCacheDirectory: URL = {
+        let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        return dir.appendingPathComponent("ProxyProviderCache", isDirectory: true)
     }()
     private let persistence = SubscriptionPersistence(fileURL: SubscriptionStore.fileURL)
     private var persistenceRevision = 0
@@ -214,6 +221,7 @@ final class SubscriptionStore: ObservableObject {
                   let index = subscriptions.firstIndex(where: { $0.id == id }) else { return }
             apply(payload, to: &subscriptions[index], resetMissingUsage: true)
             subscriptions[index].url = u
+            removeProviderCache(id)
             if !n.isEmpty {
                 subscriptions[index].name = n
                 subscriptions[index].autoNamed = false
@@ -221,6 +229,9 @@ final class SubscriptionStore: ObservableObject {
                 subscriptions[index].name = title
             }
             save()
+            if Self.hasRemoteProxyProviders(payload.yaml) {
+                await refreshProxyProviders(id, updateRuntime: false)
+            }
         } catch is CancellationError {
             return
         } catch {
@@ -231,6 +242,7 @@ final class SubscriptionStore: ObservableObject {
 
     func remove(_ id: UUID) {
         invalidateRefresh(id)
+        removeProviderCache(id)
         subscriptions.removeAll { $0.id == id }
         if selectedID == id { selectedID = subscriptions.first?.id }
         save()
@@ -265,6 +277,9 @@ final class SubscriptionStore: ObservableObject {
                 subscriptions[i].name = title
             }
             save()
+            if Self.hasRemoteProxyProviders(payload.yaml) {
+                await refreshProxyProviders(id, updateRuntime: false)
+            }
         } catch is CancellationError {
             return
         } catch {
@@ -288,6 +303,84 @@ final class SubscriptionStore: ObservableObject {
         lastError = failures.isEmpty ? nil : failures.joined(separator: "\n")
     }
 
+    /// 刷新订阅声明的 HTTP proxy-providers。连接中时先让运行内核原地更新，
+    /// 同时由主 App 保存一份订阅隔离缓存，供断开状态下浏览节点。
+    func refreshProxyProviders(_ id: UUID, updateRuntime: Bool = true) async {
+        guard !refreshingProviderIDs.contains(id),
+              let subscription = subscriptions.first(where: { $0.id == id }),
+              !subscription.isLocal else { return }
+        refreshingProviderIDs.insert(id)
+        lastError = nil
+        defer { refreshingProviderIDs.remove(id) }
+
+        var failures: [String] = []
+        let runtimeStatus = CoreStateManager.shared.status
+        if updateRuntime && selectedID == id &&
+            (runtimeStatus == .connected || runtimeStatus == .reasserting) {
+            switch await CoreStateManager.shared.sendMessage(["cmd": "updateProxyProviders"]) {
+            case .failure(let reason):
+                failures.append("运行内核：\(reason)")
+            case .ok(let data):
+                if let response = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                   let providerFailures = response["failures"] as? [String: String] {
+                    failures.append(contentsOf: providerFailures.sorted(by: { $0.key < $1.key })
+                        .map { "\($0.key)：\($0.value)" })
+                }
+            }
+        }
+
+        do {
+            let providers = try Self.providerManifest(subscription.yaml)
+            guard !providers.isEmpty else {
+                throw ProxyProviderRefreshError.noRemoteProviders
+            }
+            var cached = Self.loadProviderCache(id)
+            var downloaded = 0
+            for provider in providers {
+                do {
+                    guard let url = Self.remoteURL(provider.url) else {
+                        throw ProxyProviderRefreshError.invalidURL(provider.name)
+                    }
+                    var request = makeRequest(url: url)
+                    for (field, values) in provider.header where !values.isEmpty {
+                        request.setValue(values.joined(separator: ", "),
+                                         forHTTPHeaderField: field)
+                    }
+                    let download = try await BoundedHTTPDownloader.download(
+                        for: request,
+                        maxBytes: proxyProviderMaximumDownloadBytes,
+                        resourceTimeout: 45)
+                    defer { try? FileManager.default.removeItem(at: download.fileURL) }
+                    let data = try Data(contentsOf: download.fileURL, options: .mappedIfSafe)
+                    guard let payload = String(data: data, encoding: .utf8) else {
+                        throw SubscriptionRefreshError.notText
+                    }
+                    if let validationError = MihomoCore.validateProxyProviderPayload(payload) {
+                        throw ProxyProviderRefreshError.invalidPayload(provider.name, validationError)
+                    }
+                    cached[provider.name] = payload
+                    downloaded += 1
+                } catch {
+                    failures.append("\(provider.name)：\(error.localizedDescription)")
+                }
+            }
+            if downloaded > 0 {
+                try Self.saveProviderCache(cached, id: id)
+                providerCacheRevision &+= 1
+            }
+        } catch {
+            failures.append(error.localizedDescription)
+        }
+        lastError = failures.isEmpty ? nil : "Provider 刷新未全部完成：\n" + failures.joined(separator: "\n")
+    }
+
+    func providerPayloadsJSON(for id: UUID) -> String {
+        let cache = Self.loadProviderCache(id)
+        guard let data = try? JSONEncoder().encode(cache),
+              let json = String(data: data, encoding: .utf8) else { return "{}" }
+        return json
+    }
+
     // MARK: - 校验/统计
 
     private func makeRequest(url: URL) -> URLRequest {
@@ -298,6 +391,39 @@ final class SubscriptionStore: ObservableObject {
                          forHTTPHeaderField: "User-Agent")
         request.timeoutInterval = 30
         return request
+    }
+
+    private static func providerManifest(_ yaml: String) throws -> [RemoteProxyProvider] {
+        let data = MihomoCore.proxyProviderManifest(configYAML: yaml)
+        let response = try JSONDecoder().decode(ProxyProviderManifestResponse.self, from: data)
+        if let error = response.error { throw ProxyProviderRefreshError.manifest(error) }
+        return response.providers
+    }
+
+    private static func hasRemoteProxyProviders(_ yaml: String) -> Bool {
+        (try? providerManifest(yaml).isEmpty == false) ?? false
+    }
+
+    private static func providerCacheURL(_ id: UUID) -> URL {
+        providerCacheDirectory.appendingPathComponent("\(id.uuidString).json")
+    }
+
+    private static func loadProviderCache(_ id: UUID) -> [String: String] {
+        guard let data = try? Data(contentsOf: providerCacheURL(id)),
+              let cache = try? JSONDecoder().decode([String: String].self, from: data) else { return [:] }
+        return cache
+    }
+
+    private static func saveProviderCache(_ cache: [String: String], id: UUID) throws {
+        try FileManager.default.createDirectory(at: providerCacheDirectory,
+                                                withIntermediateDirectories: true)
+        let data = try JSONEncoder().encode(cache)
+        try data.write(to: providerCacheURL(id), options: .atomic)
+    }
+
+    private func removeProviderCache(_ id: UUID) {
+        try? FileManager.default.removeItem(at: Self.providerCacheURL(id))
+        providerCacheRevision &+= 1
     }
 
     nonisolated private static func remoteURL(_ value: String) -> URL? {
@@ -526,6 +652,46 @@ private struct SubscriptionFetchPayload: Sendable {
 private struct ActiveSubscriptionRefresh {
     let generation: Int
     let task: Task<SubscriptionFetchPayload, Error>
+}
+
+private struct RemoteProxyProvider: Decodable, Sendable {
+    let name: String
+    let url: String
+    let header: [String: [String]]
+
+    private enum CodingKeys: String, CodingKey { case name, url, header }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        name = try container.decode(String.self, forKey: .name)
+        url = try container.decode(String.self, forKey: .url)
+        header = try container.decodeIfPresent([String: [String]].self, forKey: .header) ?? [:]
+    }
+}
+
+private struct ProxyProviderManifestResponse: Decodable, Sendable {
+    let providers: [RemoteProxyProvider]
+    let error: String?
+}
+
+private enum ProxyProviderRefreshError: LocalizedError {
+    case noRemoteProviders
+    case invalidURL(String)
+    case invalidPayload(String, String)
+    case manifest(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .noRemoteProviders:
+            return "当前配置没有可刷新的远程 Proxy Provider"
+        case .invalidURL(let name):
+            return "Provider \(name) 的链接无效"
+        case .invalidPayload(let name, let reason):
+            return "Provider \(name) 内容无效：\(reason)"
+        case .manifest(let reason):
+            return "解析 Provider 配置失败：\(reason)"
+        }
+    }
 }
 
 private actor SubscriptionPersistence {

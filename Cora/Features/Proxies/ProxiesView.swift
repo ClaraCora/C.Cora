@@ -4,12 +4,10 @@ import UIKit
 /// 节点页：紧凑展示策略组，展开后可搜索、切换并比较节点延迟。
 struct ProxiesView: View {
     @EnvironmentObject private var core: CoreStateManager
+    @EnvironmentObject private var subscriptions: SubscriptionStore
     @StateObject private var controller = ProxyController()
     @State private var expanded: Set<String> = []
     @State private var searchText = ""
-    @State private var showingReloadConfirmation = false
-    @State private var configurationReloadState = ConfigurationReloadState.idle
-    @State private var configurationReloadFailure: ConfigurationReloadFailure?
 
     var body: some View {
         NavigationStack {
@@ -21,38 +19,12 @@ struct ProxiesView: View {
                             refreshControl
                         }
                     }
-                    if canReloadConfiguration {
-                        ToolbarItem(placement: .topBarTrailing) {
-                            configurationReloadControl
-                        }
-                    }
                 }
-                .confirmationDialog("重载当前配置？",
-                                    isPresented: $showingReloadConfirmation,
-                                    titleVisibility: .visible) {
-                    Button("重载配置") {
-                        Task { await reloadConfiguration() }
-                    }
-                    Button("取消", role: .cancel) {}
-                } message: {
-                    Text("将在当前 VPN 隧道内热重载「\(configurationName)」，完成后自动刷新节点。")
-                }
-                .alert(item: $configurationReloadFailure) { failure in
-                    Alert(title: Text("重载配置失败"),
-                          message: Text(failure.message),
-                          dismissButton: .default(Text("好")))
-                }
-                .task(id: core.status) {
-                    guard canQueryNodes else { return }
+                .task(id: LoadContext(status: core.status.rawValue,
+                                      subscriptionID: subscriptions.selectedID,
+                                      configurationUpdatedAt: subscriptions.selected?.updatedAt,
+                                      providerRevision: subscriptions.providerCacheRevision)) {
                     await reload()
-                }
-                .onChange(of: core.isActive) { _, active in
-                    guard !active else { return }
-                    searchText = ""
-                    expanded.removeAll()
-                    showingReloadConfirmation = false
-                    configurationReloadState = .idle
-                    controller.resetSession()
                 }
         }
     }
@@ -69,27 +41,15 @@ struct ProxiesView: View {
     }
 
     private var canRefresh: Bool {
-        canQueryNodes && controller.mode != "direct"
-    }
-
-    private var canReloadConfiguration: Bool {
-        core.status == .connected
+        controller.mode != "direct" || !controller.isRuntimeAvailable
     }
 
     private var showsSearch: Bool {
         canRefresh && !controller.groups.isEmpty
     }
 
-    private var canQueryNodes: Bool {
-        core.status == .connected || core.status == .reasserting
-    }
-
     @ViewBuilder private var content: some View {
-        if !core.isActive {
-            ContentUnavailableView("未连接",
-                systemImage: "bolt.horizontal.circle",
-                description: Text("先在「连接」页连上 VPN，再查看策略组"))
-        } else if let err = controller.error, controller.groups.isEmpty {
+        if let err = controller.error, controller.groups.isEmpty {
             ContentUnavailableView {
                 Label("拿不到节点", systemImage: "exclamationmark.triangle")
             } description: {
@@ -97,7 +57,7 @@ struct ProxiesView: View {
             } actions: {
                 Button("重试") { Task { await reload() } }
             }
-        } else if controller.mode == "direct" {
+        } else if controller.mode == "direct" && controller.isRuntimeAvailable {
             ContentUnavailableView("直连模式",
                 systemImage: "arrow.up.forward",
                 description: Text("当前为直连模式，不经过代理节点"))
@@ -112,31 +72,6 @@ struct ProxiesView: View {
         }
     }
 
-    private var configurationReloadControl: some View {
-        Group {
-            switch configurationReloadState {
-            case .reloading:
-                ProgressView()
-                    .controlSize(.small)
-                    .accessibilityLabel("正在重载配置")
-            case .succeeded:
-                Image(systemName: "checkmark.circle.fill")
-                    .foregroundStyle(.green)
-                    .accessibilityLabel("配置已重载")
-            case .idle:
-                Button {
-                    showingReloadConfirmation = true
-                } label: {
-                    Image(systemName: "arrow.triangle.2.circlepath")
-                }
-                .disabled(core.isBusy || hasNodeOperationInFlight)
-                .accessibilityLabel("重载当前配置")
-                .help("重载当前配置")
-            }
-        }
-        .frame(width: 44, height: 44)
-    }
-
     private var refreshControl: some View {
         Group {
             if controller.isLoading {
@@ -148,7 +83,6 @@ struct ProxiesView: View {
                 } label: {
                     Image(systemName: "arrow.clockwise")
                 }
-                .disabled(isReloadingConfiguration)
                 .accessibilityLabel("刷新节点")
                 .help("刷新节点")
             }
@@ -160,6 +94,14 @@ struct ProxiesView: View {
         let results = displayedGroups
 
         return List {
+            if !controller.isRuntimeAvailable {
+                Section {
+                    Label("VPN 未连接，当前显示已保存配置；节点切换和测速暂不可用。",
+                          systemImage: "eye")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            }
             if let error = controller.error {
                 Section {
                     Label(error, systemImage: "exclamationmark.triangle.fill")
@@ -191,10 +133,11 @@ struct ProxiesView: View {
                             isExpanded: result.isExpanded,
                             isTesting: controller.testing.contains(result.group.name),
                             currentDelay: controller.delays[result.group.now],
+                            canTest: controller.isRuntimeAvailable,
+                            isRuntimeAvailable: controller.isRuntimeAvailable,
                             canToggle: normalizedSearch.isEmpty,
                             onToggle: { openGroup(result.group.name) },
                             onTest: {
-                                guard !isReloadingConfiguration else { return }
                                 Task { await controller.testGroup(result.group.name) }
                             })
                         .listRowInsets(EdgeInsets(top: 8, leading: 14, bottom: 8, trailing: 8))
@@ -215,11 +158,11 @@ struct ProxiesView: View {
                                     isCurrent: item.name == result.group.now,
                                     isSelecting: selectingNode == item.name,
                                     isSelectionBlocked: selectingNode != nil,
-                                    selectable: result.group.selectable,
+                                    selectable: controller.isRuntimeAvailable && result.group.selectable,
+                                    isReadOnly: !controller.isRuntimeAvailable,
                                     delay: controller.delays[item.name],
                                     detail: controller.details[item.name],
                                     onSelect: {
-                                        guard !isReloadingConfiguration else { return }
                                         Task {
                                             await controller.select(
                                                 group: result.group.name,
@@ -306,58 +249,15 @@ struct ProxiesView: View {
     }
 
     private func reload() async {
-        guard canQueryNodes, !isReloadingConfiguration else { return }
         await controller.load()
     }
-
-    private var isReloadingConfiguration: Bool {
-        configurationReloadState == .reloading
-    }
-
-    private var hasNodeOperationInFlight: Bool {
-        controller.isLoading || !controller.testing.isEmpty || !controller.selecting.isEmpty
-    }
-
-    private var configurationName: String {
-        guard let selected = SubscriptionStore.shared.selected,
-              !selected.yaml.isEmpty else { return "直连配置" }
-        return selected.name
-    }
-
-    private func reloadConfiguration() async {
-        guard canReloadConfiguration,
-              !isReloadingConfiguration,
-              !hasNodeOperationInFlight else { return }
-        configurationReloadState = .reloading
-        do {
-            try await core.reloadConfiguration()
-            expanded.removeAll()
-            controller.resetSession()
-            await controller.load()
-            configurationReloadState = .succeeded
-            UINotificationFeedbackGenerator().notificationOccurred(.success)
-            try? await Task.sleep(nanoseconds: 1_200_000_000)
-            if configurationReloadState == .succeeded {
-                configurationReloadState = .idle
-            }
-        } catch {
-            configurationReloadState = .idle
-            configurationReloadFailure = ConfigurationReloadFailure(
-                message: error.localizedDescription)
-            UINotificationFeedbackGenerator().notificationOccurred(.error)
-        }
-    }
 }
 
-private enum ConfigurationReloadState: Equatable {
-    case idle
-    case reloading
-    case succeeded
-}
-
-private struct ConfigurationReloadFailure: Identifiable {
-    let id = UUID()
-    let message: String
+private struct LoadContext: Hashable {
+    let status: Int
+    let subscriptionID: UUID?
+    let configurationUpdatedAt: Date?
+    let providerRevision: Int
 }
 
 private struct DisplayedProxyGroup: Identifiable {
@@ -419,6 +319,8 @@ private struct GroupHeaderRow: View {
     let isExpanded: Bool
     let isTesting: Bool
     let currentDelay: Int?
+    let canTest: Bool
+    let isRuntimeAvailable: Bool
     let canToggle: Bool
     let onToggle: () -> Void
     let onTest: () -> Void
@@ -485,7 +387,7 @@ private struct GroupHeaderRow: View {
             }
 
             HStack(spacing: 5) {
-                Image(systemName: group.selectable ? "hand.tap" : "gearshape")
+                Image(systemName: isRuntimeAvailable && group.selectable ? "hand.tap" : "gearshape")
                     .font(.caption2.weight(.medium))
                     .foregroundStyle(Color.accentColor)
                 Text(group.now.isEmpty ? "未选择" : group.now)
@@ -512,11 +414,11 @@ private struct GroupHeaderRow: View {
             testLabel
         }
         .buttonStyle(SpeedTestButtonStyle())
-        .disabled(isTesting)
+        .disabled(isTesting || !canTest)
         .accessibilityLabel("测试\(group.name)延迟")
         .accessibilityValue(
             isTesting ? "正在测速" : DelayBadge.accessibilityText(currentDelay))
-        .accessibilityHint("测试该策略组全部节点")
+        .accessibilityHint(canTest ? "测试该策略组全部节点" : "连接 VPN 后可测速")
     }
 
     private var testLabel: some View {
@@ -630,6 +532,7 @@ private struct ProxyNodeListRow: View {
     let isSelecting: Bool
     let isSelectionBlocked: Bool
     let selectable: Bool
+    let isReadOnly: Bool
     let delay: Int?
     let detail: String?
     let onSelect: () -> Void
@@ -667,7 +570,7 @@ private struct ProxyNodeListRow: View {
             isCurrent ? "当前节点" : nil,
             detail?.isEmpty == false ? detail : nil,
             DelayBadge.accessibilityText(delay),
-            selectable ? nil : "由策略组自动选择",
+            isReadOnly ? "离线只读" : (selectable ? nil : "由策略组自动选择"),
         ]
         .compactMap { $0 }
         .joined(separator: "，")

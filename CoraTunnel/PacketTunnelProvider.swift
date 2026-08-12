@@ -1,4 +1,4 @@
-import NetworkExtension
+﻿import NetworkExtension
 import Mihomo // gomobile 生成的 mihomo 内核框架（含 with_gvisor）
 import Network
 import Darwin
@@ -6,7 +6,6 @@ import os.log
 import WidgetKit
 
 private let tunnelMaximumGeoAssetBytes: Int64 = 64 * 1_024 * 1_024
-private let minimumHotReloadAvailableMemory: UInt64 = 28 * 1_024 * 1_024
 
 /// Network Extension 的 Packet Tunnel 实现（Phase 2：真正接管流量）。
 ///
@@ -24,29 +23,10 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     /// 当前 mihomo 工作目录（含 run.log）。供 handleAppMessage 回传内核日志用。
     private var homeDir: String?
 
-    /// 当前运行中的 utun fd。配置重载只复用它，不重建系统隧道。
+    /// 当前运行中的 utun fd，用于确认异步启动结果仍有效。
     private var tunnelFileDescriptor: Int32?
-    private var tunnelMTU: Int?
-    private var configuredTunnelMTU: Int?
-    private var configuredIPv6: Bool?
     private var isStopping = false
-    private struct ReloadJob {
-        enum Phase: String {
-            case queued
-            case running
-            case succeeded
-            case failed
-        }
-
-        let token: String
-        var phase: Phase
-        var error: String?
-        var updatedAt: TimeInterval
-    }
-
-    private let reloadQueue = DispatchQueue(label: "com.cora.tunnel.reload", qos: .userInitiated)
-    private let reloadStateLock = NSLock()
-    private var reloadJob: ReloadJob?
+    private let runtimeQueue = DispatchQueue(label: "com.cora.tunnel.runtime", qos: .userInitiated)
     private let ipcQueue = DispatchQueue(label: "com.cora.tunnel.ipc",
                                          qos: .userInitiated,
                                          attributes: .concurrent)
@@ -120,16 +100,10 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
     override func startTunnel(options: [String: NSObject]?,
                               completionHandler: @escaping (Error?) -> Void) {
-        reloadQueue.sync {
+        runtimeQueue.sync {
             isStopping = false
             tunnelFileDescriptor = nil
-            tunnelMTU = nil
-            configuredTunnelMTU = nil
-            configuredIPv6 = nil
         }
-        reloadStateLock.lock()
-        reloadJob = nil
-        reloadStateLock.unlock()
         stopTrollStoreIPC()
         // 每次启动清空 ne.log，避免历史残留干扰排查
         // 隧道建立前先抓物理网络 DNS；隧道起来后系统主解析器会变成隧道自己的 DNS。
@@ -224,7 +198,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             FileLog.write("调用 MihomoStartWithConfig…")
             self.memoryDiagnostics.start(directoryPath: home)
             var startError: NSError?
-            let startResult: Bool? = self.reloadQueue.sync {
+            let startResult: Bool? = self.runtimeQueue.sync {
                 guard !self.isStopping else { return nil }
                 let ok = MihomoStartWithConfig(
                     Int(fd), actualMTU, configYAML, resolvedSettings, &startError)
@@ -232,9 +206,6 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                     FileLog.write("MihomoStartWithConfig 返回成功")
                     self.log.info("mihomo 启动成功")
                     self.tunnelFileDescriptor = fd
-                    self.tunnelMTU = actualMTU
-                    self.configuredTunnelMTU = configuredMTU
-                    self.configuredIPv6 = ipv6Enabled
                     AppGroupState.vpnConnected = true // 共享给控制中心磁贴显示
                     if #available(iOS 18.0, *) {
                         ControlCenter.shared.reloadControls(ofKind: ControlWidgetKind.vpn)
@@ -261,7 +232,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 return
             }
 
-            let stillRunning = self.reloadQueue.sync {
+            let stillRunning = self.runtimeQueue.sync {
                 !self.isStopping && self.tunnelFileDescriptor == fd
             }
             if stillRunning {
@@ -319,12 +290,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         FileLog.write("stopTunnel，原因 rawValue=\(reason.rawValue)")
         log.info("stopTunnel，原因：\(reason.rawValue, privacy: .public)")
         stopTrollStoreIPC()
-        reloadQueue.sync {
+        runtimeQueue.sync {
             isStopping = true
             tunnelFileDescriptor = nil
-            tunnelMTU = nil
-            configuredTunnelMTU = nil
-            configuredIPv6 = nil
             AppGroupState.vpnConnected = false // 同步给控制中心磁贴
             if #available(iOS 18.0, *) {
                 ControlCenter.shared.reloadControls(ofKind: ControlWidgetKind.vpn)
@@ -592,6 +560,10 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             ipcQueue.async {
                 reply(Data(MihomoQueryProxies().utf8))
             }
+        case "updateProxyProviders":
+            ipcQueue.async {
+                reply(Data(MihomoUpdateProxyProviders().utf8))
+            }
         case "selectProxy":
             let group = (obj?["group"] as? String) ?? ""
             let name = (obj?["name"] as? String) ?? ""
@@ -637,10 +609,6 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         case "setMode":
             MihomoSetMode((obj?["mode"] as? String) ?? "rule")
             reply(Data(#"{"ok":true}"#.utf8))
-        case "reloadConfig":
-            reloadConfiguration(obj, completionHandler: reply)
-        case "reloadStatus":
-            reply(reloadStatusResponse(token: obj?["token"] as? String))
         case "runLogChunk":
             let offset = (obj?["offset"] as? NSNumber)?.intValue ?? -1
             let generation = (obj?["generation"] as? NSNumber)?.intValue ?? 0
@@ -718,271 +686,6 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private static func jsonData(_ object: [String: Any]) -> Data {
         (try? JSONSerialization.data(withJSONObject: object)) ?? Data(#"{"ok":false}"#.utf8)
-    }
-
-    private func reloadConfiguration(_ object: [String: Any]?,
-                                     completionHandler: ((Data?) -> Void)?) {
-        let transfer = object?["transfer"] as? String
-        let token = (object?["token"] as? String).flatMap {
-            UUID(uuidString: $0) == nil ? nil : $0
-        } ?? UUID().uuidString
-        let inlineConfig = object?["config"] as? String
-        let inlineSettings = object?["settings"] as? String
-
-        if let activeToken = beginReload(token: token) {
-            completionHandler?(Self.reloadResponse(
-                error: "已有配置正在重载",
-                code: "reloadInProgress",
-                token: activeToken))
-            return
-        }
-
-        let runtime: (fd: Int32, mtu: Int, home: String)?
-        runtime = reloadQueue.sync {
-            guard !isStopping,
-                  let fd = tunnelFileDescriptor,
-                  let mtu = tunnelMTU,
-                  let home = homeDir else { return nil }
-            return (fd, mtu, home)
-        }
-        guard let runtime else {
-            finishReload(token: token, phase: .failed, error: "VPN 尚未完成启动")
-            completionHandler?(Self.reloadResponse(error: "VPN 尚未完成启动", token: token))
-            return
-        }
-
-        let input: (config: String, settings: String)
-        do {
-            input = try Self.loadReloadInput(
-                transfer: transfer,
-                token: token,
-                inlineConfig: inlineConfig,
-                inlineSettings: inlineSettings)
-        } catch {
-            let message = error.localizedDescription
-            FileLog.write("读取重载配置失败：\(message)")
-            finishReload(token: token, phase: .failed, error: message)
-            completionHandler?(Self.reloadResponse(
-                error: message,
-                code: (error as? ReloadInputError)?.responseCode,
-                token: token))
-            return
-        }
-
-        // 先回受理结果，再执行耗时的 ParseRawConfig/ApplyConfig。状态查询完全在 Swift
-        // 内完成，不会被 Go 侧 configApplyMu 或大配置解析阻塞。
-        completionHandler?(Self.reloadResponse(accepted: true, token: token))
-        reloadQueue.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-            guard let self else { return }
-            self.finishReload(token: token, phase: .running)
-
-            let configYAML = input.config.isEmpty
-                ? MihomoConfig.directModeYAML()
-                : input.config
-            let effectiveSettings = AppGroup.containerURL == nil
-                ? Self.disablingGeo(in: input.settings)
-                : input.settings
-            let requestedMTUValue = Int(MihomoConfiguredTunMTU(configYAML))
-            let requestedMTU: Int? = requestedMTUValue > 0 ? requestedMTUValue : nil
-            guard requestedMTU == self.configuredTunnelMTU else {
-                let oldValue = self.configuredTunnelMTU.map(String.init) ?? "系统"
-                let newValue = requestedMTU.map(String.init) ?? "系统"
-                let message = "tun.mtu 从 \(oldValue) 变为 \(newValue)，请断开并重新连接后生效"
-                FileLog.write("拒绝热重载：\(message)")
-                self.finishReload(token: token, phase: .failed, error: message)
-                return
-            }
-            let requestedIPv6 = Self.ipv6Enabled(settingsJSON: effectiveSettings)
-            guard requestedIPv6 == self.configuredIPv6 else {
-                let message = "IPv6 设置发生变化，请断开并重新连接后生效"
-                FileLog.write("拒绝热重载：\(message)")
-                self.finishReload(token: token, phase: .failed, error: message)
-                return
-            }
-            if let geoError = Self.validateGeoAssets(configYAML: configYAML,
-                                                      settingsJSON: effectiveSettings,
-                                                      home: runtime.home) {
-                let message = geoError.localizedDescription
-                FileLog.write("重载前 GEO / ASN 数据检查失败：\(message)")
-                self.finishReload(token: token, phase: .failed, error: message)
-                return
-            }
-
-            let injectedSettings = self.injectingSystemDNS(into: effectiveSettings)
-            var prepareError: NSError?
-            let prepared = MihomoPrepareReload(runtime.mtu, configYAML,
-                                               injectedSettings, &prepareError)
-            guard prepared else {
-                let message = prepareError?.localizedDescription ?? "mihomo 热重载准备失败"
-                FileLog.write("准备热重载失败：\(message)")
-                self.finishReload(token: token, phase: .failed, error: message)
-                return
-            }
-            guard MihomoReloadPrepared() else {
-                FileLog.write("配置与 GEO 文件均未变化，跳过热重载")
-                self.finishReload(token: token, phase: .succeeded)
-                return
-            }
-
-            self.memoryDiagnostics.record(event: "reloadPrepared")
-            // Close() removes trackers synchronously, but their socket/provider
-            // goroutines finish asynchronously. Let those stacks unwind before
-            // allocating RawConfig and the replacement runtime together.
-            Thread.sleep(forTimeInterval: 0.5)
-            MihomoForceGC()
-            Thread.sleep(forTimeInterval: 0.15)
-            self.memoryDiagnostics.record(event: "reloadDrained")
-
-            let availableMemory = UInt64(os_proc_available_memory())
-            guard availableMemory >= minimumHotReloadAvailableMemory else {
-                MihomoCancelReload()
-                self.memoryDiagnostics.record(event: "reloadCancelledLowMemory")
-                let availableMiB = availableMemory / (1_024 * 1_024)
-                let message = "热重载可用内存仅 \(availableMiB) MB，已保留旧配置和 VPN 连接"
-                FileLog.write(message)
-                self.finishReload(token: token, phase: .failed, error: message)
-                return
-            }
-
-            FileLog.write("调用 MihomoReloadConfig（config=\(configYAML.count) 字节）…")
-            self.memoryDiagnostics.record(event: "reloadBefore")
-            var reloadError: NSError?
-            let ok = MihomoReloadConfig(Int(runtime.fd), runtime.mtu, configYAML,
-                                        injectedSettings,
-                                        &reloadError)
-            self.memoryDiagnostics.record(event: ok ? "reloadAfter" : "reloadFailed")
-            guard ok else {
-                let message = reloadError?.localizedDescription ?? "mihomo 重载失败（未知错误）"
-                FileLog.write("MihomoReloadConfig 失败：\(message)")
-                self.finishReload(token: token, phase: .failed, error: message)
-                return
-            }
-
-            // 只有应用成功才更新系统重连使用的缓存，避免坏配置污染下一次启动。
-            let configPath = (runtime.home as NSString).appendingPathComponent("config.yaml")
-            let settingsPath = (runtime.home as NSString).appendingPathComponent("settings.json")
-            do {
-                try configYAML.write(toFile: configPath, atomically: true, encoding: .utf8)
-                try effectiveSettings.write(toFile: settingsPath, atomically: true, encoding: .utf8)
-            } catch {
-                FileLog.write("配置已重载，但更新重连缓存失败：\(error.localizedDescription)")
-            }
-            FileLog.write("配置重载成功")
-            self.finishReload(token: token, phase: .succeeded)
-        }
-    }
-
-    /// 返回正在执行的 token；nil 表示当前请求已成功占用重载槽位。
-    private func beginReload(token: String) -> String? {
-        reloadStateLock.lock()
-        defer { reloadStateLock.unlock() }
-        if let job = reloadJob, job.phase == .queued || job.phase == .running {
-            return job.token
-        }
-        reloadJob = ReloadJob(token: token,
-                              phase: .queued,
-                              error: nil,
-                              updatedAt: Date().timeIntervalSince1970)
-        return nil
-    }
-
-    private func finishReload(token: String, phase: ReloadJob.Phase, error: String? = nil) {
-        reloadStateLock.lock()
-        defer { reloadStateLock.unlock() }
-        guard reloadJob?.token == token else { return }
-        reloadJob?.phase = phase
-        reloadJob?.error = error
-        reloadJob?.updatedAt = Date().timeIntervalSince1970
-    }
-
-    private func reloadStatusResponse(token: String?) -> Data {
-        reloadStateLock.lock()
-        let job = reloadJob
-        reloadStateLock.unlock()
-
-        guard let token, let job, job.token == token else {
-            return Self.reloadResponse(error: "没有找到该重载任务",
-                                       code: "reloadNotFound",
-                                       token: token)
-        }
-        var response: [String: Any] = [
-            "ok": true,
-            "token": job.token,
-            "status": job.phase.rawValue,
-            "updatedAt": job.updatedAt,
-        ]
-        if let error = job.error { response["error"] = error }
-        return Self.jsonData(response)
-    }
-
-    private static func loadReloadInput(transfer: String?,
-                                        token: String?,
-                                        inlineConfig: String?,
-                                        inlineSettings: String?) throws -> (config: String, settings: String) {
-        if transfer == "appGroup" {
-            guard let token, UUID(uuidString: token) != nil,
-                  let container = AppGroup.containerURL else {
-                throw ReloadInputError.unavailableTransfer
-            }
-            let directory = container.appendingPathComponent("ReloadRequests", isDirectory: true)
-            let configURL = directory.appendingPathComponent("\(token).yaml")
-            let settingsURL = directory.appendingPathComponent("\(token).json")
-            defer {
-                try? FileManager.default.removeItem(at: configURL)
-                try? FileManager.default.removeItem(at: settingsURL)
-            }
-            do {
-                return (
-                    try String(contentsOf: configURL, encoding: .utf8),
-                    try String(contentsOf: settingsURL, encoding: .utf8)
-                )
-            } catch {
-                throw ReloadInputError.readFailed(error.localizedDescription)
-            }
-        }
-
-        guard let inlineConfig, let inlineSettings else {
-            throw ReloadInputError.missingPayload
-        }
-        return (inlineConfig, inlineSettings)
-    }
-
-    private static func reloadResponse(error: String? = nil,
-                                       code: String? = nil,
-                                       accepted: Bool = false,
-                                       token: String? = nil) -> Data {
-        var response: [String: Any] = ["ok": error == nil]
-        if let error { response["error"] = error }
-        if let code { response["code"] = code }
-        if accepted { response["accepted"] = true }
-        if let token { response["token"] = token }
-        return jsonData(response)
-    }
-
-    private enum ReloadInputError: LocalizedError {
-        case unavailableTransfer
-        case missingPayload
-        case readFailed(String)
-
-        var errorDescription: String? {
-            switch self {
-            case .unavailableTransfer:
-                return "App Group 重载通道不可用"
-            case .missingPayload:
-                return "重载配置内容缺失"
-            case .readFailed(let reason):
-                return "读取重载配置失败：\(reason)"
-            }
-        }
-
-        var responseCode: String? {
-            switch self {
-            case .unavailableTransfer, .readFailed:
-                return "reloadTransferUnavailable"
-            case .missingPayload:
-                return nil
-            }
-        }
     }
 
     /// 返回当前 Network Extension 进程的物理内存占用。

@@ -10,6 +10,7 @@ struct SubscriptionDetailView: View {
     @State private var showRemoteEditor = false
     @State private var refreshing = false
     @State private var refreshOK = false
+    @State private var providerRefreshOK = false
 
     private var sub: Subscription? {
         store.subscriptions.first(where: { $0.id == subID })
@@ -108,6 +109,25 @@ struct SubscriptionDetailView: View {
                     }
                 }
                 .disabled(refreshing)
+
+                Button {
+                    Task {
+                        providerRefreshOK = false
+                        await store.refreshProxyProviders(sub.id)
+                        providerRefreshOK = (store.lastError == nil)
+                    }
+                } label: {
+                    HStack {
+                        Label("刷新远程 Provider", systemImage: "arrow.triangle.2.circlepath")
+                        Spacer()
+                        if store.refreshingProviderIDs.contains(sub.id) {
+                            ProgressView()
+                        } else if providerRefreshOK {
+                            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                        }
+                    }
+                }
+                .disabled(refreshing || store.refreshingProviderIDs.contains(sub.id))
             }
 
             Toggle(isOn: Binding(

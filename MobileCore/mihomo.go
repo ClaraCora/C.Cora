@@ -11,7 +11,6 @@ package mihomo
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,6 +18,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"runtime/debug"
 	"sort"
@@ -38,9 +38,9 @@ import (
 	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/config"
 	C "github.com/metacubex/mihomo/constant"
+	P "github.com/metacubex/mihomo/constant/provider"
 	mdns "github.com/metacubex/mihomo/dns"
 	"github.com/metacubex/mihomo/hub/executor"
-	"github.com/metacubex/mihomo/listener"
 	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/tunnel"
 	"github.com/metacubex/mihomo/tunnel/statistic"
@@ -79,17 +79,14 @@ var (
 	physicalIface    string
 
 	// 最近一次合并配置时收集的：不适用内容提示 + 各节点协议摘要（供主 App 经 IPC 取用）。
-	configNotices             []string
-	proxyDetailsMap           = map[string]string{}
-	activeConfigFingerprint   string
-	preparedReloadFingerprint string
-	reloadPrepared            bool
-	activeDNSConfig           *config.DNS
-	activeGeneralIPv6         bool
-	activeSystemDNS           []string
-	activeUsesSystemDNS       bool
-	pendingUsesSystemDNS      bool
-	coreStartedAt             time.Time
+	configNotices        []string
+	proxyDetailsMap      = map[string]string{}
+	activeDNSConfig      *config.DNS
+	activeGeneralIPv6    bool
+	activeSystemDNS      []string
+	activeUsesSystemDNS  bool
+	pendingUsesSystemDNS bool
+	coreStartedAt        time.Time
 )
 
 // Version 返回「mihomo 内核版本 / Go 运行时版本」。
@@ -108,7 +105,7 @@ func ControlInfo() string {
 		"protocolVersion": controlProtocolVersion,
 		"coreVersion":     Version(),
 		"capabilities": []string{
-			"connections", "logs", "proxies", "reload", "runtime",
+			"connections", "logs", "proxies", "runtime",
 		},
 	})
 	if err != nil {
@@ -319,6 +316,7 @@ type appSettings struct {
 	GeoUpdateInterval int                    `json:"geoUpdateInterval"`
 	LogLevel          string                 `json:"logLevel"`
 	MixedPort         int                    `json:"mixedPort"`
+	BlockDirectSTUN   bool                   `json:"blockDirectSTUN"`
 	SystemDNS         []string               `json:"systemDNS"`
 	ApplyOverrides    bool                   `json:"applyOverrides"`
 	Overrides         configOverrideSettings `json:"overrides"`
@@ -580,279 +578,23 @@ func StartWithConfig(fd int, tunnelMTU int, configYAML string, settingsJSON stri
 		appendRunLog("run.log 重置失败: " + resetError.Error())
 	}
 
-	if err := applyRuntimeConfig(fd, tunnelMTU, configYAML, st, "启动", false); err != nil {
+	if err := applyRuntimeConfig(fd, tunnelMTU, configYAML, st); err != nil {
 		return err
 	}
-	activeConfigFingerprint = runtimeConfigFingerprint(tunnelMTU, configYAML, settingsJSON)
-	reloadPrepared = false
-	preparedReloadFingerprint = ""
 	coreStartedAt = time.Now()
 	return nil
 }
 
-// ReloadConfig 在当前 utun 上重新合并并应用主 App 下发的配置。
-// 与 StartWithConfig 共用同一条 iOS 配置处理路径，但不会清空现有日志。
-func ReloadConfig(fd int, tunnelMTU int, configYAML string, settingsJSON string) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			stack := fmt.Sprintf("panic: %v\n%s", r, debug.Stack())
-			appendRunLog("===== mihomo 重载 panic =====\n" + stack)
-			err = fmt.Errorf("mihomo reload panic: %v", r)
-		}
-	}()
-	configApplyMu.Lock()
-	defer configApplyMu.Unlock()
-	defer func() {
-		reloadPrepared = false
-		preparedReloadFingerprint = ""
-	}()
-
-	st := parseSettings(settingsJSON)
-	fingerprint := runtimeConfigFingerprint(tunnelMTU, configYAML, settingsJSON)
-	if !reloadPrepared && activeConfigFingerprint != "" && fingerprint == activeConfigFingerprint {
-		appendRunLog("配置与 GEO 文件均未变化，跳过热重载")
-		return nil
-	}
-	if reloadPrepared && fingerprint != preparedReloadFingerprint {
-		tunnel.OnRunning()
-		return fmt.Errorf("重载配置在准备后发生变化，请重新操作")
-	}
-	appendRunLog(fmt.Sprintf("ReloadConfig: fd=%d mtu=%d stack=%s ipv6=%v geo=%v(mode=%v,%s,ignoreNegation=%v) log=%s",
-		fd, tunnelMTU, st.Stack, st.IPv6, st.GeoEnabled, st.GeodataMode, st.GeoLoader,
-		st.IgnoreGeoNegation, st.LogLevel))
-	if err := applyRuntimeConfig(fd, tunnelMTU, configYAML, st, "重载", true); err != nil {
-		return err
-	}
-	activeConfigFingerprint = fingerprint
-	appendRunLog("配置重载完成")
-	return nil
-}
-
-// PrepareReload performs the reversible half of a hot reload. It suspends new
-// forwarding and closes active connections, but deliberately keeps the current
-// proxies/rules alive. Swift can then wait for connection goroutines to drain,
-// inspect iOS memory headroom, and either continue or call CancelReload.
-// ReloadPrepared reports whether the requested runtime differs from the active
-// one after this function returns successfully.
-func PrepareReload(tunnelMTU int, configYAML string, settingsJSON string) (err error) {
-	configApplyMu.Lock()
-	defer configApplyMu.Unlock()
-	defer func() {
-		if r := recover(); r != nil {
-			reloadPrepared = false
-			preparedReloadFingerprint = ""
-			tunnel.OnRunning()
-			err = fmt.Errorf("mihomo reload preparation panic: %v", r)
-		}
-	}()
-
-	if !listener.LastTunConf.Enable || listener.LastTunConf.FileDescriptor == 0 {
-		return fmt.Errorf("当前 TUN 配置不可用，请重新连接 VPN")
-	}
-	fingerprint := runtimeConfigFingerprint(tunnelMTU, configYAML, settingsJSON)
-	if activeConfigFingerprint != "" && fingerprint == activeConfigFingerprint {
-		appendRunLog("配置与 GEO 文件均未变化，无需热重载")
-		return nil
-	}
-	if reloadPrepared {
-		if fingerprint == preparedReloadFingerprint {
-			return nil
-		}
-		return fmt.Errorf("已有其他配置正在准备重载")
-	}
-
-	tunnel.OnSuspend()
-	closed := CloseAllConnections()
-	reloadPrepared = true
-	preparedReloadFingerprint = fingerprint
-	debug.FreeOSMemory()
-	appendRunLog(fmt.Sprintf("热重载准备完成：已暂停新流量并关闭连接=%d，旧配置仍可恢复", closed))
-	return nil
-}
-
-// ReloadPrepared is kept separate from PrepareReload so gomobile exposes a
-// plain BOOL instead of an Objective-C out parameter for a Go (bool, error).
-func ReloadPrepared() bool {
-	configApplyMu.RLock()
-	defer configApplyMu.RUnlock()
-	return reloadPrepared
-}
-
-// CancelReload resumes the untouched old runtime when iOS reports insufficient
-// memory after the reversible preparation phase.
-func CancelReload() {
-	configApplyMu.Lock()
-	defer configApplyMu.Unlock()
-	if !reloadPrepared {
-		return
-	}
-	reloadPrepared = false
-	preparedReloadFingerprint = ""
-	tunnel.OnRunning()
-	appendRunLog("热重载已取消，继续使用旧配置")
-}
-
-func runtimeConfigFingerprint(tunnelMTU int, configYAML string, settingsJSON string) string {
-	hash := sha256.New()
-	_, _ = fmt.Fprintf(hash, "mtu:%d\nconfig:%d\n", normalizedTunnelMTU(tunnelMTU), len(configYAML))
-	_, _ = io.WriteString(hash, configYAML)
-	canonicalSettings, _ := json.Marshal(parseSettings(settingsJSON))
-	_, _ = fmt.Fprintf(hash, "\nsettings:%d\n", len(canonicalSettings))
-	_, _ = hash.Write(canonicalSettings)
-	for _, name := range []string{"GeoIP.dat", "geoip.metadb", "GeoSite.dat", "ASN.mmdb"} {
-		info, statErr := os.Stat(filepath.Join(homeDir, name))
-		if statErr != nil {
-			_, _ = fmt.Fprintf(hash, "\n%s:missing", name)
-			continue
-		}
-		_, _ = fmt.Fprintf(hash, "\n%s:%d:%d", name, info.Size(), info.ModTime().UnixNano())
-	}
-	return fmt.Sprintf("%x", hash.Sum(nil))
-}
-
-// ValidateRuntimeConfig performs the same merge and full mihomo parse in the main App
-// process before the memory-constrained Packet Tunnel releases its current runtime.
-// It intentionally does not ApplyConfig or start any listeners.
-func ValidateRuntimeConfig(home string, tunnelMTU int, configYAML string, settingsJSON string) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("mihomo config validation panic: %v", r)
-		}
-		debug.FreeOSMemory()
-	}()
-	configApplyMu.Lock()
-	defer configApplyMu.Unlock()
-
-	if strings.TrimSpace(home) == "" {
-		return fmt.Errorf("validation home directory is empty")
-	}
-	C.SetHomeDir(filepath.Clean(home))
-	st := parseSettings(settingsJSON)
+func applyRuntimeConfig(fd int, tunnelMTU int, configYAML string, st appSettings) error {
 	merged, err := mergeConfig(configYAML, st, tunnelMTU)
 	if err != nil {
-		return fmt.Errorf("合并配置失败: %w", err)
-	}
-	configYAML = ""
-	rawCfg, err := config.UnmarshalRawConfig(merged)
-	if err != nil {
-		return fmt.Errorf("解析原始配置失败: %w", err)
-	}
-	rawCfg.Tun.Enable = true
-	rawCfg.Tun.FileDescriptor = 1
-	merged = nil
-	geodata.ClearGeoSiteCache()
-	geodata.ClearGeoIPCache()
-	mmdb.ReloadIP()
-	if _, err = config.ParseRawConfig(rawCfg); err != nil {
-		return fmt.Errorf("解析运行配置失败: %w", err)
-	}
-	return nil
-}
-
-func releaseRuntimeForReload() error {
-	if !listener.LastTunConf.Enable || listener.LastTunConf.FileDescriptor == 0 {
-		return fmt.Errorf("当前 TUN 配置不可用，请重新连接 VPN")
-	}
-
-	tunnel.OnSuspend()
-	closed := CloseAllConnections()
-	oldProxies := tunnel.Proxies()
-	oldProviders := tunnel.Providers()
-	oldRuleProviders := tunnel.RuleProviders()
-	proxyProviderCount := len(oldProviders)
-	ruleProviderCount := len(oldRuleProviders)
-	tunnel.UpdateRules(nil, nil, nil)
-	tunnel.UpdateProxies(nil, nil)
-
-	// The executor replaces provider maps without closing their old instances.
-	// Explicitly stop fetch loops, health checks, and stateful proxy adapters so
-	// repeated reloads do not accumulate runtime work until iOS jetsams the tunnel.
-	providerProxies := make([]C.Proxy, 0)
-	for _, provider := range oldProviders {
-		providerProxies = append(providerProxies, provider.Proxies()...)
-		if closer, ok := any(provider).(interface{ Close() error }); ok {
-			if err := closer.Close(); err != nil {
-				appendRunLog(fmt.Sprintf("关闭旧代理 provider %s 失败: %v", provider.Name(), err))
-			}
-		}
-	}
-	for _, provider := range oldRuleProviders {
-		if closer, ok := any(provider).(interface{ Close() error }); ok {
-			if err := closer.Close(); err != nil {
-				appendRunLog(fmt.Sprintf("关闭旧规则 provider %s 失败: %v", provider.Name(), err))
-			}
-		}
-	}
-	for _, proxy := range oldProxies {
-		if err := proxy.Close(); err != nil {
-			appendRunLog(fmt.Sprintf("关闭旧代理 %s 失败: %v", proxy.Name(), err))
-		}
-	}
-	for _, proxy := range providerProxies {
-		if err := proxy.Close(); err != nil {
-			appendRunLog(fmt.Sprintf("关闭旧 provider 节点 %s 失败: %v", proxy.Name(), err))
-		}
-	}
-	oldProxies = nil
-	oldProviders = nil
-	oldRuleProviders = nil
-	providerProxies = nil
-	activeConfigFingerprint = ""
-	geodata.ClearGeoSiteCache()
-	geodata.ClearGeoIPCache()
-	mmdb.ReloadIP()
-	if closed > 0 || proxyProviderCount > 0 || ruleProviderCount > 0 {
-		// Connection handlers and stateful adapters finish teardown asynchronously.
-		// Give them a short drain window before allocating the replacement config.
-		time.Sleep(250 * time.Millisecond)
-	}
-	debug.FreeOSMemory()
-	appendRunLog(fmt.Sprintf("低内存热重载：已关闭旧运行资源，连接=%d 代理provider=%d 规则provider=%d",
-		closed, proxyProviderCount, ruleProviderCount))
-	return nil
-}
-
-func applyRuntimeConfig(fd int, tunnelMTU int, configYAML string, st appSettings, operation string, preserveTun bool) (err error) {
-	previousNotices := append([]string(nil), configNotices...)
-	previousDetails := make(map[string]string, len(proxyDetailsMap))
-	for name, detail := range proxyDetailsMap {
-		previousDetails[name] = detail
-	}
-	applied := false
-	runtimeReleased := false
-	defer func() {
-		if !applied {
-			configNotices = previousNotices
-			proxyDetailsMap = previousDetails
-			if runtimeReleased && err != nil {
-				debug.FreeOSMemory()
-				appendRunLog("热重载失败，转发保持暂停以避免流量绕过代理")
-				err = fmt.Errorf("%w；转发已安全暂停，请重新连接 VPN", err)
-			}
-		}
-	}()
-
-	if preserveTun {
-		// 新配置已由主 App 完整预检。这里先暂停新流量并释放旧代理/规则，
-		// 避免旧运行配置和 RawConfig/Config 同时顶到 iOS NE 的 jetsam 线。
-		if err := releaseRuntimeForReload(); err != nil {
-			return err
-		}
-		runtimeReleased = true
-	}
-
-	merged, err := mergeConfig(configYAML, st, tunnelMTU)
-	if err != nil {
-		appendRunLog(operation + "合并配置失败: " + err.Error())
+		appendRunLog("启动合并配置失败: " + err.Error())
 		return err
-	}
-	if preserveTun {
-		configYAML = ""
 	}
 
 	rawCfg, err := config.UnmarshalRawConfig(merged)
 	if err != nil {
-		appendRunLog(operation + " UnmarshalRawConfig 失败: " + err.Error())
+		appendRunLog("启动 UnmarshalRawConfig 失败: " + err.Error())
 		return err
 	}
 	rawCfg.Tun.Enable = true
@@ -867,48 +609,25 @@ func applyRuntimeConfig(fd int, tunnelMTU int, configYAML string, st appSettings
 
 	cfg, err := config.ParseRawConfig(rawCfg)
 	if err != nil {
-		appendRunLog(operation + " ParseRawConfig 失败: " + err.Error())
+		appendRunLog("启动 ParseRawConfig 失败: " + err.Error())
 		return err
 	}
-	if preserveTun {
-		if !listener.LastTunConf.Enable || listener.LastTunConf.FileDescriptor == 0 {
-			return fmt.Errorf("当前 TUN 配置不可用，请重新连接 VPN")
-		}
-		// 热重载不能让 ReCreateTun 关闭 iOS 交给扩展的原始 utun fd。
-		// 固定为当前运行配置后，mihomo 会命中 Tun.OnReload，仅更新其余组件。
-		cfg.General.Tun = listener.LastTunConf
-	}
 
-	appendRunLog(operation + " ParseRawConfig 成功，开始 ApplyConfig")
-	// mihomo PUT /configs 的热重载默认 force=false；只有冷启动才需要强制
-	// 重建 HTTP/SOCKS/Mixed 等入站监听。TUN 在上面固定为现有 utun 配置。
-	executor.ApplyConfig(cfg, !preserveTun)
+	appendRunLog("启动 ParseRawConfig 成功，开始 ApplyConfig")
+	executor.ApplyConfig(cfg, true)
 	activeDNSConfig = cfg.DNS
 	activeGeneralIPv6 = cfg.General.IPv6
 	activeSystemDNS = append(activeSystemDNS[:0], st.SystemDNS...)
 	activeUsesSystemDNS = pendingUsesSystemDNS
-	// ApplyConfig 会按 YAML 重写 DefaultInterface；恢复 NWPathMonitor 选出的物理接口，
-	// 否则热重载后新连接可能失去显式出站绑定并回到 utun。
+	// ApplyConfig 会按 YAML 重写 DefaultInterface；恢复 NWPathMonitor 选出的物理接口。
 	if name := currentPhysicalInterface(); name != "" {
 		dialer.DefaultInterface.Store(name)
 		iface.FlushCache()
 		resolver.ResetConnection()
-		appendRunLog(operation + "后恢复物理出站接口 = " + name)
+		appendRunLog("启动后恢复物理出站接口 = " + name)
 	}
-	if !preserveTun {
-		// Parsing and applying a large configuration can leave temporary heap
-		// pages resident. Return them once during startup.
-		debug.FreeOSMemory()
-	} else {
-		// 热重载时立刻 full GC 会中断转发；延迟 15s 等重载稳定后再还页，
-		// 避免大订阅重载后的临时堆页常驻不还。
-		go func() {
-			time.Sleep(15 * time.Second)
-			debug.FreeOSMemory()
-		}()
-	}
-	applied = true
-	appendRunLog(operation + " ApplyConfig 返回")
+	debug.FreeOSMemory()
+	appendRunLog("启动 ApplyConfig 返回")
 	return nil
 }
 
@@ -1088,11 +807,52 @@ func mergeConfig(subYAML string, st appSettings, tunnelMTU int) ([]byte, error) 
 		}
 		filterGeoRulesFromConfig(m)
 	}
+	if st.BlockDirectSTUN {
+		injectDirectSTUNBlockRules(m)
+	}
 
 	// 解析各节点协议摘要（如 "VLESS · TCP · Reality · Vision"），供节点页副标题。
 	buildProxyDetails(m)
 
 	return yaml.Marshal(m)
+}
+
+var publicSTUNLeakEndpoints = []string{
+	"stun.l.google.com",
+	"stun1.l.google.com",
+	"stun2.l.google.com",
+	"stun3.l.google.com",
+	"stun4.l.google.com",
+	"stun.cloudflare.com",
+	"stun.services.mozilla.com",
+	"global.stun.twilio.com",
+	"stun.stunprotocol.org",
+}
+
+func injectDirectSTUNBlockRules(root map[string]any) {
+	rules, _ := root["rules"].([]any)
+	mode, _ := root["mode"].(string)
+	if strings.EqualFold(strings.TrimSpace(mode), "direct") {
+		root["mode"] = "rule"
+		rules = append(rules, "MATCH,DIRECT")
+	}
+	injected := make([]any, 0, len(publicSTUNLeakEndpoints))
+	existing := map[string]bool{}
+	for _, raw := range rules {
+		if rule, ok := raw.(string); ok {
+			existing[strings.ToUpper(strings.TrimSpace(rule))] = true
+		}
+	}
+	for _, domain := range publicSTUNLeakEndpoints {
+		rule := "DOMAIN," + domain + ",REJECT"
+		if !existing[strings.ToUpper(rule)] {
+			injected = append(injected, rule)
+		}
+	}
+	merged := make([]any, 0, len(rules)+len(injected))
+	merged = append(merged, injected...)
+	merged = append(merged, rules...)
+	root["rules"] = merged
 }
 
 func applyDNSOverride(root map[string]any, dns map[string]any, override dnsOverrideSettings) {
@@ -1553,6 +1313,340 @@ func QueryProxies() string {
 	})
 	if err != nil {
 		return `{"proxies":{},"error":"marshal: ` + err.Error() + `"}`
+	}
+	return string(out)
+}
+
+type remoteProxyProvider struct {
+	Name   string              `json:"name"`
+	URL    string              `json:"url"`
+	Header map[string][]string `json:"header,omitempty"`
+}
+
+// ProxyProviderManifest extracts the HTTP proxy providers that the main App
+// may download and cache while the tunnel is disconnected. It only parses
+// YAML and never initializes mihomo runtime providers.
+func ProxyProviderManifest(configYAML string) string {
+	var raw map[string]any
+	if err := yaml.Unmarshal([]byte(configYAML), &raw); err != nil {
+		return marshalJSON(map[string]any{"providers": []remoteProxyProvider{}, "error": err.Error()})
+	}
+	providers, _ := raw["proxy-providers"].(map[string]any)
+	names := make([]string, 0, len(providers))
+	for name := range providers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := make([]remoteProxyProvider, 0, len(names))
+	for _, name := range names {
+		definition, _ := providers[name].(map[string]any)
+		providerType, _ := definition["type"].(string)
+		providerURL, _ := definition["url"].(string)
+		if !strings.EqualFold(strings.TrimSpace(providerType), "http") || strings.TrimSpace(providerURL) == "" {
+			continue
+		}
+		headers := map[string][]string{}
+		if rawHeaders, ok := definition["header"].(map[string]any); ok {
+			for key, rawValue := range rawHeaders {
+				values := stringList(rawValue)
+				if text, ok := rawValue.(string); ok {
+					values = []string{text}
+				}
+				if len(values) > 0 {
+					headers[key] = values
+				}
+			}
+		}
+		out = append(out, remoteProxyProvider{Name: name, URL: strings.TrimSpace(providerURL), Header: headers})
+	}
+	return marshalJSON(map[string]any{"providers": out})
+}
+
+// ValidateProxyProviderPayload verifies the common provider payload shape
+// before the main App replaces its last known-good offline cache.
+func ValidateProxyProviderPayload(payload string) error {
+	_, err := parseProviderPayload(payload)
+	return err
+}
+
+// UpdateProxyProviders refreshes the active runtime's HTTP proxy providers.
+// File, inline and the reserved compatible provider are intentionally skipped.
+func UpdateProxyProviders() string {
+	configApplyMu.RLock()
+	defer configApplyMu.RUnlock()
+	providers := tunnel.Providers()
+	names := make([]string, 0, len(providers))
+	for name, provider := range providers {
+		if provider.VehicleType() == P.HTTP {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	updated := make([]string, 0, len(names))
+	failures := map[string]string{}
+	for _, name := range names {
+		if err := providers[name].Update(); err != nil {
+			failures[name] = err.Error()
+			continue
+		}
+		updated = append(updated, name)
+	}
+	return marshalJSON(map[string]any{
+		"ok":       len(failures) == 0,
+		"updated":  updated,
+		"failures": failures,
+	})
+}
+
+// OfflineProxySnapshot builds the subset of /proxies consumed by the App from
+// saved YAML and cached provider payloads. It is safe in the main App process:
+// no config.ParseRawConfig, provider initialization or network access occurs.
+func OfflineProxySnapshot(configYAML, providerPayloadsJSON string) string {
+	var raw map[string]any
+	if err := yaml.Unmarshal([]byte(configYAML), &raw); err != nil {
+		return marshalJSON(map[string]any{"proxies": map[string]any{}, "details": map[string]string{}, "mode": "rule", "error": err.Error()})
+	}
+
+	details := map[string]string{}
+	inlineNames := make([]string, 0)
+	inlineTypes := map[string]string{}
+	if proxies, ok := raw["proxies"].([]any); ok {
+		for _, item := range proxies {
+			proxy, _ := item.(map[string]any)
+			name, _ := proxy["name"].(string)
+			if name == "" {
+				continue
+			}
+			inlineNames = append(inlineNames, name)
+			details[name] = summarizeProxy(proxy)
+			inlineTypes[name], _ = proxy["type"].(string)
+		}
+	}
+
+	providerPayloads := map[string]string{}
+	_ = json.Unmarshal([]byte(providerPayloadsJSON), &providerPayloads)
+	providerDefinitions, _ := raw["proxy-providers"].(map[string]any)
+	providerNames := make([]string, 0, len(providerDefinitions))
+	for name := range providerDefinitions {
+		providerNames = append(providerNames, name)
+	}
+	sort.Strings(providerNames)
+	providerNodes := map[string][]string{}
+	providerNodeTypes := map[string]string{}
+	missingProviders := make([]string, 0)
+	for _, providerName := range providerNames {
+		payload, exists := providerPayloads[providerName]
+		if !exists {
+			definition, _ := providerDefinitions[providerName].(map[string]any)
+			providerType, _ := definition["type"].(string)
+			if strings.EqualFold(providerType, "http") {
+				missingProviders = append(missingProviders, providerName)
+			}
+			continue
+		}
+		proxies, err := parseProviderPayload(payload)
+		if err != nil {
+			continue
+		}
+		definition, _ := providerDefinitions[providerName].(map[string]any)
+		for _, proxy := range filterOfflineProxies(proxies, definition) {
+			name, _ := proxy["name"].(string)
+			if name == "" {
+				continue
+			}
+			providerNodes[providerName] = append(providerNodes[providerName], name)
+			details[name] = summarizeProxy(proxy)
+			providerNodeTypes[name], _ = proxy["type"].(string)
+		}
+	}
+
+	groups := map[string]any{}
+	groupNames := make([]string, 0)
+	groupList, _ := raw["proxy-groups"].([]any)
+	for _, item := range groupList {
+		group, _ := item.(map[string]any)
+		name, _ := group["name"].(string)
+		if name == "" {
+			continue
+		}
+		explicitMembers := stringList(group["proxies"])
+		members := append([]string{}, explicitMembers...)
+		uses := stringList(group["use"])
+		if include, _ := group["include-all"].(bool); include {
+			group["include-all-proxies"] = true
+			group["include-all-providers"] = true
+		}
+		if include, _ := group["include-all-proxies"].(bool); include {
+			members = append(members,
+				filterOfflineNames(inlineNames, group, inlineTypes, providerNodeTypes)...)
+		}
+		if include, _ := group["include-all-providers"].(bool); include {
+			uses = append(uses, providerNames...)
+		}
+		providerMembers := make([]string, 0)
+		for _, providerName := range uses {
+			providerMembers = append(providerMembers, providerNodes[providerName]...)
+		}
+		members = append(members,
+			filterOfflineNames(providerMembers, group, inlineTypes, providerNodeTypes)...)
+		members = uniqueStrings(members)
+		typ, _ := group["type"].(string)
+		icon, _ := group["icon"].(string)
+		groups[name] = map[string]any{
+			"type": offlineGroupType(typ), "now": "", "all": members, "icon": icon,
+		}
+		groupNames = append(groupNames, name)
+	}
+
+	globalMembers := append([]string{}, groupNames...)
+	globalMembers = append(globalMembers, inlineNames...)
+	for _, providerName := range providerNames {
+		globalMembers = append(globalMembers, providerNodes[providerName]...)
+	}
+	globalMembers = uniqueStrings(globalMembers)
+	groups["GLOBAL"] = map[string]any{
+		"type": "Selector", "now": "", "all": globalMembers, "icon": "",
+	}
+	mode, _ := raw["mode"].(string)
+	if mode == "" {
+		mode = "rule"
+	}
+	return marshalJSON(map[string]any{
+		"proxies": groups, "details": details, "mode": strings.ToLower(mode),
+		"missingProviders": missingProviders,
+	})
+}
+
+func parseProviderPayload(payload string) ([]map[string]any, error) {
+	var root map[string]any
+	if err := yaml.Unmarshal([]byte(payload), &root); err != nil {
+		return nil, err
+	}
+	raw, ok := root["proxies"].([]any)
+	if !ok {
+		return nil, fmt.Errorf("provider payload 缺少 proxies 列表")
+	}
+	proxies := make([]map[string]any, 0, len(raw))
+	for _, item := range raw {
+		if proxy, ok := item.(map[string]any); ok {
+			proxies = append(proxies, proxy)
+		}
+	}
+	return proxies, nil
+}
+
+func filterOfflineProxies(proxies []map[string]any, definition map[string]any) []map[string]any {
+	include := compileOptionalRegex(definition["filter"])
+	exclude := compileOptionalRegex(definition["exclude-filter"])
+	includeTypes := lowerStringSet(definition["include-type"])
+	excludeTypes := lowerStringSet(definition["exclude-type"])
+	out := make([]map[string]any, 0, len(proxies))
+	for _, proxy := range proxies {
+		name, _ := proxy["name"].(string)
+		typ, _ := proxy["type"].(string)
+		lowerType := strings.ToLower(typ)
+		if include != nil && !include.MatchString(name) || exclude != nil && exclude.MatchString(name) {
+			continue
+		}
+		if len(includeTypes) > 0 && !includeTypes[lowerType] || excludeTypes[lowerType] {
+			continue
+		}
+		out = append(out, proxy)
+	}
+	return out
+}
+
+func filterOfflineNames(names []string, group map[string]any, inlineTypes, providerTypes map[string]string) []string {
+	include := compileOptionalRegex(group["filter"])
+	exclude := compileOptionalRegex(group["exclude-filter"])
+	includeTypes := lowerStringSet(group["include-type"])
+	excludeTypes := lowerStringSet(group["exclude-type"])
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		typ := strings.ToLower(inlineTypes[name])
+		if typ == "" {
+			typ = strings.ToLower(providerTypes[name])
+		}
+		if include != nil && !include.MatchString(name) || exclude != nil && exclude.MatchString(name) {
+			continue
+		}
+		if len(includeTypes) > 0 && typ != "" && !includeTypes[typ] || (typ != "" && excludeTypes[typ]) {
+			continue
+		}
+		out = append(out, name)
+	}
+	return out
+}
+
+func compileOptionalRegex(value any) *regexp.Regexp {
+	pattern, _ := value.(string)
+	if strings.TrimSpace(pattern) == "" {
+		return nil
+	}
+	pattern = strings.ReplaceAll(pattern, "`", "|")
+	compiled, _ := regexp.Compile(pattern)
+	return compiled
+}
+
+func lowerStringSet(value any) map[string]bool {
+	result := map[string]bool{}
+	values := stringList(value)
+	if text, ok := value.(string); ok {
+		values = strings.Split(text, "|")
+	}
+	for _, item := range values {
+		if item = strings.TrimSpace(item); item != "" {
+			result[strings.ToLower(item)] = true
+		}
+	}
+	return result
+}
+
+func stringList(value any) []string {
+	raw, _ := value.([]any)
+	out := make([]string, 0, len(raw))
+	for _, item := range raw {
+		if text, ok := item.(string); ok {
+			out = append(out, text)
+		}
+	}
+	return out
+}
+
+func uniqueStrings(values []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+func offlineGroupType(value string) string {
+	switch strings.ToLower(value) {
+	case "select":
+		return "Selector"
+	case "url-test":
+		return "URLTest"
+	case "load-balance":
+		return "LoadBalance"
+	case "fallback":
+		return "Fallback"
+	case "relay":
+		return "Relay"
+	default:
+		return value
+	}
+}
+
+func marshalJSON(value any) string {
+	out, err := json.Marshal(value)
+	if err != nil {
+		return `{}`
 	}
 	return string(out)
 }
@@ -2127,9 +2221,6 @@ func Stop() {
 	activeGeneralIPv6 = false
 	activeUsesSystemDNS = false
 	coreStartedAt = time.Time{}
-	activeConfigFingerprint = ""
-	preparedReloadFingerprint = ""
-	reloadPrepared = false
 	CloseAllConnections()
 	executor.Shutdown()
 }

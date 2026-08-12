@@ -48,45 +48,119 @@ func largeBenchmarkConfig(proxyCount int, ruleCount int) string {
 	return out.String()
 }
 
-func TestValidateRuntimeConfig(t *testing.T) {
-	valid := "mode: direct\nrules:\n  - MATCH,DIRECT\n"
-	if err := ValidateRuntimeConfig(t.TempDir(), 1_500, valid, `{}`); err != nil {
-		t.Fatalf("ValidateRuntimeConfig(valid) failed: %v", err)
+func TestProxyProviderManifestOnlyIncludesHTTP(t *testing.T) {
+	var got struct {
+		Providers []remoteProxyProvider `json:"providers"`
 	}
-	if err := ValidateRuntimeConfig(t.TempDir(), 1_500, "proxies: [", `{}`); err == nil {
-		t.Fatal("ValidateRuntimeConfig accepted malformed YAML")
+	result := ProxyProviderManifest(`
+proxy-providers:
+  remote:
+    type: http
+    url: https://example.com/provider.yaml
+  local:
+    type: file
+    path: ./provider.yaml
+`)
+	if err := json.Unmarshal([]byte(result), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Providers) != 1 || got.Providers[0].Name != "remote" ||
+		got.Providers[0].URL != "https://example.com/provider.yaml" {
+		t.Fatalf("manifest = %+v", got.Providers)
 	}
 }
 
-func TestRuntimeConfigFingerprintTracksInputsAndGeoAssets(t *testing.T) {
-	previousHome := homeDir
-	homeDir = t.TempDir()
-	defer func() { homeDir = previousHome }()
-
-	base := runtimeConfigFingerprint(1_500, "mode: rule", `{"ipv6":false}`)
-	if same := runtimeConfigFingerprint(1_500, "mode: rule", `{"ipv6":false}`); same != base {
-		t.Fatal("identical runtime input produced a different fingerprint")
+func TestOfflineProxySnapshotCombinesInlineAndCachedProviders(t *testing.T) {
+	configYAML := `
+mode: rule
+proxies:
+  - {name: inline, type: ss, server: 192.0.2.1, port: 443, cipher: aes-128-gcm, password: test}
+proxy-providers:
+  airport:
+    type: http
+    url: https://example.com/provider.yaml
+    filter: "HK|SG"
+proxy-groups:
+  - name: Select
+    type: select
+    proxies: [DIRECT, inline]
+    use: [airport]
+rules:
+  - MATCH,DIRECT
+`
+	payloads, _ := json.Marshal(map[string]string{
+		"airport": `proxies:
+  - {name: HK One, type: vless, server: hk.example, port: 443, tls: true, reality-opts: {public-key: test}}
+  - {name: US One, type: trojan, server: us.example, port: 443}
+  - {name: SG One, type: vmess, server: sg.example, port: 443, network: ws}
+`,
+	})
+	var got struct {
+		Mode    string                    `json:"mode"`
+		Proxies map[string]map[string]any `json:"proxies"`
+		Details map[string]string         `json:"details"`
 	}
-	if canonical := runtimeConfigFingerprint(1_500, "mode: rule",
-		`{"logLevel":"info","ipv6":false}`); canonical != base {
-		t.Fatal("semantically identical settings JSON produced a different fingerprint")
-	}
-	if changed := runtimeConfigFingerprint(1_400, "mode: rule", `{"ipv6":false}`); changed == base {
-		t.Fatal("MTU change was not reflected in fingerprint")
-	}
-	if changed := runtimeConfigFingerprint(1_500, "mode: direct", `{"ipv6":false}`); changed == base {
-		t.Fatal("config change was not reflected in fingerprint")
-	}
-	if changed := runtimeConfigFingerprint(1_500, "mode: rule", `{"ipv6":true}`); changed == base {
-		t.Fatal("settings change was not reflected in fingerprint")
-	}
-
-	geoPath := filepath.Join(homeDir, "GeoSite.dat")
-	if err := os.WriteFile(geoPath, []byte("geo-v1"), 0o600); err != nil {
+	if err := json.Unmarshal([]byte(OfflineProxySnapshot(configYAML, string(payloads))), &got); err != nil {
 		t.Fatal(err)
 	}
-	if changed := runtimeConfigFingerprint(1_500, "mode: rule", `{"ipv6":false}`); changed == base {
-		t.Fatal("GEO asset change was not reflected in fingerprint")
+	group := got.Proxies["Select"]
+	members, _ := group["all"].([]any)
+	want := []any{"DIRECT", "inline", "HK One", "SG One"}
+	if fmt.Sprint(members) != fmt.Sprint(want) {
+		t.Fatalf("members = %v, want %v", members, want)
+	}
+	if group["now"] != "" {
+		t.Fatalf("offline now = %v, want empty", group["now"])
+	}
+	if !strings.Contains(got.Details["HK One"], "VLESS") || got.Mode != "rule" {
+		t.Fatalf("snapshot details/mode = %+v / %q", got.Details, got.Mode)
+	}
+}
+
+func TestMergeConfigBlocksKnownSTUNWithoutBlockingDirectUDP(t *testing.T) {
+	settings := appSettings{Stack: "gvisor", LogLevel: "info", BlockDirectSTUN: true}
+	m := mergedMapWithSettings(t, `
+rules:
+  - DOMAIN,stun.l.google.com,DIRECT
+  - DST-PORT,3478,DIRECT
+  - MATCH,DIRECT
+`, settings)
+	rules := m["rules"].([]any)
+	if rules[0] != "DOMAIN,stun.l.google.com,REJECT" {
+		t.Fatalf("first rule = %v, want STUN rejection before subscription rules", rules[0])
+	}
+	foundDirectPort := false
+	for _, raw := range rules {
+		if raw == "DST-PORT,3478,DIRECT" {
+			foundDirectPort = true
+		}
+		if strings.Contains(fmt.Sprint(raw), "3478,REJECT") || strings.Contains(fmt.Sprint(raw), "5349,REJECT") {
+			t.Fatalf("broad STUN/TURN port rejection found: %v", raw)
+		}
+	}
+	if !foundDirectPort {
+		t.Fatal("unrelated DIRECT UDP rule was removed")
+	}
+}
+
+func TestMergeConfigLeavesSTUNRulesUnchangedWhenDisabled(t *testing.T) {
+	m := mergedMapWithSettings(t, "rules:\n  - MATCH,DIRECT\n",
+		appSettings{Stack: "gvisor", LogLevel: "info"})
+	rules := m["rules"].([]any)
+	if len(rules) != 1 || rules[0] != "MATCH,DIRECT" {
+		t.Fatalf("rules = %v, want subscription rules only", rules)
+	}
+}
+
+func TestMergeConfigSTUNProtectionKeepsDirectModeSemantics(t *testing.T) {
+	m := mergedMapWithSettings(t, "mode: direct\n",
+		appSettings{Stack: "gvisor", LogLevel: "info", BlockDirectSTUN: true})
+	if m["mode"] != "rule" {
+		t.Fatalf("mode = %v, want rule so rejection rules are evaluated", m["mode"])
+	}
+	rules := m["rules"].([]any)
+	if rules[len(rules)-1] != "MATCH,DIRECT" {
+		t.Fatalf("last rule = %v, want MATCH,DIRECT", rules[len(rules)-1])
 	}
 }
 

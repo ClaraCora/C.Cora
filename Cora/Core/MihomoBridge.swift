@@ -14,20 +14,21 @@ enum MihomoCore {
         MihomoVersion()
     }
 
-    /// 在主 App 进程完整解析一次配置。成功后 Tunnel 才会释放旧运行配置，
-    /// 避免低内存分阶段热重载在坏配置上失去可回滚的旧状态。
-    static func runtimeConfigValidationError(home: URL,
-                                             tunnelMTU: Int,
-                                             configYAML: String,
-                                             settingsJSON: String) -> String? {
+    static func proxyProviderManifest(configYAML: String) -> Data {
+        Data(MihomoProxyProviderManifest(configYAML).utf8)
+    }
+
+    static func validateProxyProviderPayload(_ payload: String) -> String? {
         var validationError: NSError?
-        guard MihomoValidateRuntimeConfig(home.path,
-                                          tunnelMTU,
-                                          configYAML,
-                                          settingsJSON,
-                                          &validationError) else {
-            return validationError?.localizedDescription ?? "mihomo 配置预检失败"
+        guard MihomoValidateProxyProviderPayload(payload, &validationError) else {
+            return validationError?.localizedDescription ?? "Provider 内容无效"
         }
         return nil
     }
+
+    static func offlineProxySnapshot(configYAML: String,
+                                     providerPayloadsJSON: String) -> Data {
+        Data(MihomoOfflineProxySnapshot(configYAML, providerPayloadsJSON).utf8)
+    }
+
 }
