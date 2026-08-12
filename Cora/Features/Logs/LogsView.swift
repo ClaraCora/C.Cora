@@ -121,6 +121,7 @@ struct LogsView: View {
                         .id(line.id)
                         .listRowInsets(EdgeInsets(top: 6, leading: 14, bottom: 6, trailing: 12))
                         .listRowSeparator(.hidden)
+                        .listRowBackground(AppListRowBackground())
                 }
                 .listStyle(.plain)
                 .scrollContentBackground(.hidden)

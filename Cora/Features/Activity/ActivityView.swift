@@ -5,8 +5,10 @@ struct ActivityView: View {
     @State private var selection: ActivitySection = .connections
 
     var body: some View {
-        NavigationStack {
-            VStack(spacing: 0) {
+        ZStack {
+            AppAmbientBackground()
+            NavigationStack {
+                VStack(spacing: 0) {
                 Picker("连接页面", selection: $selection) {
                     ForEach(ActivitySection.allCases) { section in
                         Label(section.title, systemImage: section.systemImage)
@@ -28,6 +30,7 @@ struct ActivityView: View {
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
             }
         }
     }

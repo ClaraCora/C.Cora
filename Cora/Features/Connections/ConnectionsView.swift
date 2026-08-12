@@ -77,7 +77,7 @@ struct ConnectionsView: View {
             ConnectionSummary(snapshot: controller.snapshot ?? ConnectionsSnapshot())
                 .padding(.horizontal, 16)
                 .padding(.vertical, 10)
-                .background(Color(uiColor: .secondarySystemBackground))
+                .background(.regularMaterial)
 
             Divider()
 
@@ -96,7 +96,7 @@ struct ConnectionsView: View {
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 8)
-            .background(Color(uiColor: .systemBackground))
+            .background(.thinMaterial)
 
             Divider()
 
@@ -124,6 +124,7 @@ struct ConnectionsView: View {
                     ConnectionRow(
                         connection: connection,
                         isClosing: controller.closingIDs.contains(connection.id))
+                        .listRowBackground(AppListRowBackground())
                         .swipeActions(edge: .trailing, allowsFullSwipe: true) {
                             Button(role: .destructive) {
                                 Task { await controller.close(connection) }

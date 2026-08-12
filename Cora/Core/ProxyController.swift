@@ -8,7 +8,6 @@ struct ProxyGroupNode: Identifiable {
 
     let id: ID
     let name: String
-    let detail: String
     let normalizedSearchText: String
 }
 
@@ -26,20 +25,17 @@ struct ProxyGroup: Identifiable {
          type: String,
          now: String,
          all: [String],
-         icon: URL?,
-         details: [String: String]) {
+         icon: URL?) {
         self.name = name
         self.type = type
         self.now = now
         self.all = all
         self.icon = icon
         self.nodes = all.enumerated().map { index, node in
-            let detail = details[node] ?? ""
             return ProxyGroupNode(
                 id: .init(group: name, index: index),
                 name: node,
-                detail: detail,
-                normalizedSearchText: "\(node) \(detail)".lowercased())
+                normalizedSearchText: node.lowercased())
         }
     }
 
@@ -56,7 +52,6 @@ struct ProxyGroup: Identifiable {
 final class ProxyController: ObservableObject {
 
     @Published private(set) var groups: [ProxyGroup] = []
-    @Published private(set) var uniqueNodeCount = 0
     @Published private(set) var mode: String = "rule"
     @Published var isLoading = false
     @Published private(set) var hasLoaded = false
@@ -66,8 +61,6 @@ final class ProxyController: ObservableObject {
     /// 节点延迟（毫秒），node 名 → ms。0/缺失表示未测或超时。
     /// 持久化到磁盘：重连/重启后仍展示上次结果，下一次测速成功才覆盖。
     @Published private(set) var delays: [String: Int] = ProxyController.loadCachedDelays()
-    /// 节点协议摘要，node 名 → "VLESS · TCP · Reality · Vision"。
-    @Published private(set) var details: [String: String] = [:]
     /// 正在测速的策略组名。
     @Published private(set) var testing: Set<String> = []
     /// 正在切换的策略组与目标节点，避免重复点击并给节点行显示进度。
@@ -130,16 +123,12 @@ final class ProxyController: ObservableObject {
             self.error = "拿不到节点：\(reason)"
             mode = "rule"
             groups = []
-            uniqueNodeCount = 0
-            details = [:]
             // 保留 delays 缓存：瞬时失败不该清掉已测结果
             return
         case .ok(let data):
             guard let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
                 error = "解析失败（IPC 响应非 JSON）"
                 groups = []
-                uniqueNodeCount = 0
-                details = [:]
                 return
             }
             mode = ((obj["mode"] as? String) ?? "rule").lowercased()
@@ -152,31 +141,13 @@ final class ProxyController: ObservableObject {
             // 直连模式没有节点页数据，不再额外请求协议详情。
             if runtimeAvailable && mode == "direct" {
                 groups = []
-                uniqueNodeCount = 0
-                details = [:]
                 return
             }
 
             guard let proxies = obj["proxies"] as? [String: Any] else {
                 error = "解析代理列表失败"
                 groups = []
-                uniqueNodeCount = 0
-                details = [:]
                 return
-            }
-
-            if runtimeAvailable {
-                // 在线协议摘要来自当前运行配置。
-                let det = await CoreStateManager.shared.sendMessage(["cmd": "proxyDetails"])
-                guard generation == loadGeneration else { return }
-                if case .ok(let d) = det,
-                   let map = (try? JSONSerialization.jsonObject(with: d)) as? [String: String] {
-                    details = map
-                } else {
-                    details = [:]
-                }
-            } else {
-                details = obj["details"] as? [String: String] ?? [:]
             }
 
             // 用 GLOBAL.all 的顺序还原配置定义顺序
@@ -190,8 +161,7 @@ final class ProxyController: ObservableObject {
                                   type: d["type"] as? String ?? "",
                                   now: d["now"] as? String ?? "",
                                   all: all,
-                                  icon: iconStr.isEmpty ? nil : URL(string: iconStr),
-                                  details: details)
+                                  icon: iconStr.isEmpty ? nil : URL(string: iconStr))
             }
 
             switch mode {
@@ -215,8 +185,6 @@ final class ProxyController: ObservableObject {
                 }
                 groups = ordered
             }
-            uniqueNodeCount = Set(groups.flatMap { $0.all }).count
-
             // 缓存修剪：丢掉当前配置里已不存在的节点，避免换订阅后展示旧延迟。
             let knownNodes = Set(groups.flatMap { $0.all })
             let pruned = delays.filter { knownNodes.contains($0.key) }
@@ -228,14 +196,12 @@ final class ProxyController: ObservableObject {
         loadGeneration &+= 1
         sessionGeneration &+= 1
         groups = []
-        uniqueNodeCount = 0
         mode = "rule"
         isLoading = false
         hasLoaded = false
         isRuntimeAvailable = false
         error = nil
         // delays 保留：缓存跨会话生效，下一次测速或 load 修剪时更新
-        details = [:]
         testing = []
         selecting = [:]
     }

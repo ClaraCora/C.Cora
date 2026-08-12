@@ -10,15 +10,12 @@ struct RootView: View {
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
-        ZStack {
-            AppAmbientBackground()
-            Group {
-                if #available(iOS 26.0, *) {
-                    tabs
-                        .tabBarMinimizeBehavior(.never)
-                } else {
-                    tabs
-                }
+        Group {
+            if #available(iOS 26.0, *) {
+                tabs
+                    .tabBarMinimizeBehavior(.never)
+            } else {
+                tabs
             }
         }
         .onChange(of: core.status) { _, _ in

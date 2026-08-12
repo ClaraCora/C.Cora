@@ -24,6 +24,7 @@ struct LocalConfigEditorView: View {
                 Section("名称") {
                     TextField("如：我的本地配置", text: $name)
                 }
+                .listRowBackground(AppListRowBackground())
                 Section {
                     TextEditor(text: $yaml)
                         .font(.system(.footnote, design: .monospaced))
@@ -35,7 +36,10 @@ struct LocalConfigEditorView: View {
                 } footer: {
                     Text("需包含 proxies / proxy-groups / rules。tun、dns 等 iOS 安全项会在连接时由内核统一覆盖，无需手写。")
                 }
+                .listRowBackground(AppListRowBackground())
             }
+            .scrollContentBackground(.hidden)
+            .background(AppAmbientBackground())
             .navigationTitle(editing == nil ? "新建本地配置" : "编辑配置")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {

@@ -13,6 +13,7 @@ struct SubscriptionsView: View {
                 ContentUnavailableView("还没有配置",
                     systemImage: "tray",
                     description: Text("点右上角 + 添加订阅链接，或新建一个本地配置"))
+                    .listRowBackground(Color.clear)
             }
 
             ForEach(store.subscriptions) { sub in
@@ -21,6 +22,7 @@ struct SubscriptionsView: View {
                 } label: {
                     SubscriptionRow(sub: sub, isSelected: sub.id == store.selectedID)
                 }
+                .listRowBackground(AppListRowBackground())
                 .swipeActions(edge: .trailing) {
                     Button(role: .destructive) {
                         store.remove(sub.id)
@@ -47,7 +49,7 @@ struct SubscriptionsView: View {
             }
         }
         .scrollContentBackground(.hidden)
-        .background(Color.clear)
+        .background(AppAmbientBackground())
         .navigationTitle("配置")
         .toolbar {
             ToolbarItem(placement: .topBarLeading) {
@@ -214,16 +216,21 @@ private struct AddSubscriptionView: View {
                 Section("名称") {
                     TextField("如：我的机场", text: $name)
                 }
+                .listRowBackground(AppListRowBackground())
                 Section("订阅链接") {
                     TextField("https://...", text: $url)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .keyboardType(.URL)
                 }
+                .listRowBackground(AppListRowBackground())
                 Text("订阅内容需为 Clash/mihomo YAML。")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
+                    .listRowBackground(AppListRowBackground())
             }
+            .scrollContentBackground(.hidden)
+            .background(AppAmbientBackground())
             .navigationTitle("添加订阅")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {

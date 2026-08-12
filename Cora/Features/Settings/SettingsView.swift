@@ -8,8 +8,10 @@ struct SettingsView: View {
     @State private var installedGeoInfo: GeoInstalledInfo?
 
     var body: some View {
-        NavigationStack {
-            Form {
+        ZStack {
+            AppAmbientBackground()
+            NavigationStack {
+                Form {
                 Section {
                     NavigationLink {
                         SubscriptionsView()
@@ -17,6 +19,7 @@ struct SettingsView: View {
                         Label("配置", systemImage: "doc.text")
                     }
                 }
+                .listRowBackground(AppListRowBackground())
 
                 Section {
                     Picker("日志级别", selection: $settings.logLevel) {
@@ -28,6 +31,7 @@ struct SettingsView: View {
                 } footer: {
                     Text("TCP/IP 栈固定 gvisor（iOS 隧道扩展里 system 栈 TCP 走不通）。")
                 }
+                .listRowBackground(AppListRowBackground())
 
                 Section {
                     NavigationLink {
@@ -40,8 +44,10 @@ struct SettingsView: View {
                 } footer: {
                     Text("配置文件可单独选择是否应用这套固定设置。")
                 }
+                .listRowBackground(AppListRowBackground())
 
                 GeoSettingsSection(installedInfo: installedGeoInfo)
+                    .listRowBackground(AppListRowBackground())
 
                 Section {
                     HStack {
@@ -57,6 +63,7 @@ struct SettingsView: View {
                 } footer: {
                     Text("拉取订阅时发送的 User-Agent。机场常按 UA 返回不同格式（clash / clash-meta / mihomo / stash 等），默认 clash-meta。改后重新拉取订阅生效。")
                 }
+                .listRowBackground(AppListRowBackground())
 
                 Section {
                     HStack {
@@ -73,6 +80,7 @@ struct SettingsView: View {
                 } footer: {
                     Text("开启后内核在本机回环监听 HTTP+SOCKS 混合代理端口（0=不开）。")
                 }
+                .listRowBackground(AppListRowBackground())
 
                 Section {
                     Toggle("接管所有网络", isOn: $settings.includeAllNetworks)
@@ -90,6 +98,7 @@ struct SettingsView: View {
                        + "STUN 防泄露仅拒绝常见公网探测端点，不封锁 UDP 3478/5349，普通 DIRECT 语音、视频和 P2P 不受影响；"
                        + "使用这些公网端点的通话可能受限。排除项默认开启。改后需重连。")
                 }
+                .listRowBackground(AppListRowBackground())
 
                 Section {
                     NavigationLink {
@@ -105,25 +114,28 @@ struct SettingsView: View {
                 } header: {
                     Text("诊断")
                 }
+                .listRowBackground(AppListRowBackground())
 
                 Section {
                     Text("修改设置后需重新连接 VPN 生效。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
-            }
-            .scrollContentBackground(.hidden)
-            .background(Color.clear)
-            .navigationTitle("设置")
-            .task(id: geoInfoRefreshID) {
-                guard settings.geoEnabled else {
-                    installedGeoInfo = nil
-                    return
+                .listRowBackground(AppListRowBackground())
                 }
-                installedGeoInfo = nil
-                let info = await geoDatabase.installedInfo(geodataMode: settings.geodataMode)
-                guard !Task.isCancelled else { return }
-                installedGeoInfo = info
+                .scrollContentBackground(.hidden)
+                .background(Color.clear)
+                .navigationTitle("设置")
+                .task(id: geoInfoRefreshID) {
+                    guard settings.geoEnabled else {
+                        installedGeoInfo = nil
+                        return
+                    }
+                    installedGeoInfo = nil
+                    let info = await geoDatabase.installedInfo(geodataMode: settings.geodataMode)
+                    guard !Task.isCancelled else { return }
+                    installedGeoInfo = info
+                }
             }
         }
     }
@@ -248,6 +260,7 @@ private struct KernelStatusView: View {
                 .textSelection(.enabled)
                 .padding()
         }
+        .background(AppAmbientBackground())
         .navigationTitle("内核状态")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar { Button("刷新") { Task { await reload() } } }

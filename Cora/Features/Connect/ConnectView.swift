@@ -8,30 +8,34 @@ struct ConnectView: View {
     @EnvironmentObject private var kernel: KernelController
 
     var body: some View {
-        NavigationStack {
-            ScrollView {
-                VStack(spacing: 16) {
-                    ConnectionCard()
-                    if core.isActive {
-                        RuntimeMetricsGrid(up: kernel.up,
-                                           down: kernel.down,
-                                           memoryFootprint: kernel.memoryFootprint,
-                                           uptime: kernel.uptime,
-                                           totalDownload: kernel.totalDownload,
-                                           totalUpload: kernel.totalUpload)
-                        TrafficChart(samples: kernel.samples)
+        ZStack {
+            AppAmbientBackground()
+            NavigationStack {
+                ScrollView {
+                    VStack(spacing: 14) {
+                        ConnectionCard()
+                        if core.isActive {
+                            RuntimeMetricsGrid(up: kernel.up,
+                                               down: kernel.down,
+                                               memoryFootprint: kernel.memoryFootprint,
+                                               uptime: kernel.uptime,
+                                               totalDownload: kernel.totalDownload,
+                                               totalUpload: kernel.totalUpload)
+                            TrafficChart(samples: kernel.samples)
+                        }
+                        if !core.configNotices.isEmpty {
+                            NoticesCard(notices: core.configNotices)
+                        }
                     }
-                    if !core.configNotices.isEmpty {
-                        NoticesCard(notices: core.configNotices)
-                    }
+                    .padding(.horizontal, 16)
+                    .padding(.top, 8)
+                    .padding(.bottom, 18)
                 }
-                .padding(.horizontal, 16)
-                .padding(.top, 8)
+                .scrollIndicators(.hidden)
+                .background(Color.clear)
+                .navigationTitle("总览")
+                .task { await core.refreshStatus() }
             }
-            .scrollIndicators(.hidden)
-            .background(Color.clear)
-            .navigationTitle("总览")
-            .task { await core.refreshStatus() }
         }
     }
 }
@@ -42,7 +46,7 @@ private struct ConnectionCard: View {
     @EnvironmentObject private var kernel: KernelController
 
     var body: some View {
-        VStack(spacing: 10) {
+        VStack(spacing: 14) {
             Button {
                 Task { await core.toggleConnection() }
             } label: {
@@ -64,7 +68,7 @@ private struct ConnectionCard: View {
             .buttonStyle(.plain)
             .disabled(core.isBusy)
 
-            VStack(spacing: 4) {
+            VStack(spacing: 5) {
                 ViewThatFits(in: .horizontal) {
                     statusLine
                     VStack(spacing: 4) {
@@ -75,8 +79,8 @@ private struct ConnectionCard: View {
                     }
                 }
                 .padding(.horizontal, 12)
-                .padding(.vertical, 4)
-                .background(Capsule().fill(glowColor.opacity(0.12)))
+                .padding(.vertical, 6)
+                .background(Capsule().fill(.thinMaterial))
 
                 Text(core.isActive ? "点按断开" : "点按连接")
                     .font(.footnote)
@@ -90,28 +94,12 @@ private struct ConnectionCard: View {
                     .multilineTextAlignment(.center)
             }
 
-            Divider()
-
-            // 代理模式
-            HStack {
-                Label("模式", systemImage: "switch.2")
-                    .font(.subheadline.weight(.medium))
-                    .foregroundStyle(.secondary)
-                Spacer()
-            }
-            Picker("代理模式", selection: Binding(
-                get: { kernel.mode },
-                set: { m in Task { await kernel.setMode(m) } }
-            )) {
-                ForEach(KernelController.Mode.allCases) { Text($0.label).tag($0) }
-            }
-            .pickerStyle(.segmented)
-            .disabled(!core.isActive)
+            OverviewModeControl()
         }
-        .padding(14)
+        .padding(16)
         .background(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(Color(uiColor: .secondarySystemGroupedBackground))
+                .fill(.regularMaterial)
         )
     }
 
@@ -153,6 +141,28 @@ private struct ConnectionCard: View {
     }
 }
 
+private struct OverviewModeControl: View {
+    @EnvironmentObject private var core: CoreStateManager
+    @EnvironmentObject private var kernel: KernelController
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("代理模式", systemImage: "switch.2")
+                .font(.subheadline.weight(.medium))
+                .foregroundStyle(.secondary)
+            Picker("代理模式", selection: Binding(
+                get: { kernel.mode },
+                set: { mode in Task { await kernel.setMode(mode) } }
+            )) {
+                ForEach(KernelController.Mode.allCases) { Text($0.label).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .disabled(!core.isActive)
+        }
+        .padding(.top, 2)
+    }
+}
+
 /// 配置提示卡片：列出被忽略的不适用内容（geo 剔除、进程规则等）。
 private struct NoticesCard: View {
     let notices: [String]
@@ -172,7 +182,7 @@ private struct NoticesCard: View {
         .padding(16)
         .background(
             RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(Color(uiColor: .secondarySystemGroupedBackground))
+                .fill(.regularMaterial)
         )
     }
 }
@@ -251,11 +261,11 @@ private struct MetricWidget: View {
                 .foregroundStyle(.primary)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .padding(10)
+        .padding(11)
         .frame(maxWidth: .infinity, minHeight: 66)
         .background(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(Color(uiColor: .secondarySystemGroupedBackground))
+                .fill(.thinMaterial)
         )
         .accessibilityElement(children: .combine)
     }
@@ -324,7 +334,7 @@ private struct TrafficChart: View {
         .padding(12)
         .background(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(Color(uiColor: .secondarySystemGroupedBackground))
+                .fill(.regularMaterial)
         )
     }
 

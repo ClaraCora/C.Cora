@@ -20,10 +20,12 @@ struct SubscriptionDetailView: View {
         Group {
             if let sub {
                 List {
-                    infoSection(sub)
-                    actionSection(sub)
-                    yamlSection(sub)
+                    infoSection(sub).listRowBackground(AppListRowBackground())
+                    actionSection(sub).listRowBackground(AppListRowBackground())
+                    yamlSection(sub).listRowBackground(AppListRowBackground())
                 }
+                .scrollContentBackground(.hidden)
+                .background(AppAmbientBackground())
             } else {
                 ContentUnavailableView("配置不存在", systemImage: "doc.questionmark")
             }
@@ -211,19 +213,24 @@ struct EditSubscriptionView: View {
                 Section("名称") {
                     TextField("如：我的机场", text: $name)
                 }
+                .listRowBackground(AppListRowBackground())
                 Section("订阅链接") {
                     TextField("https://...", text: $url)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .keyboardType(.URL)
                 }
+                .listRowBackground(AppListRowBackground())
                 if urlChanged {
                     Label("保存后将按新链接重新拉取，原有节点与流量信息会被替换。",
                           systemImage: "exclamationmark.triangle")
                         .font(.footnote)
                         .foregroundStyle(.orange)
+                        .listRowBackground(AppListRowBackground())
                 }
             }
+            .scrollContentBackground(.hidden)
+            .background(AppAmbientBackground())
             .navigationTitle("编辑订阅")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {

@@ -80,7 +80,9 @@ final class CoreStateManager: ObservableObject {
     func refreshStatus() async {
         status = await tunnel.currentStatus()
         AppGroupState.vpnConnected = isActive
-        if status == .disconnected || status == .invalid {
+        if status == .connected || status == .reasserting {
+            await fetchNotices()
+        } else {
             configNotices = []
         }
     }

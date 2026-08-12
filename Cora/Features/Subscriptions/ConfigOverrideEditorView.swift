@@ -26,13 +26,17 @@ struct ConfigOverrideSettingsView: View {
                                           enabled: overrides.overwriteTun)
                 }
             }
+            .listRowBackground(AppListRowBackground())
 
             Section {
                 Button("恢复默认覆写设置", role: .destructive) {
                     showRestoreConfirmation = true
                 }
             }
+            .listRowBackground(AppListRowBackground())
         }
+        .scrollContentBackground(.hidden)
+        .background(AppAmbientBackground())
         .navigationTitle("固定覆写")
         .navigationBarTitleDisplayMode(.inline)
         .confirmationDialog("恢复所有默认覆写设置？", isPresented: $showRestoreConfirmation) {
@@ -71,6 +75,7 @@ private struct DNSOverrideSettingsView: View {
             Section {
                 Toggle("覆写 DNS", isOn: $overrides.overwriteDNS)
             }
+            .listRowBackground(AppListRowBackground())
 
             Section("基础") {
                 HStack {
@@ -89,6 +94,7 @@ private struct DNSOverrideSettingsView: View {
                 }
             }
             .disabled(!overrides.overwriteDNS)
+            .listRowBackground(AppListRowBackground())
 
             Section("解析模式") {
                 Picker("DNS 模式", selection: $overrides.dnsEnhancedMode) {
@@ -113,6 +119,7 @@ private struct DNSOverrideSettingsView: View {
                 Toggle("遵守 Rules 规则", isOn: $overrides.dnsRespectRules)
             }
             .disabled(!overrides.overwriteDNS)
+            .listRowBackground(AppListRowBackground())
 
             Section("域名解析服务器") {
                 nameserverLink("默认域名解析服务器", values: $overrides.defaultNameservers)
@@ -123,7 +130,10 @@ private struct DNSOverrideSettingsView: View {
                 Toggle("Fallback GeoIP", isOn: $overrides.fallbackGeoIP)
             }
             .disabled(!overrides.overwriteDNS)
+            .listRowBackground(AppListRowBackground())
         }
+        .scrollContentBackground(.hidden)
+        .background(AppAmbientBackground())
         .navigationTitle("DNS 覆写")
         .navigationBarTitleDisplayMode(.inline)
     }
@@ -148,6 +158,7 @@ private struct SnifferOverrideSettingsView: View {
                 Toggle("启用嗅探", isOn: $overrides.snifferEnabled)
                     .disabled(!overrides.overwriteSniffer)
             }
+            .listRowBackground(AppListRowBackground())
 
             Section("行为") {
                 Toggle("强制 DNS 映射", isOn: $overrides.snifferForceDNSMapping)
@@ -155,6 +166,7 @@ private struct SnifferOverrideSettingsView: View {
                 Toggle("覆写目标地址", isOn: $overrides.snifferOverrideDestination)
             }
             .disabled(!overrides.overwriteSniffer || !overrides.snifferEnabled)
+            .listRowBackground(AppListRowBackground())
 
             Section("协议") {
                 Toggle("HTTP", isOn: $overrides.sniffHTTP)
@@ -162,6 +174,7 @@ private struct SnifferOverrideSettingsView: View {
                 Toggle("QUIC", isOn: $overrides.sniffQUIC)
             }
             .disabled(!overrides.overwriteSniffer || !overrides.snifferEnabled)
+            .listRowBackground(AppListRowBackground())
 
             Section("域名") {
                 NavigationLink {
@@ -182,7 +195,10 @@ private struct SnifferOverrideSettingsView: View {
                 }
             }
             .disabled(!overrides.overwriteSniffer || !overrides.snifferEnabled)
+            .listRowBackground(AppListRowBackground())
         }
+        .scrollContentBackground(.hidden)
+        .background(AppAmbientBackground())
         .navigationTitle("嗅探覆写")
         .navigationBarTitleDisplayMode(.inline)
     }
@@ -196,6 +212,7 @@ private struct TunOverrideSettingsView: View {
             Section {
                 Toggle("覆写 TUN", isOn: $overrides.overwriteTun)
             }
+            .listRowBackground(AppListRowBackground())
             Section {
                 NavigationLink {
                     StringListEditorView(title: "DNS 劫持",
@@ -208,7 +225,10 @@ private struct TunOverrideSettingsView: View {
                 Toggle("ICMP 转发", isOn: $overrides.tunICMPForwarding)
             }
             .disabled(!overrides.overwriteTun)
+            .listRowBackground(AppListRowBackground())
         }
+        .scrollContentBackground(.hidden)
+        .background(AppAmbientBackground())
         .navigationTitle("TUN 覆写")
         .navigationBarTitleDisplayMode(.inline)
     }
@@ -242,9 +262,12 @@ private struct StringListEditorView: View {
                 ))
                 .autocorrectionDisabled()
                 .textInputAutocapitalization(.never)
+                .listRowBackground(AppListRowBackground())
             }
             .onDelete { values.remove(atOffsets: $0) }
         }
+        .scrollContentBackground(.hidden)
+        .background(AppAmbientBackground())
         .navigationTitle(title)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -275,9 +298,12 @@ private struct HostOverridesView: View {
                         .textInputAutocapitalization(.never)
                         .foregroundStyle(.secondary)
                 }
+                .listRowBackground(AppListRowBackground())
             }
             .onDelete { overrides.hosts.remove(atOffsets: $0) }
         }
+        .scrollContentBackground(.hidden)
+        .background(AppAmbientBackground())
         .navigationTitle("Hosts")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
