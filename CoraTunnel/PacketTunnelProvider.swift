@@ -569,6 +569,20 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             ipcQueue.async {
                 reply(Data(MihomoUpdateProxyProviders().utf8))
             }
+        case "updateProxyProvider":
+            let name = (obj?["name"] as? String) ?? ""
+            ipcQueue.async {
+                reply(Data(MihomoUpdateProxyProvider(name).utf8))
+            }
+        case "updateRuleProviders":
+            ipcQueue.async {
+                reply(Data(MihomoUpdateRuleProviders().utf8))
+            }
+        case "updateRuleProvider":
+            let name = (obj?["name"] as? String) ?? ""
+            ipcQueue.async {
+                reply(Data(MihomoUpdateRuleProvider(name).utf8))
+            }
         case "selectProxy":
             let group = (obj?["group"] as? String) ?? ""
             let name = (obj?["name"] as? String) ?? ""

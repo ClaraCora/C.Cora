@@ -3,6 +3,25 @@ import Foundation
 private let subscriptionMaximumDownloadBytes: Int64 = 10 * 1_024 * 1_024
 private let proxyProviderMaximumDownloadBytes: Int64 = 10 * 1_024 * 1_024
 
+struct RemoteResource: Identifiable, Hashable, Sendable {
+    enum Kind: String, Hashable, Sendable {
+        case proxyProvider
+        case ruleProvider
+    }
+
+    let subscriptionID: UUID
+    let subscriptionName: String
+    let name: String
+    let url: String
+    let kind: Kind
+    let behavior: String?
+    let format: String?
+
+    var id: String {
+        "\(subscriptionID.uuidString)|\(kind.rawValue)|\(name)"
+    }
+}
+
 /// 一条订阅。
 struct Subscription: Identifiable, Codable, Equatable, Sendable {
     let id: UUID
@@ -102,6 +121,7 @@ final class SubscriptionStore: ObservableObject {
     @Published var lastError: String?
     @Published private(set) var isBusy = false
     @Published private(set) var refreshingProviderIDs: Set<UUID> = []
+    @Published private(set) var refreshingResourceIDs: Set<String> = []
     @Published private(set) var providerCacheRevision = 0
 
     private static let fileURL: URL = {
@@ -323,8 +343,7 @@ final class SubscriptionStore: ObservableObject {
     /// 同时由主 App 保存一份订阅隔离缓存，供断开状态下浏览节点。
     func refreshProxyProviders(_ id: UUID, updateRuntime: Bool = true) async {
         guard !refreshingProviderIDs.contains(id),
-              let subscription = subscriptions.first(where: { $0.id == id }),
-              !subscription.isLocal else { return }
+              let subscription = subscriptions.first(where: { $0.id == id }) else { return }
         refreshingProviderIDs.insert(id)
         lastError = nil
         defer { refreshingProviderIDs.remove(id) }
@@ -391,6 +410,114 @@ final class SubscriptionStore: ObservableObject {
         lastError = failures.isEmpty ? nil : "Provider 刷新未全部完成：\n" + failures.joined(separator: "\n")
     }
 
+    func remoteResources() -> [RemoteResource] {
+        subscriptions.flatMap { subscription in
+            guard !subscription.yaml.isEmpty,
+                  let manifest = try? Self.remoteResourceManifest(subscription.yaml) else { return [] }
+            let proxyResources = manifest.proxyProviders.map {
+                RemoteResource(subscriptionID: subscription.id,
+                               subscriptionName: subscription.name,
+                               name: $0.name,
+                               url: $0.url,
+                               kind: .proxyProvider,
+                               behavior: nil,
+                               format: nil)
+            }
+            let ruleResources = manifest.ruleProviders.map {
+                RemoteResource(subscriptionID: subscription.id,
+                               subscriptionName: subscription.name,
+                               name: $0.name,
+                               url: $0.url,
+                               kind: .ruleProvider,
+                               behavior: $0.behavior,
+                               format: $0.format)
+            }
+            return proxyResources + ruleResources
+        }
+    }
+
+    func refreshProxyProvider(_ resource: RemoteResource) async {
+        guard resource.kind == .proxyProvider,
+              !refreshingResourceIDs.contains(resource.id),
+              let subscription = subscriptions.first(where: { $0.id == resource.subscriptionID }) else { return }
+        refreshingResourceIDs.insert(resource.id)
+        lastError = nil
+        defer { refreshingResourceIDs.remove(resource.id) }
+
+        var failures: [String] = []
+        let runtimeStatus = CoreStateManager.shared.status
+        if selectedID == resource.subscriptionID &&
+            (runtimeStatus == .connected || runtimeStatus == .reasserting) {
+            failures.append(contentsOf: await Self.runtimeProviderFailures(
+                command: ["cmd": "updateProxyProvider", "name": resource.name]))
+        }
+
+        do {
+            let providers = try Self.providerManifest(subscription.yaml)
+            guard let provider = providers.first(where: { $0.name == resource.name }) else {
+                throw ProxyProviderRefreshError.notFound(resource.name)
+            }
+            let payload = try await downloadProxyProvider(provider)
+            var cached = Self.loadProviderCache(resource.subscriptionID)
+            cached[provider.name] = payload
+            try Self.saveProviderCache(cached, id: resource.subscriptionID)
+            updateNodeCount(resource.subscriptionID, providerPayloads: cached)
+            providerCacheRevision &+= 1
+        } catch {
+            failures.append(error.localizedDescription)
+        }
+        lastError = failures.isEmpty ? nil : failures.joined(separator: "\n")
+    }
+
+    func refreshAllProxyProviders() async {
+        let resources = remoteResources().filter { $0.kind == .proxyProvider }
+        guard !resources.isEmpty else {
+            lastError = "没有可刷新的远程 Proxy Provider"
+            return
+        }
+        var failures: [String] = []
+        for resource in resources {
+            await refreshProxyProvider(resource)
+            if let error = lastError {
+                failures.append("\(resource.subscriptionName) / \(resource.name)：\(error)")
+            }
+        }
+        lastError = failures.isEmpty ? nil : "部分 Proxy Provider 刷新失败：\n" + failures.joined(separator: "\n")
+    }
+
+    func refreshRuleProvider(_ resource: RemoteResource) async {
+        guard resource.kind == .ruleProvider,
+              !refreshingResourceIDs.contains(resource.id),
+              runtimeCanUpdateRules(for: resource.subscriptionID) else { return }
+        refreshingResourceIDs.insert(resource.id)
+        lastError = nil
+        defer { refreshingResourceIDs.remove(resource.id) }
+        let failures = await Self.runtimeProviderFailures(
+            command: ["cmd": "updateRuleProvider", "name": resource.name])
+        lastError = failures.isEmpty ? nil : failures.joined(separator: "\n")
+    }
+
+    func refreshAllRuleProviders() async {
+        guard let selectedID, runtimeCanUpdateRules(for: selectedID) else { return }
+        let resources = remoteResources().filter {
+            $0.kind == .ruleProvider && $0.subscriptionID == selectedID
+        }
+        guard !resources.isEmpty else {
+            lastError = "当前配置没有可更新的远程 Rule Provider"
+            return
+        }
+        refreshingResourceIDs.formUnion(resources.map(\.id))
+        lastError = nil
+        defer { refreshingResourceIDs.subtract(resources.map(\.id)) }
+        let failures = await Self.runtimeProviderFailures(command: ["cmd": "updateRuleProviders"])
+        lastError = failures.isEmpty ? nil : "部分 Rule Provider 更新失败：\n" + failures.joined(separator: "\n")
+    }
+
+    func runtimeCanUpdateRules(for subscriptionID: UUID) -> Bool {
+        let status = CoreStateManager.shared.status
+        return selectedID == subscriptionID && (status == .connected || status == .reasserting)
+    }
+
     func providerPayloadsJSON(for id: UUID) -> String {
         let cache = Self.loadProviderCache(id)
         guard let data = try? JSONEncoder().encode(cache),
@@ -431,6 +558,52 @@ final class SubscriptionStore: ObservableObject {
         let response = try JSONDecoder().decode(ProxyProviderManifestResponse.self, from: data)
         if let error = response.error { throw ProxyProviderRefreshError.manifest(error) }
         return response.providers
+    }
+
+    private static func remoteResourceManifest(_ yaml: String) throws -> RemoteResourceManifestResponse {
+        let data = MihomoCore.remoteResourceManifest(configYAML: yaml)
+        let response = try JSONDecoder().decode(RemoteResourceManifestResponse.self, from: data)
+        if let error = response.error { throw ProxyProviderRefreshError.manifest(error) }
+        return response
+    }
+
+    private func downloadProxyProvider(_ provider: RemoteProxyProvider) async throws -> String {
+        guard let url = Self.remoteURL(provider.url) else {
+            throw ProxyProviderRefreshError.invalidURL(provider.name)
+        }
+        var request = makeRequest(url: url)
+        for (field, values) in provider.header where !values.isEmpty {
+            request.setValue(values.joined(separator: ", "), forHTTPHeaderField: field)
+        }
+        let download = try await BoundedHTTPDownloader.download(
+            for: request,
+            maxBytes: proxyProviderMaximumDownloadBytes,
+            resourceTimeout: 45)
+        defer { try? FileManager.default.removeItem(at: download.fileURL) }
+        let data = try Data(contentsOf: download.fileURL, options: .mappedIfSafe)
+        guard let payload = String(data: data, encoding: .utf8) else {
+            throw SubscriptionRefreshError.notText
+        }
+        if let validationError = MihomoCore.validateProxyProviderPayload(payload) {
+            throw ProxyProviderRefreshError.invalidPayload(provider.name, validationError)
+        }
+        return payload
+    }
+
+    private static func runtimeProviderFailures(command: [String: Any]) async -> [String] {
+        switch await CoreStateManager.shared.sendMessage(command) {
+        case .failure(let reason):
+            return ["运行内核：\(reason)"]
+        case .ok(let data):
+            guard let response = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+                return ["运行内核返回了无法识别的响应"]
+            }
+            if let providerFailures = response["failures"] as? [String: String] {
+                return providerFailures.sorted(by: { $0.key < $1.key })
+                    .map { "\($0.key)：\($0.value)" }
+            }
+            return (response["ok"] as? Bool) == false ? ["运行内核更新失败"] : []
+        }
     }
 
     private static func hasRemoteProxyProviders(_ yaml: String) -> Bool {
@@ -707,8 +880,22 @@ private struct ProxyProviderManifestResponse: Decodable, Sendable {
     let error: String?
 }
 
+private struct RemoteRuleProvider: Decodable, Sendable {
+    let name: String
+    let url: String
+    let behavior: String?
+    let format: String?
+}
+
+private struct RemoteResourceManifestResponse: Decodable, Sendable {
+    let proxyProviders: [RemoteProxyProvider]
+    let ruleProviders: [RemoteRuleProvider]
+    let error: String?
+}
+
 private enum ProxyProviderRefreshError: LocalizedError {
     case noRemoteProviders
+    case notFound(String)
     case invalidURL(String)
     case invalidPayload(String, String)
     case manifest(String)
@@ -717,6 +904,8 @@ private enum ProxyProviderRefreshError: LocalizedError {
         switch self {
         case .noRemoteProviders:
             return "当前配置没有可刷新的远程 Proxy Provider"
+        case .notFound(let name):
+            return "配置中找不到 Provider \(name)"
         case .invalidURL(let name):
             return "Provider \(name) 的链接无效"
         case .invalidPayload(let name, let reason):

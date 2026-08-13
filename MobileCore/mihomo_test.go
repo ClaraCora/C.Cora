@@ -70,6 +70,76 @@ proxy-providers:
 	}
 }
 
+func TestRemoteResourceManifestIncludesHTTPProxyAndRuleProviders(t *testing.T) {
+	var got struct {
+		ProxyProviders []remoteProxyProvider `json:"proxyProviders"`
+		RuleProviders  []remoteRuleProvider  `json:"ruleProviders"`
+	}
+	result := RemoteResourceManifest(`
+proxy-providers:
+  airport:
+    type: http
+    url: https://example.com/proxies.yaml
+    header:
+      User-Agent: [mihomo]
+  local-proxy:
+    type: file
+    path: ./proxy.yaml
+rule-providers:
+  ai:
+    type: http
+    behavior: domain
+    format: mrs
+    url: https://example.com/ai.mrs
+  local-rule:
+    type: file
+    behavior: classical
+    path: ./rules.yaml
+`)
+	if err := json.Unmarshal([]byte(result), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.ProxyProviders) != 1 || got.ProxyProviders[0].Name != "airport" ||
+		got.ProxyProviders[0].Header["User-Agent"][0] != "mihomo" {
+		t.Fatalf("proxy providers = %+v", got.ProxyProviders)
+	}
+	if len(got.RuleProviders) != 1 || got.RuleProviders[0].Name != "ai" ||
+		got.RuleProviders[0].Behavior != "domain" || got.RuleProviders[0].Format != "mrs" {
+		t.Fatalf("rule providers = %+v", got.RuleProviders)
+	}
+}
+
+func TestMergeConfigNormalizesDNSProxyNamesAndWarnsForMissingNames(t *testing.T) {
+	m := mergedMap(t, `
+proxy-groups:
+  - name: Ai
+    type: select
+    proxies: [DIRECT]
+dns:
+  nameserver:
+    - https://dns.google/dns-query#AI
+  nameserver-policy:
+    "+.example.com":
+      - https://dns.google/dns-query#Missing
+rules:
+  - MATCH,Ai
+`)
+	dns := nestedMap(t, m, "dns")
+	nameservers, ok := dns["nameserver"].([]any)
+	if !ok || len(nameservers) != 1 || nameservers[0] != "https://dns.google/dns-query#Ai" {
+		t.Fatalf("dns.nameserver = %v", dns["nameserver"])
+	}
+	policy := nestedMap(t, dns, "nameserver-policy")
+	missing, ok := policy["+.example.com"].([]any)
+	if !ok || len(missing) != 1 || missing[0] != "https://dns.google/dns-query#Missing" {
+		t.Fatalf("missing policy should remain inspectable: %v", policy["+.example.com"])
+	}
+	joined := strings.Join(configNotices, "\n")
+	if !strings.Contains(joined, "AI → Ai") || !strings.Contains(joined, "Missing") {
+		t.Fatalf("config notices = %v", configNotices)
+	}
+}
+
 func TestOfflineProxySnapshotCombinesInlineAndCachedProviders(t *testing.T) {
 	configYAML := `
 mode: rule

@@ -165,6 +165,9 @@ final class CoreStateManager: ObservableObject {
         case "groupDelay", "proxyDelay":
             let milliseconds = (request["timeout"] as? NSNumber)?.doubleValue ?? 5_000
             timeout = max(10, milliseconds / 1_000 + 5)
+        case "updateProxyProviders", "updateProxyProvider",
+             "updateRuleProviders", "updateRuleProvider":
+            timeout = 120
         default:
             timeout = 10
         }

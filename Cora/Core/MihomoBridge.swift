@@ -18,6 +18,10 @@ enum MihomoCore {
         Data(MihomoProxyProviderManifest(configYAML).utf8)
     }
 
+    static func remoteResourceManifest(configYAML: String) -> Data {
+        Data(MihomoRemoteResourceManifest(configYAML).utf8)
+    }
+
     static func validateProxyProviderPayload(_ payload: String) -> String? {
         var validationError: NSError?
         guard MihomoValidateProxyProviderPayload(payload, &validationError) else {

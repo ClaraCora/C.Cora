@@ -22,6 +22,11 @@ struct SettingsView: View {
                                 tint: .orange,
                                 message: core.configNotices.joined(separator: "\n\n"))
                         }
+                        SettingsNavigationRow(
+                            title: "远程资源",
+                            systemImage: "externaldrive.connected.to.line.below",
+                            message: "查看所有配置引用的远程 Proxy Provider 与 Rule Provider。Proxy Provider 可离线缓存；Rule Provider 需连接当前配置后更新。",
+                            destination: RemoteResourcesView())
                         HStack {
                             Label {
                                 InfoLabel(title: "订阅 UA", message: "拉取订阅时发送的 User-Agent。不同机场可能根据 UA 返回不同配置格式，修改后重新拉取订阅生效。")
@@ -86,6 +91,184 @@ struct SettingsView: View {
         let version = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0.1"
         let build = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1"
         return "\(version) (\(build))"
+    }
+}
+
+private struct RemoteResourcesView: View {
+    @EnvironmentObject private var subscriptions: SubscriptionStore
+    @EnvironmentObject private var core: CoreStateManager
+    @State private var resultMessage: String?
+
+    var body: some View {
+        Form {
+            remoteSection(kind: .proxyProvider,
+                          title: "Proxy Provider",
+                          emptyMessage: "没有远程 Proxy Provider",
+                          isBatchRefreshing: proxyResources.contains {
+                              subscriptions.refreshingResourceIDs.contains($0.id)
+                          },
+                          batchAction: refreshAllProxyProviders)
+
+            remoteSection(kind: .ruleProvider,
+                          title: "Rule Provider",
+                          emptyMessage: "没有远程 Rule Provider",
+                          isBatchRefreshing: ruleResources.contains {
+                              subscriptions.refreshingResourceIDs.contains($0.id)
+                          },
+                          batchAction: refreshAllRuleProviders)
+        }
+        .scrollContentBackground(.hidden)
+        .background(AppAmbientBackground())
+        .navigationTitle("远程资源")
+        .navigationBarTitleDisplayMode(.inline)
+        .task { await core.refreshStatus() }
+        .alert("远程资源", isPresented: Binding(
+            get: { resultMessage != nil },
+            set: { if !$0 { resultMessage = nil } }
+        )) {
+            Button("好") { resultMessage = nil }
+        } message: {
+            Text(resultMessage ?? "")
+        }
+    }
+
+    private var resources: [RemoteResource] {
+        subscriptions.remoteResources()
+    }
+
+    private var proxyResources: [RemoteResource] {
+        resources.filter { $0.kind == .proxyProvider }
+    }
+
+    private var ruleResources: [RemoteResource] {
+        resources.filter { $0.kind == .ruleProvider }
+    }
+
+    @ViewBuilder
+    private func remoteSection(kind: RemoteResource.Kind,
+                               title: String,
+                               emptyMessage: String,
+                               isBatchRefreshing: Bool,
+                               batchAction: @escaping () async -> Void) -> some View {
+        let sectionResources = resources.filter { $0.kind == kind }
+        Section {
+            if sectionResources.isEmpty {
+                Label(emptyMessage, systemImage: "tray")
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(sectionResources) { resource in
+                    RemoteResourceRow(
+                        resource: resource,
+                        isRefreshing: subscriptions.refreshingResourceIDs.contains(resource.id),
+                        canRefresh: resource.kind == .proxyProvider ||
+                            subscriptions.runtimeCanUpdateRules(for: resource.subscriptionID))
+                    .contextMenu {
+                        Button {
+                            Task { await refresh(resource) }
+                        } label: {
+                            Label("刷新此资源", systemImage: "arrow.clockwise")
+                        }
+                        .disabled(subscriptions.refreshingResourceIDs.contains(resource.id) ||
+                                  (resource.kind == .ruleProvider &&
+                                   !subscriptions.runtimeCanUpdateRules(for: resource.subscriptionID)))
+                    }
+                }
+            }
+        } header: {
+            HStack {
+                Text(title)
+                Spacer()
+                if isBatchRefreshing {
+                    ProgressView()
+                        .controlSize(.small)
+                        .frame(width: 44, height: 44)
+                } else {
+                    Button {
+                        Task { await batchAction() }
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                            .frame(width: 44, height: 44)
+                    }
+                    .accessibilityLabel("批量刷新\(title)")
+                    .disabled(sectionResources.isEmpty ||
+                              (kind == .ruleProvider && !canBatchUpdateRules))
+                }
+            }
+        } footer: {
+            if kind == .ruleProvider && !canBatchUpdateRules && !sectionResources.isEmpty {
+                Text("Rule Provider 由运行中的内核加载。连接对应的当前配置后可更新。")
+            }
+        }
+        .listRowBackground(AppListRowBackground())
+    }
+
+    private var canBatchUpdateRules: Bool {
+        guard let selectedID = subscriptions.selectedID else { return false }
+        return subscriptions.runtimeCanUpdateRules(for: selectedID) &&
+            ruleResources.contains { $0.subscriptionID == selectedID }
+    }
+
+    private func refresh(_ resource: RemoteResource) async {
+        switch resource.kind {
+        case .proxyProvider:
+            await subscriptions.refreshProxyProvider(resource)
+        case .ruleProvider:
+            await subscriptions.refreshRuleProvider(resource)
+        }
+        resultMessage = subscriptions.lastError ?? "\(resource.name) 已刷新"
+    }
+
+    private func refreshAllProxyProviders() async {
+        await subscriptions.refreshAllProxyProviders()
+        resultMessage = subscriptions.lastError ?? "Proxy Provider 已全部刷新"
+    }
+
+    private func refreshAllRuleProviders() async {
+        await subscriptions.refreshAllRuleProviders()
+        resultMessage = subscriptions.lastError ?? "当前配置的 Rule Provider 已全部更新"
+    }
+}
+
+private struct RemoteResourceRow: View {
+    let resource: RemoteResource
+    let isRefreshing: Bool
+    let canRefresh: Bool
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: resource.kind == .proxyProvider
+                  ? "point.3.connected.trianglepath.dotted"
+                  : "list.bullet.rectangle.portrait")
+                .foregroundStyle(resource.kind == .proxyProvider ? Color.blue : Color.orange)
+                .frame(width: 28)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(resource.name)
+                    .font(.body.weight(.medium))
+                    .lineLimit(2)
+                HStack(spacing: 6) {
+                    Text(resource.subscriptionName)
+                    if let host = URL(string: resource.url)?.host {
+                        Text("·")
+                        Text(host)
+                    }
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            if isRefreshing {
+                ProgressView()
+                    .controlSize(.small)
+            } else if !canRefresh {
+                Image(systemName: "lock")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .accessibilityLabel("连接对应配置后可更新")
+            }
+        }
+        .padding(.vertical, 3)
+        .contentShape(Rectangle())
     }
 }
 

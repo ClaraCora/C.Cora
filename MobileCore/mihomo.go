@@ -816,6 +816,9 @@ func mergeConfig(subYAML string, st appSettings, tunnelMTU int) ([]byte, error) 
 
 	// 收集本次合并的「不适用内容」提示。
 	configNotices = nil
+	// DNS URL 的 #名称区分大小写。名称写错时 mihomo 会把它当作物理接口，
+	// 查询在建立普通连接之前即失败，因此浏览器只显示“找不到服务器”。
+	normalizeDNSProxyReferences(m)
 
 	// iOS 沙盒拿不到其它进程信息 → PROCESS-NAME/PROCESS-PATH 规则无效，剔除并提示。
 	filterUnsupportedRulesFromConfig(m)
@@ -1097,6 +1100,142 @@ func filterUnsupportedRules(rules []any) []any {
 	return out
 }
 
+func normalizeDNSProxyReferences(root map[string]any) {
+	dnsConfig, ok := root["dns"].(map[string]any)
+	if !ok {
+		return
+	}
+
+	exactNames := map[string]struct{}{
+		"DIRECT": {}, "REJECT": {}, "GLOBAL": {}, "PASS": {}, "RULES": {},
+	}
+	for _, section := range []string{"proxies", "proxy-groups"} {
+		items, _ := root[section].([]any)
+		for _, item := range items {
+			definition, _ := item.(map[string]any)
+			name, _ := definition["name"].(string)
+			if name = strings.TrimSpace(name); name != "" {
+				exactNames[name] = struct{}{}
+			}
+		}
+	}
+
+	foldedNames := map[string]string{}
+	ambiguousNames := map[string]bool{}
+	for name := range exactNames {
+		folded := strings.ToLower(name)
+		if existing, exists := foldedNames[folded]; exists && existing != name {
+			ambiguousNames[folded] = true
+			continue
+		}
+		foldedNames[folded] = name
+	}
+
+	corrected := map[string]string{}
+	unresolved := map[string]bool{}
+	normalize := func(value any) any {
+		return normalizeDNSReferenceValue(value, exactNames, foldedNames,
+			ambiguousNames, corrected, unresolved)
+	}
+	for _, key := range []string{
+		"nameserver", "fallback", "default-nameserver",
+		"proxy-server-nameserver", "direct-nameserver",
+	} {
+		if value, exists := dnsConfig[key]; exists {
+			dnsConfig[key] = normalize(value)
+		}
+	}
+	for _, key := range []string{"nameserver-policy", "proxy-server-nameserver-policy"} {
+		if policy, ok := dnsConfig[key].(map[string]any); ok {
+			for rule, value := range policy {
+				policy[rule] = normalize(value)
+			}
+		}
+	}
+
+	if len(corrected) > 0 {
+		pairs := make([]string, 0, len(corrected))
+		for original, replacement := range corrected {
+			pairs = append(pairs, original+" → "+replacement)
+		}
+		sort.Strings(pairs)
+		configNotices = append(configNotices,
+			"已纠正 DNS 出站策略名称大小写："+strings.Join(pairs, "、"))
+	}
+	if len(unresolved) > 0 {
+		names := make([]string, 0, len(unresolved))
+		for name := range unresolved {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		configNotices = append(configNotices,
+			"DNS 出站名称未匹配配置内策略，将被当作网络接口使用，请检查："+
+				strings.Join(names, "、"))
+	}
+}
+
+func normalizeDNSReferenceValue(value any, exactNames map[string]struct{},
+	foldedNames map[string]string, ambiguousNames map[string]bool,
+	corrected map[string]string, unresolved map[string]bool) any {
+	switch typed := value.(type) {
+	case string:
+		return normalizeDNSReferenceString(typed, exactNames, foldedNames,
+			ambiguousNames, corrected, unresolved)
+	case []any:
+		out := make([]any, len(typed))
+		for index, item := range typed {
+			out[index] = normalizeDNSReferenceValue(item, exactNames, foldedNames,
+				ambiguousNames, corrected, unresolved)
+		}
+		return out
+	default:
+		return value
+	}
+}
+
+func normalizeDNSReferenceString(value string, exactNames map[string]struct{},
+	foldedNames map[string]string, ambiguousNames map[string]bool,
+	corrected map[string]string, unresolved map[string]bool) string {
+	prefix, fragment, found := strings.Cut(value, "#")
+	if !found || fragment == "" {
+		return value
+	}
+	parts := strings.Split(fragment, "&")
+	changed := false
+	for index, part := range parts {
+		if part == "" || strings.Contains(part, "=") {
+			continue
+		}
+		if _, exists := exactNames[part]; exists {
+			continue
+		}
+		folded := strings.ToLower(part)
+		if replacement, exists := foldedNames[folded]; exists && !ambiguousNames[folded] {
+			parts[index] = replacement
+			corrected[part] = replacement
+			changed = true
+			continue
+		}
+		if !looksLikeNetworkInterface(part) {
+			unresolved[part] = true
+		}
+	}
+	if !changed {
+		return value
+	}
+	return prefix + "#" + strings.Join(parts, "&")
+}
+
+func looksLikeNetworkInterface(name string) bool {
+	lower := strings.ToLower(strings.TrimSpace(name))
+	for _, prefix := range []string{"en", "utun", "pdp_ip", "lo", "eth", "wlan", "rmnet"} {
+		if strings.HasPrefix(lower, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func filterUnsupportedRulesFromConfig(m map[string]any) {
 	if rules, ok := m["rules"].([]any); ok {
 		m["rules"] = filterUnsupportedRules(rules)
@@ -1375,6 +1514,13 @@ type remoteProxyProvider struct {
 	Header map[string][]string `json:"header,omitempty"`
 }
 
+type remoteRuleProvider struct {
+	Name     string `json:"name"`
+	URL      string `json:"url"`
+	Behavior string `json:"behavior,omitempty"`
+	Format   string `json:"format,omitempty"`
+}
+
 // ProxyProviderManifest extracts the HTTP proxy providers that the main App
 // may download and cache while the tunnel is disconnected. It only parses
 // YAML and never initializes mihomo runtime providers.
@@ -1383,6 +1529,28 @@ func ProxyProviderManifest(configYAML string) string {
 	if err := yaml.Unmarshal([]byte(configYAML), &raw); err != nil {
 		return marshalJSON(map[string]any{"providers": []remoteProxyProvider{}, "error": err.Error()})
 	}
+	return marshalJSON(map[string]any{"providers": remoteProxyProviders(raw)})
+}
+
+// RemoteResourceManifest extracts every HTTP Proxy Provider and Rule Provider
+// without initializing the runtime. The main App uses it to present resources
+// from disconnected configurations as well as the active one.
+func RemoteResourceManifest(configYAML string) string {
+	var raw map[string]any
+	if err := yaml.Unmarshal([]byte(configYAML), &raw); err != nil {
+		return marshalJSON(map[string]any{
+			"proxyProviders": []remoteProxyProvider{},
+			"ruleProviders":  []remoteRuleProvider{},
+			"error":          err.Error(),
+		})
+	}
+	return marshalJSON(map[string]any{
+		"proxyProviders": remoteProxyProviders(raw),
+		"ruleProviders":  remoteRuleProviders(raw),
+	})
+}
+
+func remoteProxyProviders(raw map[string]any) []remoteProxyProvider {
 	providers, _ := raw["proxy-providers"].(map[string]any)
 	names := make([]string, 0, len(providers))
 	for name := range providers {
@@ -1411,7 +1579,34 @@ func ProxyProviderManifest(configYAML string) string {
 		}
 		out = append(out, remoteProxyProvider{Name: name, URL: strings.TrimSpace(providerURL), Header: headers})
 	}
-	return marshalJSON(map[string]any{"providers": out})
+	return out
+}
+
+func remoteRuleProviders(raw map[string]any) []remoteRuleProvider {
+	providers, _ := raw["rule-providers"].(map[string]any)
+	names := make([]string, 0, len(providers))
+	for name := range providers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := make([]remoteRuleProvider, 0, len(names))
+	for _, name := range names {
+		definition, _ := providers[name].(map[string]any)
+		providerType, _ := definition["type"].(string)
+		providerURL, _ := definition["url"].(string)
+		if !strings.EqualFold(strings.TrimSpace(providerType), "http") || strings.TrimSpace(providerURL) == "" {
+			continue
+		}
+		behavior, _ := definition["behavior"].(string)
+		format, _ := definition["format"].(string)
+		out = append(out, remoteRuleProvider{
+			Name:     name,
+			URL:      strings.TrimSpace(providerURL),
+			Behavior: strings.TrimSpace(behavior),
+			Format:   strings.TrimSpace(format),
+		})
+	}
+	return out
 }
 
 // ValidateProxyProviderPayload verifies the common provider payload shape
@@ -1434,10 +1629,59 @@ func UpdateProxyProviders() string {
 		}
 	}
 	sort.Strings(names)
+	return updateRuntimeProviders(names, func(name string) error { return providers[name].Update() })
+}
+
+// UpdateProxyProvider refreshes one named HTTP Proxy Provider in the active runtime.
+func UpdateProxyProvider(name string) string {
+	configApplyMu.RLock()
+	defer configApplyMu.RUnlock()
+	providers := tunnel.Providers()
+	provider, ok := providers[name]
+	if !ok {
+		return providerNotFoundResponse(name)
+	}
+	if provider.VehicleType() != P.HTTP {
+		return providerWrongVehicleResponse(name)
+	}
+	return updateRuntimeProviders([]string{name}, func(string) error { return provider.Update() })
+}
+
+// UpdateRuleProviders refreshes all HTTP Rule Providers in the active runtime.
+func UpdateRuleProviders() string {
+	configApplyMu.RLock()
+	defer configApplyMu.RUnlock()
+	providers := tunnel.RuleProviders()
+	names := make([]string, 0, len(providers))
+	for name, provider := range providers {
+		if provider.VehicleType() == P.HTTP {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return updateRuntimeProviders(names, func(name string) error { return providers[name].Update() })
+}
+
+// UpdateRuleProvider refreshes one named HTTP Rule Provider in the active runtime.
+func UpdateRuleProvider(name string) string {
+	configApplyMu.RLock()
+	defer configApplyMu.RUnlock()
+	providers := tunnel.RuleProviders()
+	provider, ok := providers[name]
+	if !ok {
+		return providerNotFoundResponse(name)
+	}
+	if provider.VehicleType() != P.HTTP {
+		return providerWrongVehicleResponse(name)
+	}
+	return updateRuntimeProviders([]string{name}, func(string) error { return provider.Update() })
+}
+
+func updateRuntimeProviders(names []string, update func(string) error) string {
 	updated := make([]string, 0, len(names))
 	failures := map[string]string{}
 	for _, name := range names {
-		if err := providers[name].Update(); err != nil {
+		if err := update(name); err != nil {
 			failures[name] = err.Error()
 			continue
 		}
@@ -1447,6 +1691,22 @@ func UpdateProxyProviders() string {
 		"ok":       len(failures) == 0,
 		"updated":  updated,
 		"failures": failures,
+	})
+}
+
+func providerNotFoundResponse(name string) string {
+	return marshalJSON(map[string]any{
+		"ok":       false,
+		"updated":  []string{},
+		"failures": map[string]string{name: "provider not found"},
+	})
+}
+
+func providerWrongVehicleResponse(name string) string {
+	return marshalJSON(map[string]any{
+		"ok":       false,
+		"updated":  []string{},
+		"failures": map[string]string{name: "provider is not an HTTP resource"},
 	})
 }
 

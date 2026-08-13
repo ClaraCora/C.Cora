@@ -7,6 +7,9 @@ struct ProxiesView: View {
     @EnvironmentObject private var subscriptions: SubscriptionStore
     @StateObject private var controller = ProxyController()
     @State private var expanded: Set<String> = []
+    @State private var gridRowFrames: [Int: CGRect] = [:]
+    @State private var gridRestoreAnchors: [String: UnitPoint] = [:]
+    @State private var gridScrollRequest: GridScrollRequest?
     @State private var searchText = ""
     @State private var isSearchPresented = false
     @State private var groupGradients: [String: Int] = [:]
@@ -227,12 +230,15 @@ struct ProxiesView: View {
                     ContentUnavailableView.search(text: searchText)
                 } else {
                         ForEach(Array(rows.enumerated()), id: \.offset) { rowIndex, row in
+                            let expandsUpward = rowIndex >= upwardExpansionStart
                             VStack(alignment: .leading, spacing: 12) {
-                                // Keep the final three rows clear of the tab bar by placing
-                                // their expanded panel above the source cards.
-                                if rowIndex >= upwardExpansionStart,
+                                if expandsUpward,
                                    let expandedGroup = row.first(where: { $0.isExpanded }) {
-                                    expandedPanel(for: expandedGroup)
+                                    expandedPanel(for: expandedGroup) {
+                                        toggleGridGroup(expandedGroup.group.name,
+                                                        rowIndex: rowIndex,
+                                                        viewportHeight: viewport.size.height)
+                                    }
                                         .id(expandedPanelID(for: expandedGroup.group.name))
                                 }
 
@@ -241,7 +247,11 @@ struct ProxiesView: View {
                                         GroupGridCard(
                                             group: result.group,
                                             gradientIndex: groupGradient(for: result.group.name),
-                                            onToggle: { openGroup(result.group.name) },
+                                            onToggle: {
+                                                toggleGridGroup(result.group.name,
+                                                                rowIndex: rowIndex,
+                                                                viewportHeight: viewport.size.height)
+                                            },
                                             onGradient: { setGradient($0, for: result.group.name) },
                                             onRandomizeAll: randomizeAllGradients)
                                             .frame(maxWidth: .infinity)
@@ -252,18 +262,34 @@ struct ProxiesView: View {
                                             .accessibilityHidden(true)
                                     }
                                 }
-                                if rowIndex < upwardExpansionStart,
+                                .id(gridRowID(rowIndex))
+                                .background {
+                                    GeometryReader { rowGeometry in
+                                        Color.clear.preference(
+                                            key: GridRowFramePreferenceKey.self,
+                                            value: [
+                                                rowIndex: rowGeometry.frame(
+                                                    in: .named(GridCoordinateSpace.name))
+                                            ])
+                                    }
+                                }
+                                if !expandsUpward,
                                    let expandedGroup = row.first(where: { $0.isExpanded }) {
-                                    expandedPanel(for: expandedGroup)
+                                    expandedPanel(for: expandedGroup) {
+                                        toggleGridGroup(expandedGroup.group.name,
+                                                        rowIndex: rowIndex,
+                                                        viewportHeight: viewport.size.height)
+                                    }
                                         .id(expandedPanelID(for: expandedGroup.group.name))
                                 }
                             }
                         }
-                        // Leave enough scrollable content below an expanded panel so a
-                        // group near the bottom can still move into the readable area.
+                        // The tab bar can cover the last row when the content is shorter
+                        // than the viewport. Keep enough inert content below the grid so
+                        // an expanded panel can always be scrolled into the safe area.
                         if !expanded.isEmpty {
                             Color.clear
-                                .frame(height: max(180, viewport.size.height * 0.62))
+                                .frame(height: max(260, viewport.size.height + 80))
                                 .accessibilityHidden(true)
                         }
                     }
@@ -271,14 +297,23 @@ struct ProxiesView: View {
                     .padding(.horizontal, 14)
                     .padding(.vertical, 10)
                 }
+                .coordinateSpace(name: GridCoordinateSpace.name)
                 .background(Color.clear)
                 .refreshable { await reload() }
-                .onChange(of: expanded) { _, names in
-                    guard let name = names.first else { return }
-                    DispatchQueue.main.async {
-                        withAnimation(.easeOut(duration: 0.16)) {
-                            proxy.scrollTo(expandedPanelID(for: name), anchor: .top)
-                        }
+                .onPreferenceChange(GridRowFramePreferenceKey.self) { frames in
+                    if gridRowFrames != frames {
+                        gridRowFrames = frames
+                    }
+                }
+                .task(id: gridScrollRequest) {
+                    guard let request = gridScrollRequest else { return }
+                    // Wait for the expanded/collapsed stack to finish one layout pass so
+                    // ScrollViewReader targets the new geometry instead of the old row.
+                    await Task.yield()
+                    try? await Task.sleep(nanoseconds: 80_000_000)
+                    guard !Task.isCancelled else { return }
+                    withAnimation(.easeOut(duration: 0.18)) {
+                        proxy.scrollTo(request.targetID, anchor: request.anchor)
                     }
                 }
             }
@@ -299,8 +334,13 @@ struct ProxiesView: View {
         "proxy-expanded-\(name)"
     }
 
+    private func gridRowID(_ index: Int) -> String {
+        "proxy-grid-row-\(index)"
+    }
+
     @ViewBuilder
-    private func expandedPanel(for result: DisplayedProxyGroup) -> some View {
+    private func expandedPanel(for result: DisplayedProxyGroup,
+                               onToggle: @escaping () -> Void) -> some View {
         GroupExpandedPanel(
             group: result.group,
             isTesting: controller.testing.contains(result.group.name),
@@ -309,7 +349,7 @@ struct ProxiesView: View {
             testingNodes: controller.testingNodes,
             delays: controller.delays,
              gradientIndex: groupGradient(for: result.group.name),
-            onToggle: { openGroup(result.group.name) },
+            onToggle: onToggle,
             onTest: { Task { await controller.testGroup(result.group.name) } },
             onTestNode: { name in Task { await controller.testNode(name, in: result.group.name) } },
              onGradient: { setGradient($0, for: result.group.name) },
@@ -360,6 +400,62 @@ struct ProxiesView: View {
                 expanded.insert(name)
             }
         }
+    }
+
+    private func toggleGridGroup(_ name: String,
+                                 rowIndex: Int,
+                                 viewportHeight: CGFloat) {
+        guard normalizedSearch.isEmpty else {
+            searchText = ""
+            openGridGroup(name)
+            return
+        }
+
+        if expanded.contains(name) {
+            let restoreAnchor = gridRestoreAnchors.removeValue(forKey: name) ?? .center
+            withAnimation(.easeOut(duration: 0.18)) {
+                expanded.remove(name)
+            }
+            gridScrollRequest = GridScrollRequest(targetID: gridRowID(rowIndex),
+                                                  anchor: restoreAnchor)
+            return
+        }
+
+        saveGridRestoreAnchor(for: name,
+                              rowIndex: rowIndex,
+                              viewportHeight: viewportHeight)
+        withAnimation(.easeOut(duration: 0.18)) {
+            // A grid row has room for one detail panel. Keeping one explicit expansion
+            // also avoids Set ordering from choosing an unrelated scroll target.
+            expanded = [name]
+        }
+        // Scroll to the panel itself. This is important for the final rows: their
+        // panel is rendered above the cards, so anchoring the row leaves the panel
+        // partially behind the navigation/tab bars.
+        gridScrollRequest = GridScrollRequest(targetID: expandedPanelID(for: name),
+                                              anchor: .top)
+    }
+
+    private func openGridGroup(_ name: String) {
+        guard controller.groups.contains(where: { $0.name == name }) else {
+            expanded = [name]
+            return
+        }
+        expanded = [name]
+        gridScrollRequest = GridScrollRequest(targetID: expandedPanelID(for: name),
+                                              anchor: .top)
+    }
+
+    private func saveGridRestoreAnchor(for name: String,
+                                       rowIndex: Int,
+                                       viewportHeight: CGFloat) {
+        guard let frame = gridRowFrames[rowIndex], viewportHeight > frame.height else {
+            gridRestoreAnchors[name] = .center
+            return
+        }
+        let availableTravel = viewportHeight - frame.height
+        let relativeY = min(max(frame.minY / availableTravel, 0), 1)
+        gridRestoreAnchors[name] = UnitPoint(x: 0.5, y: relativeY)
     }
 
     private func openGroup(_ name: String) {
@@ -422,6 +518,32 @@ private struct LoadContext: Hashable {
     let subscriptionID: UUID?
     let configurationUpdatedAt: Date?
     let providerRevision: Int
+}
+
+private struct GridScrollRequest: Hashable {
+    let id = UUID()
+    let targetID: String
+    let anchor: UnitPoint
+
+    static func == (lhs: GridScrollRequest, rhs: GridScrollRequest) -> Bool {
+        lhs.id == rhs.id
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+    }
+}
+
+private enum GridCoordinateSpace {
+    static let name = "proxy-grid-viewport"
+}
+
+private struct GridRowFramePreferenceKey: PreferenceKey {
+    static var defaultValue: [Int: CGRect] = [:]
+
+    static func reduce(value: inout [Int: CGRect], nextValue: () -> [Int: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, latest in latest })
+    }
 }
 
 private struct DisplayedProxyGroup: Identifiable {
