@@ -1767,9 +1767,28 @@ func GroupDelay(group, url string, timeoutMs int) string {
 	defer cancel()
 
 	var expectedStatus utils.IntRanges[uint16] // 零值=不限定状态码，与不带 expected 的 REST 行为一致
-	dm, err := g.URLTest(ctx, url, expectedStatus)
-	if err != nil {
-		return `{"error":"` + err.Error() + `"}`
+	// Some automatic groups ignore the URL supplied to ProxyGroup.URLTest and
+	// use their configured health-check URL. Test their resolved members here so
+	// the app's configured URL applies uniformly to every group type.
+	dm := make(map[string]uint16)
+	var delayMu sync.Mutex
+	var wait sync.WaitGroup
+	for _, proxy := range g.Proxies() {
+		proxy := proxy
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			delay, testErr := proxy.URLTest(ctx, url, expectedStatus)
+			if testErr == nil && delay > 0 {
+				delayMu.Lock()
+				dm[proxy.Name()] = delay
+				delayMu.Unlock()
+			}
+		}()
+	}
+	wait.Wait()
+	if len(dm) == 0 {
+		return `{"error":"测速地址不可达或全部节点超时"}`
 	}
 	out, err := json.Marshal(dm)
 	if err != nil {

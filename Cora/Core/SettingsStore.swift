@@ -32,6 +32,8 @@ final class SettingsStore: ObservableObject {
     @Published var geoUpdateInterval: Int { didSet { d.set(geoUpdateInterval, forKey: K.geoInterval) } }
     /// 日志等级：silent / error / warning / info / debug。
     @Published var logLevel: String { didSet { d.set(logLevel, forKey: K.logLevel) } }
+    /// 策略组与节点测速使用的 HTTP(S) 地址，仅由主 App 的测速 IPC 使用，无需重连。
+    @Published var delayTestURL: String { didSet { d.set(delayTestURL, forKey: K.delayTestURL) } }
     /// 混合代理端口（HTTP+SOCKS，本机回环）。0=不开。下发给内核 mixed-port。
     @Published var mixedPort: Int {
         didSet {
@@ -76,6 +78,7 @@ final class SettingsStore: ObservableObject {
         "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat"
     static let defaultASNURL =
         "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/GeoLite2-ASN.mmdb"
+    static let defaultDelayTestURL = "https://www.gstatic.com/generate_204"
 
     private let d = UserDefaults.standard
     private enum K {
@@ -87,6 +90,7 @@ final class SettingsStore: ObservableObject {
         static let ignoreGeoNegation = "set.ignoreGeoNegation"
         static let geoAuto = "set.geoAuto", geoInterval = "set.geoInterval"
         static let logLevel = "set.logLevel"
+        static let delayTestURL = "set.delayTestURL"
         static let mixedPort = "set.mixedPort"
         static let blockDirectSTUN = "set.blockDirectSTUN"
         static let inclAll = "set.inclAll", exCell = "set.exCell", exAPNs = "set.exAPNs"
@@ -108,6 +112,7 @@ final class SettingsStore: ObservableObject {
         let gi = d.integer(forKey: K.geoInterval)
         geoUpdateInterval = gi == 0 ? 24 : gi
         logLevel = d.string(forKey: K.logLevel) ?? "info"
+        delayTestURL = d.string(forKey: K.delayTestURL) ?? Self.defaultDelayTestURL
         mixedPort = min(max(d.integer(forKey: K.mixedPort), 0), 65_535)
         blockDirectSTUN = d.object(forKey: K.blockDirectSTUN) as? Bool ?? false
         includeAllNetworks = d.object(forKey: K.inclAll) as? Bool ?? false

@@ -25,7 +25,7 @@ struct ConnectionsView: View {
                                    onRefresh: { await controller.refresh(showLoading: false) })
             }
         }
-        .navigationTitle("记录")
+        .navigationTitle("")
         .navigationBarTitleDisplayMode(.inline)
     }
 }
@@ -495,6 +495,19 @@ private struct MenuFilter<Content: View>: View {
 private struct ConnectionRecordRow: View {
     let entry: ConnectionHistoryEntry
 
+    var body: some View {
+        NavigationLink {
+            ConnectionDetailView(entry: entry)
+        } label: {
+            ConnectionRecordContent(entry: entry)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct ConnectionRecordContent: View {
+    let entry: ConnectionHistoryEntry
+
     private var connection: ActiveConnection { entry.connection }
 
     var body: some View {
@@ -512,10 +525,6 @@ private struct ConnectionRecordRow: View {
                     .padding(.horizontal, 5)
                     .padding(.vertical, 2)
                     .background(networkTint.opacity(0.12), in: Capsule())
-                Text(connection.strategyName)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
                 Spacer(minLength: 4)
                 Image(systemName: entry.isActive ? "lock.open" : "lock")
                     .font(.caption)
@@ -526,6 +535,17 @@ private struct ConnectionRecordRow: View {
                 .font(.body.weight(.medium))
                 .foregroundStyle(.primary)
                 .lineLimit(1)
+
+            HStack(spacing: 5) {
+                Image(systemName: "slider.horizontal.3")
+                Text(connection.strategyName)
+                Image(systemName: "chevron.right")
+                    .font(.caption2.weight(.semibold))
+                Text(connection.proxyNodeName)
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
 
             HStack(spacing: 10) {
                 Text(connection.networkLabel)
@@ -550,6 +570,143 @@ private struct ConnectionRecordRow: View {
         case "udp": return .purple
         case "tcp": return .blue
         default: return .gray
+        }
+    }
+}
+
+private struct ConnectionDetailView: View {
+    @EnvironmentObject private var controller: ConnectionsController
+
+    let entry: ConnectionHistoryEntry
+
+    private var connection: ActiveConnection { entry.connection }
+    private var isActive: Bool {
+        controller.snapshot?.connections.contains(where: { $0.id == connection.id }) == true
+    }
+
+    var body: some View {
+        List {
+            Section {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 7) {
+                        Circle()
+                            .fill(isActive ? Color.green : Color.secondary.opacity(0.55))
+                            .frame(width: 8, height: 8)
+                        Text(isActive ? "活跃连接" : "已结束")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Text(connection.networkLabel)
+                            .font(.caption.monospaced().weight(.bold))
+                            .foregroundStyle(networkTint)
+                    }
+                    Text(connection.destinationAddressOrTitle)
+                        .font(.title3.weight(.semibold))
+                        .lineLimit(2)
+                    Text(connection.recordTimeText)
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.vertical, 4)
+            }
+            .listRowBackground(AppListRowBackground())
+
+            Section("路由") {
+                ConnectionDetailValue(title: "策略组",
+                                      value: connection.strategyName,
+                                      systemImage: "slider.horizontal.3")
+                ConnectionDetailValue(title: "出口节点",
+                                      value: connection.proxyNodeName,
+                                      systemImage: "point.3.connected.trianglepath.dotted")
+                if connection.chains.count > 1 {
+                    ConnectionDetailValue(title: "完整链路",
+                                          value: connection.routeText,
+                                          systemImage: "arrow.triangle.branch")
+                }
+                if !connection.ruleText.isEmpty {
+                    ConnectionDetailValue(title: "命中规则",
+                                          value: connection.ruleText,
+                                          systemImage: "list.bullet.rectangle")
+                }
+            }
+            .listRowBackground(AppListRowBackground())
+
+            Section("连接信息") {
+                if !connection.sourceAddress.isEmpty {
+                    ConnectionDetailValue(title: "来源", value: connection.sourceAddress,
+                                          systemImage: "iphone")
+                }
+                if !connection.destinationAddress.isEmpty {
+                    ConnectionDetailValue(title: "目标地址", value: connection.destinationAddress,
+                                          systemImage: "network")
+                }
+                if !connection.metadata.process.isEmpty {
+                    ConnectionDetailValue(title: "进程", value: connection.metadata.process,
+                                          systemImage: "app.dashed")
+                }
+                if !connection.durationText.isEmpty {
+                    ConnectionDetailValue(title: "持续时间", value: connection.durationText,
+                                          systemImage: "clock")
+                }
+            }
+            .listRowBackground(AppListRowBackground())
+
+            Section("流量") {
+                ConnectionDetailValue(title: "上行", value: ByteFormat.size(connection.upload),
+                                      systemImage: "arrow.up")
+                ConnectionDetailValue(title: "下行", value: ByteFormat.size(connection.download),
+                                      systemImage: "arrow.down")
+                ConnectionDetailValue(title: "合计", value: ByteFormat.size(connection.transferred),
+                                      systemImage: "sum")
+            }
+            .listRowBackground(AppListRowBackground())
+
+            if isActive {
+                Section {
+                    Button(role: .destructive) {
+                        Task { await controller.close(connection) }
+                    } label: {
+                        HStack {
+                            Label("关闭此连接", systemImage: "xmark.circle")
+                            Spacer()
+                            if controller.closingIDs.contains(connection.id) {
+                                ProgressView().controlSize(.small)
+                            }
+                        }
+                    }
+                    .disabled(controller.closingIDs.contains(connection.id))
+                }
+                .listRowBackground(AppListRowBackground())
+            }
+        }
+        .scrollContentBackground(.hidden)
+        .background(AppAmbientBackground())
+        .navigationTitle("连接详情")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private var networkTint: Color {
+        switch connection.networkKey {
+        case "udp": return .purple
+        case "tcp": return .blue
+        default: return .gray
+        }
+    }
+}
+
+private struct ConnectionDetailValue: View {
+    let title: String
+    let value: String
+    let systemImage: String
+
+    var body: some View {
+        LabeledContent {
+            Text(value)
+                .multilineTextAlignment(.trailing)
+                .textSelection(.enabled)
+                .foregroundStyle(.secondary)
+        } label: {
+            Label(title, systemImage: systemImage)
         }
     }
 }

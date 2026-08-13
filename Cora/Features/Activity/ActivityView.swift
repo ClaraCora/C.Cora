@@ -11,22 +11,15 @@ struct ActivityView: View {
             ZStack {
                 AppAmbientBackground()
                 VStack(spacing: 0) {
-                    Picker("连接页面", selection: $selection) {
-                        ForEach(ActivitySection.allCases) { section in
-                            Label(section.title, systemImage: section.systemImage)
-                                .tag(section)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
+                    ActivitySectionControl(selection: $selection)
                     .padding(.horizontal, 16)
-                    .padding(.vertical, 8)
-                    .background(.ultraThinMaterial)
+                    .padding(.vertical, 10)
 
                     Group {
                         switch selection {
                         case .connections:
                             ConnectionsView(controller: connections)
+                                .environmentObject(connections)
                         case .logs:
                             LogsView()
                         }
@@ -42,6 +35,45 @@ struct ActivityView: View {
             }
             await connections.poll()
         }
+    }
+}
+
+private struct ActivitySectionControl: View {
+    @Binding var selection: ActivitySection
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ForEach(ActivitySection.allCases) { section in
+                Button {
+                    selection = section
+                } label: {
+                    Label(section.title, systemImage: section.systemImage)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(selection == section ? .white : .primary)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 40)
+                        .background {
+                            if selection == section {
+                                LinearGradient(colors: [.blue, .cyan],
+                                               startPoint: .topLeading,
+                                               endPoint: .bottomTrailing)
+                                    .overlay(.ultraThinMaterial.opacity(0.12))
+                                    .clipShape(Capsule())
+                            }
+                        }
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .accessibilityAddTraits(selection == section ? .isSelected : [])
+            }
+        }
+        .padding(4)
+        .background(.thinMaterial, in: Capsule())
+        .overlay {
+            Capsule()
+                .stroke(Color.white.opacity(0.30), lineWidth: 1)
+        }
+        .accessibilityElement(children: .contain)
     }
 }
 

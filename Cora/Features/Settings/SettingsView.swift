@@ -46,7 +46,11 @@ struct SettingsView: View {
 
                     Section {
                         HStack {
-                            InfoLabel(title: "订阅 UA", message: "拉取订阅时发送的 User-Agent。不同机场可能根据 UA 返回不同配置格式，修改后重新拉取订阅生效。")
+                            Label {
+                                InfoLabel(title: "订阅 UA", message: "拉取订阅时发送的 User-Agent。不同机场可能根据 UA 返回不同配置格式，修改后重新拉取订阅生效。")
+                            } icon: {
+                                Image(systemName: "network.badge.shield.half.filled")
+                            }
                             Spacer()
                             TextField("clash-meta", text: $settings.subscriptionUA)
                                 .multilineTextAlignment(.trailing)
@@ -59,7 +63,11 @@ struct SettingsView: View {
 
                     Section {
                         HStack {
-                            InfoLabel(title: "混合代理端口", message: "在本机回环监听 HTTP+SOCKS 混合代理端口，设为 0 表示关闭。")
+                            Label {
+                                InfoLabel(title: "混合代理端口", message: "在本机回环监听 HTTP+SOCKS 混合代理端口，设为 0 表示关闭。")
+                            } icon: {
+                                Image(systemName: "point.3.connected.trianglepath.dotted")
+                            }
                             Spacer()
                             TextField("0=不开", value: $settings.mixedPort,
                                       format: IntegerFormatStyle<Int>.number.grouping(.never))
@@ -67,6 +75,26 @@ struct SettingsView: View {
                                 .multilineTextAlignment(.trailing)
                                 .frame(width: 90)
                         }
+                    }
+                    .listRowBackground(AppListRowBackground())
+
+                    Section {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Label {
+                                InfoLabel(title: "延迟测试地址", message: "策略组和单节点测速都会请求此 HTTP 或 HTTPS 地址。留空时使用默认的 Google generate_204 地址；修改后立即用于下一次测速。")
+                            } icon: {
+                                Image(systemName: "speedometer")
+                            }
+                            TextField(SettingsStore.defaultDelayTestURL,
+                                      text: $settings.delayTestURL,
+                                      axis: .vertical)
+                                .font(.footnote.monospaced())
+                                .keyboardType(.URL)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
+                                .lineLimit(1...2)
+                        }
+                        .padding(.vertical, 2)
                     }
                     .listRowBackground(AppListRowBackground())
                 }
@@ -82,6 +110,8 @@ struct SettingsView: View {
 private struct KernelSettingsView: View {
     @EnvironmentObject private var settings: SettingsStore
     @EnvironmentObject private var core: CoreStateManager
+    @State private var isKernelAvailable = false
+    @State private var isCheckingKernel = true
 
     var body: some View {
         Form {
@@ -104,7 +134,16 @@ private struct KernelSettingsView: View {
                 NavigationLink {
                     KernelStatusView()
                 } label: {
-                    Label("内核状态", systemImage: "stethoscope")
+                    HStack {
+                        Text("内核状态")
+                        Spacer()
+                        if isCheckingKernel {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Text(isKernelAvailable ? "✅" : "❌")
+                                .accessibilityLabel(isKernelAvailable ? "内核可用" : "内核不可用")
+                        }
+                    }
                 }
                 HStack {
                     InfoLabel(title: "内核版本", message: "当前由隧道扩展运行的 mihomo 内核版本。")
@@ -120,6 +159,24 @@ private struct KernelSettingsView: View {
         .background(AppAmbientBackground())
         .navigationTitle("内核设置")
         .navigationBarTitleDisplayMode(.inline)
+        .task(id: core.status.rawValue) { await refreshKernelAvailability() }
+    }
+
+    private func refreshKernelAvailability() async {
+        guard core.status == .connected || core.status == .reasserting else {
+            isKernelAvailable = false
+            isCheckingKernel = false
+            return
+        }
+        isCheckingKernel = true
+        let result = await CoreStateManager.shared.sendMessage(["cmd": "hello"])
+        guard !Task.isCancelled else { return }
+        if case .ok = result {
+            isKernelAvailable = true
+        } else {
+            isKernelAvailable = false
+        }
+        isCheckingKernel = false
     }
 }
 

@@ -112,6 +112,12 @@ struct ActiveConnection: Decodable, Identifiable, Sendable {
         return value.isEmpty ? "DIRECT" : value
     }
 
+    /// mihomo 的连接链路从最终出口节点开始，策略组位于后续链路中。
+    var proxyNodeName: String {
+        let value = chains.first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return value.isEmpty ? "DIRECT" : value
+    }
+
     var destinationAddressOrTitle: String {
         let title = destinationTitle
         guard !metadata.destinationPort.isEmpty,
