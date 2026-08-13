@@ -211,6 +211,7 @@ struct ProxiesView: View {
             Array(results[index..<min(index + 2, results.count)])
         }
         return GeometryReader { viewport in
+            ZStack(alignment: .topLeading) {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 14) {
                 if !controller.isRuntimeAvailable {
@@ -257,19 +258,18 @@ struct ProxiesView: View {
             .background(Color.clear)
             .coordinateSpace(name: "proxy-grid")
             .refreshable { await reload() }
-            .overlay {
-                if let name = gridPopupGroup,
-                   let group = controller.groups.first(where: { $0.name == name }),
-                   let frame = gridCardFrames[name] {
-                    gridPopup(group: group,
-                              cardFrame: frame,
-                              viewport: viewport.size)
-                        .transition(.opacity.combined(with: .scale(scale: 0.98)))
-                        .zIndex(10)
-                }
-            }
             .onPreferenceChange(GridCardFramePreferenceKey.self) { frames in
                 gridCardFrames = frames
+            }
+            if let name = gridPopupGroup,
+               let group = controller.groups.first(where: { $0.name == name }),
+               let frame = gridCardFrames[name] {
+                gridPopup(group: group,
+                          cardFrame: frame,
+                          viewport: viewport.size)
+                    .transition(.opacity.combined(with: .scale(scale: 0.98)))
+                    .zIndex(10)
+            }
             }
         }
         .frame(minHeight: 0)
@@ -286,31 +286,37 @@ struct ProxiesView: View {
         let opensDown = cardFrame.midY < viewport.height / 2
         ZStack(alignment: .topLeading) {
             Color.black.opacity(0.001)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .ignoresSafeArea()
                 .contentShape(Rectangle())
                 .onTapGesture { withAnimation(.easeOut(duration: 0.16)) { gridPopupGroup = nil } }
 
-            GroupExpandedPanel(
-                group: group,
-                isTesting: controller.testing.contains(group.name),
-                canTest: controller.isRuntimeAvailable,
-                selecting: controller.selecting[group.name],
-                testingNodes: controller.testingNodes,
-                delays: controller.delays,
-             gradientIndex: groupGradient(for: group.name),
-                onToggle: { withAnimation(.easeOut(duration: 0.16)) { gridPopupGroup = nil } },
-                onTest: { Task { await controller.testGroup(group.name) } },
-                onTestNode: { name in Task { await controller.testNode(name, in: group.name) } },
-                onGradient: { setGradient($0, for: group.name) },
-                onRandomizeAll: randomizeAllGradients,
-                onSelect: { name in Task { await controller.select(group: group.name, name: name) } })
+            ZStack {
+                Color(uiColor: .systemBackground)
+                GroupExpandedPanel(
+                    group: group,
+                    isTesting: controller.testing.contains(group.name),
+                    canTest: controller.isRuntimeAvailable,
+                    selecting: controller.selecting[group.name],
+                    testingNodes: controller.testingNodes,
+                    delays: controller.delays,
+                    gradientIndex: groupGradient(for: group.name),
+                    onToggle: { withAnimation(.easeOut(duration: 0.16)) { gridPopupGroup = nil } },
+                    onTest: { Task { await controller.testGroup(group.name) } },
+                    onTestNode: { name in Task { await controller.testNode(name, in: group.name) } },
+                    onGradient: { setGradient($0, for: group.name) },
+                    onRandomizeAll: randomizeAllGradients,
+                    onSelect: { name in Task { await controller.select(group: group.name, name: name) } })
+            }
                 .frame(width: popupWidth, height: popupHeight)
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                 .shadow(color: .black.opacity(0.20), radius: 24, y: 10)
                 .offset(x: x,
                         y: opensDown ? cardFrame.minY : max(14, cardFrame.maxY - popupHeight))
                 .contentShape(Rectangle())
                 .onTapGesture { }
-                    }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
     private func randomizeAllGradients() {

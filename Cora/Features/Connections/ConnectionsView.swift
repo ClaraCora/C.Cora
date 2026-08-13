@@ -40,10 +40,10 @@ private struct ConnectionOverview: View {
 
     private var activeCount: Int { controller.historySummary.activeCount }
     private var strategyTotals: [TrafficAggregate] {
-        trafficTotals(from: controller.historySummary.strategyVolumes)
+        trafficTotals(from: controller.historySummary.strategyVolumes, role: .strategy)
     }
     private var hostTotals: [TrafficAggregate] {
-        Array(trafficTotals(from: controller.historySummary.hostVolumes).prefix(5))
+        Array(trafficTotals(from: controller.historySummary.hostVolumes, role: .host).prefix(5))
     }
     private var totalTraffic: Int64 {
         controller.historySummary.uploadTotal + controller.historySummary.downloadTotal
@@ -304,7 +304,7 @@ private struct HostTrafficDetailView: View {
 
     private var total: Int64 { volume.total }
     private var strategyTotals: [TrafficAggregate] {
-        trafficTotals(for: entries) { $0.connection.strategyName }
+        trafficTotals(for: entries, role: .strategy) { $0.connection.strategyName }
     }
 
     var body: some View {
@@ -827,6 +827,7 @@ private struct TrafficAggregate: Identifiable {
 }
 
 private func trafficTotals(for entries: [ConnectionHistoryEntry],
+                           role: TrafficColor.Role = .strategy,
                            key: (ConnectionHistoryEntry) -> String) -> [TrafficAggregate] {
     var values: [String: (upload: Int64, download: Int64)] = [:]
     for entry in entries {
@@ -839,17 +840,18 @@ private func trafficTotals(for entries: [ConnectionHistoryEntry],
         TrafficAggregate(name: name,
                          upload: value.upload,
                          download: value.download,
-                         color: TrafficColor.color(for: name))
+                         color: TrafficColor.color(for: name, role: role))
     }
     .sorted { $0.total > $1.total }
 }
 
-private func trafficTotals(from volumes: [String: ConnectionTrafficVolume]) -> [TrafficAggregate] {
+private func trafficTotals(from volumes: [String: ConnectionTrafficVolume],
+                           role: TrafficColor.Role = .strategy) -> [TrafficAggregate] {
     volumes.map { name, value in
         TrafficAggregate(name: name,
                          upload: value.upload,
                          download: value.download,
-                         color: TrafficColor.color(for: name))
+                         color: TrafficColor.color(for: name, role: role))
     }
     .sorted { left, right in
         left.total == right.total ? left.name.localizedStandardCompare(right.name) == .orderedAscending
@@ -857,20 +859,28 @@ private func trafficTotals(from volumes: [String: ConnectionTrafficVolume]) -> [
     }
 }
 
-private func trafficTotals(from volumes: [ConnectionHistoryTrafficVolume]) -> [TrafficAggregate] {
+private func trafficTotals(from volumes: [ConnectionHistoryTrafficVolume],
+                           role: TrafficColor.Role = .strategy) -> [TrafficAggregate] {
     volumes.map { value in
         TrafficAggregate(name: value.name,
                          upload: value.upload,
                          download: value.download,
-                         color: TrafficColor.color(for: value.name))
+                         color: TrafficColor.color(for: value.name, role: role))
     }
 }
 
 private enum TrafficColor {
-    private static let palette: [Color] = [.blue, .green, .orange, .purple, .red, .cyan, .pink, .teal]
+    enum Role: Equatable {
+        case strategy
+        case host
+    }
 
-    static func color(for value: String) -> Color {
+    private static let strategyPalette: [Color] = [.blue, .indigo, .purple, .teal, .cyan, .green]
+    private static let hostPalette: [Color] = [.orange, .red, .pink, .yellow, .brown, .mint]
+
+    static func color(for value: String, role: Role = .strategy) -> Color {
         let hash = value.unicodeScalars.reduce(0) { ($0 &* 31) &+ Int($1.value) }
+        let palette = role == .host ? hostPalette : strategyPalette
         return palette[abs(hash) % palette.count]
     }
 }
