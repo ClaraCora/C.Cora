@@ -42,7 +42,7 @@ struct ConnectionsSnapshot: Decodable, Sendable {
     }
 }
 
-struct ConnectionHistoryEntry: Identifiable, Sendable {
+struct ConnectionHistoryEntry: Codable, Identifiable, Sendable {
     let connection: ActiveConnection
     let isActive: Bool
     let endedAt: Date?
@@ -51,7 +51,7 @@ struct ConnectionHistoryEntry: Identifiable, Sendable {
 }
 
 /// 会话级流量累积项。它只保存名称和两个 Int64，不保存完整连接详情。
-struct ConnectionTrafficVolume: Sendable, Equatable {
+struct ConnectionTrafficVolume: Codable, Sendable, Equatable {
     var upload: Int64 = 0
     var download: Int64 = 0
 
@@ -64,7 +64,7 @@ struct ConnectionTrafficVolume: Sendable, Equatable {
 }
 
 /// 与详情记录分离的当前 VPN 会话统计；VPN 停止或重连时重置。
-struct ConnectionSessionSummary: Sendable {
+struct ConnectionSessionSummary: Codable, Sendable {
     var totalConnectionCount = 0
     var activeConnectionCount = 0
     var uploadTotal: Int64 = 0
@@ -77,7 +77,7 @@ struct ConnectionSessionSummary: Sendable {
     }
 }
 
-struct ActiveConnection: Decodable, Identifiable, Sendable {
+struct ActiveConnection: Codable, Identifiable, Sendable {
     let id: String
     let metadata: ConnectionMetadata
     let upload: Int64
@@ -108,6 +108,18 @@ struct ActiveConnection: Decodable, Identifiable, Sendable {
         chains = try values.decodeIfPresent([String].self, forKey: .chains) ?? []
         rule = values.lossyString(forKey: .rule)
         rulePayload = values.lossyString(forKey: .rulePayload)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(id, forKey: .id)
+        try values.encode(metadata, forKey: .metadata)
+        try values.encode(upload, forKey: .upload)
+        try values.encode(download, forKey: .download)
+        try values.encode(start, forKey: .start)
+        try values.encode(chains, forKey: .chains)
+        try values.encode(rule, forKey: .rule)
+        try values.encode(rulePayload, forKey: .rulePayload)
     }
 
     var destinationTitle: String {
@@ -204,7 +216,7 @@ struct ActiveConnection: Decodable, Identifiable, Sendable {
     }
 }
 
-struct ConnectionMetadata: Decodable, Sendable {
+struct ConnectionMetadata: Codable, Sendable {
     let network: String
     let type: String
     let sourceIP: String
@@ -266,6 +278,8 @@ final class ConnectionsController: ObservableObject {
     private static let maximumRememberedConnectionIDs = 20_000
     private static let maximumStrategyStatistics = 256
     private static let maximumHostStatistics = 4_096
+    private static let persistenceKey = "connectionSession.v1"
+    private static let persistenceInterval: TimeInterval = 5
 
     @Published private(set) var snapshot: ConnectionsSnapshot?
     @Published private(set) var history: [ConnectionHistoryEntry] = []
@@ -281,12 +295,29 @@ final class ConnectionsController: ObservableObject {
     // temporarily truncated, without retaining full connection details.
     private var rememberedConnectionIDs: Set<UInt64> = []
     private var rememberedConnectionOrder: [UInt64] = []
+    private var lastPersistenceDate = Date.distantPast
 
-    private struct ActiveConnectionSample {
+    private struct ActiveConnectionSample: Codable {
         let upload: Int64
         let download: Int64
         let strategyName: String
         let hostName: String
+    }
+
+    /// A compact snapshot of the current VPN session. It stays in the App's own
+    /// storage, never in the Network Extension, so restoring the record screen
+    /// cannot increase the extension's memory footprint.
+    private struct PersistedSession: Codable {
+        let version: Int
+        let summary: ConnectionSessionSummary
+        let history: [ConnectionHistoryEntry]
+        let activeSamples: [String: ActiveConnectionSample]
+        let rememberedConnectionOrder: [UInt64]
+        let savedAt: Date
+    }
+
+    init() {
+        restorePersistedSession()
     }
 
     /// 由页面 `.task` 持有生命周期；离开页面后 SwiftUI 会取消轮询。
@@ -314,6 +345,15 @@ final class ConnectionsController: ObservableObject {
         closingIDs.removeAll()
         isClosingAll = false
         error = nil
+        UserDefaults.standard.removeObject(forKey: Self.persistenceKey)
+        lastPersistenceDate = .distantPast
+    }
+
+    /// Flushes the compact session state before the App is suspended. This is
+    /// intentionally owned by the App process; NE should only keep live VPN
+    /// state and must not become a long-lived connection-history database.
+    func flushPersistence() {
+        persistSession(force: true)
     }
 
     func refresh(showLoading: Bool = true) async {
@@ -333,6 +373,7 @@ final class ConnectionsController: ObservableObject {
                 snapshot = latest
                 mergeSessionStatistics(with: latest.connections)
                 mergeHistory(with: latest.connections)
+                persistSession()
                 error = nil
             } catch {
                 guard !Task.isCancelled, generation == currentGeneration else { return }
@@ -364,6 +405,7 @@ final class ConnectionsController: ObservableObject {
                     connections: current.connections.filter { $0.id != connection.id })
                 mergeSessionStatistics(with: snapshot?.connections ?? [])
                 mergeHistory(with: snapshot?.connections ?? [])
+                persistSession(force: true)
             }
             error = nil
         case .some(let reason):
@@ -388,6 +430,7 @@ final class ConnectionsController: ObservableObject {
                     uploadTotal: current.uploadTotal)
                 mergeSessionStatistics(with: [])
                 mergeHistory(with: [])
+                persistSession(force: true)
             }
             error = nil
         case .some(let reason):
@@ -510,6 +553,40 @@ final class ConnectionsController: ObservableObject {
             rememberedConnectionIDs.remove(expired)
         }
         return true
+    }
+
+    private func restorePersistedSession() {
+        guard let data = UserDefaults.standard.data(forKey: Self.persistenceKey),
+              let persisted = try? JSONDecoder().decode(PersistedSession.self, from: data),
+              persisted.version == 1 else {
+            return
+        }
+
+        sessionSummary = persisted.summary
+        history = Array(persisted.history.prefix(Self.maximumEndedHistory))
+        activeSamples = persisted.activeSamples
+        rememberedConnectionOrder = Array(
+            persisted.rememberedConnectionOrder.suffix(Self.maximumRememberedConnectionIDs))
+        rememberedConnectionIDs = Set(rememberedConnectionOrder)
+        lastPersistenceDate = persisted.savedAt
+    }
+
+    private func persistSession(force: Bool = false) {
+        let now = Date()
+        guard force || now.timeIntervalSince(lastPersistenceDate) >= Self.persistenceInterval else {
+            return
+        }
+
+        let persisted = PersistedSession(
+            version: 1,
+            summary: sessionSummary,
+            history: history,
+            activeSamples: activeSamples,
+            rememberedConnectionOrder: rememberedConnectionOrder,
+            savedAt: now)
+        guard let data = try? JSONEncoder().encode(persisted) else { return }
+        UserDefaults.standard.set(data, forKey: Self.persistenceKey)
+        lastPersistenceDate = now
     }
 }
 

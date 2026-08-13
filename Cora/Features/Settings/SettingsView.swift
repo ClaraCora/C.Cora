@@ -117,7 +117,7 @@ private struct DelayTestSettingsView: View {
         Form {
             Section {
                 InfoToggleRow(
-                    title: "统一延迟",
+                    title: "统一测试地址",
                     message: "让 mihomo 的策略组使用统一的测速地址。关闭时保留配置内各策略组自带的测速地址；主 App 手动测速仍使用下方地址。",
                     isOn: $settings.unifiedDelay)
 

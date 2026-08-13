@@ -32,7 +32,7 @@ struct RootView: View {
                 connections.reset()
             case .connected, .reasserting:
                 await connections.poll()
-            case .disconnected, .invalid:
+            case .disconnected:
                 connections.reset()
             default:
                 break
@@ -76,6 +76,7 @@ struct RootView: View {
                 }
             }
         case .inactive, .background:
+            connections.flushPersistence()
             Task { await subscriptions.flushPersistence() }
         default:
             break
