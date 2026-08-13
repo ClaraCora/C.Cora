@@ -181,12 +181,10 @@ jobs:
               echo '### Xcode build diagnostics'
               echo
               echo '```text'
-              grep -iE "error:|fatal error:|swiftcompile|compileswift|build failed|undefined symbols|ld:" xcodebuild.log \
-                | tail -n 160 || true
+              tail -n 240 xcodebuild.log || true
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
-            grep -iE "error:|fatal error:|swiftcompile|compileswift|build failed|undefined symbols|ld:" xcodebuild.log \
-              | tail -n 160 \
+            tail -n 240 xcodebuild.log \
               | while IFS= read -r line; do
                   echo "::error title=Xcode build::${line}"
                 done
