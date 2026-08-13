@@ -7,8 +7,6 @@ struct ProxiesView: View {
     @EnvironmentObject private var subscriptions: SubscriptionStore
     @StateObject private var controller = ProxyController()
     @State private var expanded: Set<String> = []
-    @State private var gridPopupGroup: String?
-    @State private var gridCardFrames: [String: CGRect] = [:]
     @State private var searchText = ""
     @State private var isSearchPresented = false
     @State private var groupGradients: [String: Int] = [:]
@@ -50,9 +48,6 @@ struct ProxiesView: View {
             }
             .onChange(of: isSearchPresented) { _, presented in
                 if !presented { searchText = "" }
-            }
-            .onChange(of: layoutRawValue) { _, value in
-                if value != ProxyNodeLayout.grid.rawValue { gridPopupGroup = nil }
             }
         }
     }
@@ -210,8 +205,7 @@ struct ProxiesView: View {
         let rows = stride(from: 0, to: results.count, by: 2).map { index in
             Array(results[index..<min(index + 2, results.count)])
         }
-        return GeometryReader { viewport in
-            ZStack(alignment: .topLeading) {
+        return ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 14) {
                 if !controller.isRuntimeAvailable {
@@ -248,6 +242,10 @@ struct ProxiesView: View {
                                         .accessibilityHidden(true)
                                 }
                             }
+                            if let expandedGroup = row.first(where: { $0.isExpanded }) {
+                                expandedPanel(for: expandedGroup)
+                                    .id(expandedPanelID(for: expandedGroup.group.name))
+                            }
                         }
                     }
                     .padding(.horizontal, 14)
@@ -256,67 +254,17 @@ struct ProxiesView: View {
                 .padding(.vertical, 10)
             }
             .background(Color.clear)
-            .coordinateSpace(name: "proxy-grid")
             .refreshable { await reload() }
-            .onPreferenceChange(GridCardFramePreferenceKey.self) { frames in
-                gridCardFrames = frames
-            }
-            if let name = gridPopupGroup,
-               let group = controller.groups.first(where: { $0.name == name }),
-               let frame = gridCardFrames[name] {
-                gridPopup(group: group,
-                          cardFrame: frame,
-                          viewport: viewport.size)
-                    .transition(.opacity.combined(with: .scale(scale: 0.98)))
-                    .zIndex(10)
-            }
+            .onChange(of: expanded) { _, names in
+                guard let name = names.first else { return }
+                DispatchQueue.main.async {
+                    withAnimation(.easeOut(duration: 0.16)) {
+                        proxy.scrollTo(expandedPanelID(for: name), anchor: .top)
+                    }
+                }
             }
         }
         .frame(minHeight: 0)
-    }
-
-    @ViewBuilder
-    private func gridPopup(group: ProxyGroup,
-                           cardFrame: CGRect,
-                           viewport: CGSize) -> some View {
-        let popupWidth = min(max(280, viewport.width - 28), 420)
-        let popupHeight = min(max(250, viewport.height * 0.62), 460)
-        let x = min(max(14, cardFrame.midX - popupWidth / 2),
-                    max(14, viewport.width - popupWidth - 14))
-        let opensDown = cardFrame.midY < viewport.height / 2
-        ZStack(alignment: .topLeading) {
-            Color.black.opacity(0.001)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .ignoresSafeArea()
-                .contentShape(Rectangle())
-                .onTapGesture { withAnimation(.easeOut(duration: 0.16)) { gridPopupGroup = nil } }
-
-            ZStack {
-                Color(uiColor: .systemBackground)
-                GroupExpandedPanel(
-                    group: group,
-                    isTesting: controller.testing.contains(group.name),
-                    canTest: controller.isRuntimeAvailable,
-                    selecting: controller.selecting[group.name],
-                    testingNodes: controller.testingNodes,
-                    delays: controller.delays,
-                    gradientIndex: groupGradient(for: group.name),
-                    onToggle: { withAnimation(.easeOut(duration: 0.16)) { gridPopupGroup = nil } },
-                    onTest: { Task { await controller.testGroup(group.name) } },
-                    onTestNode: { name in Task { await controller.testNode(name, in: group.name) } },
-                    onGradient: { setGradient($0, for: group.name) },
-                    onRandomizeAll: randomizeAllGradients,
-                    onSelect: { name in Task { await controller.select(group: group.name, name: name) } })
-            }
-                .frame(width: popupWidth, height: popupHeight)
-                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                .shadow(color: .black.opacity(0.20), radius: 24, y: 10)
-                .offset(x: x,
-                        y: opensDown ? cardFrame.minY : max(14, cardFrame.maxY - popupHeight))
-                .contentShape(Rectangle())
-                .onTapGesture { }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
     private func randomizeAllGradients() {
@@ -386,16 +334,7 @@ struct ProxiesView: View {
 
     private func toggle(_ name: String) {
         guard normalizedSearch.isEmpty else { return }
-        if nodeLayout == .grid {
-            withAnimation(.easeOut(duration: 0.16)) {
-                gridPopupGroup = gridPopupGroup == name ? nil : name
-            }
-            return
-        }
-        let animation: Animation? = nodeLayout == .list
-            ? .easeOut(duration: 0.16)
-            : .easeInOut(duration: 0.22)
-        withAnimation(animation) {
+        withAnimation(.easeOut(duration: nodeLayout == .list ? 0.16 : 0.20)) {
             if expanded.contains(name) {
                 expanded.remove(name)
             } else {
@@ -472,15 +411,6 @@ private struct DisplayedProxyGroup: Identifiable {
     let isExpanded: Bool
 
     var id: String { group.id }
-}
-
-private struct GridCardFramePreferenceKey: PreferenceKey {
-    static var defaultValue: [String: CGRect] = [:]
-
-    static func reduce(value: inout [String: CGRect],
-                       nextValue: () -> [String: CGRect]) {
-        value.merge(nextValue(), uniquingKeysWith: { $1 })
-    }
 }
 
 private struct StrategyGroupListPanel: View {
@@ -832,13 +762,6 @@ private struct GroupGridCard: View {
         .contextMenu {
             GradientMenu(selected: gradientIndex, onSelect: onGradient,
                          onRandomizeAll: onRandomizeAll)
-        }
-        .background {
-            GeometryReader { proxy in
-                Color.clear.preference(
-                    key: GridCardFramePreferenceKey.self,
-                    value: [group.name: proxy.frame(in: .named("proxy-grid"))])
-            }
         }
     }
 }
