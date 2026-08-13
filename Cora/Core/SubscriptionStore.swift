@@ -411,7 +411,7 @@ final class SubscriptionStore: ObservableObject {
     }
 
     func remoteResources() -> [RemoteResource] {
-        subscriptions.flatMap { subscription in
+        subscriptions.flatMap { subscription -> [RemoteResource] in
             guard !subscription.yaml.isEmpty,
                   let manifest = try? Self.remoteResourceManifest(subscription.yaml) else { return [] }
             let proxyResources = manifest.proxyProviders.map {
