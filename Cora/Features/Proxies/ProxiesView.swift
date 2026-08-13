@@ -257,6 +257,7 @@ struct ProxiesView: View {
                                 .accessibilityHidden(true)
                         }
                     }
+                }
                     .padding(.horizontal, 14)
                     .padding(.vertical, 10)
                 }
