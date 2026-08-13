@@ -1864,10 +1864,30 @@ func TrafficNow() string {
 }
 
 // ConnectionsSnapshot returns a bounded, newest-first connection list for the
-// app-owned IPC channel. Bounding the list avoids large REST-style snapshots
-// creating avoidable encode/decode peaks in the Network Extension process.
+// app-owned IPC channel. A limit of zero is a totals-only request, used by the
+// overview polling path to avoid encoding connection details in the NE process.
+// Bounding the list avoids large REST-style snapshots creating avoidable
+// encode/decode peaks in the Network Extension process.
 func ConnectionsSnapshot(limit int) string {
-	if limit <= 0 {
+	uploadTotal, downloadTotal := statistic.DefaultManager.Total()
+	if limit == 0 {
+		out, err := json.Marshal(struct {
+			DownloadTotal int64                    `json:"downloadTotal"`
+			UploadTotal   int64                    `json:"uploadTotal"`
+			Connections   []*statistic.TrackerInfo `json:"connections"`
+			Total         int                      `json:"total"`
+			Truncated     bool                     `json:"truncated"`
+		}{
+			DownloadTotal: downloadTotal,
+			UploadTotal:   uploadTotal,
+			Connections:   make([]*statistic.TrackerInfo, 0),
+		})
+		if err != nil {
+			return `{"downloadTotal":0,"uploadTotal":0,"connections":[],"total":0,"truncated":false}`
+		}
+		return string(out)
+	}
+	if limit < 0 {
 		limit = defaultConnectionSnapshotLimit
 	} else if limit > maxConnectionSnapshotLimit {
 		limit = maxConnectionSnapshotLimit
@@ -1887,7 +1907,6 @@ func ConnectionsSnapshot(limit int) string {
 	if len(connections) > limit {
 		connections = connections[:limit]
 	}
-	uploadTotal, downloadTotal := statistic.DefaultManager.Total()
 	out, err := json.Marshal(struct {
 		DownloadTotal int64                    `json:"downloadTotal"`
 		UploadTotal   int64                    `json:"uploadTotal"`

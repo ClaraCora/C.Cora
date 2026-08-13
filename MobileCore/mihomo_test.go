@@ -471,6 +471,16 @@ func TestConnectionsIPCEmptySnapshotAndMissingClose(t *testing.T) {
 	if snapshot.Total < len(snapshot.Connections) {
 		t.Fatalf("snapshot total %d < returned %d", snapshot.Total, len(snapshot.Connections))
 	}
+
+	var totalsOnly struct {
+		Connections []json.RawMessage `json:"connections"`
+	}
+	if err := json.Unmarshal([]byte(ConnectionsSnapshot(0)), &totalsOnly); err != nil {
+		t.Fatalf("ConnectionsSnapshot totals-only returned invalid JSON: %v", err)
+	}
+	if len(totalsOnly.Connections) != 0 {
+		t.Fatalf("ConnectionsSnapshot totals-only returned %d connection details", len(totalsOnly.Connections))
+	}
 	if err := CloseConnection(""); err == nil {
 		t.Fatal("CloseConnection accepted an empty ID")
 	}

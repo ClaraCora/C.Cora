@@ -199,6 +199,9 @@ struct ProxiesView: View {
 
     private var gridGroupList: some View {
         let results = displayedGroups
+        let rows = stride(from: 0, to: results.count, by: 2).map { index in
+            Array(results[index..<min(index + 2, results.count)])
+        }
         return ScrollView {
             LazyVStack(alignment: .leading, spacing: 14) {
                 if !controller.isRuntimeAvailable {
@@ -217,34 +220,26 @@ struct ProxiesView: View {
                 if results.isEmpty {
                     ContentUnavailableView.search(text: searchText)
                 } else {
-                    if let expandedGroup = results.first(where: { $0.isExpanded }) {
-                        GroupExpandedPanel(
-                            group: expandedGroup.group,
-                            isTesting: controller.testing.contains(expandedGroup.group.name),
-                            canTest: controller.isRuntimeAvailable,
-                            selecting: controller.selecting[expandedGroup.group.name],
-                            testingNodes: controller.testingNodes,
-                            delays: controller.delays,
-                            gradientIndex: groupGradient(for: expandedGroup.group.name),
-                            onToggle: { openGroup(expandedGroup.group.name) },
-                            onTest: { Task { await controller.testGroup(expandedGroup.group.name) } },
-                            onTestNode: { name in Task { await controller.testNode(name, in: expandedGroup.group.name) } },
-                            onGradient: { setGradient($0, for: expandedGroup.group.name) },
-                            onSelect: { name in
-                                Task { await controller.select(group: expandedGroup.group.name, name: name) }
-                            })
-                        .padding(.horizontal, 14)
-                    }
-                    LazyVGrid(columns: [
-                        GridItem(.flexible(), spacing: 12),
-                        GridItem(.flexible(), spacing: 12),
-                    ], spacing: 12) {
-                        ForEach(results.filter { !$0.isExpanded }) { result in
-                            GroupGridCard(
-                                group: result.group,
-                                gradientIndex: groupGradient(for: result.group.name),
-                                onToggle: { openGroup(result.group.name) },
-                                onGradient: { setGradient($0, for: result.group.name) })
+                    ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                        VStack(alignment: .leading, spacing: 12) {
+                            HStack(alignment: .top, spacing: 12) {
+                                ForEach(row) { result in
+                                    GroupGridCard(
+                                        group: result.group,
+                                        gradientIndex: groupGradient(for: result.group.name),
+                                        onToggle: { openGroup(result.group.name) },
+                                        onGradient: { setGradient($0, for: result.group.name) })
+                                        .frame(maxWidth: .infinity)
+                                }
+                                if row.count == 1 {
+                                    Color.clear
+                                        .frame(maxWidth: .infinity, minHeight: 76)
+                                        .accessibilityHidden(true)
+                                }
+                            }
+                            if let expandedGroup = row.first(where: { $0.isExpanded }) {
+                                expandedPanel(for: expandedGroup)
+                            }
                         }
                     }
                     .padding(.horizontal, 14)
@@ -254,6 +249,25 @@ struct ProxiesView: View {
         }
         .background(Color.clear)
         .refreshable { await reload() }
+    }
+
+    @ViewBuilder
+    private func expandedPanel(for result: DisplayedProxyGroup) -> some View {
+        GroupExpandedPanel(
+            group: result.group,
+            isTesting: controller.testing.contains(result.group.name),
+            canTest: controller.isRuntimeAvailable,
+            selecting: controller.selecting[result.group.name],
+            testingNodes: controller.testingNodes,
+            delays: controller.delays,
+            gradientIndex: groupGradient(for: result.group.name),
+            onToggle: { openGroup(result.group.name) },
+            onTest: { Task { await controller.testGroup(result.group.name) } },
+            onTestNode: { name in Task { await controller.testNode(name, in: result.group.name) } },
+            onGradient: { setGradient($0, for: result.group.name) },
+            onSelect: { name in
+                Task { await controller.select(group: result.group.name, name: name) }
+            })
     }
 
     private var normalizedSearch: String {
@@ -666,8 +680,6 @@ private struct ProxyNodeListRow: View {
                       systemImage: isTestingDelay ? "hourglass" : "speedometer")
             }
             .disabled(!canTest || isTestingDelay)
-        } preview: {
-            Color.clear.frame(width: 1, height: 1)
         }
     }
 
@@ -851,8 +863,6 @@ private struct GroupNodeGridCell: View {
                       systemImage: isTestingDelay ? "hourglass" : "speedometer")
             }
             .disabled(!canTest || isTestingDelay)
-        } preview: {
-            Color.clear.frame(width: 1, height: 1)
         }
     }
 

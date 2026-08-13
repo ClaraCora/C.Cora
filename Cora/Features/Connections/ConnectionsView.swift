@@ -1,199 +1,701 @@
 import SwiftUI
 
-/// mihomo 当前活动会话。页面可见时每秒经 NE IPC 读取一次有上限的快照。
 struct ConnectionsView: View {
     @EnvironmentObject private var core: CoreStateManager
-    @StateObject private var controller = ConnectionsController()
-    @State private var searchText = ""
-    @State private var networkFilter: ConnectionNetworkFilter = .all
-    @State private var sortOrder: ConnectionSortOrder = .newest
-    @State private var showingCloseAllConfirmation = false
+    @ObservedObject var controller: ConnectionsController
 
     var body: some View {
-        content
-            .navigationTitle("连接记录")
-            .navigationBarTitleDisplayMode(.inline)
-            .searchable(text: $searchText, prompt: "搜索目标、地址、规则或链路")
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    sortMenu
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        showingCloseAllConfirmation = true
-                    } label: {
-                        if controller.isClosingAll {
-                            ProgressView().controlSize(.small)
-                        } else {
-                            Image(systemName: "xmark.circle")
-                        }
-                    }
-                    .disabled(connections.isEmpty || controller.isClosingAll)
-                    .accessibilityLabel("关闭全部连接")
-                    .help("关闭全部连接")
-                }
-            }
-            .confirmationDialog("关闭全部活动连接？",
-                                isPresented: $showingCloseAllConfirmation,
-                                titleVisibility: .visible) {
-                Button("关闭全部", role: .destructive) {
-                    Task { await controller.closeAll() }
-                }
-                Button("取消", role: .cancel) {}
-            }
-            .task(id: core.isActive) {
-                guard core.isActive else {
-                    controller.reset()
-                    return
-                }
-                await controller.poll()
-            }
-    }
-
-    @ViewBuilder private var content: some View {
-        if !core.isActive {
-            ContentUnavailableView("VPN 未连接",
-                systemImage: "bolt.horizontal.circle")
-        } else if controller.isLoading && controller.snapshot == nil {
-            ProgressView("读取活动连接…")
-        } else if let error = controller.error, controller.snapshot == nil {
-            ContentUnavailableView {
-                Label("无法读取连接", systemImage: "exclamationmark.triangle")
-            } description: {
-                Text(error)
-            } actions: {
-                Button("重试") { Task { await controller.refresh() } }
-            }
-        } else {
-            connectionWorkspace
-        }
-    }
-
-    private var connectionWorkspace: some View {
-        let visibleConnections = filteredConnections
-        let allConnections = connections
-
-        return VStack(spacing: 0) {
-            ConnectionSummary(snapshot: controller.snapshot ?? ConnectionsSnapshot())
-                .padding(.horizontal, 16)
-                .padding(.vertical, 10)
-                .background(.regularMaterial)
-
-            Divider()
-
-            HStack(spacing: 12) {
-                Picker("协议", selection: $networkFilter) {
-                    ForEach(ConnectionNetworkFilter.allCases) { filter in
-                        Text(filter.title).tag(filter)
-                    }
-                }
-                .pickerStyle(.segmented)
-
-                Text("\(visibleConnections.count) / \(allConnections.count)")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    .frame(minWidth: 44, alignment: .trailing)
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 8)
-            .background(.thinMaterial)
-
-            Divider()
-
-            if let error = controller.error {
-                Label(error, systemImage: "exclamationmark.triangle.fill")
-                    .font(.footnote)
-                    .foregroundStyle(.orange)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 8)
-                    .background(Color.orange.opacity(0.08))
-            }
-
-            if visibleConnections.isEmpty {
-                if normalizedSearch.isEmpty && networkFilter == .all {
-                    ContentUnavailableView("暂无活动连接", systemImage: "network.slash")
-                } else if !normalizedSearch.isEmpty {
-                    ContentUnavailableView.search(text: searchText)
-                } else {
-                    ContentUnavailableView("没有 \(networkFilter.title) 连接",
-                                           systemImage: "line.3.horizontal.decrease.circle")
+        Group {
+            if !core.isActive {
+                ContentUnavailableView("VPN 未连接", systemImage: "bolt.horizontal.circle")
+            } else if controller.isLoading && controller.snapshot == nil {
+                ProgressView("读取连接记录...")
+            } else if let error = controller.error, controller.snapshot == nil {
+                ContentUnavailableView {
+                    Label("无法读取连接", systemImage: "exclamationmark.triangle")
+                } description: {
+                    Text(error)
+                } actions: {
+                    Button("重试") { Task { await controller.refresh() } }
                 }
             } else {
-                List(visibleConnections) { connection in
-                    ConnectionRow(
-                        connection: connection,
-                        isClosing: controller.closingIDs.contains(connection.id))
+                ConnectionOverview(history: controller.history,
+                                   isRefreshing: controller.isLoading,
+                                   error: controller.error,
+                                   onRefresh: { await controller.refresh(showLoading: false) })
+            }
+        }
+        .navigationTitle("记录")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+private struct ConnectionOverview: View {
+    let history: [ConnectionHistoryEntry]
+    let isRefreshing: Bool
+    let error: String?
+    let onRefresh: () async -> Void
+
+    private var activeCount: Int { history.filter(\.isActive).count }
+    private var strategyTotals: [TrafficAggregate] {
+        trafficTotals(for: history) { $0.connection.strategyName }
+    }
+    private var hostTotals: [TrafficAggregate] {
+        Array(trafficTotals(for: history) { $0.connection.destinationTitle }.prefix(5))
+    }
+    private var totalTraffic: Int64 {
+        history.reduce(0) { $0 + $1.connection.transferred }
+    }
+
+    var body: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 22) {
+                HStack(spacing: 12) {
+                    NavigationLink {
+                        ConnectionListView(title: "全部连接",
+                                           entries: history,
+                                           showsSessionLimitNote: true)
+                    } label: {
+                        ConnectionCountCard(title: "全部连接",
+                                            value: history.count,
+                                            symbol: "point.3.connected.trianglepath.dotted",
+                                            tint: .blue)
+                    }
+                    .buttonStyle(.plain)
+
+                    NavigationLink {
+                        ConnectionListView(title: "活跃连接",
+                                           entries: history.filter(\.isActive),
+                                           initialStatus: .active)
+                    } label: {
+                        ConnectionCountCard(title: "活跃连接",
+                                            value: activeCount,
+                                            symbol: "bolt.horizontal.circle",
+                                            tint: .green)
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                if let error {
+                    Label(error, systemImage: "exclamationmark.triangle.fill")
+                        .font(.footnote)
+                        .foregroundStyle(.orange)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 10)
+                        .background(Color.orange.opacity(0.10),
+                                    in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                }
+
+                NavigationLink {
+                    StrategyTrafficListView(entries: history)
+                } label: {
+                    VStack(alignment: .leading, spacing: 10) {
+                        sectionHeading("策略", symbol: "slider.horizontal.3")
+                        StrategyTrafficCard(totals: strategyTotals, totalTraffic: totalTraffic)
+                    }
+                }
+                .buttonStyle(.plain)
+
+                VStack(alignment: .leading, spacing: 10) {
+                    sectionHeading("主机名", symbol: "network")
+                    HostTrafficCard(totals: hostTotals,
+                                    allEntries: history,
+                                    totalTraffic: totalTraffic)
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 14)
+        }
+        .refreshable { await onRefresh() }
+        .overlay(alignment: .topTrailing) {
+            if isRefreshing {
+                ProgressView().controlSize(.small).padding(18)
+            }
+        }
+    }
+
+    private func sectionHeading(_ title: String, symbol: String) -> some View {
+        Label(title, systemImage: symbol)
+            .font(.title3.weight(.semibold))
+            .foregroundStyle(.primary)
+    }
+}
+
+private struct ConnectionCountCard: View {
+    let title: String
+    let value: Int
+    let symbol: String
+    let tint: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Image(systemName: symbol)
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(tint)
+            Text(title)
+                .font(.headline)
+                .foregroundStyle(.primary)
+            Text(value.formatted())
+                .font(.title2.monospacedDigit().weight(.semibold))
+                .foregroundStyle(.primary)
+        }
+        .frame(maxWidth: .infinity, minHeight: 108, alignment: .leading)
+        .padding(16)
+        .background(.regularMaterial,
+                    in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .stroke(tint.opacity(0.14), lineWidth: 1)
+        }
+        .contentShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+}
+
+private struct StrategyTrafficCard: View {
+    let totals: [TrafficAggregate]
+    let totalTraffic: Int64
+
+    private var displayedTotals: [TrafficAggregate] {
+        Array(totals.prefix(6))
+    }
+    private var displayedTraffic: Int64 {
+        displayedTotals.reduce(0) { $0 + $1.total }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            TrafficDistributionBar(totals: displayedTotals, totalTraffic: displayedTraffic)
+                .frame(height: 34)
+
+            HStack {
+                Text("策略流量分布")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text(ByteFormat.size(totalTraffic))
+                    .font(.subheadline.monospacedDigit().weight(.medium))
+                    .foregroundStyle(.primary)
+            }
+
+            FlowLegend(totals: displayedTotals)
+        }
+        .padding(16)
+        .background(.regularMaterial,
+                    in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+}
+
+private struct HostTrafficCard: View {
+    let totals: [TrafficAggregate]
+    let allEntries: [ConnectionHistoryEntry]
+    let totalTraffic: Int64
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if totals.isEmpty {
+                ContentUnavailableView("暂无连接记录", systemImage: "network.slash")
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 18)
+            } else {
+                ForEach(Array(totals.enumerated()), id: \.element.id) { index, total in
+                    NavigationLink {
+                        HostTrafficDetailView(host: total.name,
+                                              entries: allEntries.filter {
+                                                  $0.connection.destinationTitle == total.name
+                                              })
+                    } label: {
+                        HostTrafficRow(total: total, totalTraffic: totalTraffic)
+                    }
+                    .buttonStyle(.plain)
+
+                    if index < totals.count - 1 {
+                        Divider().padding(.leading, 14)
+                    }
+                }
+            }
+        }
+        .padding(10)
+        .background(.regularMaterial,
+                    in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+}
+
+private struct HostTrafficRow: View {
+    let total: TrafficAggregate
+    let totalTraffic: Int64
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Text(total.name)
+                    .font(.subheadline)
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                Spacer(minLength: 8)
+                Text(ByteFormat.size(total.total))
+                    .font(.subheadline.monospacedDigit().weight(.medium))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+            }
+            TrafficProgress(value: total.total,
+                            maximum: max(totalTraffic, total.total),
+                            color: total.color)
+                .frame(height: 7)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 10)
+        .contentShape(Rectangle())
+    }
+}
+
+private struct StrategyTrafficListView: View {
+    let entries: [ConnectionHistoryEntry]
+
+    private var totals: [TrafficAggregate] {
+        trafficTotals(for: entries) { $0.connection.strategyName }
+    }
+
+    var body: some View {
+        List(totals) { total in
+            NavigationLink {
+                ConnectionListView(title: total.name,
+                                   entries: entries.filter { $0.connection.strategyName == total.name },
+                                   initialStrategy: total.name)
+            } label: {
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack {
+                        Text(total.name)
+                        Spacer()
+                        Text(ByteFormat.size(total.total))
+                            .font(.subheadline.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    HStack(spacing: 8) {
+                        Label(ByteFormat.size(total.upload), systemImage: "arrow.up")
+                        Label(ByteFormat.size(total.download), systemImage: "arrow.down")
+                    }
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                }
+            }
+            .listRowBackground(AppListRowBackground())
+        }
+        .scrollContentBackground(.hidden)
+        .background(AppAmbientBackground())
+        .navigationTitle("策略")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+private struct HostTrafficDetailView: View {
+    let host: String
+    let entries: [ConnectionHistoryEntry]
+
+    private var total: Int64 { entries.reduce(0) { $0 + $1.connection.transferred } }
+    private var strategyTotals: [TrafficAggregate] {
+        trafficTotals(for: entries) { $0.connection.strategyName }
+    }
+
+    var body: some View {
+        List {
+            Section {
+                ConnectionTrafficHeader(title: host, entries: entries, total: total)
+            }
+            .listRowBackground(AppListRowBackground())
+
+            Section("策略") {
+                ForEach(strategyTotals) { item in
+                    NavigationLink {
+                        ConnectionListView(title: item.name,
+                                           entries: entries.filter { $0.connection.strategyName == item.name },
+                                           initialStrategy: item.name)
+                    } label: {
+                        TrafficAggregateRow(item: item)
+                    }
+                }
+            }
+            .listRowBackground(AppListRowBackground())
+
+            Section("连接") {
+                ForEach(entries) { entry in
+                    ConnectionRecordRow(entry: entry)
+                }
+            }
+            .listRowBackground(AppListRowBackground())
+        }
+        .scrollContentBackground(.hidden)
+        .background(AppAmbientBackground())
+        .navigationTitle("主机名")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+private struct ConnectionTrafficHeader: View {
+    let title: String
+    let entries: [ConnectionHistoryEntry]
+    let total: Int64
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(title)
+                .font(.title3.weight(.semibold))
+                .lineLimit(2)
+            HStack(spacing: 12) {
+                Label(ByteFormat.size(entries.reduce(0) { $0 + $1.connection.upload }), systemImage: "arrow.up")
+                Label(ByteFormat.size(entries.reduce(0) { $0 + $1.connection.download }), systemImage: "arrow.down")
+            }
+            .font(.subheadline.monospacedDigit())
+            .foregroundStyle(.secondary)
+            Text("总计 \(ByteFormat.size(total))")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 4)
+    }
+}
+
+private struct ConnectionListView: View {
+    let title: String
+    let entries: [ConnectionHistoryEntry]
+    var initialStatus: ConnectionStatusFilter = .all
+    var initialStrategy: String? = nil
+    var showsSessionLimitNote = false
+
+    @State private var query = ""
+    @State private var status: ConnectionStatusFilter = .all
+    @State private var network: ConnectionNetworkFilter = .all
+    @State private var strategy = ""
+    @State private var sortOrder: ConnectionSortOrder = .newest
+
+    var body: some View {
+        List {
+            Section {
+                filterBar
+            } footer: {
+                if showsSessionLimitNote {
+                    Text("仅显示本次 VPN 会话；已结束记录最多保留最近 120 条。")
+                }
+            }
+            .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0))
+            .listRowBackground(Color.clear)
+
+            if filteredEntries.isEmpty {
+                ContentUnavailableView(query.isEmpty ? "没有匹配的连接" : "没有搜索结果",
+                                       systemImage: "line.3.horizontal.decrease.circle")
+                    .listRowBackground(Color.clear)
+            } else {
+                ForEach(filteredEntries) { entry in
+                    ConnectionRecordRow(entry: entry)
                         .listRowBackground(AppListRowBackground())
-                        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                            Button(role: .destructive) {
-                                Task { await controller.close(connection) }
-                            } label: {
-                                Label("关闭", systemImage: "xmark")
-                            }
+                }
+            }
+        }
+        .listStyle(.plain)
+        .scrollContentBackground(.hidden)
+        .background(AppAmbientBackground())
+        .navigationTitle(title)
+        .navigationBarTitleDisplayMode(.inline)
+        .searchable(text: $query, prompt: "搜索主机、策略或地址")
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Menu {
+                    Picker("排序", selection: $sortOrder) {
+                        ForEach(ConnectionSortOrder.allCases) { order in
+                            Label(order.title, systemImage: order.systemImage).tag(order)
                         }
-                        .listRowInsets(EdgeInsets(top: 9, leading: 16,
-                                                  bottom: 9, trailing: 16))
-                }
-                .listStyle(.plain)
-                .scrollContentBackground(.hidden)
-                .background(Color.clear)
-                .refreshable { await controller.refresh(showLoading: false) }
-            }
-        }
-    }
-
-    private var sortMenu: some View {
-        Menu {
-            Picker("排序", selection: $sortOrder) {
-                ForEach(ConnectionSortOrder.allCases) { order in
-                    Label(order.title, systemImage: order.systemImage)
-                        .tag(order)
+                    }
+                } label: {
+                    Image(systemName: "arrow.up.arrow.down")
                 }
             }
-        } label: {
-            Image(systemName: "arrow.up.arrow.down")
         }
-        .disabled(connections.isEmpty)
-        .accessibilityLabel("连接排序：\(sortOrder.title)")
-        .help("连接排序")
-    }
-
-    private var connections: [ActiveConnection] {
-        controller.snapshot?.connections ?? []
-    }
-
-    private var normalizedSearch: String {
-        searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    }
-
-    private var filteredConnections: [ActiveConnection] {
-        let query = normalizedSearch
-        let filtered = connections.filter { connection in
-            networkFilter.matches(connection)
-                && (query.isEmpty || connection.searchableText.contains(query))
+        .onAppear {
+            status = initialStatus
+            strategy = initialStrategy ?? ""
         }
-        if sortOrder == .newest { return filtered }
-        return filtered.sorted { lhs, rhs in
+    }
+
+    private var filterBar: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                MenuFilter(title: status.title) {
+                    Picker("状态", selection: $status) {
+                        ForEach(ConnectionStatusFilter.allCases) { filter in
+                            Text(filter.title).tag(filter)
+                        }
+                    }
+                }
+                MenuFilter(title: network.title) {
+                    Picker("协议", selection: $network) {
+                        ForEach(ConnectionNetworkFilter.allCases) { filter in
+                            Text(filter.title).tag(filter)
+                        }
+                    }
+                }
+                MenuFilter(title: strategy.isEmpty ? "策略" : strategy) {
+                    Button("全部策略") { strategy = "" }
+                    ForEach(availableStrategies, id: \.self) { name in
+                        Button(name) { strategy = name }
+                    }
+                }
+            }
+            .padding(.horizontal, 16)
+        }
+    }
+
+    private var availableStrategies: [String] {
+        Array(Set(entries.map { $0.connection.strategyName })).sorted()
+    }
+
+    private var filteredEntries: [ConnectionHistoryEntry] {
+        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let filtered = entries.filter { entry in
+            status.matches(entry)
+                && network.matches(entry.connection)
+                && (strategy.isEmpty || entry.connection.strategyName == strategy)
+                && (needle.isEmpty || entry.connection.searchableText.contains(needle))
+        }
+        return filtered.sorted { left, right in
             switch sortOrder {
             case .newest:
-                return (lhs.startDate ?? .distantPast) > (rhs.startDate ?? .distantPast)
+                return (left.connection.startDate ?? left.endedAt ?? .distantPast)
+                    > (right.connection.startDate ?? right.endedAt ?? .distantPast)
             case .download:
-                return ordered(lhs.download, before: rhs.download, lhs: lhs, rhs: rhs)
+                return left.connection.download > right.connection.download
             case .upload:
-                return ordered(lhs.upload, before: rhs.upload, lhs: lhs, rhs: rhs)
+                return left.connection.upload > right.connection.upload
             case .total:
-                return ordered(lhs.transferred, before: rhs.transferred, lhs: lhs, rhs: rhs)
+                return left.connection.transferred > right.connection.transferred
             }
         }
     }
+}
 
-    private func ordered(_ left: Int64, before right: Int64,
-                         lhs: ActiveConnection, rhs: ActiveConnection) -> Bool {
-        if left == right {
-            return (lhs.startDate ?? .distantPast) > (rhs.startDate ?? .distantPast)
+private struct MenuFilter<Content: View>: View {
+    let title: String
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        Menu {
+            content()
+        } label: {
+            HStack(spacing: 5) {
+                Text(title).lineLimit(1)
+                Image(systemName: "chevron.down").font(.caption2.weight(.semibold))
+            }
+            .font(.subheadline)
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 12)
+            .frame(height: 34)
+            .background(Color(uiColor: .tertiarySystemFill), in: Capsule())
         }
-        return left > right
+    }
+}
+
+private struct ConnectionRecordRow: View {
+    let entry: ConnectionHistoryEntry
+
+    private var connection: ActiveConnection { entry.connection }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(entry.isActive ? Color.green : Color.secondary.opacity(0.55))
+                    .frame(width: 8, height: 8)
+                Text(connection.recordTimeText)
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                Text(connection.networkLabel)
+                    .font(.caption2.monospaced().weight(.bold))
+                    .foregroundStyle(networkTint)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 2)
+                    .background(networkTint.opacity(0.12), in: Capsule())
+                Text(connection.strategyName)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                Image(systemName: entry.isActive ? "lock.open" : "lock")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+
+            Text(connection.destinationAddressOrTitle)
+                .font(.body.weight(.medium))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+
+            HStack(spacing: 10) {
+                Text(connection.networkLabel)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(networkTint)
+                if !connection.durationText.isEmpty {
+                    Text(connection.durationText).font(.caption).foregroundStyle(.secondary)
+                }
+                Label(ByteFormat.size(connection.upload), systemImage: "arrow.up")
+                Label(ByteFormat.size(connection.download), systemImage: "arrow.down")
+            }
+            .font(.caption.monospacedDigit())
+            .foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 6)
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
+    }
+
+    private var networkTint: Color {
+        switch connection.networkKey {
+        case "udp": return .purple
+        case "tcp": return .blue
+        default: return .gray
+        }
+    }
+}
+
+private struct TrafficAggregateRow: View {
+    let item: TrafficAggregate
+
+    var body: some View {
+        HStack {
+            Circle().fill(item.color).frame(width: 9, height: 9)
+            Text(item.name)
+            Spacer()
+            Text(ByteFormat.size(item.total))
+                .font(.subheadline.monospacedDigit())
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+private struct TrafficDistributionBar: View {
+    let totals: [TrafficAggregate]
+    let totalTraffic: Int64
+
+    var body: some View {
+        GeometryReader { geometry in
+            HStack(spacing: 2) {
+                if totals.isEmpty || totalTraffic == 0 {
+                    Color.secondary.opacity(0.16)
+                } else {
+                    ForEach(totals) { total in
+                        total.color
+                            .frame(width: max(3, geometry.size.width
+                                * CGFloat(Double(total.total) / Double(totalTraffic))))
+                    }
+                }
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+    }
+}
+
+private struct TrafficProgress: View {
+    let value: Int64
+    let maximum: Int64
+    let color: Color
+
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.secondary.opacity(0.14))
+                Capsule().fill(color)
+                    .frame(width: maximum > 0
+                           ? geometry.size.width * CGFloat(Double(value) / Double(maximum))
+                           : 0)
+            }
+        }
+    }
+}
+
+private struct FlowLegend: View {
+    let totals: [TrafficAggregate]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            ForEach(Array(totals.chunked(into: 3).enumerated()), id: \.offset) { _, row in
+                HStack(spacing: 5) {
+                    ForEach(row) { item in
+                        HStack(spacing: 5) {
+                            Circle().fill(item.color).frame(width: 8, height: 8)
+                            Text(item.name).lineLimit(1)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
+private struct TrafficAggregate: Identifiable {
+    let name: String
+    let upload: Int64
+    let download: Int64
+    let color: Color
+
+    var id: String { name }
+    var total: Int64 { upload + download }
+}
+
+private func trafficTotals(for entries: [ConnectionHistoryEntry],
+                           key: (ConnectionHistoryEntry) -> String) -> [TrafficAggregate] {
+    var values: [String: (upload: Int64, download: Int64)] = [:]
+    for entry in entries {
+        let name = key(entry).isEmpty ? "未知" : key(entry)
+        let current = values[name, default: (0, 0)]
+        values[name] = (current.upload + entry.connection.upload,
+                        current.download + entry.connection.download)
+    }
+    return values.map { name, value in
+        TrafficAggregate(name: name,
+                         upload: value.upload,
+                         download: value.download,
+                         color: TrafficColor.color(for: name))
+    }
+    .sorted { $0.total > $1.total }
+}
+
+private enum TrafficColor {
+    private static let palette: [Color] = [.blue, .green, .orange, .purple, .red, .cyan, .pink, .teal]
+
+    static func color(for value: String) -> Color {
+        let hash = value.unicodeScalars.reduce(0) { ($0 &* 31) &+ Int($1.value) }
+        return palette[abs(hash) % palette.count]
+    }
+}
+
+private extension Array {
+    func chunked(into size: Int) -> [[Element]] {
+        stride(from: 0, to: count, by: size).map { index in
+            Array(self[index..<Swift.min(index + size, count)])
+        }
+    }
+}
+
+private enum ConnectionStatusFilter: String, CaseIterable, Identifiable {
+    case all
+    case active
+    case ended
+
+    var id: Self { self }
+    var title: String {
+        switch self {
+        case .all: return "全部"
+        case .active: return "活跃"
+        case .ended: return "已结束"
+        }
+    }
+
+    func matches(_ entry: ConnectionHistoryEntry) -> Bool {
+        switch self {
+        case .all: return true
+        case .active: return entry.isActive
+        case .ended: return !entry.isActive
+        }
     }
 }
 
@@ -203,10 +705,9 @@ private enum ConnectionNetworkFilter: String, CaseIterable, Identifiable {
     case udp
 
     var id: Self { self }
-
     var title: String {
         switch self {
-        case .all: return "全部"
+        case .all: return "协议"
         case .tcp: return "TCP"
         case .udp: return "UDP"
         }
@@ -224,144 +725,20 @@ private enum ConnectionSortOrder: String, CaseIterable, Identifiable {
     case total
 
     var id: Self { self }
-
     var title: String {
         switch self {
-        case .newest: return "最新建立"
-        case .download: return "下载流量"
-        case .upload: return "上传流量"
+        case .newest: return "最新"
+        case .download: return "下行流量"
+        case .upload: return "上行流量"
         case .total: return "总流量"
         }
     }
-
     var systemImage: String {
         switch self {
         case .newest: return "clock"
         case .download: return "arrow.down"
         case .upload: return "arrow.up"
         case .total: return "sum"
-        }
-    }
-}
-
-private struct ConnectionSummary: View {
-    let snapshot: ConnectionsSnapshot
-
-    var body: some View {
-        HStack(spacing: 8) {
-            SummaryValue(title: "活动", value: String(snapshot.connections.count),
-                         detail: "TCP \(snapshot.tcpCount) · UDP \(snapshot.udpCount)",
-                         systemImage: "link", tint: .green)
-            Divider().frame(height: 42)
-            SummaryValue(title: "下行", value: ByteFormat.size(snapshot.downloadTotal),
-                         detail: "累计", systemImage: "arrow.down", tint: .blue)
-            Divider().frame(height: 42)
-            SummaryValue(title: "上行", value: ByteFormat.size(snapshot.uploadTotal),
-                         detail: "累计", systemImage: "arrow.up", tint: .orange)
-        }
-        .accessibilityElement(children: .combine)
-    }
-}
-
-private struct SummaryValue: View {
-    let title: String
-    let value: String
-    let detail: String
-    let systemImage: String
-    let tint: Color
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Label(title, systemImage: systemImage)
-                .font(.caption2.weight(.medium))
-                .foregroundStyle(tint)
-            Text(value)
-                .font(.subheadline.monospacedDigit().weight(.semibold))
-                .lineLimit(1)
-                .minimumScaleFactor(0.7)
-            Text(detail)
-                .font(.caption2.monospacedDigit())
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .minimumScaleFactor(0.75)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-}
-
-private struct ConnectionRow: View {
-    let connection: ActiveConnection
-    let isClosing: Bool
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text(connection.networkLabel)
-                    .font(.caption2.monospaced().weight(.bold))
-                    .foregroundStyle(networkTint)
-                    .padding(.horizontal, 6)
-                    .frame(height: 20)
-                    .background(Capsule().fill(networkTint.opacity(0.12)))
-
-                Text(connection.destinationTitle)
-                    .font(.subheadline.weight(.semibold))
-                    .lineLimit(1)
-
-                Spacer(minLength: 8)
-
-                if isClosing {
-                    ProgressView().controlSize(.small)
-                } else if !connection.durationText.isEmpty {
-                    Label(connection.durationText, systemImage: "clock")
-                        .font(.caption2.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-            }
-
-            if !connection.endpointText.isEmpty {
-                Text(connection.endpointText)
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-
-            Label(connection.routeText,
-                  systemImage: "point.3.connected.trianglepath.dotted")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-
-            HStack(alignment: .firstTextBaseline, spacing: 10) {
-                if !connection.ruleText.isEmpty {
-                    Label(connection.ruleText, systemImage: "arrow.triangle.branch")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                        .lineLimit(1)
-                }
-
-                Spacer(minLength: 4)
-
-                HStack(spacing: 10) {
-                    Label(ByteFormat.size(connection.download), systemImage: "arrow.down")
-                        .foregroundStyle(.blue)
-                    Label(ByteFormat.size(connection.upload), systemImage: "arrow.up")
-                        .foregroundStyle(.orange)
-                }
-                .font(.caption2.monospacedDigit())
-                .labelStyle(.titleAndIcon)
-                .fixedSize(horizontal: true, vertical: false)
-            }
-        }
-        .contentShape(Rectangle())
-        .accessibilityElement(children: .combine)
-    }
-
-    private var networkTint: Color {
-        switch connection.networkKey {
-        case "udp": return .orange
-        case "tcp": return .blue
-        default: return .gray
         }
     }
 }

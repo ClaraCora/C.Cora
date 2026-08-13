@@ -42,6 +42,14 @@ struct ConnectionsSnapshot: Decodable, Sendable {
     }
 }
 
+struct ConnectionHistoryEntry: Identifiable, Sendable {
+    let connection: ActiveConnection
+    let isActive: Bool
+    let endedAt: Date?
+
+    var id: String { connection.id }
+}
+
 struct ActiveConnection: Decodable, Identifiable, Sendable {
     let id: String
     let metadata: ConnectionMetadata
@@ -97,6 +105,23 @@ struct ActiveConnection: Decodable, Identifiable, Sendable {
 
     var routeText: String {
         chains.isEmpty ? "DIRECT" : chains.joined(separator: " → ")
+    }
+
+    var strategyName: String {
+        let value = chains.last?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return value.isEmpty ? "DIRECT" : value
+    }
+
+    var destinationAddressOrTitle: String {
+        let title = destinationTitle
+        guard !metadata.destinationPort.isEmpty,
+              !title.contains(":") else { return title }
+        return "\(title):\(metadata.destinationPort)"
+    }
+
+    var recordTimeText: String {
+        guard let startDate else { return start }
+        return startDate.formatted(date: .omitted, time: .shortened)
     }
 
     var ruleText: String {
@@ -202,7 +227,12 @@ struct ConnectionMetadata: Decodable, Sendable {
 
 @MainActor
 final class ConnectionsController: ObservableObject {
+    // Active connections are supplied by the core with its own limit. Keep only a
+    // small, in-memory tail of finished connections for the current VPN session.
+    private static let maximumEndedHistory = 120
+
     @Published private(set) var snapshot: ConnectionsSnapshot?
+    @Published private(set) var history: [ConnectionHistoryEntry] = []
     @Published private(set) var isLoading = false
     @Published private(set) var closingIDs: Set<String> = []
     @Published private(set) var isClosingAll = false
@@ -226,6 +256,7 @@ final class ConnectionsController: ObservableObject {
     func reset() {
         generation &+= 1
         snapshot = nil
+        history = []
         isLoading = false
         closingIDs.removeAll()
         isClosingAll = false
@@ -247,6 +278,7 @@ final class ConnectionsController: ObservableObject {
                 let latest = try JSONDecoder().decode(ConnectionsSnapshot.self, from: data)
                 guard !Task.isCancelled, generation == currentGeneration else { return }
                 snapshot = latest
+                mergeHistory(with: latest.connections)
                 error = nil
             } catch {
                 guard !Task.isCancelled, generation == currentGeneration else { return }
@@ -276,6 +308,7 @@ final class ConnectionsController: ObservableObject {
                     downloadTotal: current.downloadTotal,
                     uploadTotal: current.uploadTotal,
                     connections: current.connections.filter { $0.id != connection.id })
+                mergeHistory(with: snapshot?.connections ?? [])
             }
             error = nil
         case .some(let reason):
@@ -298,6 +331,7 @@ final class ConnectionsController: ObservableObject {
                 snapshot = ConnectionsSnapshot(
                     downloadTotal: current.downloadTotal,
                     uploadTotal: current.uploadTotal)
+                mergeHistory(with: [])
             }
             error = nil
         case .some(let reason):
@@ -317,6 +351,34 @@ final class ConnectionsController: ObservableObject {
                 return (response["error"] as? String) ?? "未知错误"
             }
             return nil
+        }
+    }
+
+    private func mergeHistory(with activeConnections: [ActiveConnection]) {
+        let activeIDs = Set(activeConnections.map(\.id))
+        let now = Date()
+
+        let activeEntries = activeConnections.map { connection in
+            ConnectionHistoryEntry(connection: connection, isActive: true, endedAt: nil)
+        }
+
+        // Do not let a long-running VPN session turn the record screen into an
+        // unbounded memory cache. History is deliberately session-only and is
+        // discarded by reset() when the VPN stops or reconnects.
+        let endedEntries = history
+            .filter { !activeIDs.contains($0.id) }
+            .map {
+                ConnectionHistoryEntry(connection: $0.connection,
+                                       isActive: false,
+                                       endedAt: $0.endedAt ?? now)
+            }
+            .sorted { ($0.endedAt ?? .distantPast) > ($1.endedAt ?? .distantPast) }
+            .prefix(Self.maximumEndedHistory)
+
+        history = (activeEntries + Array(endedEntries)).sorted { left, right in
+            let leftDate = left.connection.startDate ?? left.endedAt ?? .distantPast
+            let rightDate = right.connection.startDate ?? right.endedAt ?? .distantPast
+            return leftDate > rightDate
         }
     }
 }

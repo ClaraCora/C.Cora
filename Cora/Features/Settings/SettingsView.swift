@@ -4,12 +4,6 @@ import SwiftUI
 struct SettingsView: View {
     @EnvironmentObject private var settings: SettingsStore
     @EnvironmentObject private var core: CoreStateManager
-    @EnvironmentObject private var geoDatabase: GeoDatabaseManager
-    @State private var installedGeoInfo: GeoInstalledInfo?
-    @State private var kernelExpanded = false
-    @State private var geoExpanded = false
-    @State private var routeExpanded = false
-
     var body: some View {
         NavigationStack {
             ZStack {
@@ -26,55 +20,27 @@ struct SettingsView: View {
                                 title: "配置提示",
                                 systemImage: "exclamationmark.triangle.fill",
                                 tint: .orange,
-                                message: core.configNotices.joined(separator: "\n\n")
-                            )
+                                message: core.configNotices.joined(separator: "\n\n"))
                         }
                     }
                     .listRowBackground(AppListRowBackground())
 
                     Section {
-                        DisclosureGroup(isExpanded: $kernelExpanded) {
-                            Picker(selection: $settings.logLevel) {
-                                ForEach(SettingsStore.logLevelOptions, id: \.self) { Text($0).tag($0) }
-                            } label: {
-                                InfoLabel(title: "日志级别", message: "控制内核输出的日志详细程度。修改后重新连接 VPN 生效。")
-                            }
-                            InfoToggleRow(title: "启用 IPv6", message: "允许隧道处理 IPv6 流量。部分网络或配置不支持 IPv6 时可以关闭。", isOn: $settings.ipv6)
-                            NavigationLink {
-                                ConfigOverrideSettingsView()
-                            } label: {
-                                InfoLabel(title: "覆写设置", message: "为配置文件选择是否应用 Cora 的固定 DNS、嗅探和 TUN 设置。")
-                            }
-                            NavigationLink {
-                                KernelStatusView()
-                            } label: {
-                                Label("内核状态", systemImage: "stethoscope")
-                            }
-                            HStack {
-                                InfoLabel(title: "内核版本", message: "当前由隧道扩展运行的 mihomo 内核版本。")
-                                Spacer()
-                                Text(core.coreVersion)
-                                    .foregroundStyle(.secondary)
-                                    .monospaced()
-                            }
-                        } label: {
-                            HStack(spacing: 8) {
-                                Label("内核设置", systemImage: "gearshape.2")
-                                InfoButton(message: "TCP/IP 栈固定使用 gvisor，因为 iOS 隧道扩展中的 system 栈 TCP 无法正常工作。修改设置后需重新连接 VPN 生效。")
-                            }
-                        }
-                    }
-                    .listRowBackground(AppListRowBackground())
-
-                    Section {
-                        DisclosureGroup(isExpanded: $geoExpanded) {
-                            GeoSettingsContent(installedInfo: installedGeoInfo)
-                        } label: {
-                            HStack(spacing: 8) {
-                                Label("GEO 与 ASN", systemImage: "globe.americas")
-                                InfoButton(message: "关闭 GEO 会剔除订阅里的 GEOIP、GEOSITE 和 IP-ASN 规则。Geodata 模式关闭时使用 MMDB，开启时使用 GeoIP.dat；主 App 优先使用当前配置的 geox-url。更新后需重新连接。")
-                            }
-                        }
+                        SettingsNavigationRow(
+                            title: "内核设置",
+                            systemImage: "gearshape.2",
+                            message: "管理内核日志、IPv6、配置覆盖和诊断信息。",
+                            destination: KernelSettingsView())
+                        SettingsNavigationRow(
+                            title: "GEO 与 ASN",
+                            systemImage: "globe.americas",
+                            message: "管理 GEO/ASN 规则数据和更新方式。",
+                            destination: GeoSettingsView())
+                        SettingsNavigationRow(
+                            title: "隧道路由",
+                            systemImage: "arrow.triangle.branch",
+                            message: "管理 VPN 接管范围和系统服务排除项。",
+                            destination: TunnelRouteSettingsView())
                     }
                     .listRowBackground(AppListRowBackground())
 
@@ -103,46 +69,132 @@ struct SettingsView: View {
                         }
                     }
                     .listRowBackground(AppListRowBackground())
-
-                    Section {
-                        DisclosureGroup(isExpanded: $routeExpanded) {
-                            InfoToggleRow(title: "接管所有网络", message: "将系统默认排除的流量也纳入隧道。只有需要完整 VPN 覆盖时才建议开启。", isOn: $settings.includeAllNetworks)
-                            InfoToggleRow(title: "强制路由", message: "即使未接管所有网络，也强制按规则路由隧道流量。", isOn: $settings.enforceRoutes)
-                            InfoToggleRow(title: "阻止常见 WebRTC STUN 直连", message: "仅阻止常见公网 STUN 探测端点以降低 WebRTC 泄露风险，不封锁普通 DIRECT 的语音、视频和 P2P 流量。", isOn: $settings.blockDirectSTUN)
-                            InfoToggleRow(title: "排除蜂窝服务", message: "将蜂窝网络服务排除在隧道之外，避免影响系统电话和运营商服务。", isOn: $settings.excludeCellularServices)
-                            InfoToggleRow(title: "排除 APNs 推送", message: "将 Apple 推送服务排除在隧道之外，保持系统通知稳定。", isOn: $settings.excludeAPNs)
-                            if #available(iOS 17.4, *) {
-                                InfoToggleRow(title: "排除设备间通信", message: "将本地设备间通信排除在隧道之外，保留 AirDrop 和附近设备连接。", isOn: $settings.excludeDeviceCommunication)
-                            }
-                        } label: {
-                            HStack(spacing: 8) {
-                                Label("隧道路由", systemImage: "arrow.triangle.branch")
-                                InfoButton(message: "系统隧道和排除项的路由范围。修改后需要重新连接 VPN；STUN 防泄露不会封锁普通 DIRECT 的语音、视频和 P2P 流量。")
-                            }
-                        }
-                    }
-                    .listRowBackground(AppListRowBackground())
                 }
                 .scrollContentBackground(.hidden)
                 .background(Color.clear)
-                .navigationTitle("设置")
-                .task { await core.refreshStatus() }
-                .task(id: geoInfoRefreshID) {
-                    guard settings.geoEnabled else {
-                        installedGeoInfo = nil
-                        return
-                    }
-                    installedGeoInfo = nil
-                    let info = await geoDatabase.installedInfo(geodataMode: settings.geodataMode)
-                    guard !Task.isCancelled else { return }
-                    installedGeoInfo = info
-                }
             }
+            .navigationTitle("设置")
+            .task { await core.refreshStatus() }
         }
     }
+}
 
-    private var geoInfoRefreshID: String {
+private struct KernelSettingsView: View {
+    @EnvironmentObject private var settings: SettingsStore
+    @EnvironmentObject private var core: CoreStateManager
+
+    var body: some View {
+        Form {
+            Section {
+                Picker(selection: $settings.logLevel) {
+                    ForEach(SettingsStore.logLevelOptions, id: \.self) { Text($0).tag($0) }
+                } label: {
+                    InfoLabel(title: "日志级别", message: "控制内核输出的日志详细程度。修改后重新连接 VPN 生效。")
+                }
+                InfoToggleRow(title: "启用 IPv6", message: "允许隧道处理 IPv6 流量。部分网络或配置不支持 IPv6 时可以关闭。", isOn: $settings.ipv6)
+                NavigationLink {
+                    ConfigOverrideSettingsView()
+                } label: {
+                    InfoLabel(title: "覆盖设置", message: "为配置文件选择是否应用 Cora 的固定 DNS、嗅探和 TUN 设置。")
+                }
+            }
+            .listRowBackground(AppListRowBackground())
+
+            Section {
+                NavigationLink {
+                    KernelStatusView()
+                } label: {
+                    Label("内核状态", systemImage: "stethoscope")
+                }
+                HStack {
+                    InfoLabel(title: "内核版本", message: "当前由隧道扩展运行的 mihomo 内核版本。")
+                    Spacer()
+                    Text(core.coreVersion)
+                        .foregroundStyle(.secondary)
+                        .monospaced()
+                }
+            }
+            .listRowBackground(AppListRowBackground())
+        }
+        .scrollContentBackground(.hidden)
+        .background(AppAmbientBackground())
+        .navigationTitle("内核设置")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+private struct GeoSettingsView: View {
+    @EnvironmentObject private var settings: SettingsStore
+    @EnvironmentObject private var geoDatabase: GeoDatabaseManager
+    @State private var installedInfo: GeoInstalledInfo?
+
+    var body: some View {
+        Form {
+            GeoSettingsContent(installedInfo: installedInfo)
+                .listRowBackground(AppListRowBackground())
+        }
+        .scrollContentBackground(.hidden)
+        .background(AppAmbientBackground())
+        .navigationTitle("GEO 与 ASN")
+        .navigationBarTitleDisplayMode(.inline)
+        .task(id: refreshID) { await refreshInstalledInfo() }
+    }
+
+    private var refreshID: String {
         "\(settings.geoEnabled)-\(settings.geodataMode)-\(geoDatabase.revision)"
+    }
+
+    private func refreshInstalledInfo() async {
+        guard settings.geoEnabled else {
+            installedInfo = nil
+            return
+        }
+        installedInfo = nil
+        let info = await geoDatabase.installedInfo(geodataMode: settings.geodataMode)
+        guard !Task.isCancelled else { return }
+        installedInfo = info
+    }
+}
+
+private struct TunnelRouteSettingsView: View {
+    @EnvironmentObject private var settings: SettingsStore
+
+    var body: some View {
+        Form {
+            Section {
+                InfoToggleRow(title: "接管所有网络", message: "将系统默认排除的流量也纳入隧道。只有需要完整 VPN 覆盖时才建议开启。", isOn: $settings.includeAllNetworks)
+                InfoToggleRow(title: "强制路由", message: "即使未接管所有网络，也强制按规则路由隧道流量。", isOn: $settings.enforceRoutes)
+                InfoToggleRow(title: "阻止常见 WebRTC STUN 直连", message: "仅阻止常见公网 STUN 探测端点以降低 WebRTC 泄露风险，不封锁普通 DIRECT 的语音、视频和 P2P 流量。", isOn: $settings.blockDirectSTUN)
+                InfoToggleRow(title: "排除蜂窝服务", message: "将蜂窝网络服务排除在隧道之外，避免影响系统电话和运营商服务。", isOn: $settings.excludeCellularServices)
+                InfoToggleRow(title: "排除 APNs 推送", message: "将 Apple 推送服务排除在隧道之外，保持系统通知稳定。", isOn: $settings.excludeAPNs)
+                if #available(iOS 17.4, *) {
+                    InfoToggleRow(title: "排除设备间通信", message: "将本地设备间通信排除在隧道之外，保留 AirDrop 和附近设备连接。", isOn: $settings.excludeDeviceCommunication)
+                }
+            }
+            .listRowBackground(AppListRowBackground())
+        }
+        .scrollContentBackground(.hidden)
+        .background(AppAmbientBackground())
+        .navigationTitle("隧道路由")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+private struct SettingsNavigationRow<Destination: View>: View {
+    let title: String
+    let systemImage: String
+    let message: String
+    let destination: Destination
+
+    var body: some View {
+        NavigationLink {
+            destination
+        } label: {
+            HStack(spacing: 8) {
+                Label(title, systemImage: systemImage)
+                InfoButton(message: message, accessibilityLabel: "查看\(title)说明")
+            }
+        }
     }
 }
 
@@ -276,7 +328,8 @@ private struct InfoButton: View {
                 .font(.footnote)
                 .foregroundStyle(.primary)
                 .multilineTextAlignment(.leading)
-                .frame(minWidth: 220, maxWidth: 300, alignment: .leading)
+                .frame(minWidth: 220, maxWidth: 320, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
                 .padding(16)
                 .presentationCompactAdaptation(.popover)
         }
