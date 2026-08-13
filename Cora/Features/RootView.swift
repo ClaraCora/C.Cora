@@ -8,6 +8,7 @@ struct RootView: View {
     @EnvironmentObject private var subscriptions: SubscriptionStore
     @EnvironmentObject private var kernel: KernelController
     @Environment(\.scenePhase) private var scenePhase
+    @StateObject private var connections = ConnectionsController()
 
     var body: some View {
         Group {
@@ -25,6 +26,18 @@ struct RootView: View {
             handleScenePhase(phase)
         }
         .onAppear { syncStreams() }
+        .task(id: core.status.rawValue) {
+            switch core.status {
+            case .connecting:
+                connections.reset()
+            case .connected, .reasserting:
+                await connections.poll()
+            case .disconnected, .invalid:
+                connections.reset()
+            default:
+                break
+            }
+        }
     }
 
     private var tabs: some View {
@@ -33,7 +46,7 @@ struct RootView: View {
                 .tabItem { Label("总览", systemImage: "gauge.with.dots.needle.67percent") }
             ProxiesView()
                 .tabItem { Label("策略", systemImage: "slider.horizontal.3") }
-            ActivityView()
+            ActivityView(connections: connections)
                 .tabItem { Label("记录", systemImage: "clock.arrow.circlepath") }
             SettingsView()
                 .tabItem { Label("设置", systemImage: "gearshape") }

@@ -50,6 +50,33 @@ struct ConnectionHistoryEntry: Identifiable, Sendable {
     var id: String { connection.id }
 }
 
+/// 会话级流量累积项。它只保存名称和两个 Int64，不保存完整连接详情。
+struct ConnectionTrafficVolume: Sendable, Equatable {
+    var upload: Int64 = 0
+    var download: Int64 = 0
+
+    var total: Int64 { upload + download }
+
+    mutating func add(upload: Int64, download: Int64) {
+        self.upload += max(0, upload)
+        self.download += max(0, download)
+    }
+}
+
+/// 与详情记录分离的当前 VPN 会话统计；VPN 停止或重连时重置。
+struct ConnectionSessionSummary: Sendable {
+    var totalConnectionCount = 0
+    var activeConnectionCount = 0
+    var uploadTotal: Int64 = 0
+    var downloadTotal: Int64 = 0
+    var strategyVolumes: [String: ConnectionTrafficVolume] = [:]
+    var hostVolumes: [String: ConnectionTrafficVolume] = [:]
+
+    var totalTraffic: Int64 {
+        uploadTotal + downloadTotal
+    }
+}
+
 struct ActiveConnection: Decodable, Identifiable, Sendable {
     let id: String
     let metadata: ConnectionMetadata
@@ -236,18 +263,34 @@ final class ConnectionsController: ObservableObject {
     // Active connections are supplied by the core with its own limit. Keep only a
     // small, in-memory tail of finished connections for the current VPN session.
     private static let maximumEndedHistory = 120
+    private static let maximumRememberedConnectionIDs = 20_000
+    private static let maximumStrategyStatistics = 256
+    private static let maximumHostStatistics = 4_096
 
     @Published private(set) var snapshot: ConnectionsSnapshot?
     @Published private(set) var history: [ConnectionHistoryEntry] = []
+    @Published private(set) var sessionSummary = ConnectionSessionSummary()
     @Published private(set) var isLoading = false
     @Published private(set) var closingIDs: Set<String> = []
     @Published private(set) var isClosingAll = false
     @Published var error: String?
     private var generation = 0
+    private var activeSamples: [String: ActiveConnectionSample] = [:]
+    // These compact, bounded IDs live in the main App rather than the Network
+    // Extension. They keep session totals stable if the IPC active list is
+    // temporarily truncated, without retaining full connection details.
+    private var rememberedConnectionIDs: Set<UInt64> = []
+    private var rememberedConnectionOrder: [UInt64] = []
+
+    private struct ActiveConnectionSample {
+        let upload: Int64
+        let download: Int64
+        let strategyName: String
+        let hostName: String
+    }
 
     /// 由页面 `.task` 持有生命周期；离开页面后 SwiftUI 会取消轮询。
     func poll() async {
-        reset()
         await refresh(showLoading: true)
         while !Task.isCancelled {
             do {
@@ -263,6 +306,10 @@ final class ConnectionsController: ObservableObject {
         generation &+= 1
         snapshot = nil
         history = []
+        sessionSummary = ConnectionSessionSummary()
+        activeSamples = [:]
+        rememberedConnectionIDs.removeAll(keepingCapacity: true)
+        rememberedConnectionOrder.removeAll(keepingCapacity: true)
         isLoading = false
         closingIDs.removeAll()
         isClosingAll = false
@@ -284,6 +331,7 @@ final class ConnectionsController: ObservableObject {
                 let latest = try JSONDecoder().decode(ConnectionsSnapshot.self, from: data)
                 guard !Task.isCancelled, generation == currentGeneration else { return }
                 snapshot = latest
+                mergeSessionStatistics(with: latest.connections)
                 mergeHistory(with: latest.connections)
                 error = nil
             } catch {
@@ -314,6 +362,7 @@ final class ConnectionsController: ObservableObject {
                     downloadTotal: current.downloadTotal,
                     uploadTotal: current.uploadTotal,
                     connections: current.connections.filter { $0.id != connection.id })
+                mergeSessionStatistics(with: snapshot?.connections ?? [])
                 mergeHistory(with: snapshot?.connections ?? [])
             }
             error = nil
@@ -337,6 +386,7 @@ final class ConnectionsController: ObservableObject {
                 snapshot = ConnectionsSnapshot(
                     downloadTotal: current.downloadTotal,
                     uploadTotal: current.uploadTotal)
+                mergeSessionStatistics(with: [])
                 mergeHistory(with: [])
             }
             error = nil
@@ -386,6 +436,80 @@ final class ConnectionsController: ObservableObject {
             let rightDate = right.connection.startDate ?? right.endedAt ?? .distantPast
             return leftDate > rightDate
         }
+    }
+
+    /// 用每个活动连接的增量更新会话统计，避免把最近 120 条详情缓存误当作总流量。
+    private func mergeSessionStatistics(with activeConnections: [ActiveConnection]) {
+        var updatedSummary = sessionSummary
+        var nextSamples: [String: ActiveConnectionSample] = [:]
+        nextSamples.reserveCapacity(activeConnections.count)
+
+        for connection in activeConnections {
+            let strategyName = connection.strategyName
+            let hostName = connection.destinationTitle.isEmpty ? "未知" : connection.destinationTitle
+            let previous = activeSamples[connection.id]
+            let uploadDelta = previous.map { max(0, connection.upload - $0.upload) } ?? connection.upload
+            let downloadDelta = previous.map { max(0, connection.download - $0.download) } ?? connection.download
+
+            let statisticStrategy = previous?.strategyName ?? strategyName
+            let statisticHost = previous?.hostName ?? hostName
+
+            if previous == nil, rememberConnectionID(connection.id) {
+                updatedSummary.totalConnectionCount += 1
+            }
+            updatedSummary.uploadTotal += uploadDelta
+            updatedSummary.downloadTotal += downloadDelta
+            addTraffic(upload: uploadDelta,
+                       download: downloadDelta,
+                       named: statisticStrategy,
+                       to: &updatedSummary.strategyVolumes,
+                       maximumEntries: Self.maximumStrategyStatistics)
+            addTraffic(upload: uploadDelta,
+                       download: downloadDelta,
+                       named: statisticHost,
+                       to: &updatedSummary.hostVolumes,
+                       maximumEntries: Self.maximumHostStatistics)
+            nextSamples[connection.id] = ActiveConnectionSample(
+                upload: connection.upload,
+                download: connection.download,
+                strategyName: strategyName,
+                hostName: hostName)
+        }
+
+        updatedSummary.activeConnectionCount = activeConnections.count
+        activeSamples = nextSamples
+        sessionSummary = updatedSummary
+    }
+
+    private func addTraffic(upload: Int64,
+                            download: Int64,
+                            named rawName: String,
+                            to volumes: inout [String: ConnectionTrafficVolume],
+                            maximumEntries: Int) {
+        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let key = name.isEmpty ? "未知" : name
+        if volumes[key] == nil, volumes.count >= maximumEntries,
+           let smallest = volumes.min(by: { $0.value.total < $1.value.total })?.key {
+            volumes.removeValue(forKey: smallest)
+        }
+        var volume = volumes[key, default: ConnectionTrafficVolume()]
+        volume.add(upload: upload, download: download)
+        volumes[key] = volume
+    }
+
+    /// Avoid counting an active connection twice when it briefly falls outside
+    /// the IPC response limit and appears again on a later refresh.
+    private func rememberConnectionID(_ id: String) -> Bool {
+        let hash = id.utf8.reduce(UInt64(1_469_598_103_934_665_603)) { value, byte in
+            (value ^ UInt64(byte)) &* 1_099_511_628_211
+        }
+        guard rememberedConnectionIDs.insert(hash).inserted else { return false }
+        rememberedConnectionOrder.append(hash)
+        if rememberedConnectionOrder.count > Self.maximumRememberedConnectionIDs {
+            let expired = rememberedConnectionOrder.removeFirst()
+            rememberedConnectionIDs.remove(expired)
+        }
+        return true
     }
 }
 

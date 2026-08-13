@@ -265,6 +265,10 @@ final class ProxyController: ObservableObject {
         return configured.isEmpty ? SettingsStore.defaultDelayTestURL : configured
     }
 
+    private var delayTestTimeoutMilliseconds: Int {
+        SettingsStore.shared.delayTestTimeout * 1_000
+    }
+
     /// 对某策略组做延迟测试（IPC groupDelay），结果并入 delays。
     func testGroup(_ name: String) async {
         guard isRuntimeAvailable, !testing.contains(name) else { return }
@@ -277,7 +281,8 @@ final class ProxyController: ObservableObject {
             }
         }
         let result = await CoreStateManager.shared.sendMessage(
-            ["cmd": "groupDelay", "group": name, "url": delayTestURL, "timeout": 5000])
+            ["cmd": "groupDelay", "group": name, "url": delayTestURL,
+             "timeout": delayTestTimeoutMilliseconds])
         guard session == sessionGeneration else { return }
         switch result {
         case .ok(let data):
@@ -313,7 +318,7 @@ final class ProxyController: ObservableObject {
         }
         let result = await CoreStateManager.shared.sendMessage(
             ["cmd": "proxyDelay", "name": name, "group": group ?? "",
-             "url": delayTestURL, "timeout": 5000])
+             "url": delayTestURL, "timeout": delayTestTimeoutMilliseconds])
         guard session == sessionGeneration else { return }
         switch result {
         case .ok(let data):

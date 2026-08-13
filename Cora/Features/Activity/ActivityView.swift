@@ -2,9 +2,8 @@ import SwiftUI
 
 /// 活动连接是底栏固定入口；日志保留在同一工作区内，避免底栏超过五项。
 struct ActivityView: View {
-    @EnvironmentObject private var core: CoreStateManager
     @State private var selection: ActivitySection = .connections
-    @StateObject private var connections = ConnectionsController()
+    @ObservedObject var connections: ConnectionsController
 
     var body: some View {
         NavigationStack {
@@ -19,7 +18,6 @@ struct ActivityView: View {
                         switch selection {
                         case .connections:
                             ConnectionsView(controller: connections)
-                                .environmentObject(connections)
                         case .logs:
                             LogsView()
                         }
@@ -27,13 +25,6 @@ struct ActivityView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
-        }
-        .task(id: core.isActive) {
-            guard core.isActive else {
-                connections.reset()
-                return
-            }
-            await connections.poll()
         }
     }
 }

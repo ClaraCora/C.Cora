@@ -41,6 +41,11 @@ struct SettingsView: View {
                             systemImage: "arrow.triangle.branch",
                             message: "管理 VPN 接管范围和系统服务排除项。",
                             destination: TunnelRouteSettingsView())
+                        SettingsNavigationRow(
+                            title: "延迟测试",
+                            systemImage: "speedometer",
+                            message: "管理策略组与单节点测速的统一地址和超时。",
+                            destination: DelayTestSettingsView())
                     }
                     .listRowBackground(AppListRowBackground())
 
@@ -79,22 +84,13 @@ struct SettingsView: View {
                     .listRowBackground(AppListRowBackground())
 
                     Section {
-                        VStack(alignment: .leading, spacing: 6) {
-                            Label {
-                                InfoLabel(title: "延迟测试地址", message: "策略组和单节点测速都会请求此 HTTP 或 HTTPS 地址。留空时使用默认的 Google generate_204 地址；修改后立即用于下一次测速。")
-                            } icon: {
-                                Image(systemName: "speedometer")
-                            }
-                            TextField(SettingsStore.defaultDelayTestURL,
-                                      text: $settings.delayTestURL,
-                                      axis: .vertical)
-                                .font(.footnote.monospaced())
-                                .keyboardType(.URL)
-                                .textInputAutocapitalization(.never)
-                                .autocorrectionDisabled()
-                                .lineLimit(1...2)
+                        HStack {
+                            Label("App 版本", systemImage: "info.circle")
+                            Spacer()
+                            Text(appVersion)
+                                .foregroundStyle(.secondary)
+                                .monospacedDigit()
                         }
-                        .padding(.vertical, 2)
                     }
                     .listRowBackground(AppListRowBackground())
                 }
@@ -104,6 +100,61 @@ struct SettingsView: View {
             .navigationTitle("设置")
             .task { await core.refreshStatus() }
         }
+    }
+
+    private var appVersion: String {
+        let bundle = Bundle.main
+        let version = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.0"
+        let build = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1"
+        return "\(version) (\(build))"
+    }
+}
+
+private struct DelayTestSettingsView: View {
+    @EnvironmentObject private var settings: SettingsStore
+
+    var body: some View {
+        Form {
+            Section {
+                InfoToggleRow(
+                    title: "统一延迟",
+                    message: "让 mihomo 的策略组使用统一的测速地址。关闭时保留配置内各策略组自带的测速地址；主 App 手动测速仍使用下方地址。",
+                    isOn: $settings.unifiedDelay)
+
+                HStack {
+                    InfoLabel(title: "测速超时", message: "单个节点最长等待时间。范围为 1 到 60 秒，默认 5 秒。")
+                    Spacer()
+                    TextField("5", value: $settings.delayTestTimeout,
+                              format: IntegerFormatStyle<Int>.number.grouping(.never))
+                        .keyboardType(.numberPad)
+                        .multilineTextAlignment(.trailing)
+                        .frame(width: 56)
+                    Text("秒")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .listRowBackground(AppListRowBackground())
+
+            Section {
+                VStack(alignment: .leading, spacing: 6) {
+                    InfoLabel(title: "测速地址", message: "策略组与单节点测速都会请求此 HTTP 或 HTTPS 地址。留空时使用 Google generate_204；修改后立即用于下一次测速。")
+                    TextField(SettingsStore.defaultDelayTestURL,
+                              text: $settings.delayTestURL,
+                              axis: .vertical)
+                        .font(.footnote.monospaced())
+                        .keyboardType(.URL)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .lineLimit(1...3)
+                }
+                .padding(.vertical, 2)
+            }
+            .listRowBackground(AppListRowBackground())
+        }
+        .scrollContentBackground(.hidden)
+        .background(AppAmbientBackground())
+        .navigationTitle("延迟测试")
+        .navigationBarTitleDisplayMode(.inline)
     }
 }
 

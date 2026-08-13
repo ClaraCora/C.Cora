@@ -304,14 +304,16 @@ struct ProxiesView: View {
 
     private func toggle(_ name: String) {
         guard normalizedSearch.isEmpty else { return }
-        if nodeLayout == .grid {
-            expanded = expanded.contains(name) ? [] : [name]
-            return
-        }
-        if expanded.contains(name) {
-            expanded.remove(name)
-        } else {
-            expanded.insert(name)
+        withAnimation(.easeInOut(duration: 0.22)) {
+            if nodeLayout == .grid {
+                expanded = expanded.contains(name) ? [] : [name]
+                return
+            }
+            if expanded.contains(name) {
+                expanded.remove(name)
+            } else {
+                expanded.insert(name)
+            }
         }
     }
 
@@ -420,7 +422,6 @@ private struct StrategyGroupListPanel: View {
 
             if isExpanded {
                 Divider().overlay(Color.primary.opacity(0.10))
-                Group {
                 if group.all.isEmpty {
                     Text("该策略组没有节点")
                         .font(.footnote)
@@ -453,11 +454,8 @@ private struct StrategyGroupListPanel: View {
                         }
                     }
                 }
-                }
-                .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
-        .animation(.easeInOut(duration: 0.22), value: isExpanded)
         .background(GroupGradient.background(for: gradientIndex))
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
@@ -520,7 +518,6 @@ private struct GroupHeaderButton: View {
                     .foregroundStyle(.tertiary)
                     .frame(width: 18, height: 44)
                     .rotationEffect(.degrees(canToggle && isExpanded ? 90 : 0))
-                    .animation(.easeInOut(duration: 0.16), value: isExpanded)
             }
             .frame(maxWidth: .infinity, minHeight: 50, alignment: .leading)
             .contentShape(Rectangle())
@@ -659,7 +656,7 @@ private struct ProxyNodeListRow: View {
     let onSelect: () -> Void
 
     var body: some View {
-        Group {
+        ZStack {
             if selectable && !isCurrent {
                 Button(action: onSelect) {
                     row
@@ -670,10 +667,13 @@ private struct ProxyNodeListRow: View {
             } else if isCurrent {
                 row
                     .accessibilityAddTraits(.isSelected)
+                    .onTapGesture { }
             } else {
                 row
+                    .onTapGesture { }
             }
         }
+        .contentShape(Rectangle())
         .contextMenu {
             Button(action: onTestDelay) {
                 Label(isTestingDelay ? "正在测速" : "测试此节点延迟",

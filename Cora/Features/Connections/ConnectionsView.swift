@@ -19,7 +19,8 @@ struct ConnectionsView: View {
                     Button("重试") { Task { await controller.refresh() } }
                 }
             } else {
-                ConnectionOverview(history: controller.history,
+                ConnectionOverview(controller: controller,
+                                   history: controller.history,
                                    isRefreshing: controller.isLoading,
                                    error: controller.error,
                                    onRefresh: { await controller.refresh(showLoading: false) })
@@ -31,20 +32,21 @@ struct ConnectionsView: View {
 }
 
 private struct ConnectionOverview: View {
+    @ObservedObject var controller: ConnectionsController
     let history: [ConnectionHistoryEntry]
     let isRefreshing: Bool
     let error: String?
     let onRefresh: () async -> Void
 
-    private var activeCount: Int { history.filter(\.isActive).count }
+    private var activeCount: Int { controller.sessionSummary.activeConnectionCount }
     private var strategyTotals: [TrafficAggregate] {
-        trafficTotals(for: history) { $0.connection.strategyName }
+        trafficTotals(from: controller.sessionSummary.strategyVolumes)
     }
     private var hostTotals: [TrafficAggregate] {
-        Array(trafficTotals(for: history) { $0.connection.destinationTitle }.prefix(5))
+        Array(trafficTotals(from: controller.sessionSummary.hostVolumes).prefix(5))
     }
     private var totalTraffic: Int64 {
-        history.reduce(0) { $0 + $1.connection.transferred }
+        controller.sessionSummary.totalTraffic
     }
 
     var body: some View {
@@ -54,10 +56,11 @@ private struct ConnectionOverview: View {
                     NavigationLink {
                         ConnectionListView(title: "全部连接",
                                            entries: history,
+                                           controller: controller,
                                            showsSessionLimitNote: true)
                     } label: {
                         ConnectionCountCard(title: "全部连接",
-                                            value: history.count,
+                                            value: controller.sessionSummary.totalConnectionCount,
                                             symbol: "point.3.connected.trianglepath.dotted",
                                             tint: .blue)
                     }
@@ -66,6 +69,7 @@ private struct ConnectionOverview: View {
                     NavigationLink {
                         ConnectionListView(title: "活跃连接",
                                            entries: history.filter(\.isActive),
+                                           controller: controller,
                                            initialStatus: .active)
                     } label: {
                         ConnectionCountCard(title: "活跃连接",
@@ -87,7 +91,9 @@ private struct ConnectionOverview: View {
                 }
 
                 NavigationLink {
-                    StrategyTrafficListView(entries: history)
+                    StrategyTrafficListView(entries: history,
+                                            totals: strategyTotals,
+                                            controller: controller)
                 } label: {
                     VStack(alignment: .leading, spacing: 10) {
                         sectionHeading("策略", symbol: "slider.horizontal.3")
@@ -100,6 +106,7 @@ private struct ConnectionOverview: View {
                     sectionHeading("主机名", symbol: "network")
                     HostTrafficCard(totals: hostTotals,
                                     allEntries: history,
+                                    controller: controller,
                                     totalTraffic: totalTraffic)
                 }
             }
@@ -188,6 +195,7 @@ private struct StrategyTrafficCard: View {
 private struct HostTrafficCard: View {
     let totals: [TrafficAggregate]
     let allEntries: [ConnectionHistoryEntry]
+    @ObservedObject var controller: ConnectionsController
     let totalTraffic: Int64
 
     var body: some View {
@@ -202,7 +210,9 @@ private struct HostTrafficCard: View {
                         HostTrafficDetailView(host: total.name,
                                               entries: allEntries.filter {
                                                   $0.connection.destinationTitle == total.name
-                                              })
+                                              },
+                                              volume: total,
+                                              controller: controller)
                     } label: {
                         HostTrafficRow(total: total, totalTraffic: totalTraffic)
                     }
@@ -250,16 +260,15 @@ private struct HostTrafficRow: View {
 
 private struct StrategyTrafficListView: View {
     let entries: [ConnectionHistoryEntry]
-
-    private var totals: [TrafficAggregate] {
-        trafficTotals(for: entries) { $0.connection.strategyName }
-    }
+    let totals: [TrafficAggregate]
+    @ObservedObject var controller: ConnectionsController
 
     var body: some View {
         List(totals) { total in
             NavigationLink {
                 ConnectionListView(title: total.name,
                                    entries: entries.filter { $0.connection.strategyName == total.name },
+                                   controller: controller,
                                    initialStrategy: total.name)
             } label: {
                 VStack(alignment: .leading, spacing: 5) {
@@ -290,8 +299,10 @@ private struct StrategyTrafficListView: View {
 private struct HostTrafficDetailView: View {
     let host: String
     let entries: [ConnectionHistoryEntry]
+    let volume: TrafficAggregate
+    @ObservedObject var controller: ConnectionsController
 
-    private var total: Int64 { entries.reduce(0) { $0 + $1.connection.transferred } }
+    private var total: Int64 { volume.total }
     private var strategyTotals: [TrafficAggregate] {
         trafficTotals(for: entries) { $0.connection.strategyName }
     }
@@ -299,7 +310,7 @@ private struct HostTrafficDetailView: View {
     var body: some View {
         List {
             Section {
-                ConnectionTrafficHeader(title: host, entries: entries, total: total)
+                ConnectionTrafficHeader(title: host, total: total, volume: volume)
             }
             .listRowBackground(AppListRowBackground())
 
@@ -308,6 +319,7 @@ private struct HostTrafficDetailView: View {
                     NavigationLink {
                         ConnectionListView(title: item.name,
                                            entries: entries.filter { $0.connection.strategyName == item.name },
+                                           controller: controller,
                                            initialStrategy: item.name)
                     } label: {
                         TrafficAggregateRow(item: item)
@@ -318,7 +330,7 @@ private struct HostTrafficDetailView: View {
 
             Section("连接") {
                 ForEach(entries) { entry in
-                    ConnectionRecordRow(entry: entry)
+                    ConnectionRecordRow(entry: entry, controller: controller)
                 }
             }
             .listRowBackground(AppListRowBackground())
@@ -332,8 +344,8 @@ private struct HostTrafficDetailView: View {
 
 private struct ConnectionTrafficHeader: View {
     let title: String
-    let entries: [ConnectionHistoryEntry]
     let total: Int64
+    let volume: TrafficAggregate
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -341,8 +353,8 @@ private struct ConnectionTrafficHeader: View {
                 .font(.title3.weight(.semibold))
                 .lineLimit(2)
             HStack(spacing: 12) {
-                Label(ByteFormat.size(entries.reduce(0) { $0 + $1.connection.upload }), systemImage: "arrow.up")
-                Label(ByteFormat.size(entries.reduce(0) { $0 + $1.connection.download }), systemImage: "arrow.down")
+                Label(ByteFormat.size(volume.upload), systemImage: "arrow.up")
+                Label(ByteFormat.size(volume.download), systemImage: "arrow.down")
             }
             .font(.subheadline.monospacedDigit())
             .foregroundStyle(.secondary)
@@ -357,6 +369,7 @@ private struct ConnectionTrafficHeader: View {
 private struct ConnectionListView: View {
     let title: String
     let entries: [ConnectionHistoryEntry]
+    @ObservedObject var controller: ConnectionsController
     var initialStatus: ConnectionStatusFilter = .all
     var initialStrategy: String? = nil
     var showsSessionLimitNote = false
@@ -385,7 +398,7 @@ private struct ConnectionListView: View {
                     .listRowBackground(Color.clear)
             } else {
                 ForEach(filteredEntries) { entry in
-                    ConnectionRecordRow(entry: entry)
+                    ConnectionRecordRow(entry: entry, controller: controller)
                         .listRowBackground(AppListRowBackground())
                 }
             }
@@ -494,10 +507,11 @@ private struct MenuFilter<Content: View>: View {
 
 private struct ConnectionRecordRow: View {
     let entry: ConnectionHistoryEntry
+    @ObservedObject var controller: ConnectionsController
 
     var body: some View {
         NavigationLink {
-            ConnectionDetailView(entry: entry)
+            ConnectionDetailView(entry: entry, controller: controller)
         } label: {
             ConnectionRecordContent(entry: entry)
         }
@@ -575,13 +589,12 @@ private struct ConnectionRecordContent: View {
 }
 
 private struct ConnectionDetailView: View {
-    @EnvironmentObject private var controller: ConnectionsController
-
     let entry: ConnectionHistoryEntry
+    @ObservedObject var controller: ConnectionsController
 
     private var connection: ActiveConnection { entry.connection }
     private var isActive: Bool {
-        controller.snapshot?.connections.contains(where: { $0.id == connection.id }) == true
+        entry.isActive
     }
 
     var body: some View {
@@ -814,6 +827,19 @@ private func trafficTotals(for entries: [ConnectionHistoryEntry],
                          color: TrafficColor.color(for: name))
     }
     .sorted { $0.total > $1.total }
+}
+
+private func trafficTotals(from volumes: [String: ConnectionTrafficVolume]) -> [TrafficAggregate] {
+    volumes.map { name, value in
+        TrafficAggregate(name: name,
+                         upload: value.upload,
+                         download: value.download,
+                         color: TrafficColor.color(for: name))
+    }
+    .sorted { left, right in
+        left.total == right.total ? left.name.localizedStandardCompare(right.name) == .orderedAscending
+            : left.total > right.total
+    }
 }
 
 private enum TrafficColor {

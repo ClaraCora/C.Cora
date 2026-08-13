@@ -315,6 +315,7 @@ type appSettings struct {
 	GeoAutoUpdate     bool                   `json:"geoAutoUpdate"`
 	GeoUpdateInterval int                    `json:"geoUpdateInterval"`
 	LogLevel          string                 `json:"logLevel"`
+	UnifiedDelay      bool                   `json:"unifiedDelay"`
 	MixedPort         int                    `json:"mixedPort"`
 	BlockDirectSTUN   bool                   `json:"blockDirectSTUN"`
 	SystemDNS         []string               `json:"systemDNS"`
@@ -370,7 +371,7 @@ type tunOverrideSettings struct {
 
 // parseSettings 解析设置 JSON，缺省值兜底（与主 App SettingsStore 默认一致）。
 func parseSettings(settingsJSON string) appSettings {
-	s := appSettings{Stack: "gvisor", LogLevel: "info",
+	s := appSettings{Stack: "gvisor", LogLevel: "info", UnifiedDelay: true,
 		ApplyOverrides: true,
 		GeoEnabled:     true, GeoLoader: "memconservative", GeodataMode: true,
 		IgnoreGeoNegation: false, GeoUpdateInterval: 24,
@@ -746,6 +747,7 @@ func mergeConfig(subYAML string, st appSettings, tunnelMTU int) ([]byte, error) 
 	}
 	m["ipv6"] = st.IPv6
 	m["log-level"] = st.LogLevel
+	m["unified-delay"] = st.UnifiedDelay
 
 	// WebUI/external-controller is intentionally unavailable in the extension.
 	// Strip subscription-owned endpoints so no HTTP control listener is exposed.

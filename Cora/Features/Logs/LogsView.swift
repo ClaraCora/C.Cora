@@ -13,7 +13,7 @@ struct LogsView: View {
 
     var body: some View {
         content
-            .navigationTitle("日志")
+            .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
             .searchable(text: $controller.searchText,
                         placement: .navigationBarDrawer(displayMode: .always),
@@ -202,39 +202,94 @@ struct LogsView: View {
     }
 }
 
-/// 轻量控制台行：避免每条日志的卡片、阴影和全文选择参与滚动布局。
+/// 紧凑的两层记录行：保持列表滚动成本低，全文在详情页按需显示。
 private struct LogRow: View {
     let line: LogLine
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            RoundedRectangle(cornerRadius: 1)
-                .fill(levelColor)
-                .frame(width: 3, height: 15)
+        NavigationLink {
+            LogDetailView(line: line)
+        } label: {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 7) {
+                    Circle()
+                        .fill(levelColor)
+                        .frame(width: 8, height: 8)
+                    Text(line.time, format: .dateTime.hour().minute().second())
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                    Text(line.type.uppercased())
+                        .font(.caption2.monospaced().weight(.bold))
+                        .foregroundStyle(levelColor)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(levelColor.opacity(0.12), in: Capsule())
+                    Spacer(minLength: 0)
+                }
 
-            Text(line.time, format: .dateTime.hour().minute().second())
-                .font(.system(size: 10, design: .monospaced))
-                .foregroundStyle(.tertiary)
-                .frame(width: 54, alignment: .leading)
-
-            Text(line.type.uppercased())
-                .font(.system(size: 9, weight: .semibold, design: .monospaced))
-                .foregroundStyle(levelColor)
-                .frame(width: 48, alignment: .leading)
-
-            Text(line.payload)
-                .font(.system(.caption, design: .monospaced))
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .contentShape(Rectangle())
-        .contextMenu {
-            Button {
-                UIPasteboard.general.string = line.payload
-            } label: {
-                Label("复制日志", systemImage: "doc.on.doc")
+                Text(line.payload)
+                    .font(.subheadline)
+                    .foregroundStyle(.primary)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
+        .buttonStyle(.plain)
         .accessibilityElement(children: .combine)
+    }
+
+    private var levelColor: Color {
+        switch line.type.lowercased() {
+        case "error": return .red
+        case "warning", "warn": return .orange
+        case "debug": return .gray
+        default: return .blue
+        }
+    }
+}
+
+private struct LogDetailView: View {
+    let line: LogLine
+
+    var body: some View {
+        List {
+            Section {
+                HStack(spacing: 7) {
+                    Circle().fill(levelColor).frame(width: 8, height: 8)
+                    Text(line.type.uppercased())
+                        .font(.subheadline.weight(.semibold))
+                    Spacer()
+                    Text(line.time, format: .dateTime.hour().minute().second())
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .listRowBackground(AppListRowBackground())
+
+            Section("日志内容") {
+                Text(line.payload)
+                    .font(.system(.footnote, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 4)
+            }
+            .listRowBackground(AppListRowBackground())
+        }
+        .scrollContentBackground(.hidden)
+        .background(AppAmbientBackground())
+        .navigationTitle("日志详情")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    UIPasteboard.general.string = line.payload
+                } label: {
+                    Image(systemName: "doc.on.doc")
+                }
+                .accessibilityLabel("复制日志")
+            }
+        }
     }
 
     private var levelColor: Color {

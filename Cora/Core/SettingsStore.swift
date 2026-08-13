@@ -34,6 +34,20 @@ final class SettingsStore: ObservableObject {
     @Published var logLevel: String { didSet { d.set(logLevel, forKey: K.logLevel) } }
     /// 策略组与节点测速使用的 HTTP(S) 地址，仅由主 App 的测速 IPC 使用，无需重连。
     @Published var delayTestURL: String { didSet { d.set(delayTestURL, forKey: K.delayTestURL) } }
+    /// 让各策略组使用同一测速地址，默认开启并在下次连接时写入内核配置。
+    @Published var unifiedDelay: Bool { didSet { d.set(unifiedDelay, forKey: K.unifiedDelay) } }
+    /// 策略组与节点测速的 IPC 超时（秒）。仅影响主 App 测速，无需重连。
+    @Published var delayTestTimeout: Int {
+        didSet {
+            let normalized = min(max(delayTestTimeout, 1), 60)
+            if delayTestTimeout != normalized {
+                delayTestTimeout = normalized
+                d.set(normalized, forKey: K.delayTestTimeout)
+                return
+            }
+            d.set(delayTestTimeout, forKey: K.delayTestTimeout)
+        }
+    }
     /// 混合代理端口（HTTP+SOCKS，本机回环）。0=不开。下发给内核 mixed-port。
     @Published var mixedPort: Int {
         didSet {
@@ -91,6 +105,8 @@ final class SettingsStore: ObservableObject {
         static let geoAuto = "set.geoAuto", geoInterval = "set.geoInterval"
         static let logLevel = "set.logLevel"
         static let delayTestURL = "set.delayTestURL"
+        static let unifiedDelay = "set.unifiedDelay"
+        static let delayTestTimeout = "set.delayTestTimeout"
         static let mixedPort = "set.mixedPort"
         static let blockDirectSTUN = "set.blockDirectSTUN"
         static let inclAll = "set.inclAll", exCell = "set.exCell", exAPNs = "set.exAPNs"
@@ -113,6 +129,9 @@ final class SettingsStore: ObservableObject {
         geoUpdateInterval = gi == 0 ? 24 : gi
         logLevel = d.string(forKey: K.logLevel) ?? "info"
         delayTestURL = d.string(forKey: K.delayTestURL) ?? Self.defaultDelayTestURL
+        unifiedDelay = d.object(forKey: K.unifiedDelay) as? Bool ?? true
+        let delayTimeout = d.integer(forKey: K.delayTestTimeout)
+        delayTestTimeout = delayTimeout == 0 ? 5 : min(max(delayTimeout, 1), 60)
         mixedPort = min(max(d.integer(forKey: K.mixedPort), 0), 65_535)
         blockDirectSTUN = d.object(forKey: K.blockDirectSTUN) as? Bool ?? false
         includeAllNetworks = d.object(forKey: K.inclAll) as? Bool ?? false
@@ -140,6 +159,7 @@ final class SettingsStore: ObservableObject {
             "geoAutoUpdate": geoAutoUpdate,
             "geoUpdateInterval": geoUpdateInterval,
             "logLevel": logLevel,
+            "unifiedDelay": unifiedDelay,
             "mixedPort": mixedPort,
             "blockDirectSTUN": blockDirectSTUN,
             "proxySelections": proxySelections,
