@@ -177,13 +177,29 @@ jobs:
             echo "Xcode build failed with status ${BUILD_STATUS}; surfacing compiler diagnostics:"
             # GitHub hides raw logs for unauthenticated viewers. Emit the useful
             # compiler lines as annotations so the failure remains inspectable.
-            grep -E "error:|fatal error:|SwiftCompile|CompileSwift" xcodebuild.log \
-              | tail -n 120 \
+            {
+              echo '### Xcode build diagnostics'
+              echo
+              echo '```text'
+              grep -iE "error:|fatal error:|swiftcompile|compileswift|build failed|undefined symbols|ld:" xcodebuild.log \
+                | tail -n 160 || true
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            grep -iE "error:|fatal error:|swiftcompile|compileswift|build failed|undefined symbols|ld:" xcodebuild.log \
+              | tail -n 160 \
               | while IFS= read -r line; do
                   echo "::error title=Xcode build::${line}"
                 done
           fi
           exit "$BUILD_STATUS"
+
+      - name: Upload Xcode build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log-${{ github.run_number }}
+          path: xcodebuild.log
+          if-no-files-found: ignore
 
       - name: Package into .ipa (unsigned)
         run: |
