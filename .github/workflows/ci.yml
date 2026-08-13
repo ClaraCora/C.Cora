@@ -156,7 +156,7 @@ jobs:
 
       - name: Build (unsigned)
         run: |
-          set -euo pipefail
+          set -uo pipefail
           # 主 App、Tunnel、Control 必须随每次产物递增 build 号；否则覆盖安装时
           # iOS 可能继续使用旧的 Network Extension 注册，表现为连接后立即断开。
           BUILD_NUMBER="${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
@@ -171,7 +171,19 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
-            clean build
+            clean build 2>&1 | tee xcodebuild.log
+          BUILD_STATUS=${PIPESTATUS[0]}
+          if [ "$BUILD_STATUS" -ne 0 ]; then
+            echo "Xcode build failed with status ${BUILD_STATUS}; surfacing compiler diagnostics:"
+            # GitHub hides raw logs for unauthenticated viewers. Emit the useful
+            # compiler lines as annotations so the failure remains inspectable.
+            grep -E "error:|fatal error:|SwiftCompile|CompileSwift" xcodebuild.log \
+              | tail -n 120 \
+              | while IFS= read -r line; do
+                  echo "::error title=Xcode build::${line}"
+                done
+          fi
+          exit "$BUILD_STATUS"
 
       - name: Package into .ipa (unsigned)
         run: |
