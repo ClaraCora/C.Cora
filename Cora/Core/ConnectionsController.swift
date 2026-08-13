@@ -296,6 +296,8 @@ final class ConnectionsController: ObservableObject {
     private var rememberedConnectionIDs: Set<UInt64> = []
     private var rememberedConnectionOrder: [UInt64] = []
     private var lastPersistenceDate = Date.distantPast
+    private var lastKernelUploadTotal: Int64?
+    private var lastKernelDownloadTotal: Int64?
 
     private struct ActiveConnectionSample: Codable {
         let upload: Int64
@@ -313,6 +315,8 @@ final class ConnectionsController: ObservableObject {
         let history: [ConnectionHistoryEntry]
         let activeSamples: [String: ActiveConnectionSample]
         let rememberedConnectionOrder: [UInt64]
+        let lastKernelUploadTotal: Int64?
+        let lastKernelDownloadTotal: Int64?
         let savedAt: Date
     }
 
@@ -341,6 +345,8 @@ final class ConnectionsController: ObservableObject {
         activeSamples = [:]
         rememberedConnectionIDs.removeAll(keepingCapacity: true)
         rememberedConnectionOrder.removeAll(keepingCapacity: true)
+        lastKernelUploadTotal = nil
+        lastKernelDownloadTotal = nil
         isLoading = false
         closingIDs.removeAll()
         isClosingAll = false
@@ -371,10 +377,15 @@ final class ConnectionsController: ObservableObject {
                 let latest = try JSONDecoder().decode(ConnectionsSnapshot.self, from: data)
                 guard !Task.isCancelled, generation == currentGeneration else { return }
                 snapshot = latest
+                if hasStartedNewKernelSession(with: latest) {
+                    clearSessionState()
+                }
                 mergeSessionStatistics(with: latest.connections)
                 mergeHistory(with: latest.connections)
                 reconcileSessionTotals(uploadTotal: latest.uploadTotal,
                                        downloadTotal: latest.downloadTotal)
+                lastKernelUploadTotal = latest.uploadTotal
+                lastKernelDownloadTotal = latest.downloadTotal
                 persistSession()
                 error = nil
             } catch {
@@ -567,6 +578,28 @@ final class ConnectionsController: ObservableObject {
         return true
     }
 
+    /// A lower core counter means the Network Extension was restarted while the
+    /// App was absent. Keep the persisted view state for a live tunnel, but do
+    /// not accidentally merge two separate VPN sessions.
+    private func hasStartedNewKernelSession(with snapshot: ConnectionsSnapshot) -> Bool {
+        guard let previousUpload = lastKernelUploadTotal,
+              let previousDownload = lastKernelDownloadTotal else {
+            return false
+        }
+        return snapshot.uploadTotal < previousUpload || snapshot.downloadTotal < previousDownload
+    }
+
+    private func clearSessionState() {
+        history = []
+        sessionSummary = ConnectionSessionSummary()
+        activeSamples = [:]
+        rememberedConnectionIDs.removeAll(keepingCapacity: true)
+        rememberedConnectionOrder.removeAll(keepingCapacity: true)
+        lastKernelUploadTotal = nil
+        lastKernelDownloadTotal = nil
+        UserDefaults.standard.removeObject(forKey: Self.persistenceKey)
+    }
+
     private func restorePersistedSession() {
         guard let data = UserDefaults.standard.data(forKey: Self.persistenceKey),
               let persisted = try? JSONDecoder().decode(PersistedSession.self, from: data),
@@ -580,6 +613,8 @@ final class ConnectionsController: ObservableObject {
         rememberedConnectionOrder = Array(
             persisted.rememberedConnectionOrder.suffix(Self.maximumRememberedConnectionIDs))
         rememberedConnectionIDs = Set(rememberedConnectionOrder)
+        lastKernelUploadTotal = persisted.lastKernelUploadTotal
+        lastKernelDownloadTotal = persisted.lastKernelDownloadTotal
         lastPersistenceDate = persisted.savedAt
     }
 
@@ -595,6 +630,8 @@ final class ConnectionsController: ObservableObject {
             history: history,
             activeSamples: activeSamples,
             rememberedConnectionOrder: rememberedConnectionOrder,
+            lastKernelUploadTotal: lastKernelUploadTotal,
+            lastKernelDownloadTotal: lastKernelDownloadTotal,
             savedAt: now)
         guard let data = try? JSONEncoder().encode(persisted) else { return }
         UserDefaults.standard.set(data, forKey: Self.persistenceKey)
