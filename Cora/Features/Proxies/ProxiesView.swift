@@ -406,6 +406,7 @@ private struct StrategyGroupListPanel: View {
 
             if isExpanded {
                 Divider().overlay(Color.primary.opacity(0.10))
+                Group {
                 if group.all.isEmpty {
                     Text("该策略组没有节点")
                         .font(.footnote)
@@ -437,6 +438,7 @@ private struct StrategyGroupListPanel: View {
                             }
                         }
                     }
+                }
                 }
                 .transition(.opacity.combined(with: .move(edge: .top)))
             }
