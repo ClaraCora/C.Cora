@@ -1,0 +1,76 @@
+diff --git a/tunnel/statistic/closed_snapshot_test.go b/tunnel/statistic/closed_snapshot_test.go
+new file mode 100644
+index 0000000..77ada41
+--- /dev/null
++++ b/tunnel/statistic/closed_snapshot_test.go
+@@ -0,0 +1,70 @@
++package statistic
++
++import (
++	"strings"
++	"testing"
++
++	"github.com/metacubex/mihomo/common/atomic"
++	C "github.com/metacubex/mihomo/constant"
++)
++
++func TestClosedSinceStartsEmpty(t *testing.T) {
++	m := &Manager{}
++	next, dropped, infos := m.ClosedSince(0, 10)
++	if next != 0 || dropped || len(infos) != 0 {
++		t.Fatalf("ClosedSince empty = next=%d dropped=%t infos=%d", next, dropped, len(infos))
++	}
++}
++
++func TestClosedSnapshotIsBoundedAndIndependent(t *testing.T) {
++	source := &TrackerInfo{
++		UploadTotal: atomic.NewInt64(7),
++		DownloadTotal: atomic.NewInt64(11),
++	}
++	copied := cloneTrackerInfo(source)
++	source.UploadTotal.Add(1)
++	if copied.UploadTotal.Load() != 7 {
++		t.Fatalf("clone counter changed with source: %d", copied.UploadTotal.Load())
++	}
++
++	long := strings.Repeat("x", 600)
++	copied = cloneTrackerInfo(&TrackerInfo{
++		Metadata: &C.Metadata{Host: long, ProcessPath: long},
++		Chain: C.Chain{"first", long, long, long, long, long, long, long, long, long, long, long, "last"},
++	})
++	if len(copied.Metadata.Host) != 256 || len(copied.Metadata.ProcessPath) != 256 ||
++		len(copied.Chain) != 4 || len(copied.Chain[1]) != 128 {
++		t.Fatalf("clone did not bound fields: %#v", copied)
++	}
++	if copied.Chain[0] != "first" || copied.Chain[len(copied.Chain)-1] != "last" {
++		t.Fatalf("clone did not preserve chain ends: %#v", copied.Chain)
++	}
++}
++
++func TestClosedSinceKeepsNewestFixedWindow(t *testing.T) {
++	m := &Manager{}
++	for index := 0; index < maxClosedConnectionSnapshots+2; index++ {
++		m.closedCursor++
++		slot := (m.closedStart + m.closedCount) % maxClosedConnectionSnapshots
++		m.closed[slot] = closedConnectionSnapshot{
++			cursor: m.closedCursor,
++			info: &TrackerInfo{
++				UploadTotal: atomic.NewInt64(int64(index)),
++				DownloadTotal: atomic.NewInt64(0),
++			},
++		}
++		if m.closedCount < maxClosedConnectionSnapshots {
++			m.closedCount++
++		} else {
++			m.closedStart = (m.closedStart + 1) % maxClosedConnectionSnapshots
++		}
++	}
++
++	next, dropped, infos := m.ClosedSince(0, maxClosedConnectionSnapshots)
++	if !dropped || next != maxClosedConnectionSnapshots+2 || len(infos) != maxClosedConnectionSnapshots {
++		t.Fatalf("ClosedSince window = next=%d dropped=%t infos=%d", next, dropped, len(infos))
++	}
++	if got := infos[0].UploadTotal.Load(); got != 2 {
++		t.Fatalf("first retained upload = %d, want 2", got)
++	}
++}

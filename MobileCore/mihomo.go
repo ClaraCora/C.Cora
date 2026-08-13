@@ -10,6 +10,7 @@ package mihomo
 
 import (
 	"bytes"
+	"container/heap"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -65,6 +66,33 @@ const defaultConnectionSnapshotLimit = 200
 const maxConnectionSnapshotLimit = 500
 
 const defaultRunLogChunkBytes = 48 << 10
+
+// connectionSnapshotHeap keeps only the oldest item at its root, allowing the
+// IPC snapshot to select the newest live connections without allocating a
+// slice proportional to the total number of active trackers.
+type connectionSnapshotHeap []*statistic.TrackerInfo
+
+func (items connectionSnapshotHeap) Len() int { return len(items) }
+
+func (items connectionSnapshotHeap) Less(left, right int) bool {
+	return items[left].Start.Before(items[right].Start)
+}
+
+func (items connectionSnapshotHeap) Swap(left, right int) {
+	items[left], items[right] = items[right], items[left]
+}
+
+func (items *connectionSnapshotHeap) Push(value any) {
+	*items = append(*items, value.(*statistic.TrackerInfo))
+}
+
+func (items *connectionSnapshotHeap) Pop() any {
+	old := *items
+	last := len(old) - 1
+	value := old[last]
+	*items = old[:last]
+	return value
+}
 
 // homeDir 是 mihomo 工作目录（= App Group 容器），run.log 也写在这里。
 var (
@@ -1914,20 +1942,26 @@ func ConnectionsSnapshot(limit int) string {
 		limit = maxConnectionSnapshotLimit
 	}
 
-	connections := make([]*statistic.TrackerInfo, 0, limit)
+	connections := make(connectionSnapshotHeap, 0, limit)
+	heap.Init(&connections)
+	total := 0
 	statistic.DefaultManager.Range(func(tracker statistic.Tracker) bool {
 		if info := tracker.Info(); info != nil {
-			connections = append(connections, info)
+			total++
+			if len(connections) < limit {
+				heap.Push(&connections, info)
+				return true
+			}
+			if info.Start.After(connections[0].Start) {
+				connections[0] = info
+				heap.Fix(&connections, 0)
+			}
 		}
 		return true
 	})
 	sort.Slice(connections, func(left, right int) bool {
 		return connections[left].Start.After(connections[right].Start)
 	})
-	total := len(connections)
-	if len(connections) > limit {
-		connections = connections[:limit]
-	}
 	out, err := json.Marshal(struct {
 		DownloadTotal int64                    `json:"downloadTotal"`
 		UploadTotal   int64                    `json:"uploadTotal"`
@@ -1943,6 +1977,35 @@ func ConnectionsSnapshot(limit int) string {
 	})
 	if err != nil {
 		return `{"downloadTotal":0,"uploadTotal":0,"connections":[],"total":0,"truncated":false}`
+	}
+	return string(out)
+}
+
+// ClosedConnectionsSnapshot returns a small batch of connection snapshots that
+// have just left Mihomo's tracker manager. The manager's internal queue is
+// capped at 512 entries and is drained by the Network Extension into its
+// bounded SQLite history, never retained as a long-lived Go slice.
+func ClosedConnectionsSnapshot(cursor int64, limit int) string {
+	if cursor < 0 {
+		cursor = 0
+	}
+	if limit < 1 {
+		limit = 1
+	} else if limit > 512 {
+		limit = 512
+	}
+	next, dropped, connections := statistic.DefaultManager.ClosedSince(uint64(cursor), limit)
+	out, err := json.Marshal(struct {
+		Cursor      uint64                   `json:"cursor"`
+		Dropped     bool                     `json:"dropped"`
+		Connections []*statistic.TrackerInfo `json:"connections"`
+	}{
+		Cursor:      next,
+		Dropped:     dropped,
+		Connections: connections,
+	})
+	if err != nil {
+		return `{"cursor":0,"dropped":false,"connections":[]}`
 	}
 	return string(out)
 }

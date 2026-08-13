@@ -118,8 +118,8 @@ jobs:
       - name: Verify patched Mihomo allocator
         run: |
           set -euxo pipefail
-          go -C "$PATCHED_MIHOMO" test ./common/pool ./config
-          go -C "$PATCHED_MIHOMO" test -tags "with_low_memory" ./common/pool ./config
+          go -C "$PATCHED_MIHOMO" test ./common/pool ./config ./tunnel/statistic
+          go -C "$PATCHED_MIHOMO" test -tags "with_low_memory" ./common/pool ./config ./tunnel/statistic
 
       - name: Verify patched gVisor TCP
         run: |

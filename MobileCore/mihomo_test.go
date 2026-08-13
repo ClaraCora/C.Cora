@@ -481,6 +481,16 @@ func TestConnectionsIPCEmptySnapshotAndMissingClose(t *testing.T) {
 	if len(totalsOnly.Connections) != 0 {
 		t.Fatalf("ConnectionsSnapshot totals-only returned %d connection details", len(totalsOnly.Connections))
 	}
+	var closedSnapshot struct {
+		Cursor      int               `json:"cursor"`
+		Connections []json.RawMessage `json:"connections"`
+	}
+	if err := json.Unmarshal([]byte(ClosedConnectionsSnapshot(0, 32)), &closedSnapshot); err != nil {
+		t.Fatalf("ClosedConnectionsSnapshot returned invalid JSON: %v", err)
+	}
+	if closedSnapshot.Cursor < 0 {
+		t.Fatalf("ClosedConnectionsSnapshot cursor = %d", closedSnapshot.Cursor)
+	}
 	if err := CloseConnection(""); err == nil {
 		t.Fatal("CloseConnection accepted an empty ID")
 	}

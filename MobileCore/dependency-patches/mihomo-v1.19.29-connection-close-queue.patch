@@ -1,0 +1,164 @@
+diff --git a/tunnel/statistic/manager.go b/tunnel/statistic/manager.go
+index c69746d..3c1e29b 100644
+--- a/tunnel/statistic/manager.go
++++ b/tunnel/statistic/manager.go
+@@ -2,13 +2,18 @@ package statistic
+ 
+ import (
+ 	"os"
++	"sync"
+ 	"time"
++	"unicode/utf8"
+ 
+ 	"github.com/metacubex/mihomo/common/atomic"
+ 	"github.com/metacubex/mihomo/common/xsync"
+ 	"github.com/metacubex/mihomo/component/memory"
++	C "github.com/metacubex/mihomo/constant"
+ )
+ 
++const maxClosedConnectionSnapshots = 512
++
+ var DefaultManager *Manager
+ 
+ func init() {
+@@ -29,6 +34,11 @@ type Manager struct {
+ 	connections   xsync.Map[string, Tracker]
+ 	uploadTemp    atomic.Int64
+ 	downloadTemp  atomic.Int64
++	closedMu      sync.Mutex
++	closed        [maxClosedConnectionSnapshots]closedConnectionSnapshot
++	closedStart   int
++	closedCount   int
++	closedCursor  uint64
+ 	uploadBlip    atomic.Int64
+ 	downloadBlip  atomic.Int64
+ 	uploadTotal   atomic.Int64
+@@ -37,12 +47,127 @@ type Manager struct {
+ 	memory        uint64
+ }
+ 
++type closedConnectionSnapshot struct {
++	cursor uint64
++	info   *TrackerInfo
++}
++
+ func (m *Manager) Join(c Tracker) {
+ 	m.connections.Store(c.ID(), c)
+ }
+ 
+ func (m *Manager) Leave(c Tracker) {
+-	m.connections.Delete(c.ID())
++	if tracker, exists := m.connections.LoadAndDelete(c.ID()); exists {
++		if info := cloneTrackerInfo(tracker.Info()); info != nil {
++			m.closedMu.Lock()
++			m.closedCursor += 1
++			slot := (m.closedStart + m.closedCount) % maxClosedConnectionSnapshots
++			m.closed[slot] = closedConnectionSnapshot{
++				cursor: m.closedCursor,
++				info: info,
++			}
++			if m.closedCount < maxClosedConnectionSnapshots {
++				m.closedCount++
++			} else {
++				m.closedStart = (m.closedStart + 1) % maxClosedConnectionSnapshots
++			}
++			m.closedMu.Unlock()
++		}
++	}
++}
++
++// ClosedSince returns completed tracker snapshots after cursor. The queue is
++// intentionally tiny and bounded: callers must drain it promptly instead of
++// using the connection manager as a long-lived history store.
++func (m *Manager) ClosedSince(cursor uint64, limit int) (next uint64, dropped bool, infos []*TrackerInfo) {
++	if limit < 1 {
++		limit = 1
++	} else if limit > maxClosedConnectionSnapshots {
++		limit = maxClosedConnectionSnapshots
++	}
++
++	m.closedMu.Lock()
++	defer m.closedMu.Unlock()
++	next = cursor
++	if m.closedCount == 0 {
++		return next, false, nil
++	}
++
++	oldest := m.closed[m.closedStart].cursor
++	dropped = cursor < oldest - 1
++	for index := 0; index < m.closedCount; index++ {
++		snapshot := m.closed[(m.closedStart+index)%maxClosedConnectionSnapshots]
++		if snapshot.cursor <= cursor {
++			continue
++		}
++		infos = append(infos, snapshot.info)
++		next = snapshot.cursor
++		if len(infos) == limit {
++			break
++		}
++	}
++	return next, dropped, infos
++}
++
++func cloneTrackerInfo(info *TrackerInfo) *TrackerInfo {
++	if info == nil {
++		return nil
++	}
++	copyInfo := *info
++	copyInfo.UploadTotal = atomic.NewInt64(info.UploadTotal.Load())
++	copyInfo.DownloadTotal = atomic.NewInt64(info.DownloadTotal.Load())
++	copyInfo.Chain = boundedChain(info.Chain)
++	copyInfo.ProviderChain = boundedChain(info.ProviderChain)
++	copyInfo.Rule = boundedString(info.Rule, 96)
++	copyInfo.RulePayload = boundedString(info.RulePayload, 256)
++	if info.Metadata != nil {
++		metadata := info.Metadata
++		copyInfo.Metadata = &C.Metadata{
++			NetWork:     metadata.NetWork,
++			Type:        metadata.Type,
++			SrcIP:       metadata.SrcIP,
++			DstIP:       metadata.DstIP,
++			SrcPort:     metadata.SrcPort,
++			DstPort:     metadata.DstPort,
++			Host:        boundedString(metadata.Host, 256),
++			Process:     boundedString(metadata.Process, 128),
++			ProcessPath: boundedString(metadata.ProcessPath, 256),
++			SniffHost:   boundedString(metadata.SniffHost, 256),
++		}
++	}
++	return &copyInfo
++}
++
++func boundedChain(chain C.Chain) C.Chain {
++	const maximumEntries = 4
++	const maximumEntryBytes = 128
++	length := len(chain)
++	if length > maximumEntries {
++		length = maximumEntries
++	}
++	copyChain := make(C.Chain, length)
++	for index := range copyChain {
++		sourceIndex := index
++		if len(chain) > maximumEntries && index == maximumEntries-1 {
++			sourceIndex = len(chain) - 1
++		}
++		copyChain[index] = boundedString(chain[sourceIndex], maximumEntryBytes)
++	}
++	return copyChain
++}
++
++func boundedString(value string, maximum int) string {
++	if maximum <= 0 {
++		return ""
++	}
++	if len(value) > maximum {
++		end := maximum
++		for end > 0 && !utf8.RuneStart(value[end]) {
++			end--
++		}
++		value = value[:end]
++	}
++	return string([]byte(value))
+ }
+ 
+ func (m *Manager) Get(id string) (c Tracker) {

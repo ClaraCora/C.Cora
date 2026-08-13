@@ -1,5 +1,57 @@
 # Third-party patches
 
+## mihomo-v1.19.29-connection-close-queue
+
+- Added: 2026-08-13
+- Upstream module: `github.com/metacubex/mihomo v1.19.29`
+- Patched file: `tunnel/statistic/manager.go`
+- Build tags: default and `with_low_memory`
+
+### Reason
+
+The iOS App can be terminated while its Packet Tunnel keeps forwarding traffic.
+Keeping every finished connection in Mihomo, Swift, or the extension process
+would make a busy browsing session grow without a hard memory bound and risks
+Jetsam terminating the Network Extension. The App still needs enough final
+connection information to persist a durable, bounded history in its App Group.
+
+### Local behavior
+
+`statistic.Manager` copies a completed tracker into a fixed 512-item ring when
+it leaves the live manager. Each copy owns its counter data and retains only
+bounded routing and metadata text, so the released tracker cannot mutate
+history. The ring does not reallocate while it is full. `ClosedSince` exposes
+incremental batches behind a cursor and reports when an old cursor fell behind
+the FIFO.
+The Packet Tunnel drains this queue every two seconds into its SQLite history;
+SQLite retains at most seven days, 20,000 rows, or 50 MiB, removing only the
+oldest completed rows. Live packets never wait for this database work.
+
+At more than roughly 256 short-lived connections per second for a sustained
+two-second interval, the FIFO can overflow. Some finished detail rows can then
+be absent, and the extension writes a diagnostic log entry, but packet
+forwarding, active connections, and the extension memory limit are unaffected.
+
+### Verification
+
+The Mihomo preparation script verifies the exact upstream source and patched
+SHA-256 hashes. CI runs `./tunnel/statistic` together with the existing pool
+and config checks in both default and `with_low_memory` modes. The patch suite
+checks an empty cursor response and confirms copied tracker counters are no
+longer aliased to the live tracker.
+
+### Rollback
+
+Revert the commit that added this section and remove:
+
+- `dependency-patches/mihomo-v1.19.29-connection-close-queue.patch`;
+- `dependency-patches/mihomo-v1.19.29-connection-close-queue-test.patch`;
+- the history patch preparation and verification wiring;
+- `ClosedConnectionsSnapshot` and the Packet Tunnel history recorder.
+
+Existing App Group history can simply be left in place; it is not read by
+earlier versions.
+
 ## sing-and-mihomo-ss-record-oversize-buffer-pool
 
 - Added: 2026-07-25

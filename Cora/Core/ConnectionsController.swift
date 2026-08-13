@@ -50,6 +50,30 @@ struct ConnectionHistoryEntry: Codable, Identifiable, Sendable {
     var id: String { connection.id }
 }
 
+extension ActiveConnection {
+    init(historyRecord record: ConnectionHistoryRecord) {
+        id = record.id
+        metadata = ConnectionMetadata(network: record.network,
+                                      type: record.connectionType,
+                                      sourceIP: record.sourceIP,
+                                      destinationIP: record.destinationIP,
+                                      sourcePort: record.sourcePort,
+                                      destinationPort: record.destinationPort,
+                                      host: record.host,
+                                      sniffHost: record.sniffHost,
+                                      process: record.process,
+                                      processPath: record.processPath)
+        upload = record.upload
+        download = record.download
+        start = record.startedAt.ISO8601Format()
+        startDate = record.startedAt
+        chains = record.chains
+        rule = record.rule
+        rulePayload = record.rulePayload
+        networkKey = record.network.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+}
+
 /// 会话级流量累积项。它只保存名称和两个 Int64，不保存完整连接详情。
 struct ConnectionTrafficVolume: Codable, Sendable, Equatable {
     var upload: Int64 = 0
@@ -272,9 +296,6 @@ struct ConnectionMetadata: Codable, Sendable {
 
 @MainActor
 final class ConnectionsController: ObservableObject {
-    // Active connections are supplied by the core with its own limit. Keep only a
-    // small, in-memory tail of finished connections for the current VPN session.
-    private static let maximumEndedHistory = 120
     private static let maximumRememberedConnectionIDs = 20_000
     private static let maximumStrategyStatistics = 256
     private static let maximumHostStatistics = 4_096
@@ -284,6 +305,9 @@ final class ConnectionsController: ObservableObject {
     @Published private(set) var snapshot: ConnectionsSnapshot?
     @Published private(set) var history: [ConnectionHistoryEntry] = []
     @Published private(set) var sessionSummary = ConnectionSessionSummary()
+    @Published private(set) var historySummary = ConnectionHistorySummary.empty
+    @Published private(set) var hasMoreHistory = false
+    @Published private(set) var isLoadingMoreHistory = false
     @Published private(set) var isLoading = false
     @Published private(set) var closingIDs: Set<String> = []
     @Published private(set) var isClosingAll = false
@@ -298,6 +322,9 @@ final class ConnectionsController: ObservableObject {
     private var lastPersistenceDate = Date.distantPast
     private var lastKernelUploadTotal: Int64?
     private var lastKernelDownloadTotal: Int64?
+    private let historyStore = ConnectionHistoryStore.openShared()
+    private var historyOffset = 0
+    private var lastHistoryRefreshDate = Date.distantPast
 
     private struct ActiveConnectionSample: Codable {
         let upload: Int64
@@ -322,6 +349,7 @@ final class ConnectionsController: ObservableObject {
 
     init() {
         restorePersistedSession()
+        reloadHistoryFromStore()
     }
 
     /// 由页面 `.task` 持有生命周期；离开页面后 SwiftUI 会取消轮询。
@@ -340,7 +368,8 @@ final class ConnectionsController: ObservableObject {
     func reset() {
         generation &+= 1
         snapshot = nil
-        history = []
+        reloadHistoryFromStore(activeConnections: [])
+        isLoadingMoreHistory = false
         sessionSummary = ConnectionSessionSummary()
         activeSamples = [:]
         rememberedConnectionIDs.removeAll(keepingCapacity: true)
@@ -351,13 +380,11 @@ final class ConnectionsController: ObservableObject {
         closingIDs.removeAll()
         isClosingAll = false
         error = nil
-        UserDefaults.standard.removeObject(forKey: Self.persistenceKey)
         lastPersistenceDate = .distantPast
     }
 
-    /// Flushes the compact session state before the App is suspended. This is
-    /// intentionally owned by the App process; NE should only keep live VPN
-    /// state and must not become a long-lived connection-history database.
+    /// Flushes only compact view statistics. Full connection records live in
+    /// the App Group SQLite store owned by the running Network Extension.
     func flushPersistence() {
         persistSession(force: true)
     }
@@ -381,12 +408,13 @@ final class ConnectionsController: ObservableObject {
                     clearSessionState()
                 }
                 mergeSessionStatistics(with: latest.connections)
-                mergeHistory(with: latest.connections)
                 reconcileSessionTotals(uploadTotal: latest.uploadTotal,
                                        downloadTotal: latest.downloadTotal)
                 lastKernelUploadTotal = latest.uploadTotal
                 lastKernelDownloadTotal = latest.downloadTotal
                 persistSession()
+                reloadHistoryFromStore(activeConnections: latest.connections,
+                                       force: showLoading)
                 error = nil
             } catch {
                 guard !Task.isCancelled, generation == currentGeneration else { return }
@@ -417,8 +445,8 @@ final class ConnectionsController: ObservableObject {
                     uploadTotal: current.uploadTotal,
                     connections: current.connections.filter { $0.id != connection.id })
                 mergeSessionStatistics(with: snapshot?.connections ?? [])
-                mergeHistory(with: snapshot?.connections ?? [])
                 persistSession(force: true)
+                reloadHistoryFromStore(activeConnections: snapshot?.connections ?? [])
             }
             error = nil
         case .some(let reason):
@@ -442,8 +470,8 @@ final class ConnectionsController: ObservableObject {
                     downloadTotal: current.downloadTotal,
                     uploadTotal: current.uploadTotal)
                 mergeSessionStatistics(with: [])
-                mergeHistory(with: [])
                 persistSession(force: true)
+                reloadHistoryFromStore(activeConnections: [])
             }
             error = nil
         case .some(let reason):
@@ -466,32 +494,58 @@ final class ConnectionsController: ObservableObject {
         }
     }
 
-    private func mergeHistory(with activeConnections: [ActiveConnection]) {
-        let activeIDs = Set(activeConnections.map(\.id))
+    func reloadHistoryFromStore(activeConnections: [ActiveConnection]? = nil,
+                                force: Bool = true) {
+        guard let historyStore else {
+            if let activeConnections { history = activeEntries(activeConnections) }
+            return
+        }
+        let active = activeConnections ?? snapshot?.connections ?? []
         let now = Date()
-
-        let activeEntries = activeConnections.map { connection in
-            ConnectionHistoryEntry(connection: connection, isActive: true, endedAt: nil)
+        guard force || now.timeIntervalSince(lastHistoryRefreshDate) >= 2 else {
+            // Keep the visible active rows responsive without repeating the
+            // full SQLite aggregate query on every one-second App poll.
+            let stored = history.filter { !$0.isActive }
+            history = activeEntries(active) + stored
+            return
         }
+        lastHistoryRefreshDate = now
+        historyOffset = 0
+        let persisted = historyStore.fetchPage(offset: 0)
+        history = mergedHistory(activeConnections: active, persisted: persisted)
+        historyOffset = persisted.count
+        hasMoreHistory = persisted.count == ConnectionHistoryStore.defaultFetchPageSize
+        historySummary = historyStore.summary()
+    }
 
-        // Do not let a long-running VPN session turn the record screen into an
-        // unbounded memory cache. History is deliberately session-only and is
-        // discarded by reset() when the VPN stops or reconnects.
-        let endedEntries = history
-            .filter { !activeIDs.contains($0.id) }
-            .map {
-                ConnectionHistoryEntry(connection: $0.connection,
-                                       isActive: false,
-                                       endedAt: $0.endedAt ?? now)
-            }
-            .sorted { ($0.endedAt ?? .distantPast) > ($1.endedAt ?? .distantPast) }
-            .prefix(Self.maximumEndedHistory)
+    func loadMoreHistory() {
+        guard !isLoadingMoreHistory, hasMoreHistory, let historyStore else { return }
+        isLoadingMoreHistory = true
+        let page = historyStore.fetchPage(offset: historyOffset)
+        historyOffset += page.count
+        hasMoreHistory = page.count == ConnectionHistoryStore.defaultFetchPageSize
+        let knownIDs = Set(history.map(\.id))
+        let extra = page.filter { !knownIDs.contains($0.id) }.map(historyEntry)
+        history.append(contentsOf: extra)
+        isLoadingMoreHistory = false
+    }
 
-        history = (activeEntries + Array(endedEntries)).sorted { left, right in
-            let leftDate = left.connection.startDate ?? left.endedAt ?? .distantPast
-            let rightDate = right.connection.startDate ?? right.endedAt ?? .distantPast
-            return leftDate > rightDate
-        }
+    private func mergedHistory(activeConnections: [ActiveConnection],
+                               persisted: [ConnectionHistoryRecord]) -> [ConnectionHistoryEntry] {
+        let active = activeEntries(activeConnections)
+        let activeIDs = Set(active.map(\.id))
+        let stored = persisted.filter { !activeIDs.contains($0.id) }.map(historyEntry)
+        return active + stored
+    }
+
+    private func activeEntries(_ connections: [ActiveConnection]) -> [ConnectionHistoryEntry] {
+        connections.map { ConnectionHistoryEntry(connection: $0, isActive: true, endedAt: nil) }
+    }
+
+    private func historyEntry(_ record: ConnectionHistoryRecord) -> ConnectionHistoryEntry {
+        ConnectionHistoryEntry(connection: ActiveConnection(historyRecord: record),
+                               isActive: record.isActive,
+                               endedAt: record.endedAt)
     }
 
     /// 用每个活动连接的增量更新会话统计，避免把最近 120 条详情缓存误当作总流量。
@@ -590,7 +644,6 @@ final class ConnectionsController: ObservableObject {
     }
 
     private func clearSessionState() {
-        history = []
         sessionSummary = ConnectionSessionSummary()
         activeSamples = [:]
         rememberedConnectionIDs.removeAll(keepingCapacity: true)
@@ -608,7 +661,9 @@ final class ConnectionsController: ObservableObject {
         }
 
         sessionSummary = persisted.summary
-        history = Array(persisted.history.prefix(Self.maximumEndedHistory))
+        // Older App-only history is intentionally ignored. The shared store is
+        // authoritative and survives App termination while the VPN keeps running.
+        history = []
         activeSamples = persisted.activeSamples
         rememberedConnectionOrder = Array(
             persisted.rememberedConnectionOrder.suffix(Self.maximumRememberedConnectionIDs))
@@ -627,7 +682,7 @@ final class ConnectionsController: ObservableObject {
         let persisted = PersistedSession(
             version: 1,
             summary: sessionSummary,
-            history: history,
+            history: [],
             activeSamples: activeSamples,
             rememberedConnectionOrder: rememberedConnectionOrder,
             lastKernelUploadTotal: lastKernelUploadTotal,

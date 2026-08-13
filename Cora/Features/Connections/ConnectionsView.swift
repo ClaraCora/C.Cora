@@ -38,15 +38,15 @@ private struct ConnectionOverview: View {
     let error: String?
     let onRefresh: () async -> Void
 
-    private var activeCount: Int { controller.sessionSummary.activeConnectionCount }
+    private var activeCount: Int { controller.historySummary.activeCount }
     private var strategyTotals: [TrafficAggregate] {
-        trafficTotals(from: controller.sessionSummary.strategyVolumes)
+        trafficTotals(from: controller.historySummary.strategyVolumes)
     }
     private var hostTotals: [TrafficAggregate] {
-        Array(trafficTotals(from: controller.sessionSummary.hostVolumes).prefix(5))
+        Array(trafficTotals(from: controller.historySummary.hostVolumes).prefix(5))
     }
     private var totalTraffic: Int64 {
-        controller.sessionSummary.totalTraffic
+        controller.historySummary.uploadTotal + controller.historySummary.downloadTotal
     }
 
     var body: some View {
@@ -57,10 +57,10 @@ private struct ConnectionOverview: View {
                         ConnectionListView(title: "全部连接",
                                            entries: history,
                                            controller: controller,
-                                           showsSessionLimitNote: true)
+                                           showsRetentionNote: true)
                     } label: {
                         ConnectionCountCard(title: "全部连接",
-                                            value: controller.sessionSummary.totalConnectionCount,
+                                            value: controller.historySummary.recordCount,
                                             symbol: "point.3.connected.trianglepath.dotted",
                                             tint: .blue)
                     }
@@ -372,7 +372,7 @@ private struct ConnectionListView: View {
     @ObservedObject var controller: ConnectionsController
     var initialStatus: ConnectionStatusFilter = .all
     var initialStrategy: String? = nil
-    var showsSessionLimitNote = false
+    var showsRetentionNote = false
 
     @State private var query = ""
     @State private var status: ConnectionStatusFilter = .all
@@ -385,8 +385,8 @@ private struct ConnectionListView: View {
             Section {
                 filterBar
             } footer: {
-                if showsSessionLimitNote {
-                    Text("记录会跨 App 重启保留；已结束连接最多保留最近 120 条。")
+                if showsRetentionNote {
+                    Text("记录保留最近 7 天，最多 20,000 条或 50 MB；达到任一上限会自动删除最旧记录。")
                 }
             }
             .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0))
@@ -400,6 +400,21 @@ private struct ConnectionListView: View {
                 ForEach(filteredEntries) { entry in
                     ConnectionRecordRow(entry: entry, controller: controller)
                         .listRowBackground(AppListRowBackground())
+                }
+                if query.isEmpty, status == .all, network == .all, strategy.isEmpty,
+                   controller.hasMoreHistory {
+                    HStack {
+                        Spacer()
+                        if controller.isLoadingMoreHistory {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Button("加载更多") {
+                                controller.loadMoreHistory()
+                            }
+                        }
+                        Spacer()
+                    }
+                    .listRowBackground(Color.clear)
                 }
             }
         }
@@ -839,6 +854,15 @@ private func trafficTotals(from volumes: [String: ConnectionTrafficVolume]) -> [
     .sorted { left, right in
         left.total == right.total ? left.name.localizedStandardCompare(right.name) == .orderedAscending
             : left.total > right.total
+    }
+}
+
+private func trafficTotals(from volumes: [ConnectionHistoryTrafficVolume]) -> [TrafficAggregate] {
+    volumes.map { value in
+        TrafficAggregate(name: value.name,
+                         upload: value.upload,
+                         download: value.download,
+                         color: TrafficColor.color(for: value.name))
     }
 }
 

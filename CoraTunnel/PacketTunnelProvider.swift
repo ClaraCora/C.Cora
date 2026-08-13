@@ -42,6 +42,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private static let ipcResponseLifetime: TimeInterval = 30
     private var trollStoreIPCServer: TrollStoreFileIPCServer?
     private let memoryDiagnostics = MemoryDiagnostics()
+    // Observability is kept outside the packet data path. The recorder writes
+    // bounded rows to the App Group SQLite file.
+    private let connectionHistoryRecorder = ConnectionHistoryRecorder()
 
     /// 隧道建立前抓取的物理网络 DNS，供配置里的 `system` nameserver 替换用。
     private var systemDNSServers: [String] = []
@@ -210,6 +213,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                     if #available(iOS 18.0, *) {
                         ControlCenter.shared.reloadControls(ofKind: ControlWidgetKind.vpn)
                     }
+                    self.connectionHistoryRecorder.start()
                     self.startPathMonitor() // 开始把真实出站接口喂给内核
                 }
                 return ok
@@ -298,6 +302,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 ControlCenter.shared.reloadControls(ofKind: ControlWidgetKind.vpn)
             }
             stopPathMonitor()
+            connectionHistoryRecorder.stop()
             memoryDiagnostics.stop(event: "stop")
             MihomoStop()
         }
