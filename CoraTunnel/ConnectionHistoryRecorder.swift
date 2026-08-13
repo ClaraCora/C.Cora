@@ -1,4 +1,5 @@
 import Foundation
+import Mihomo
 
 /// Samples Mihomo's bounded active-connection snapshot while the App may be
 /// absent, then writes only compact rows to the shared SQLite store. The sample
@@ -63,7 +64,7 @@ final class ConnectionHistoryRecorder {
             // missing ID might still be live, so rely on Mihomo's bounded
             // close queue instead of falsely ending it.
             if !snapshot.isTruncated {
-                store.finishActive(except: Set(snapshot.records.map(\.id)))
+                store.finishActive(except: Set(snapshot.records.map { $0.id }))
             }
         }
 
