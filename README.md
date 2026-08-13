@@ -1,6 +1,8 @@
 # Cora
 
-基于 [mihomo](https://github.com/MetaCubeX/mihomo) 内核的 iOS 代理客户端，SwiftUI + MVVM，个人自签自用。
+基于 [mihomo](https://github.com/MetaCubeX/mihomo) 内核的 iOS 代理客户端，SwiftUI + MVVM，个人自签测试。
+
+当前版本：**1.0.1**
 
 详细路线见 [PLAN.md](PLAN.md)。
 
@@ -52,10 +54,15 @@ bash scripts/prepare-xcode.sh --rebuild-core
 | NE 扩展 | `com.miclash.app.tunnel` |
 | App Group | `group.com.miclash.app` |
 
-## 进度
+## 功能概览
 
-- **Phase 0（进行中）**：工程地基 + CI + NE 空壳，验证 VPN 权限链路。
-- Phase 1：mihomo `gomobile bind` 化为 MihomoCore.xcframework。
-- Phase 2：tun 接管流量。
-- Phase 3：UI（ShipSwift）。
-- Phase 4：订阅/保活/打磨。
+- 总览、策略、记录、设置四个页面。
+- 策略页支持列表/网格模式，网格默认开启；分组可选图案、全部随机图案、节点选择和延迟测试。
+- 订阅支持远程 Provider 刷新，支持自定义订阅 UA。
+- 记录页支持活动连接详情、关闭连接、日志、策略/主机流量聚合和分页历史。
+- 记录使用 App Group SQLite 限制为最近 7 天、最多 20,000 条、约 50 MB；VPN 断开后清空本次会话。
+- 支持 GEO/ASN、隧道路由、STUN 直连拦截、混合代理端口和内核诊断。
+
+## 当前状态
+
+项目已完成主要功能和 CI 无签名 IPA 构建流程。后续以真机签名测试、证书更新和兼容性修复为主。

@@ -7,10 +7,12 @@ struct ProxiesView: View {
     @EnvironmentObject private var subscriptions: SubscriptionStore
     @StateObject private var controller = ProxyController()
     @State private var expanded: Set<String> = []
+    @State private var gridPopupGroup: String?
+    @State private var gridCardFrames: [String: CGRect] = [:]
     @State private var searchText = ""
     @State private var isSearchPresented = false
     @State private var groupGradients: [String: Int] = [:]
-    @AppStorage("proxyNodeLayout") private var layoutRawValue = ProxyNodeLayout.list.rawValue
+    @AppStorage("proxyNodeLayout") private var layoutRawValue = ProxyNodeLayout.grid.rawValue
     @AppStorage("proxyGroupGradients") private var gradientStorage = "{}"
 
     var body: some View {
@@ -48,6 +50,9 @@ struct ProxiesView: View {
             }
             .onChange(of: isSearchPresented) { _, presented in
                 if !presented { searchText = "" }
+            }
+            .onChange(of: layoutRawValue) { _, value in
+                if value != ProxyNodeLayout.grid.rawValue { gridPopupGroup = nil }
             }
         }
     }
@@ -180,8 +185,9 @@ struct ProxiesView: View {
                         onToggle: { openGroup(result.group.name) },
                         onTest: { Task { await controller.testGroup(result.group.name) } },
                         onTestNode: { name in Task { await controller.testNode(name, in: result.group.name) } },
-                        onGradient: { setGradient($0, for: result.group.name) },
-                        onSelect: { name in
+             onGradient: { setGradient($0, for: result.group.name) },
+             onRandomizeAll: nil,
+             onSelect: { name in
                             Task { await controller.select(group: result.group.name, name: name) }
                         })
                     .listRowInsets(EdgeInsets(top: 4, leading: 14, bottom: 4, trailing: 14))
@@ -202,9 +208,9 @@ struct ProxiesView: View {
         let rows = stride(from: 0, to: results.count, by: 2).map { index in
             Array(results[index..<min(index + 2, results.count)])
         }
-        return ScrollViewReader { proxy in
+        return GeometryReader { viewport in
             ScrollView {
-            LazyVStack(alignment: .leading, spacing: 14) {
+                LazyVStack(alignment: .leading, spacing: 14) {
                 if !controller.isRuntimeAvailable {
                     Label("VPN 未连接。选择会保存，并在下次连接时生效；测速需连接后使用。",
                           systemImage: "checkmark.circle")
@@ -229,7 +235,8 @@ struct ProxiesView: View {
                                         group: result.group,
                                         gradientIndex: groupGradient(for: result.group.name),
                                         onToggle: { openGroup(result.group.name) },
-                                        onGradient: { setGradient($0, for: result.group.name) })
+                                        onGradient: { setGradient($0, for: result.group.name) },
+                                        onRandomizeAll: randomizeAllGradients)
                                         .frame(maxWidth: .infinity)
                                 }
                                 if row.count == 1 {
@@ -238,28 +245,82 @@ struct ProxiesView: View {
                                         .accessibilityHidden(true)
                                 }
                             }
-                            if let expandedGroup = row.first(where: { $0.isExpanded }) {
-                                expandedPanel(for: expandedGroup)
-                                    .id(expandedPanelID(for: expandedGroup.group.name))
-                            }
                         }
                     }
                     .padding(.horizontal, 14)
                 }
+                .padding(.vertical, 10)
             }
-            .padding(.vertical, 10)
-        }
             .background(Color.clear)
+            .coordinateSpace(name: "proxy-grid")
             .refreshable { await reload() }
-            .onChange(of: expanded) { _, names in
-                guard let name = names.first else { return }
-                DispatchQueue.main.async {
-                    withAnimation(.easeOut(duration: 0.16)) {
-                        proxy.scrollTo(expandedPanelID(for: name), anchor: .top)
-                    }
+            .overlay {
+                if let name = gridPopupGroup,
+                   let group = controller.groups.first(where: { $0.name == name }),
+                   let frame = gridCardFrames[name] {
+                    gridPopup(group: group,
+                              cardFrame: frame,
+                              viewport: viewport.size)
+                        .transition(.opacity.combined(with: .scale(scale: 0.98)))
+                        .zIndex(10)
                 }
             }
+            .onPreferenceChange(GridCardFramePreferenceKey.self) { frames in
+                gridCardFrames = frames
+            }
         }
+        .frame(minHeight: 0)
+    }
+
+    @ViewBuilder
+    private func gridPopup(group: ProxyGroup,
+                           cardFrame: CGRect,
+                           viewport: CGSize) -> some View {
+        let popupWidth = min(max(280, viewport.width - 28), 420)
+        let popupHeight = min(max(250, viewport.height * 0.62), 460)
+        let x = min(max(14, cardFrame.midX - popupWidth / 2),
+                    max(14, viewport.width - popupWidth - 14))
+        let opensDown = cardFrame.midY < viewport.height / 2
+        ZStack(alignment: .topLeading) {
+            Color.black.opacity(0.001)
+                .ignoresSafeArea()
+                .contentShape(Rectangle())
+                .onTapGesture { withAnimation(.easeOut(duration: 0.16)) { gridPopupGroup = nil } }
+
+            GroupExpandedPanel(
+                group: group,
+                isTesting: controller.testing.contains(group.name),
+                canTest: controller.isRuntimeAvailable,
+                selecting: controller.selecting[group.name],
+                testingNodes: controller.testingNodes,
+                delays: controller.delays,
+             gradientIndex: groupGradient(for: group.name),
+                onToggle: { withAnimation(.easeOut(duration: 0.16)) { gridPopupGroup = nil } },
+                onTest: { Task { await controller.testGroup(group.name) } },
+                onTestNode: { name in Task { await controller.testNode(name, in: group.name) } },
+                onGradient: { setGradient($0, for: group.name) },
+                onRandomizeAll: randomizeAllGradients,
+                onSelect: { name in Task { await controller.select(group: group.name, name: name) } })
+                .frame(width: popupWidth, height: popupHeight)
+                .shadow(color: .black.opacity(0.20), radius: 24, y: 10)
+                .offset(x: x,
+                        y: opensDown ? cardFrame.maxY : max(14, cardFrame.minY - popupHeight))
+                .contentShape(Rectangle())
+                .onTapGesture { }
+                    }
+    }
+
+    private func randomizeAllGradients() {
+        var updated = groupGradients
+        for group in controller.groups {
+            updated[group.name] = Int.random(in: 0..<GroupGradient.palettes.count)
+        }
+        groupGradients = updated
+        persistGradients()
+    }
+
+    private func expandedPanelID(for name: String) -> String {
+        "proxy-expanded-\(name)"
     }
 
     @ViewBuilder
@@ -271,11 +332,12 @@ struct ProxiesView: View {
             selecting: controller.selecting[result.group.name],
             testingNodes: controller.testingNodes,
             delays: controller.delays,
-            gradientIndex: groupGradient(for: result.group.name),
+             gradientIndex: groupGradient(for: result.group.name),
             onToggle: { openGroup(result.group.name) },
             onTest: { Task { await controller.testGroup(result.group.name) } },
             onTestNode: { name in Task { await controller.testNode(name, in: result.group.name) } },
-            onGradient: { setGradient($0, for: result.group.name) },
+             onGradient: { setGradient($0, for: result.group.name) },
+             onRandomizeAll: nil,
             onSelect: { name in
                 Task { await controller.select(group: result.group.name, name: name) }
             })
@@ -315,14 +377,16 @@ struct ProxiesView: View {
 
     private func toggle(_ name: String) {
         guard normalizedSearch.isEmpty else { return }
+        if nodeLayout == .grid {
+            withAnimation(.easeOut(duration: 0.16)) {
+                gridPopupGroup = gridPopupGroup == name ? nil : name
+            }
+            return
+        }
         let animation: Animation? = nodeLayout == .list
             ? .easeOut(duration: 0.16)
             : .easeInOut(duration: 0.22)
         withAnimation(animation) {
-            if nodeLayout == .grid {
-                expanded = expanded.contains(name) ? [] : [name]
-                return
-            }
             if expanded.contains(name) {
                 expanded.remove(name)
             } else {
@@ -405,6 +469,15 @@ private struct DisplayedProxyGroup: Identifiable {
     var id: String { group.id }
 }
 
+private struct GridCardFramePreferenceKey: PreferenceKey {
+    static var defaultValue: [String: CGRect] = [:]
+
+    static func reduce(value: inout [String: CGRect],
+                       nextValue: () -> [String: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { $1 })
+    }
+}
+
 private struct StrategyGroupListPanel: View {
     let group: ProxyGroup
     let visibleNodes: [ProxyGroupNode]
@@ -436,7 +509,11 @@ private struct StrategyGroupListPanel: View {
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 7)
-            .contextMenu { GradientMenu(selected: gradientIndex, onSelect: onGradient) }
+            .contextMenu {
+                GradientMenu(selected: gradientIndex,
+                             onSelect: onGradient,
+                             onRandomizeAll: nil)
+            }
 
             if isExpanded {
                 Divider().overlay(Color.primary.opacity(0.10))
@@ -739,6 +816,7 @@ private struct GroupGridCard: View {
     let gradientIndex: Int
     let onToggle: () -> Void
     let onGradient: (Int) -> Void
+    let onRandomizeAll: (() -> Void)?
 
     var body: some View {
         GroupCompactHeader(group: group, onToggle: onToggle)
@@ -747,7 +825,15 @@ private struct GroupGridCard: View {
         .background(GroupGradient.background(for: gradientIndex))
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         .contextMenu {
-            GradientMenu(selected: gradientIndex, onSelect: onGradient)
+            GradientMenu(selected: gradientIndex, onSelect: onGradient,
+                         onRandomizeAll: onRandomizeAll)
+        }
+        .background {
+            GeometryReader { proxy in
+                Color.clear.preference(
+                    key: GridCardFramePreferenceKey.self,
+                    value: [group.name: proxy.frame(in: .named("proxy-grid"))])
+            }
         }
     }
 }
@@ -764,21 +850,26 @@ private struct GroupExpandedPanel: View {
     let onTest: () -> Void
     let onTestNode: (String) -> Void
     let onGradient: (Int) -> Void
+    let onRandomizeAll: (() -> Void)?
     let onSelect: (String) -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 10) {
             GroupExpandedHeader(group: group,
                                 isTesting: isTesting,
                                 canTest: canTest,
                                 onToggle: onToggle,
                                 onTest: onTest)
-            .contextMenu { GradientMenu(selected: gradientIndex, onSelect: onGradient) }
+            .contextMenu {
+                GradientMenu(selected: gradientIndex,
+                             onSelect: onGradient,
+                             onRandomizeAll: onRandomizeAll)
+            }
 
             LazyVGrid(columns: [
                 GridItem(.flexible(), spacing: 12),
                 GridItem(.flexible(), spacing: 12),
-            ], spacing: 12) {
+            ], spacing: 8) {
                 ForEach(group.nodes) { item in
                     GroupNodeGridCell(node: item,
                                       isCurrent: item.name == group.now,
@@ -793,10 +884,10 @@ private struct GroupExpandedPanel: View {
                 }
             }
         }
-        .padding(14)
+        .padding(10)
         .background(GroupGradient.background(for: gradientIndex))
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .animation(.easeInOut(duration: 0.22), value: group.id)
+        .animation(.easeOut(duration: 0.16), value: group.id)
     }
 }
 
@@ -886,7 +977,7 @@ private struct GroupNodeGridCell: View {
     }
 
     private var card: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 2) {
             HStack(alignment: .top, spacing: 6) {
                 Text(node.name)
                     .font(.subheadline.weight(isCurrent ? .semibold : .regular))
@@ -909,8 +1000,9 @@ private struct GroupNodeGridCell: View {
                 }
             }
         }
-        .padding(9)
-        .frame(maxWidth: .infinity, minHeight: 84, alignment: .topLeading)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .frame(maxWidth: .infinity, minHeight: 76, alignment: .topLeading)
         .background {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .fill(isCurrent
@@ -933,6 +1025,7 @@ private struct GroupNodeGridCell: View {
 private struct GradientMenu: View {
     let selected: Int
     let onSelect: (Int) -> Void
+    let onRandomizeAll: (() -> Void)?
 
     var body: some View {
         Menu("分组背景") {
@@ -940,6 +1033,12 @@ private struct GradientMenu: View {
                 Button { onSelect(index) } label: {
                     Label(GroupGradient.name(for: index),
                           systemImage: index == selected ? "checkmark" : "paintpalette")
+                }
+            }
+            if let onRandomizeAll {
+                Divider()
+                Button(action: onRandomizeAll) {
+                    Label("全部随机图案", systemImage: "shuffle")
                 }
             }
         }

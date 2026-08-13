@@ -22,6 +22,19 @@ struct SettingsView: View {
                                 tint: .orange,
                                 message: core.configNotices.joined(separator: "\n\n"))
                         }
+                        HStack {
+                            Label {
+                                InfoLabel(title: "订阅 UA", message: "拉取订阅时发送的 User-Agent。不同机场可能根据 UA 返回不同配置格式，修改后重新拉取订阅生效。")
+                            } icon: {
+                                Image(systemName: "network.badge.shield.half.filled")
+                            }
+                            Spacer()
+                            TextField("clash-meta", text: $settings.subscriptionUA)
+                                .multilineTextAlignment(.trailing)
+                                .autocorrectionDisabled()
+                                .textInputAutocapitalization(.never)
+                                .frame(maxWidth: 180)
+                        }
                     }
                     .listRowBackground(AppListRowBackground())
 
@@ -51,40 +64,6 @@ struct SettingsView: View {
 
                     Section {
                         HStack {
-                            Label {
-                                InfoLabel(title: "订阅 UA", message: "拉取订阅时发送的 User-Agent。不同机场可能根据 UA 返回不同配置格式，修改后重新拉取订阅生效。")
-                            } icon: {
-                                Image(systemName: "network.badge.shield.half.filled")
-                            }
-                            Spacer()
-                            TextField("clash-meta", text: $settings.subscriptionUA)
-                                .multilineTextAlignment(.trailing)
-                                .autocorrectionDisabled()
-                                .textInputAutocapitalization(.never)
-                                .frame(maxWidth: 180)
-                        }
-                    }
-                    .listRowBackground(AppListRowBackground())
-
-                    Section {
-                        HStack {
-                            Label {
-                                InfoLabel(title: "混合代理端口", message: "在本机回环监听 HTTP+SOCKS 混合代理端口，设为 0 表示关闭。")
-                            } icon: {
-                                Image(systemName: "point.3.connected.trianglepath.dotted")
-                            }
-                            Spacer()
-                            TextField("0=不开", value: $settings.mixedPort,
-                                      format: IntegerFormatStyle<Int>.number.grouping(.never))
-                                .keyboardType(.numberPad)
-                                .multilineTextAlignment(.trailing)
-                                .frame(width: 90)
-                        }
-                    }
-                    .listRowBackground(AppListRowBackground())
-
-                    Section {
-                        HStack {
                             Label("App 版本", systemImage: "info.circle")
                             Spacer()
                             Text(appVersion)
@@ -104,7 +83,7 @@ struct SettingsView: View {
 
     private var appVersion: String {
         let bundle = Bundle.main
-        let version = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.0"
+        let version = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0.1"
         let build = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1"
         return "\(version) (\(build))"
     }
@@ -173,6 +152,19 @@ private struct KernelSettingsView: View {
                     InfoLabel(title: "日志级别", message: "控制内核输出的日志详细程度。修改后重新连接 VPN 生效。")
                 }
                 InfoToggleRow(title: "启用 IPv6", message: "允许隧道处理 IPv6 流量。部分网络或配置不支持 IPv6 时可以关闭。", isOn: $settings.ipv6)
+                HStack {
+                    Label {
+                        InfoLabel(title: "混合代理端口", message: "在本机回环监听 HTTP+SOCKS 混合代理端口，设为 0 表示关闭。")
+                    } icon: {
+                        Image(systemName: "point.3.connected.trianglepath.dotted")
+                    }
+                    Spacer()
+                    TextField("0=不开", value: $settings.mixedPort,
+                              format: IntegerFormatStyle<Int>.number.grouping(.never))
+                        .keyboardType(.numberPad)
+                        .multilineTextAlignment(.trailing)
+                        .frame(width: 90)
+                }
                 NavigationLink {
                     ConfigOverrideSettingsView()
                 } label: {
