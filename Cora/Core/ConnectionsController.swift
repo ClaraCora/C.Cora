@@ -373,6 +373,8 @@ final class ConnectionsController: ObservableObject {
                 snapshot = latest
                 mergeSessionStatistics(with: latest.connections)
                 mergeHistory(with: latest.connections)
+                reconcileSessionTotals(uploadTotal: latest.uploadTotal,
+                                       downloadTotal: latest.downloadTotal)
                 persistSession()
                 error = nil
             } catch {
@@ -538,6 +540,16 @@ final class ConnectionsController: ObservableObject {
         var volume = volumes[key, default: ConnectionTrafficVolume()]
         volume.add(upload: upload, download: download)
         volumes[key] = volume
+    }
+
+    /// mihomo keeps traffic totals for the lifetime of the running tunnel, even
+    /// while the App process is not resident. Make those counters authoritative
+    /// when the App comes back so traffic from that gap is not lost.
+    private func reconcileSessionTotals(uploadTotal: Int64, downloadTotal: Int64) {
+        var updatedSummary = sessionSummary
+        updatedSummary.uploadTotal = max(updatedSummary.uploadTotal, max(0, uploadTotal))
+        updatedSummary.downloadTotal = max(updatedSummary.downloadTotal, max(0, downloadTotal))
+        sessionSummary = updatedSummary
     }
 
     /// Avoid counting an active connection twice when it briefly falls outside

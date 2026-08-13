@@ -386,7 +386,7 @@ private struct ConnectionListView: View {
                 filterBar
             } footer: {
                 if showsSessionLimitNote {
-                    Text("仅显示本次 VPN 会话；已结束记录最多保留最近 120 条。")
+                    Text("记录会跨 App 重启保留；已结束连接最多保留最近 120 条。")
                 }
             }
             .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0))
