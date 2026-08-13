@@ -205,6 +205,7 @@ struct ProxiesView: View {
         let rows = stride(from: 0, to: results.count, by: 2).map { index in
             Array(results[index..<min(index + 2, results.count)])
         }
+        let upwardExpansionStart = max(0, rows.count - 3)
         return GeometryReader { viewport in
             ScrollViewReader { proxy in
                 ScrollView {
@@ -225,8 +226,16 @@ struct ProxiesView: View {
                 if results.isEmpty {
                     ContentUnavailableView.search(text: searchText)
                 } else {
-                        ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                        ForEach(Array(rows.enumerated()), id: \.offset) { rowIndex, row in
                             VStack(alignment: .leading, spacing: 12) {
+                                // Keep the final three rows clear of the tab bar by placing
+                                // their expanded panel above the source cards.
+                                if rowIndex >= upwardExpansionStart,
+                                   let expandedGroup = row.first(where: { $0.isExpanded }) {
+                                    expandedPanel(for: expandedGroup)
+                                        .id(expandedPanelID(for: expandedGroup.group.name))
+                                }
+
                                 HStack(alignment: .top, spacing: 12) {
                                     ForEach(row) { result in
                                         GroupGridCard(
@@ -243,7 +252,8 @@ struct ProxiesView: View {
                                             .accessibilityHidden(true)
                                     }
                                 }
-                                if let expandedGroup = row.first(where: { $0.isExpanded }) {
+                                if rowIndex < upwardExpansionStart,
+                                   let expandedGroup = row.first(where: { $0.isExpanded }) {
                                     expandedPanel(for: expandedGroup)
                                         .id(expandedPanelID(for: expandedGroup.group.name))
                                 }
