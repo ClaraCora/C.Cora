@@ -295,7 +295,7 @@ final class ProxyController: ObservableObject {
     }
 
     /// 仅测试一个节点，结果写入与整组测速共用的延迟缓存。
-    func testNode(_ name: String) async {
+    func testNode(_ name: String, in group: String? = nil) async {
         guard isRuntimeAvailable, !testingNodes.contains(name) else { return }
         let session = sessionGeneration
         error = nil
@@ -306,7 +306,7 @@ final class ProxyController: ObservableObject {
             }
         }
         let result = await CoreStateManager.shared.sendMessage(
-            ["cmd": "proxyDelay", "name": name, "timeout": 5000])
+            ["cmd": "proxyDelay", "name": name, "group": group ?? "", "timeout": 5000])
         guard session == sessionGeneration else { return }
         switch result {
         case .ok(let data):

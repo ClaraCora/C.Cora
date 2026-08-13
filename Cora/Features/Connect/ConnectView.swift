@@ -23,9 +23,6 @@ struct ConnectView: View {
                                                samples: kernel.samples)
                         }
 
-                        if !core.configNotices.isEmpty {
-                            NoticesCard(notices: core.configNotices)
-                        }
                     }
                     .padding(.horizontal, 16)
                     .padding(.top, 28)
@@ -34,7 +31,6 @@ struct ConnectView: View {
                 .scrollIndicators(.hidden)
                 .background(Color.clear)
             }
-            .navigationTitle("总览")
             .navigationBarTitleDisplayMode(.inline)
             .task { await core.refreshStatus() }
         }
@@ -244,29 +240,6 @@ private extension KernelController.Mode {
     }
 }
 
-private struct NoticesCard: View {
-    let notices: [String]
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Label("配置提示", systemImage: "exclamationmark.triangle.fill")
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(.orange)
-            ForEach(notices, id: \.self) { notice in
-                Text("• \(notice)")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-        }
-        .padding(16)
-        .background(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(.regularMaterial)
-        )
-    }
-}
-
 private struct RuntimeMetricsGrid: View {
     let up: Int64
     let down: Int64
@@ -397,7 +370,7 @@ private struct MetricWidget: View {
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(tint)
             Text(value)
-                .font(.callout.monospacedDigit().weight(.semibold))
+                .font(.title3.monospacedDigit().weight(.semibold))
                 .lineLimit(1)
                 .minimumScaleFactor(0.65)
                 .foregroundStyle(.primary)

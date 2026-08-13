@@ -1780,10 +1780,23 @@ func GroupDelay(group, url string, timeoutMs int) string {
 
 // ProxyDelay 对单个代理做延迟测试，供策略页节点卡片的长按菜单使用。
 // 返回 {"delay": 毫秒}；失败返回 {"error": ...}。
-func ProxyDelay(name, url string, timeoutMs int) string {
+func ProxyDelay(name, group, url string, timeoutMs int) string {
 	configApplyMu.RLock()
 	defer configApplyMu.RUnlock()
 	p, exist := tunnel.Proxies()[name]
+	if !exist && strings.TrimSpace(group) != "" {
+		if parent, ok := tunnel.Proxies()[group]; ok {
+			if proxyGroup, ok := parent.Adapter().(outboundgroup.ProxyGroup); ok {
+				for _, member := range proxyGroup.Proxies() {
+					if member.Name() == name {
+						p = member
+						exist = true
+						break
+					}
+				}
+			}
+		}
+	}
 	if !exist {
 		return `{"error":"节点不存在"}`
 	}

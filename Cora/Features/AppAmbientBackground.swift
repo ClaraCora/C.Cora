@@ -1,40 +1,39 @@
 import SwiftUI
 
-/// 所有一级页面共用的苹果色系动态底色。色场按时间驱动，避免导航切换后动画状态丢失。
+/// 一级页面共用的静态苹果色系底色。
+/// 采用静态径向色场，避免滚动时持续触发高成本模糊动画。
 struct AppAmbientBackground: View {
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: reduceMotion ? 1 : 1.0 / 15.0)) { timeline in
-            GeometryReader { proxy in
-                let size = proxy.size
-                let time = reduceMotion ? 0 : timeline.date.timeIntervalSinceReferenceDate
+        GeometryReader { proxy in
+            let extent = max(proxy.size.width, proxy.size.height)
+            ZStack {
+                baseGradient
 
-                ZStack {
-                    baseGradient
+                RadialGradient(colors: [primaryField, .clear],
+                               center: .center,
+                               startRadius: 8,
+                               endRadius: extent * 0.72)
+                    .frame(width: extent * 1.42, height: extent * 1.18)
+                    .offset(x: -proxy.size.width * 0.28,
+                            y: -proxy.size.height * 0.28)
 
-                    ambientField(color: palette[0], size: size,
-                                 x: CGFloat(sin(time / 19)) * size.width * 0.24 - size.width * 0.18,
-                                 y: CGFloat(cos(time / 23)) * size.height * 0.17 - size.height * 0.28,
-                                 rotation: sin(time / 31) * 14)
+                RadialGradient(colors: [secondaryField, .clear],
+                               center: .center,
+                               startRadius: 8,
+                               endRadius: extent * 0.68)
+                    .frame(width: extent * 1.34, height: extent * 1.08)
+                    .offset(x: proxy.size.width * 0.30,
+                            y: proxy.size.height * 0.04)
 
-                    ambientField(color: palette[1], size: size,
-                                 x: CGFloat(cos(time / 21)) * size.width * 0.27 + size.width * 0.22,
-                                 y: CGFloat(sin(time / 27)) * size.height * 0.20 - size.height * 0.02,
-                                 rotation: cos(time / 29) * 18)
-
-                    ambientField(color: palette[2], size: size,
-                                 x: CGFloat(sin(time / 25 + 1.4)) * size.width * 0.30 - size.width * 0.08,
-                                 y: CGFloat(cos(time / 20 + 0.8)) * size.height * 0.18 + size.height * 0.30,
-                                 rotation: sin(time / 33 + 0.6) * 16)
-
-                    ambientField(color: palette[3], size: size,
-                                 x: CGFloat(cos(time / 28 + 2.1)) * size.width * 0.24 + size.width * 0.20,
-                                 y: CGFloat(sin(time / 24 + 1.7)) * size.height * 0.16 + size.height * 0.42,
-                                 rotation: cos(time / 35 + 0.4) * 12)
-                }
-                .compositingGroup()
+                RadialGradient(colors: [tertiaryField, .clear],
+                               center: .center,
+                               startRadius: 4,
+                               endRadius: extent * 0.64)
+                    .frame(width: extent * 1.25, height: extent * 0.92)
+                    .offset(x: -proxy.size.width * 0.06,
+                            y: proxy.size.height * 0.38)
             }
         }
         .ignoresSafeArea()
@@ -57,39 +56,27 @@ struct AppAmbientBackground: View {
                 Color(red: 0.91, green: 1.00, blue: 0.98),
             ]
         }
-        return LinearGradient(colors: colors, startPoint: .topLeading, endPoint: .bottomTrailing)
+        return LinearGradient(colors: colors,
+                              startPoint: .topLeading,
+                              endPoint: .bottomTrailing)
     }
 
-    private var palette: [Color] {
-        if colorScheme == .dark {
-            return [
-                Color(red: 0.08, green: 0.45, blue: 1.00).opacity(0.58),
-                Color(red: 0.72, green: 0.18, blue: 0.92).opacity(0.43),
-                Color(red: 0.00, green: 0.78, blue: 0.82).opacity(0.46),
-                Color(red: 0.96, green: 0.18, blue: 0.52).opacity(0.30),
-            ]
-        }
-        return [
-            Color(red: 0.00, green: 0.64, blue: 1.00).opacity(0.48),
-            Color(red: 0.72, green: 0.50, blue: 1.00).opacity(0.42),
-            Color(red: 0.00, green: 0.88, blue: 0.79).opacity(0.39),
-            Color(red: 1.00, green: 0.42, blue: 0.68).opacity(0.33),
-        ]
+    private var primaryField: Color {
+        colorScheme == .dark
+            ? Color(red: 0.08, green: 0.45, blue: 1.00).opacity(0.28)
+            : Color(red: 0.00, green: 0.64, blue: 1.00).opacity(0.22)
     }
 
-    private func ambientField(color: Color, size: CGSize,
-                              x: CGFloat, y: CGFloat, rotation: Double) -> some View {
-        let extent = max(size.width, size.height)
-        return Ellipse()
-            .fill(
-                RadialGradient(colors: [color, color.opacity(0.42), .clear],
-                               center: .center, startRadius: 8, endRadius: extent * 0.62)
-            )
-            .frame(width: extent * 1.45, height: extent * 0.82)
-            .blur(radius: colorScheme == .dark ? 48 : 56)
-            .rotationEffect(.degrees(rotation))
-            .offset(x: x, y: y)
-            .blendMode(colorScheme == .dark ? .screen : .normal)
+    private var secondaryField: Color {
+        colorScheme == .dark
+            ? Color(red: 0.72, green: 0.18, blue: 0.92).opacity(0.22)
+            : Color(red: 0.72, green: 0.50, blue: 1.00).opacity(0.20)
+    }
+
+    private var tertiaryField: Color {
+        colorScheme == .dark
+            ? Color(red: 0.00, green: 0.78, blue: 0.82).opacity(0.22)
+            : Color(red: 0.00, green: 0.88, blue: 0.79).opacity(0.18)
     }
 }
 

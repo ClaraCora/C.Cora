@@ -179,7 +179,7 @@ struct ProxiesView: View {
                         gradientIndex: groupGradient(for: result.group.name),
                         onToggle: { openGroup(result.group.name) },
                         onTest: { Task { await controller.testGroup(result.group.name) } },
-                        onTestNode: { name in Task { await controller.testNode(name) } },
+                        onTestNode: { name in Task { await controller.testNode(name, in: result.group.name) } },
                         onGradient: { setGradient($0, for: result.group.name) },
                         onSelect: { name in
                             Task { await controller.select(group: result.group.name, name: name) }
@@ -228,7 +228,7 @@ struct ProxiesView: View {
                             gradientIndex: groupGradient(for: expandedGroup.group.name),
                             onToggle: { openGroup(expandedGroup.group.name) },
                             onTest: { Task { await controller.testGroup(expandedGroup.group.name) } },
-                            onTestNode: { name in Task { await controller.testNode(name) } },
+                            onTestNode: { name in Task { await controller.testNode(name, in: expandedGroup.group.name) } },
                             onGradient: { setGradient($0, for: expandedGroup.group.name) },
                             onSelect: { name in
                                 Task { await controller.select(group: expandedGroup.group.name, name: name) }
@@ -438,8 +438,10 @@ private struct StrategyGroupListPanel: View {
                         }
                     }
                 }
+                .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
+        .animation(.easeInOut(duration: 0.22), value: isExpanded)
         .background(GroupGradient.background(for: gradientIndex))
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
@@ -611,9 +613,9 @@ private struct GroupIcon: View {
         .frame(width: 32, height: 32)
         .accessibilityHidden(true)
         .task(id: url) {
-            image = nil
-            failed = false
             guard let url else { return }
+            guard image == nil else { return }
+            failed = false
             await load(url)
         }
     }
@@ -662,6 +664,8 @@ private struct ProxyNodeListRow: View {
                       systemImage: isTestingDelay ? "hourglass" : "speedometer")
             }
             .disabled(!canTest || isTestingDelay)
+        } preview: {
+            Color.clear.frame(width: 1, height: 1)
         }
     }
 
@@ -677,10 +681,10 @@ private struct ProxyNodeListRow: View {
             .background {
                 if isCurrent {
                     RoundedRectangle(cornerRadius: 9, style: .continuous)
-                        .fill(Color.accentColor.opacity(0.24))
+                        .fill(Color.accentColor.opacity(0.10))
                         .overlay {
                             RoundedRectangle(cornerRadius: 9, style: .continuous)
-                                .stroke(Color.accentColor.opacity(0.72), lineWidth: 1.5)
+                                .stroke(Color.accentColor.opacity(0.42), lineWidth: 1)
                         }
                 }
             }
@@ -736,7 +740,7 @@ private struct GroupExpandedPanel: View {
                                 canTest: canTest,
                                 onToggle: onToggle,
                                 onTest: onTest)
-                .contextMenu { GradientMenu(selected: gradientIndex, onSelect: onGradient) }
+            .contextMenu { GradientMenu(selected: gradientIndex, onSelect: onGradient) }
 
             LazyVGrid(columns: [
                 GridItem(.flexible(), spacing: 12),
@@ -757,12 +761,9 @@ private struct GroupExpandedPanel: View {
             }
         }
         .padding(14)
-        .background {
-            GroupGradient.background(for: gradientIndex)
-                .contentShape(Rectangle())
-                .onTapGesture(perform: onToggle)
-        }
+        .background(GroupGradient.background(for: gradientIndex))
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .animation(.easeInOut(duration: 0.22), value: group.id)
     }
 }
 
@@ -807,6 +808,9 @@ private struct GroupExpandedHeader: View {
             .buttonStyle(SpeedTestButtonStyle())
             .foregroundStyle(Color.accentColor)
             .disabled(isTesting || !canTest)
+            .frame(width: 56, height: 56)
+            .contentShape(Rectangle())
+            .zIndex(2)
             .accessibilityLabel("测试\(group.name)延迟")
         }
     }
@@ -845,6 +849,8 @@ private struct GroupNodeGridCell: View {
                       systemImage: isTestingDelay ? "hourglass" : "speedometer")
             }
             .disabled(!canTest || isTestingDelay)
+        } preview: {
+            Color.clear.frame(width: 1, height: 1)
         }
     }
 
@@ -877,12 +883,12 @@ private struct GroupNodeGridCell: View {
         .background {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .fill(isCurrent
-                      ? Color.accentColor.opacity(0.28)
+                      ? Color.accentColor.opacity(0.12)
                       : Color(uiColor: .secondarySystemGroupedBackground).opacity(0.82))
                 .overlay {
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
                         .stroke(isCurrent
-                                ? Color.accentColor.opacity(0.86)
+                                ? Color.accentColor.opacity(0.48)
                                 : Color.primary.opacity(0.08),
                                 lineWidth: isCurrent ? 1.5 : 1)
                 }

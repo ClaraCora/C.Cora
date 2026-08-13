@@ -581,10 +581,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             }
         case "proxyDelay":
             let name = (obj?["name"] as? String) ?? ""
+            let group = (obj?["group"] as? String) ?? ""
             let url = (obj?["url"] as? String) ?? ""
             let timeout = (obj?["timeout"] as? NSNumber)?.intValue ?? 5000
             ipcQueue.async {
-                reply(Data(MihomoProxyDelay(name, url, timeout).utf8))
+                reply(Data(MihomoProxyDelay(name, group, url, timeout).utf8))
             }
         case "connections":
             let limit = (obj?["limit"] as? NSNumber)?.intValue ?? 200
