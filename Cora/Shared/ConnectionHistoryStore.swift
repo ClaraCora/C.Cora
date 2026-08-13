@@ -648,7 +648,7 @@ final class ConnectionHistoryStore: @unchecked Sendable {
     }
 
     private func bindText(_ value: String, to statement: OpaquePointer?, index: Int32) {
-        value.withCString { pointer in
+        _ = value.withCString { pointer in
             sqlite3_bind_text(statement, index, pointer, -1, Self.sqliteTransient)
         }
     }

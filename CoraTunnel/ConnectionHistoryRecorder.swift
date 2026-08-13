@@ -78,7 +78,7 @@ final class ConnectionHistoryRecorder {
                 // The close queue contains final tracker counters, so update
                 // the row before marking it inactive.
                 store.upsertActive(closed)
-                store.finish(ids: Set(closed.map(\.id)))
+                store.finish(ids: Set(closed.map { $0.id }))
             }
         }
 
