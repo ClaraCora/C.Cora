@@ -63,6 +63,8 @@ final class ProxyController: ObservableObject {
     @Published private(set) var delays: [String: Int] = ProxyController.loadCachedDelays()
     /// 正在测速的策略组名。
     @Published private(set) var testing: Set<String> = []
+    /// 正在单独测速的节点名。
+    @Published private(set) var testingNodes: Set<String> = []
     /// 正在切换的策略组与目标节点，避免重复点击并给节点行显示进度。
     @Published private(set) var selecting: [String: String] = [:]
     private var loadGeneration = 0
@@ -203,6 +205,7 @@ final class ProxyController: ObservableObject {
         error = nil
         // delays 保留：缓存跨会话生效，下一次测速或 load 修剪时更新
         testing = []
+        testingNodes = []
         selecting = [:]
     }
 
@@ -285,6 +288,41 @@ final class ProxyController: ObservableObject {
                 if let value = (ms as? NSNumber)?.intValue { updated[node] = value }
             }
             delays = updated
+            saveDelays()
+        case .failure(let reason):
+            self.error = "测速失败：\(reason)"
+        }
+    }
+
+    /// 仅测试一个节点，结果写入与整组测速共用的延迟缓存。
+    func testNode(_ name: String) async {
+        guard isRuntimeAvailable, !testingNodes.contains(name) else { return }
+        let session = sessionGeneration
+        error = nil
+        testingNodes.insert(name)
+        defer {
+            if session == sessionGeneration {
+                testingNodes.remove(name)
+            }
+        }
+        let result = await CoreStateManager.shared.sendMessage(
+            ["cmd": "proxyDelay", "name": name, "timeout": 5000])
+        guard session == sessionGeneration else { return }
+        switch result {
+        case .ok(let data):
+            guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+                self.error = "测速失败：响应非 JSON"
+                return
+            }
+            if let message = object["error"] as? String {
+                self.error = "测速失败：\(message)"
+                return
+            }
+            guard let delay = (object["delay"] as? NSNumber)?.intValue else {
+                self.error = "测速失败：响应缺少延迟"
+                return
+            }
+            delays[name] = delay
             saveDelays()
         case .failure(let reason):
             self.error = "测速失败：\(reason)"

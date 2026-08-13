@@ -5,31 +5,31 @@ struct ActivityView: View {
     @State private var selection: ActivitySection = .connections
 
     var body: some View {
-        ZStack {
-            AppAmbientBackground()
-            NavigationStack {
+        NavigationStack {
+            ZStack {
+                AppAmbientBackground()
                 VStack(spacing: 0) {
-                Picker("连接页面", selection: $selection) {
-                    ForEach(ActivitySection.allCases) { section in
-                        Label(section.title, systemImage: section.systemImage)
-                            .tag(section)
+                    Picker("连接页面", selection: $selection) {
+                        ForEach(ActivitySection.allCases) { section in
+                            Label(section.title, systemImage: section.systemImage)
+                                .tag(section)
+                        }
                     }
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .padding(.horizontal, 16)
-                .padding(.vertical, 8)
-                .background(.ultraThinMaterial)
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+                    .background(.ultraThinMaterial)
 
-                Group {
-                    switch selection {
-                    case .connections:
-                        ConnectionsView()
-                    case .logs:
-                        LogsView()
+                    Group {
+                        switch selection {
+                        case .connections:
+                            ConnectionsView()
+                        case .logs:
+                            LogsView()
+                        }
                     }
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
         }

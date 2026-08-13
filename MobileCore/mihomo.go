@@ -1778,6 +1778,39 @@ func GroupDelay(group, url string, timeoutMs int) string {
 	return string(out)
 }
 
+// ProxyDelay 对单个代理做延迟测试，供策略页节点卡片的长按菜单使用。
+// 返回 {"delay": 毫秒}；失败返回 {"error": ...}。
+func ProxyDelay(name, url string, timeoutMs int) string {
+	configApplyMu.RLock()
+	defer configApplyMu.RUnlock()
+	p, exist := tunnel.Proxies()[name]
+	if !exist {
+		return `{"error":"节点不存在"}`
+	}
+	if url == "" {
+		url = "https://www.gstatic.com/generate_204"
+	}
+	if timeoutMs <= 0 {
+		timeoutMs = 5000
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(timeoutMs))
+	defer cancel()
+
+	var expectedStatus utils.IntRanges[uint16]
+	delay, err := p.URLTest(ctx, url, expectedStatus)
+	if err != nil {
+		return `{"error":"` + err.Error() + `"}`
+	}
+	if delay == 0 {
+		return `{"error":"延迟测试失败"}`
+	}
+	out, err := json.Marshal(map[string]uint16{"delay": delay})
+	if err != nil {
+		return `{"error":"marshal: ` + err.Error() + `"}`
+	}
+	return string(out)
+}
+
 // Mode 返回当前模式字符串（rule/global/direct）。对应 Swift 侧 `MihomoMode()`。
 func Mode() string {
 	configApplyMu.RLock()

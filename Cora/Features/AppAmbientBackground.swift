@@ -1,69 +1,95 @@
 import SwiftUI
 
-/// 所有一级页面共用的苹果色系动态底色。内容区使用半透明系统材质，保留层次与可读性。
+/// 所有一级页面共用的苹果色系动态底色。色场按时间驱动，避免导航切换后动画状态丢失。
 struct AppAmbientBackground: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.colorScheme) private var colorScheme
-    @State private var drift = false
 
     var body: some View {
-        GeometryReader { proxy in
-            let size = proxy.size
-            ZStack {
-                baseColor
-                colorField(color(0), size: size,
-                           x: drift ? -size.width * 0.16 : size.width * 0.20,
-                           y: drift ? -size.height * 0.20 : size.height * 0.12,
-                           rotation: drift ? -20 : 12)
-                colorField(color(1), size: size,
-                           x: drift ? size.width * 0.27 : -size.width * 0.22,
-                           y: drift ? size.height * 0.12 : -size.height * 0.18,
-                           rotation: drift ? 24 : -16)
-                colorField(color(2), size: size,
-                           x: drift ? size.width * 0.04 : -size.width * 0.10,
-                           y: drift ? size.height * 0.36 : -size.height * 0.30,
-                           rotation: drift ? 8 : -8)
+        TimelineView(.animation(minimumInterval: reduceMotion ? 1 : 1.0 / 15.0)) { timeline in
+            GeometryReader { proxy in
+                let size = proxy.size
+                let time = reduceMotion ? 0 : timeline.date.timeIntervalSinceReferenceDate
+
+                ZStack {
+                    baseGradient
+
+                    ambientField(color: palette[0], size: size,
+                                 x: CGFloat(sin(time / 19)) * size.width * 0.24 - size.width * 0.18,
+                                 y: CGFloat(cos(time / 23)) * size.height * 0.17 - size.height * 0.28,
+                                 rotation: sin(time / 31) * 14)
+
+                    ambientField(color: palette[1], size: size,
+                                 x: CGFloat(cos(time / 21)) * size.width * 0.27 + size.width * 0.22,
+                                 y: CGFloat(sin(time / 27)) * size.height * 0.20 - size.height * 0.02,
+                                 rotation: cos(time / 29) * 18)
+
+                    ambientField(color: palette[2], size: size,
+                                 x: CGFloat(sin(time / 25 + 1.4)) * size.width * 0.30 - size.width * 0.08,
+                                 y: CGFloat(cos(time / 20 + 0.8)) * size.height * 0.18 + size.height * 0.30,
+                                 rotation: sin(time / 33 + 0.6) * 16)
+
+                    ambientField(color: palette[3], size: size,
+                                 x: CGFloat(cos(time / 28 + 2.1)) * size.width * 0.24 + size.width * 0.20,
+                                 y: CGFloat(sin(time / 24 + 1.7)) * size.height * 0.16 + size.height * 0.42,
+                                 rotation: cos(time / 35 + 0.4) * 12)
+                }
+                .compositingGroup()
             }
-            .ignoresSafeArea()
-            .onAppear { startAnimationIfNeeded() }
-            .onChange(of: reduceMotion) { _, _ in startAnimationIfNeeded() }
         }
+        .ignoresSafeArea()
         .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
 
-    private var baseColor: Color {
-        Color(uiColor: colorScheme == .dark ? .systemBackground : .systemGroupedBackground)
+    private var baseGradient: LinearGradient {
+        let colors: [Color]
+        if colorScheme == .dark {
+            colors = [
+                Color(red: 0.025, green: 0.035, blue: 0.075),
+                Color(red: 0.055, green: 0.045, blue: 0.105),
+                Color(red: 0.025, green: 0.075, blue: 0.095),
+            ]
+        } else {
+            colors = [
+                Color(red: 0.93, green: 0.98, blue: 1.00),
+                Color(red: 0.98, green: 0.94, blue: 1.00),
+                Color(red: 0.91, green: 1.00, blue: 0.98),
+            ]
+        }
+        return LinearGradient(colors: colors, startPoint: .topLeading, endPoint: .bottomTrailing)
     }
 
-    private func color(_ index: Int) -> Color {
-        let light: [Color] = [
-            .cyan.opacity(0.48), .pink.opacity(0.37), .mint.opacity(0.42),
+    private var palette: [Color] {
+        if colorScheme == .dark {
+            return [
+                Color(red: 0.08, green: 0.45, blue: 1.00).opacity(0.58),
+                Color(red: 0.72, green: 0.18, blue: 0.92).opacity(0.43),
+                Color(red: 0.00, green: 0.78, blue: 0.82).opacity(0.46),
+                Color(red: 0.96, green: 0.18, blue: 0.52).opacity(0.30),
+            ]
+        }
+        return [
+            Color(red: 0.00, green: 0.64, blue: 1.00).opacity(0.48),
+            Color(red: 0.72, green: 0.50, blue: 1.00).opacity(0.42),
+            Color(red: 0.00, green: 0.88, blue: 0.79).opacity(0.39),
+            Color(red: 1.00, green: 0.42, blue: 0.68).opacity(0.33),
         ]
-        let dark: [Color] = [
-            .blue.opacity(0.42), .purple.opacity(0.38), .teal.opacity(0.36),
-        ]
-        return (colorScheme == .dark ? dark : light)[index]
     }
 
-    private func colorField(_ color: Color, size: CGSize,
-                            x: CGFloat, y: CGFloat, rotation: Double) -> some View {
-        Ellipse()
-            .fill(color)
-            .frame(width: max(size.width, size.height) * 1.22,
-                   height: max(size.width, size.height) * 0.68)
-            .blur(radius: 86)
+    private func ambientField(color: Color, size: CGSize,
+                              x: CGFloat, y: CGFloat, rotation: Double) -> some View {
+        let extent = max(size.width, size.height)
+        return Ellipse()
+            .fill(
+                RadialGradient(colors: [color, color.opacity(0.42), .clear],
+                               center: .center, startRadius: 8, endRadius: extent * 0.62)
+            )
+            .frame(width: extent * 1.45, height: extent * 0.82)
+            .blur(radius: colorScheme == .dark ? 48 : 56)
             .rotationEffect(.degrees(rotation))
             .offset(x: x, y: y)
-    }
-
-    private func startAnimationIfNeeded() {
-        guard !reduceMotion else {
-            drift = false
-            return
-        }
-        withAnimation(.easeInOut(duration: 22).repeatForever(autoreverses: true)) {
-            drift = true
-        }
+            .blendMode(colorScheme == .dark ? .screen : .normal)
     }
 }
 

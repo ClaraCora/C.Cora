@@ -14,40 +14,40 @@ struct ProxiesView: View {
     @AppStorage("proxyGroupGradients") private var gradientStorage = "{}"
 
     var body: some View {
-        ZStack {
-            AppAmbientBackground()
-            NavigationStack {
+        NavigationStack {
+            ZStack {
+                AppAmbientBackground()
                 navigationContent
-                    .navigationTitle("")
-                    .navigationBarTitleDisplayMode(.inline)
-                    .toolbar {
-                        if showsSearch || canRefresh {
-                            ToolbarItemGroup(placement: .topBarTrailing) {
-                                if showsSearch {
-                                    layoutMenu
+            }
+            .navigationTitle("")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                if showsSearch || canRefresh {
+                    ToolbarItemGroup(placement: .topBarTrailing) {
+                        if showsSearch {
+                            layoutMenu
 
-                                    Button {
-                                        isSearchPresented = true
-                                    } label: {
-                                        Image(systemName: "magnifyingglass")
-                                    }
-                                    .accessibilityLabel("搜索节点")
-                                    .help("搜索节点")
-                                }
-                                refreshControl
+                            Button {
+                                isSearchPresented = true
+                            } label: {
+                                Image(systemName: "magnifyingglass")
                             }
+                            .accessibilityLabel("搜索节点")
+                            .help("搜索节点")
                         }
+                        refreshControl
                     }
-                    .task(id: LoadContext(status: core.status.rawValue,
-                                          subscriptionID: subscriptions.selectedID,
-                                          configurationUpdatedAt: subscriptions.selected?.updatedAt,
-                                          providerRevision: subscriptions.providerCacheRevision)) {
-                        loadGroupGradients()
-                        await reload()
-                    }
-                    .onChange(of: isSearchPresented) { _, presented in
-                        if !presented { searchText = "" }
-                    }
+                }
+            }
+            .task(id: LoadContext(status: core.status.rawValue,
+                                  subscriptionID: subscriptions.selectedID,
+                                  configurationUpdatedAt: subscriptions.selected?.updatedAt,
+                                  providerRevision: subscriptions.providerCacheRevision)) {
+                loadGroupGradients()
+                await reload()
+            }
+            .onChange(of: isSearchPresented) { _, presented in
+                if !presented { searchText = "" }
             }
         }
     }
@@ -174,10 +174,12 @@ struct ProxiesView: View {
                         canTest: controller.isRuntimeAvailable,
                         canToggle: normalizedSearch.isEmpty,
                         selecting: controller.selecting[result.group.name],
+                        testingNodes: controller.testingNodes,
                         delays: controller.delays,
                         gradientIndex: groupGradient(for: result.group.name),
                         onToggle: { openGroup(result.group.name) },
                         onTest: { Task { await controller.testGroup(result.group.name) } },
+                        onTestNode: { name in Task { await controller.testNode(name) } },
                         onGradient: { setGradient($0, for: result.group.name) },
                         onSelect: { name in
                             Task { await controller.select(group: result.group.name, name: name) }
@@ -221,10 +223,12 @@ struct ProxiesView: View {
                             isTesting: controller.testing.contains(expandedGroup.group.name),
                             canTest: controller.isRuntimeAvailable,
                             selecting: controller.selecting[expandedGroup.group.name],
+                            testingNodes: controller.testingNodes,
                             delays: controller.delays,
                             gradientIndex: groupGradient(for: expandedGroup.group.name),
                             onToggle: { openGroup(expandedGroup.group.name) },
                             onTest: { Task { await controller.testGroup(expandedGroup.group.name) } },
+                            onTestNode: { name in Task { await controller.testNode(name) } },
                             onGradient: { setGradient($0, for: expandedGroup.group.name) },
                             onSelect: { name in
                                 Task { await controller.select(group: expandedGroup.group.name, name: name) }
@@ -376,10 +380,12 @@ private struct StrategyGroupListPanel: View {
     let canTest: Bool
     let canToggle: Bool
     let selecting: String?
+    let testingNodes: Set<String>
     let delays: [String: Int]
     let gradientIndex: Int
     let onToggle: () -> Void
     let onTest: () -> Void
+    let onTestNode: (String) -> Void
     let onGradient: (Int) -> Void
     let onSelect: (String) -> Void
 
@@ -396,6 +402,7 @@ private struct StrategyGroupListPanel: View {
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 7)
+            .contextMenu { GradientMenu(selected: gradientIndex, onSelect: onGradient) }
 
             if isExpanded {
                 Divider().overlay(Color.primary.opacity(0.10))
@@ -414,7 +421,10 @@ private struct StrategyGroupListPanel: View {
                             isSelectionBlocked: selecting != nil,
                             selectable: group.selectable,
                             isReadOnly: !canTest && !group.selectable,
+                            canTest: canTest,
+                            isTestingDelay: testingNodes.contains(item.name),
                             delay: delays[item.name],
+                            onTestDelay: { onTestNode(item.name) },
                             onSelect: { onSelect(item.name) })
                         .padding(.horizontal, 14)
                         .padding(.vertical, 7)
@@ -432,7 +442,6 @@ private struct StrategyGroupListPanel: View {
         }
         .background(GroupGradient.background(for: gradientIndex))
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .contextMenu { GradientMenu(selected: gradientIndex, onSelect: onGradient) }
     }
 
     private var testButton: some View {
@@ -625,22 +634,34 @@ private struct ProxyNodeListRow: View {
     let isSelectionBlocked: Bool
     let selectable: Bool
     let isReadOnly: Bool
+    let canTest: Bool
+    let isTestingDelay: Bool
     let delay: Int?
+    let onTestDelay: () -> Void
     let onSelect: () -> Void
 
-    @ViewBuilder var body: some View {
-        if selectable && !isCurrent {
-            Button(action: onSelect) {
+    var body: some View {
+        Group {
+            if selectable && !isCurrent {
+                Button(action: onSelect) {
+                    row
+                }
+                .buttonStyle(.plain)
+                .disabled(isSelectionBlocked)
+                .accessibilityHint("双击切换到此节点")
+            } else if isCurrent {
+                row
+                    .accessibilityAddTraits(.isSelected)
+            } else {
                 row
             }
-            .buttonStyle(.plain)
-            .disabled(isSelectionBlocked)
-            .accessibilityHint("双击切换到此节点")
-        } else if isCurrent {
-            row
-                .accessibilityAddTraits(.isSelected)
-        } else {
-            row
+        }
+        .contextMenu {
+            Button(action: onTestDelay) {
+                Label(isTestingDelay ? "正在测速" : "测试此节点延迟",
+                      systemImage: isTestingDelay ? "hourglass" : "speedometer")
+            }
+            .disabled(!canTest || isTestingDelay)
         }
     }
 
@@ -653,6 +674,16 @@ private struct ProxyNodeListRow: View {
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(node)
             .accessibilityValue(accessibilityValue)
+            .background {
+                if isCurrent {
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .fill(Color.accentColor.opacity(0.24))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                .stroke(Color.accentColor.opacity(0.72), lineWidth: 1.5)
+                        }
+                }
+            }
     }
 
     private var accessibilityValue: String {
@@ -689,10 +720,12 @@ private struct GroupExpandedPanel: View {
     let isTesting: Bool
     let canTest: Bool
     let selecting: String?
+    let testingNodes: Set<String>
     let delays: [String: Int]
     let gradientIndex: Int
     let onToggle: () -> Void
     let onTest: () -> Void
+    let onTestNode: (String) -> Void
     let onGradient: (Int) -> Void
     let onSelect: (String) -> Void
 
@@ -703,6 +736,7 @@ private struct GroupExpandedPanel: View {
                                 canTest: canTest,
                                 onToggle: onToggle,
                                 onTest: onTest)
+                .contextMenu { GradientMenu(selected: gradientIndex, onSelect: onGradient) }
 
             LazyVGrid(columns: [
                 GridItem(.flexible(), spacing: 12),
@@ -714,23 +748,21 @@ private struct GroupExpandedPanel: View {
                                       isSelecting: selecting == item.name,
                                       isSelectionBlocked: selecting != nil,
                                       selectable: group.selectable,
+                                      canTest: canTest,
+                                      isTestingDelay: testingNodes.contains(item.name),
                                       delay: delays[item.name],
+                                      onTestDelay: { onTestNode(item.name) },
                                       onSelect: { onSelect(item.name) })
                 }
             }
         }
         .padding(14)
         .background {
-            // 节点卡片与测速按钮会优先接收点击；其余面板空白区域可直接收起。
-            Button(action: onToggle) { Color.clear.contentShape(Rectangle()) }
-                .buttonStyle(.plain)
-                .accessibilityLabel("收起\(group.name)")
+            GroupGradient.background(for: gradientIndex)
+                .contentShape(Rectangle())
+                .onTapGesture(perform: onToggle)
         }
-        .background(GroupGradient.background(for: gradientIndex))
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .contextMenu {
-            GradientMenu(selected: gradientIndex, onSelect: onGradient)
-        }
     }
 }
 
@@ -772,7 +804,7 @@ private struct GroupExpandedHeader: View {
                     .font(.system(size: 16, weight: .semibold))
                     .frame(width: 44, height: 44)
             }
-            .buttonStyle(.plain)
+            .buttonStyle(SpeedTestButtonStyle())
             .foregroundStyle(Color.accentColor)
             .disabled(isTesting || !canTest)
             .accessibilityLabel("测试\(group.name)延迟")
@@ -786,37 +818,78 @@ private struct GroupNodeGridCell: View {
     let isSelecting: Bool
     let isSelectionBlocked: Bool
     let selectable: Bool
+    let canTest: Bool
+    let isTestingDelay: Bool
     let delay: Int?
+    let onTestDelay: () -> Void
     let onSelect: () -> Void
 
     var body: some View {
-        Button(action: onSelect) {
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(alignment: .top, spacing: 6) {
-                    Text(node.name)
-                        .font(.subheadline.weight(isCurrent ? .semibold : .regular))
-                        .lineLimit(2)
-                        .frame(minHeight: 36, alignment: .topLeading)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    if isSelecting {
-                        ProgressView().controlSize(.mini)
-                    } else if isCurrent {
-                        Image(systemName: "checkmark.circle.fill").foregroundStyle(Color.accentColor)
-                    }
+        ZStack {
+            if selectable && !isCurrent {
+                Button(action: onSelect) { card }
+                    .buttonStyle(.plain)
+                    .disabled(isSelectionBlocked)
+            } else if isCurrent {
+                card
+                    .accessibilityAddTraits(.isSelected)
+                    .onTapGesture { }
+            } else {
+                card
+                    .onTapGesture { }
+            }
+        }
+        .contextMenu {
+            Button(action: onTestDelay) {
+                Label(isTestingDelay ? "正在测速" : "测试此节点延迟",
+                      systemImage: isTestingDelay ? "hourglass" : "speedometer")
+            }
+            .disabled(!canTest || isTestingDelay)
+        }
+    }
+
+    private var card: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .top, spacing: 6) {
+                Text(node.name)
+                    .font(.subheadline.weight(isCurrent ? .semibold : .regular))
+                    .lineLimit(2)
+                    .frame(minHeight: 36, alignment: .topLeading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                if isSelecting {
+                    ProgressView().controlSize(.mini)
+                } else if isCurrent {
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(Color.accentColor)
                 }
-                Spacer(minLength: 0)
-                HStack {
-                    Spacer()
+            }
+            Spacer(minLength: 0)
+            HStack {
+                Spacer()
+                if isTestingDelay {
+                    ProgressView().controlSize(.mini)
+                } else {
                     DelayBadge(delay: delay)
                 }
             }
-            .padding(9)
-            .frame(maxWidth: .infinity, minHeight: 84, alignment: .topLeading)
-            .background(isCurrent ? Color.accentColor.opacity(0.12) : Color(uiColor: .secondarySystemGroupedBackground).opacity(0.68))
-            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         }
-        .buttonStyle(.plain)
-        .disabled(!selectable || isCurrent || isSelectionBlocked)
+        .padding(9)
+        .frame(maxWidth: .infinity, minHeight: 84, alignment: .topLeading)
+        .background {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(isCurrent
+                      ? Color.accentColor.opacity(0.28)
+                      : Color(uiColor: .secondarySystemGroupedBackground).opacity(0.82))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .stroke(isCurrent
+                                ? Color.accentColor.opacity(0.86)
+                                : Color.primary.opacity(0.08),
+                                lineWidth: isCurrent ? 1.5 : 1)
+                }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(node.name)
+        .accessibilityValue(isCurrent ? "当前节点，\(DelayBadge.accessibilityText(delay))" : DelayBadge.accessibilityText(delay))
     }
 }
 

@@ -162,7 +162,7 @@ final class CoreStateManager: ObservableObject {
         let command = request["cmd"] as? String ?? ""
         let timeout: TimeInterval
         switch command {
-        case "groupDelay":
+        case "groupDelay", "proxyDelay":
             let milliseconds = (request["timeout"] as? NSNumber)?.doubleValue ?? 5_000
             timeout = max(10, milliseconds / 1_000 + 5)
         default:

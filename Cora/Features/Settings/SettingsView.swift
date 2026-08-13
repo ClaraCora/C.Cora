@@ -8,9 +8,9 @@ struct SettingsView: View {
     @State private var installedGeoInfo: GeoInstalledInfo?
 
     var body: some View {
-        ZStack {
-            AppAmbientBackground()
-            NavigationStack {
+        NavigationStack {
+            ZStack {
+                AppAmbientBackground()
                 Form {
                 Section {
                     NavigationLink {
