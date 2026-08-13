@@ -50,7 +50,8 @@ final class ConnectionHistoryRecorder {
             timer?.setEventHandler {}
             timer?.cancel()
             timer = nil
-            sampleLocked()
+            // The App clears the shared session history when the VPN reaches
+            // disconnected. Avoid a final write racing that clear operation.
             store?.finishAllActive()
         }
     }

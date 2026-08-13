@@ -202,7 +202,8 @@ struct ProxiesView: View {
         let rows = stride(from: 0, to: results.count, by: 2).map { index in
             Array(results[index..<min(index + 2, results.count)])
         }
-        return ScrollView {
+        return ScrollViewReader { proxy in
+            ScrollView {
             LazyVStack(alignment: .leading, spacing: 14) {
                 if !controller.isRuntimeAvailable {
                     Label("VPN 未连接。选择会保存，并在下次连接时生效；测速需连接后使用。",
@@ -239,6 +240,7 @@ struct ProxiesView: View {
                             }
                             if let expandedGroup = row.first(where: { $0.isExpanded }) {
                                 expandedPanel(for: expandedGroup)
+                                    .id(expandedPanelID(for: expandedGroup.group.name))
                             }
                         }
                     }
@@ -247,8 +249,17 @@ struct ProxiesView: View {
             }
             .padding(.vertical, 10)
         }
-        .background(Color.clear)
-        .refreshable { await reload() }
+            .background(Color.clear)
+            .refreshable { await reload() }
+            .onChange(of: expanded) { _, names in
+                guard let name = names.first else { return }
+                DispatchQueue.main.async {
+                    withAnimation(.easeOut(duration: 0.16)) {
+                        proxy.scrollTo(expandedPanelID(for: name), anchor: .top)
+                    }
+                }
+            }
+        }
     }
 
     @ViewBuilder
@@ -304,7 +315,10 @@ struct ProxiesView: View {
 
     private func toggle(_ name: String) {
         guard normalizedSearch.isEmpty else { return }
-        withAnimation(.easeInOut(duration: 0.22)) {
+        let animation: Animation? = nodeLayout == .list
+            ? .easeOut(duration: 0.16)
+            : .easeInOut(duration: 0.22)
+        withAnimation(animation) {
             if nodeLayout == .grid {
                 expanded = expanded.contains(name) ? [] : [name]
                 return
@@ -324,6 +338,10 @@ struct ProxiesView: View {
             searchText = ""
             expanded.insert(name)
         }
+    }
+
+    private func expandedPanelID(for name: String) -> String {
+        "proxy-expanded-\(name)"
     }
 
     private func reload() async {
@@ -681,6 +699,7 @@ private struct ProxyNodeListRow: View {
             }
             .disabled(!canTest || isTestingDelay)
         }
+        .contentShape(Rectangle())
     }
 
     private var row: some View {

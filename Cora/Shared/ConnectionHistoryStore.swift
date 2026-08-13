@@ -354,6 +354,17 @@ final class ConnectionHistoryStore: @unchecked Sendable {
         }
     }
 
+    /// Clears all records at a VPN session boundary.
+    func clearAll() {
+        queue.sync {
+            do {
+                try execute("DELETE FROM connection_history")
+                try execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                try execute("PRAGMA incremental_vacuum")
+            } catch { }
+        }
+    }
+
     func fetchPage(offset: Int, limit: Int = ConnectionHistoryStore.defaultPageSize)
         -> [ConnectionHistoryRecord] {
         queue.sync {

@@ -368,7 +368,12 @@ final class ConnectionsController: ObservableObject {
     func reset() {
         generation &+= 1
         snapshot = nil
-        reloadHistoryFromStore(activeConnections: [])
+        historyStore?.clearAll()
+        history = []
+        historySummary = .empty
+        historyOffset = 0
+        hasMoreHistory = false
+        lastHistoryRefreshDate = .distantPast
         isLoadingMoreHistory = false
         sessionSummary = ConnectionSessionSummary()
         activeSamples = [:]
@@ -381,6 +386,7 @@ final class ConnectionsController: ObservableObject {
         isClosingAll = false
         error = nil
         lastPersistenceDate = .distantPast
+        UserDefaults.standard.removeObject(forKey: Self.persistenceKey)
     }
 
     /// Flushes only compact view statistics. Full connection records live in
