@@ -249,8 +249,8 @@ struct ProxiesView: View {
                     }
                     .padding(.horizontal, 14)
                 }
+                }
                 .padding(.vertical, 10)
-            }
             }
             .background(Color.clear)
             .coordinateSpace(name: "proxy-grid")
@@ -403,10 +403,6 @@ struct ProxiesView: View {
             searchText = ""
             expanded.insert(name)
         }
-    }
-
-    private func expandedPanelID(for name: String) -> String {
-        "proxy-expanded-\(name)"
     }
 
     private func reload() async {
