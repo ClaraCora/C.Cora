@@ -205,9 +205,10 @@ struct ProxiesView: View {
         let rows = stride(from: 0, to: results.count, by: 2).map { index in
             Array(results[index..<min(index + 2, results.count)])
         }
-        return ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 14) {
+        return GeometryReader { viewport in
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 14) {
                 if !controller.isRuntimeAvailable {
                     Label("VPN 未连接。选择会保存，并在下次连接时生效；测速需连接后使用。",
                           systemImage: "checkmark.circle")
@@ -224,42 +225,49 @@ struct ProxiesView: View {
                 if results.isEmpty {
                     ContentUnavailableView.search(text: searchText)
                 } else {
-                    ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
-                        VStack(alignment: .leading, spacing: 12) {
-                            HStack(alignment: .top, spacing: 12) {
-                                ForEach(row) { result in
-                                    GroupGridCard(
-                                        group: result.group,
-                                        gradientIndex: groupGradient(for: result.group.name),
-                                        onToggle: { openGroup(result.group.name) },
-                                        onGradient: { setGradient($0, for: result.group.name) },
-                                        onRandomizeAll: randomizeAllGradients)
-                                        .frame(maxWidth: .infinity)
+                        ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                            VStack(alignment: .leading, spacing: 12) {
+                                HStack(alignment: .top, spacing: 12) {
+                                    ForEach(row) { result in
+                                        GroupGridCard(
+                                            group: result.group,
+                                            gradientIndex: groupGradient(for: result.group.name),
+                                            onToggle: { openGroup(result.group.name) },
+                                            onGradient: { setGradient($0, for: result.group.name) },
+                                            onRandomizeAll: randomizeAllGradients)
+                                            .frame(maxWidth: .infinity)
+                                    }
+                                    if row.count == 1 {
+                                        Color.clear
+                                            .frame(maxWidth: .infinity, minHeight: 76)
+                                            .accessibilityHidden(true)
+                                    }
                                 }
-                                if row.count == 1 {
-                                    Color.clear
-                                        .frame(maxWidth: .infinity, minHeight: 76)
-                                        .accessibilityHidden(true)
+                                if let expandedGroup = row.first(where: { $0.isExpanded }) {
+                                    expandedPanel(for: expandedGroup)
+                                        .id(expandedPanelID(for: expandedGroup.group.name))
                                 }
                             }
-                            if let expandedGroup = row.first(where: { $0.isExpanded }) {
-                                expandedPanel(for: expandedGroup)
-                                    .id(expandedPanelID(for: expandedGroup.group.name))
-                            }
+                        }
+                        // Leave enough scrollable content below an expanded panel so a
+                        // group near the bottom can still move into the readable area.
+                        if !expanded.isEmpty {
+                            Color.clear
+                                .frame(height: max(180, viewport.size.height * 0.62))
+                                .accessibilityHidden(true)
                         }
                     }
                     .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
                 }
-                }
-                .padding(.vertical, 10)
-            }
-            .background(Color.clear)
-            .refreshable { await reload() }
-            .onChange(of: expanded) { _, names in
-                guard let name = names.first else { return }
-                DispatchQueue.main.async {
-                    withAnimation(.easeOut(duration: 0.16)) {
-                        proxy.scrollTo(expandedPanelID(for: name), anchor: .top)
+                .background(Color.clear)
+                .refreshable { await reload() }
+                .onChange(of: expanded) { _, names in
+                    guard let name = names.first else { return }
+                    DispatchQueue.main.async {
+                        withAnimation(.easeOut(duration: 0.16)) {
+                            proxy.scrollTo(expandedPanelID(for: name), anchor: .top)
+                        }
                     }
                 }
             }
