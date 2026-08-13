@@ -199,7 +199,6 @@ struct ProxiesView: View {
             onTest: { Task { await controller.testGroup(group.name) } },
             onTestNode: { name in Task { await controller.testNode(name, in: group.name) } },
             onGradient: { setGradient($0, for: group.name) },
-            onRandomizeAll: nil,
             onSelect: { name in Task { await controller.select(group: group.name, name: name) } })
             .listRowInsets(EdgeInsets(top: 4, leading: 14, bottom: 4, trailing: 14))
             .listRowSeparator(.hidden)
