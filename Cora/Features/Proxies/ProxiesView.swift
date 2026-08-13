@@ -251,6 +251,7 @@ struct ProxiesView: View {
                 }
                 .padding(.vertical, 10)
             }
+            }
             .background(Color.clear)
             .coordinateSpace(name: "proxy-grid")
             .refreshable { await reload() }
@@ -304,7 +305,7 @@ struct ProxiesView: View {
                 .frame(width: popupWidth, height: popupHeight)
                 .shadow(color: .black.opacity(0.20), radius: 24, y: 10)
                 .offset(x: x,
-                        y: opensDown ? cardFrame.maxY : max(14, cardFrame.minY - popupHeight))
+                        y: opensDown ? cardFrame.minY : max(14, cardFrame.maxY - popupHeight))
                 .contentShape(Rectangle())
                 .onTapGesture { }
                     }
