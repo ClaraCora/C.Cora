@@ -170,29 +170,7 @@ struct ProxiesView: View {
                     .listRowBackground(Color.clear)
             } else {
                 ForEach(results) { result in
-                    StrategyGroupListPanel(
-                        group: result.group,
-                        visibleNodes: result.nodes,
-                        isExpanded: result.isExpanded,
-                        isTesting: controller.testing.contains(result.group.name),
-                        currentDelay: controller.delays[result.group.now],
-                        canTest: controller.isRuntimeAvailable,
-                        canToggle: normalizedSearch.isEmpty,
-                        selecting: controller.selecting[result.group.name],
-                        testingNodes: controller.testingNodes,
-                        delays: controller.delays,
-                        gradientIndex: groupGradient(for: result.group.name),
-                        onToggle: { openGroup(result.group.name) },
-                        onTest: { Task { await controller.testGroup(result.group.name) } },
-                        onTestNode: { name in Task { await controller.testNode(name, in: result.group.name) } },
-             onGradient: { setGradient($0, for: result.group.name) },
-             onRandomizeAll: nil,
-             onSelect: { name in
-                            Task { await controller.select(group: result.group.name, name: name) }
-                        })
-                    .listRowInsets(EdgeInsets(top: 4, leading: 14, bottom: 4, trailing: 14))
-                    .listRowSeparator(.hidden)
-                    .listRowBackground(Color.clear)
+                    listPanel(for: result)
                 }
             }
         }
@@ -201,6 +179,31 @@ struct ProxiesView: View {
         .scrollContentBackground(.hidden)
         .background(Color.clear)
         .refreshable { await reload() }
+    }
+
+    private func listPanel(for result: DisplayedProxyGroup) -> some View {
+        let group = result.group
+        return StrategyGroupListPanel(
+            group: group,
+            visibleNodes: result.nodes,
+            isExpanded: result.isExpanded,
+            isTesting: controller.testing.contains(group.name),
+            currentDelay: controller.delays[group.now],
+            canTest: controller.isRuntimeAvailable,
+            canToggle: normalizedSearch.isEmpty,
+            selecting: controller.selecting[group.name],
+            testingNodes: controller.testingNodes,
+            delays: controller.delays,
+            gradientIndex: groupGradient(for: group.name),
+            onToggle: { openGroup(group.name) },
+            onTest: { Task { await controller.testGroup(group.name) } },
+            onTestNode: { name in Task { await controller.testNode(name, in: group.name) } },
+            onGradient: { setGradient($0, for: group.name) },
+            onRandomizeAll: nil,
+            onSelect: { name in Task { await controller.select(group: group.name, name: name) } })
+            .listRowInsets(EdgeInsets(top: 4, leading: 14, bottom: 4, trailing: 14))
+            .listRowSeparator(.hidden)
+            .listRowBackground(Color.clear)
     }
 
     private var gridGroupList: some View {
