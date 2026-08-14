@@ -13,6 +13,7 @@ import (
 	"container/heap"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -2088,7 +2089,7 @@ func GroupDelay(group, url string, timeoutMs int) string {
 }
 
 // ProxyDelay 对单个代理做延迟测试，供策略页节点卡片的长按菜单使用。
-// 返回 {"delay": 毫秒}；失败返回 {"error": ...}。
+// 返回 {"delay": 毫秒}，超时为 0；其他失败返回 {"error": ...}。
 func ProxyDelay(name, group, url string, timeoutMs int) string {
 	configApplyMu.RLock()
 	defer configApplyMu.RUnlock()
@@ -2121,16 +2122,28 @@ func ProxyDelay(name, group, url string, timeoutMs int) string {
 	var expectedStatus utils.IntRanges[uint16]
 	delay, err := p.URLTest(ctx, url, expectedStatus)
 	if err != nil {
+		if proxyDelayTimedOut(ctx, err) {
+			return `{"delay":0}`
+		}
 		return `{"error":"` + err.Error() + `"}`
 	}
 	if delay == 0 {
-		return `{"error":"延迟测试失败"}`
+		return `{"delay":0}`
 	}
 	out, err := json.Marshal(map[string]uint16{"delay": delay})
 	if err != nil {
 		return `{"error":"marshal: ` + err.Error() + `"}`
 	}
 	return string(out)
+}
+
+func proxyDelayTimedOut(ctx context.Context, err error) bool {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) ||
+		errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var networkError net.Error
+	return errors.As(err, &networkError) && networkError.Timeout()
 }
 
 // Mode 返回当前模式字符串（rule/global/direct）。对应 Swift 侧 `MihomoMode()`。
