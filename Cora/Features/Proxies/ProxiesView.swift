@@ -167,7 +167,6 @@ struct ProxiesView: View {
 
         return ScrollView {
             LazyVStack(alignment: .leading, spacing: 10) {
-                strategyScrollOffsetMarker
                 if !controller.isRuntimeAvailable {
                     Label("VPN 未连接。选择会保存，并在下次连接时生效；测速需连接后使用。",
                           systemImage: "checkmark.circle")
@@ -204,6 +203,7 @@ struct ProxiesView: View {
             .padding(.horizontal, 14)
             .padding(.vertical, 6)
             .animation(.easeOut(duration: 0.16), value: expanded)
+            .background(strategyScrollOffsetReporter)
         }
         .coordinateSpace(name: StrategyCoordinateSpace.name)
         .simultaneousGesture(listDismissGesture(activeGroupName))
@@ -261,7 +261,6 @@ struct ProxiesView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 14) {
-                strategyScrollOffsetMarker
                 if !controller.isRuntimeAvailable {
                     Label("VPN 未连接。选择会保存，并在下次连接时生效；测速需连接后使用。",
                           systemImage: "checkmark.circle")
@@ -344,6 +343,7 @@ struct ProxiesView: View {
                                 .accessibilityHidden(true)
                         }
                     }
+                    .background(strategyScrollOffsetReporter)
                 }
                 .coordinateSpace(name: GridCoordinateSpace.name)
                     .padding(.horizontal, 14)
@@ -562,13 +562,12 @@ struct ProxiesView: View {
         return index / 2
     }
 
-    private var strategyScrollOffsetMarker: some View {
+    private var strategyScrollOffsetReporter: some View {
         GeometryReader { geometry in
             Color.clear.preference(
                 key: StrategyScrollOffsetPreferenceKey.self,
                 value: geometry.frame(in: .named(StrategyCoordinateSpace.name)).minY)
         }
-        .frame(height: 0)
         .accessibilityHidden(true)
     }
 
