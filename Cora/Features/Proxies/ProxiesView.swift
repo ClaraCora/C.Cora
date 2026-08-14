@@ -337,8 +337,6 @@ struct ProxiesView: View {
                     }
                 }
                 .coordinateSpace(name: GridCoordinateSpace.name)
-                .coordinateSpace(name: StrategyCoordinateSpace.name)
-                .simultaneousGesture(gridDismissGesture(activeGroupName))
                     .padding(.horizontal, 14)
                     .padding(.vertical, 6)
                 }
@@ -366,6 +364,9 @@ struct ProxiesView: View {
             }
         }
         .frame(minHeight: 0)
+        .coordinateSpace(name: StrategyCoordinateSpace.name)
+        .contentShape(Rectangle())
+        .simultaneousGesture(gridDismissGesture(activeGroupName))
     }
 
     private func randomizeAllGradients() {
@@ -1203,15 +1204,20 @@ private struct ProxyNodeRow: View {
                 .lineLimit(dynamicTypeSize.isAccessibilitySize ? 3 : 2)
                 .fixedSize(horizontal: false, vertical: true)
             if let subtitle, !subtitle.isEmpty {
-                Text(subtitle)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(dynamicTypeSize.isAccessibilitySize ? 3 : 2)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            HStack(spacing: 8) {
-                Spacer(minLength: 4)
-                DelayBadge(delay: delay)
+                HStack(spacing: 8) {
+                    Text(subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Spacer(minLength: 4)
+                    DelayBadge(delay: delay)
+                }
+            } else {
+                HStack(spacing: 8) {
+                    Spacer(minLength: 4)
+                    DelayBadge(delay: delay)
+                }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
