@@ -11,7 +11,6 @@ struct ProxiesView: View {
     @State private var gridRestoreAnchors: [String: UnitPoint] = [:]
     @State private var gridScrollRequest: GridScrollRequest?
     @State private var expandedPanelFrames: [String: CGRect] = [:]
-    @State private var lastStrategyScrollOffset: CGFloat?
     @State private var toolbarControlsVisible = true
     @State private var searchText = ""
     @State private var isSearchPresented = false
@@ -28,8 +27,8 @@ struct ProxiesView: View {
             .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                if toolbarControlsVisible && (showsSearch || canRefresh) {
-                    ToolbarItemGroup(placement: .topBarTrailing) {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    HStack(spacing: 4) {
                         if showsSearch {
                             layoutMenu
 
@@ -41,11 +40,23 @@ struct ProxiesView: View {
                             .accessibilityLabel("搜索节点")
                             .help("搜索节点")
                         }
-                        refreshControl
+                        if canRefresh {
+                            refreshControl
+                        }
                     }
+                    .opacity(toolbarControlsVisible ? 1 : 0)
+                    .allowsHitTesting(toolbarControlsVisible)
+                    .accessibilityHidden(!toolbarControlsVisible)
+                    .frame(width: toolbarControlsVisible && (showsSearch || canRefresh) ? nil : 0,
+                           height: 44,
+                           alignment: .trailing)
+                    .clipped()
+                    .animation(.easeOut(duration: 0.16), value: toolbarControlsVisible)
                 }
             }
-            .animation(.easeOut(duration: 0.16), value: toolbarControlsVisible)
+            .onAppear {
+                toolbarControlsVisible = true
+            }
             .task(id: LoadContext(status: core.status.rawValue,
                                   subscriptionID: subscriptions.selectedID,
                                   configurationUpdatedAt: subscriptions.selected?.updatedAt,
@@ -55,6 +66,7 @@ struct ProxiesView: View {
             }
             .onChange(of: isSearchPresented) { _, presented in
                 if !presented { searchText = "" }
+                toolbarControlsVisible = true
             }
             .onChange(of: layoutRawValue) { _, value in
                 // Both layouts share one expansion model. Keep a single valid group
@@ -63,7 +75,6 @@ struct ProxiesView: View {
                 expanded = retained.map { [$0] } ?? []
                 gridScrollRequest = nil
                 expandedPanelFrames = [:]
-                lastStrategyScrollOffset = nil
                 toolbarControlsVisible = true
             }
         }
@@ -203,15 +214,13 @@ struct ProxiesView: View {
             .padding(.horizontal, 14)
             .padding(.vertical, 6)
             .animation(.easeOut(duration: 0.16), value: expanded)
-            .background(strategyScrollOffsetReporter)
         }
         .coordinateSpace(name: StrategyCoordinateSpace.name)
         .simultaneousGesture(listDismissGesture(activeGroupName))
+        .simultaneousGesture(strategyToolbarGesture())
         .onPreferenceChange(ExpandedPanelFramePreferenceKey.self) { frames in
             expandedPanelFrames = frames
         }
-        .onPreferenceChange(StrategyScrollOffsetPreferenceKey.self,
-                            perform: updateToolbarVisibility(for:))
         .scrollContentBackground(.hidden)
         .background(Color.clear)
         .refreshable { await reload() }
@@ -260,11 +269,7 @@ struct ProxiesView: View {
         return GeometryReader { viewport in
             ScrollViewReader { proxy in
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 0) {
-                        strategyScrollOffsetReporter
-                            .frame(height: 0)
-
-                        LazyVStack(alignment: .leading, spacing: 14) {
+                    LazyVStack(alignment: .leading, spacing: 14) {
                 if !controller.isRuntimeAvailable {
                     Label("VPN 未连接。选择会保存，并在下次连接时生效；测速需连接后使用。",
                           systemImage: "checkmark.circle")
@@ -347,8 +352,6 @@ struct ProxiesView: View {
                                 .accessibilityHidden(true)
                         }
                     }
-                        }
-                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .coordinateSpace(name: GridCoordinateSpace.name)
                     .padding(.horizontal, 14)
@@ -364,8 +367,6 @@ struct ProxiesView: View {
                 .onPreferenceChange(ExpandedPanelFramePreferenceKey.self) { frames in
                     expandedPanelFrames = frames
                 }
-                .onPreferenceChange(StrategyScrollOffsetPreferenceKey.self,
-                                    perform: updateToolbarVisibility(for:))
                 .task(id: gridScrollRequest) {
                     guard let request = gridScrollRequest else { return }
                     // Re-apply the target after the expanded panel has completed layout.
@@ -383,6 +384,7 @@ struct ProxiesView: View {
         .coordinateSpace(name: StrategyCoordinateSpace.name)
         .contentShape(Rectangle())
         .simultaneousGesture(gridDismissGesture(activeGroupName))
+        .simultaneousGesture(strategyToolbarGesture())
     }
 
     private func randomizeAllGradients() {
@@ -567,30 +569,21 @@ struct ProxiesView: View {
         return index / 2
     }
 
-    private var strategyScrollOffsetReporter: some View {
-        GeometryReader { geometry in
-            Color.clear.preference(
-                key: StrategyScrollOffsetPreferenceKey.self,
-                value: geometry.frame(in: .named(StrategyCoordinateSpace.name)).minY)
-        }
-        .accessibilityHidden(true)
-    }
+    private func strategyToolbarGesture() -> some Gesture {
+        DragGesture(minimumDistance: 8, coordinateSpace: .local)
+            .onChanged { value in
+                guard !isSearchPresented else { return }
+                let vertical = value.translation.height
+                let horizontal = value.translation.width
+                guard abs(vertical) >= 12,
+                      abs(vertical) > abs(horizontal) else { return }
 
-    private func updateToolbarVisibility(for offset: CGFloat) {
-        guard let previousOffset = lastStrategyScrollOffset else {
-            lastStrategyScrollOffset = offset
-            return
-        }
-
-        let delta = offset - previousOffset
-        guard abs(delta) >= 5 else { return }
-        let shouldShow = delta > 0
-        if shouldShow != toolbarControlsVisible {
-            withAnimation(.easeOut(duration: 0.16)) {
-                toolbarControlsVisible = shouldShow
+                let shouldShow = vertical > 0
+                guard shouldShow != toolbarControlsVisible else { return }
+                withAnimation(.easeOut(duration: 0.16)) {
+                    toolbarControlsVisible = shouldShow
+                }
             }
-        }
-        lastStrategyScrollOffset = offset
     }
 
     private func reload() async {
@@ -682,14 +675,6 @@ private struct ExpandedPanelFramePreferenceKey: PreferenceKey {
     static func reduce(value: inout [String: CGRect],
                        nextValue: () -> [String: CGRect]) {
         value.merge(nextValue(), uniquingKeysWith: { _, latest in latest })
-    }
-}
-
-private struct StrategyScrollOffsetPreferenceKey: PreferenceKey {
-    static var defaultValue: CGFloat = .zero
-
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = nextValue()
     }
 }
 
