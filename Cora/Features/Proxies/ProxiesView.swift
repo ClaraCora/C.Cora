@@ -343,7 +343,9 @@ struct ProxiesView: View {
                                 .accessibilityHidden(true)
                         }
                     }
-                    .background(strategyScrollOffsetReporter)
+                    .background {
+                        strategyScrollOffsetReporter
+                    }
                 }
                 .coordinateSpace(name: GridCoordinateSpace.name)
                     .padding(.horizontal, 14)
