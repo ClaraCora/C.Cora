@@ -311,7 +311,6 @@ struct ProxiesView: View {
                                 .accessibilityHidden(true)
                         }
                     }
-                    .contentShape(Rectangle())
                     .onTapGesture {
                         guard let name = activeGroupName,
                               let rowIndex = gridRowIndex(for: name) else { return }
@@ -332,7 +331,7 @@ struct ProxiesView: View {
                 .task(id: gridScrollRequest) {
                     guard let request = gridScrollRequest else { return }
                     // Re-apply the target after the expanded panel has completed layout.
-                    for delay in [60_000_000, 180_000_000] {
+                    for delay in [UInt64(60_000_000), UInt64(180_000_000)] {
                         try? await Task.sleep(nanoseconds: delay)
                         guard !Task.isCancelled else { return }
                         withAnimation(.easeOut(duration: 0.16)) {
