@@ -311,11 +311,11 @@ struct ProxiesView: View {
                                 .accessibilityHidden(true)
                         }
                     }
-                    .onTapGesture {
-                        guard let name = activeGroupName,
-                              let rowIndex = gridRowIndex(for: name) else { return }
-                        closeGridGroup(name, rowIndex: rowIndex)
-                    }
+                }
+                .onTapGesture {
+                    guard let name = activeGroupName,
+                          let rowIndex = gridRowIndex(for: name) else { return }
+                    closeGridGroup(name, rowIndex: rowIndex)
                 }
                     .padding(.horizontal, 14)
                     .padding(.vertical, 6)
