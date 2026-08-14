@@ -11,6 +11,13 @@ struct ProxyGroupNode: Identifiable {
     let normalizedSearchText: String
 }
 
+/// A node test is scoped to one strategy group. This prevents equal node names
+/// in different groups from sharing an in-progress state.
+struct ProxyNodeTestKey: Hashable {
+    let group: String
+    let node: String
+}
+
 /// 一个策略组。
 struct ProxyGroup: Identifiable {
     var id: String { name }
@@ -63,8 +70,8 @@ final class ProxyController: ObservableObject {
     @Published private(set) var delays: [String: Int] = ProxyController.loadCachedDelays()
     /// 正在测速的策略组名。
     @Published private(set) var testing: Set<String> = []
-    /// 正在单独测速的节点名。
-    @Published private(set) var testingNodes: Set<String> = []
+    /// 正在单独测速的节点，以策略组和节点名共同标识。
+    @Published private(set) var testingNodes: Set<ProxyNodeTestKey> = []
     /// 正在切换的策略组与目标节点，避免重复点击并给节点行显示进度。
     @Published private(set) var selecting: [String: String] = [:]
     private var loadGeneration = 0
@@ -307,13 +314,14 @@ final class ProxyController: ObservableObject {
 
     /// 仅测试一个节点，结果写入与整组测速共用的延迟缓存。
     func testNode(_ name: String, in group: String? = nil) async {
-        guard isRuntimeAvailable, !testingNodes.contains(name) else { return }
+        let testingKey = ProxyNodeTestKey(group: group ?? "", node: name)
+        guard isRuntimeAvailable, !testingNodes.contains(testingKey) else { return }
         let session = sessionGeneration
         error = nil
-        testingNodes.insert(name)
+        testingNodes.insert(testingKey)
         defer {
             if session == sessionGeneration {
-                testingNodes.remove(name)
+                testingNodes.remove(testingKey)
             }
         }
         let result = await CoreStateManager.shared.sendMessage(

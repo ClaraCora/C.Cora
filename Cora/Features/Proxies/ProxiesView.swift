@@ -15,6 +15,7 @@ struct ProxiesView: View {
     @State private var searchText = ""
     @State private var isSearchPresented = false
     @State private var groupGradients: [String: Int] = [:]
+    @State private var activeNodeTestTarget: ProxyNodeTestTarget?
     @AppStorage("proxyNodeLayout") private var layoutRawValue = ProxyNodeLayout.grid.rawValue
     @AppStorage("proxyGroupGradients") private var gradientStorage = "{}"
 
@@ -76,6 +77,7 @@ struct ProxiesView: View {
                 gridScrollRequest = nil
                 expandedPanelFrames = [:]
                 toolbarControlsVisible = true
+                activeNodeTestTarget = nil
             }
         }
     }
@@ -243,7 +245,8 @@ struct ProxiesView: View {
             gradientIndex: groupGradient(for: group.name),
             onToggle: { toggleListGroup(group.name) },
             onTest: { Task { await controller.testGroup(group.name) } },
-            onTestNode: { name in Task { await controller.testNode(name, in: group.name) } },
+            onTestActiveNode: testActiveNode,
+            onPrepareTestTarget: prepareNodeTestTarget,
             onGradient: { setGradient($0, for: group.name) },
             onRandomizeAll: randomizeAllGradients,
             onSelect: { name in Task { await controller.select(group: group.name, name: name) } })
@@ -415,11 +418,12 @@ struct ProxiesView: View {
             selecting: controller.selecting[result.group.name],
             testingNodes: controller.testingNodes,
             delays: controller.delays,
-             gradientIndex: groupGradient(for: result.group.name),
+            gradientIndex: groupGradient(for: result.group.name),
             onToggle: onToggle,
             onTest: { Task { await controller.testGroup(result.group.name) } },
-            onTestNode: { name in Task { await controller.testNode(name, in: result.group.name) } },
-             onGradient: { setGradient($0, for: result.group.name) },
+            onTestActiveNode: testActiveNode,
+            onPrepareTestTarget: prepareNodeTestTarget,
+            onGradient: { setGradient($0, for: result.group.name) },
             onRandomizeAll: randomizeAllGradients,
             onSelect: { name in
                 Task { await controller.select(group: result.group.name, name: name) }
@@ -431,6 +435,21 @@ struct ProxiesView: View {
                     value: [result.group.name: geometry.frame(
                         in: .named(StrategyCoordinateSpace.name))])
             }
+        }
+    }
+
+    private func prepareNodeTestTarget(_ target: ProxyNodeTestTarget) {
+        guard activeNodeTestTarget != target else { return }
+        activeNodeTestTarget = target
+    }
+
+    /// Lazy SwiftUI containers can retain a context menu's first action closure.
+    /// Resolve the target from page state when the action actually runs.
+    private func testActiveNode() {
+        guard let target = activeNodeTestTarget else { return }
+        activeNodeTestTarget = nil
+        Task {
+            await controller.testNode(target.nodeName, in: target.groupName)
         }
     }
 
@@ -686,6 +705,14 @@ private struct DisplayedProxyGroup: Identifiable {
     var id: String { group.id }
 }
 
+private struct ProxyNodeTestTarget: Hashable, Identifiable {
+    let groupName: String
+    let nodeName: String
+    let nodeID: ProxyGroupNode.ID
+
+    var id: ProxyGroupNode.ID { nodeID }
+}
+
 private struct StrategyGroupListPanel: View {
     let group: ProxyGroup
     let allGroups: [ProxyGroup]
@@ -695,12 +722,13 @@ private struct StrategyGroupListPanel: View {
     let isTesting: Bool
     let canTest: Bool
     let selecting: String?
-    let testingNodes: Set<String>
+    let testingNodes: Set<ProxyNodeTestKey>
     let delays: [String: Int]
     let gradientIndex: Int
     let onToggle: () -> Void
     let onTest: () -> Void
-    let onTestNode: (String) -> Void
+    let onTestActiveNode: () -> Void
+    let onPrepareTestTarget: (ProxyNodeTestTarget) -> Void
     let onGradient: (Int) -> Void
     let onRandomizeAll: () -> Void
     let onSelect: (String) -> Void
@@ -736,6 +764,9 @@ private struct StrategyGroupListPanel: View {
                         .padding(.horizontal, 14)
                 } else {
                     ForEach(Array(visibleNodes.enumerated()), id: \.element.id) { index, item in
+                        let testTarget = ProxyNodeTestTarget(groupName: group.name,
+                                                             nodeName: item.name,
+                                                             nodeID: item.id)
                         ProxyNodeListRow(
                             node: item.name,
                             referencedGroup: allGroups.first {
@@ -747,9 +778,12 @@ private struct StrategyGroupListPanel: View {
                             selectable: group.selectable,
                             isReadOnly: !canTest && !group.selectable,
                             canTest: canTest,
-                            isTestingDelay: testingNodes.contains(item.name),
+                            testTarget: testTarget,
+                            isTestingDelay: testingNodes.contains(
+                                ProxyNodeTestKey(group: group.name, node: item.name)),
                             delay: delays[item.name],
-                            onTestDelay: { onTestNode(item.name) },
+                            onTestActiveNode: onTestActiveNode,
+                            onPrepareTestTarget: { onPrepareTestTarget(testTarget) },
                             onSelect: { onSelect(item.name) })
                         .padding(.horizontal, 14)
                         .padding(.vertical, 7)
@@ -888,9 +922,11 @@ private struct ProxyNodeListRow: View {
     let selectable: Bool
     let isReadOnly: Bool
     let canTest: Bool
+    let testTarget: ProxyNodeTestTarget
     let isTestingDelay: Bool
     let delay: Int?
-    let onTestDelay: () -> Void
+    let onTestActiveNode: () -> Void
+    let onPrepareTestTarget: () -> Void
     let onSelect: () -> Void
 
     var body: some View {
@@ -913,12 +949,17 @@ private struct ProxyNodeListRow: View {
         }
         .contentShape(Rectangle())
         .contextMenu {
-            Button(action: onTestDelay) {
+            Button(action: onTestActiveNode) {
                 Label(isTestingDelay ? "正在测速" : "测试此节点延迟",
                       systemImage: isTestingDelay ? "hourglass" : "speedometer")
             }
             .disabled(!canTest || isTestingDelay)
         }
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 0, coordinateSpace: .local)
+                .onChanged { _ in onPrepareTestTarget() }
+        )
+        .id(testTarget.id)
         .contentShape(Rectangle())
     }
 
@@ -985,12 +1026,13 @@ private struct GroupExpandedPanel: View {
     let isTesting: Bool
     let canTest: Bool
     let selecting: String?
-    let testingNodes: Set<String>
+    let testingNodes: Set<ProxyNodeTestKey>
     let delays: [String: Int]
     let gradientIndex: Int
     let onToggle: () -> Void
     let onTest: () -> Void
-    let onTestNode: (String) -> Void
+    let onTestActiveNode: () -> Void
+    let onPrepareTestTarget: (ProxyNodeTestTarget) -> Void
     let onGradient: (Int) -> Void
     let onRandomizeAll: (() -> Void)?
     let onSelect: (String) -> Void
@@ -1013,6 +1055,9 @@ private struct GroupExpandedPanel: View {
                 GridItem(.flexible(), spacing: 12),
             ], spacing: 8) {
                 ForEach(group.nodes) { item in
+                    let testTarget = ProxyNodeTestTarget(groupName: group.name,
+                                                         nodeName: item.name,
+                                                         nodeID: item.id)
                     GroupNodeGridCell(node: item,
                                       referencedGroup: allGroups.first {
                                           $0.name == item.name && $0.name != group.name
@@ -1022,9 +1067,12 @@ private struct GroupExpandedPanel: View {
                                       isSelectionBlocked: selecting != nil,
                                       selectable: group.selectable,
                                       canTest: canTest,
-                                      isTestingDelay: testingNodes.contains(item.name),
+                                      testTarget: testTarget,
+                                      isTestingDelay: testingNodes.contains(
+                                          ProxyNodeTestKey(group: group.name, node: item.name)),
                                       delay: delays[item.name],
-                                      onTestDelay: { onTestNode(item.name) },
+                                      onTestActiveNode: onTestActiveNode,
+                                      onPrepareTestTarget: { onPrepareTestTarget(testTarget) },
                                       onSelect: { onSelect(item.name) })
                 }
             }
@@ -1094,9 +1142,11 @@ private struct GroupNodeGridCell: View {
     let isSelectionBlocked: Bool
     let selectable: Bool
     let canTest: Bool
+    let testTarget: ProxyNodeTestTarget
     let isTestingDelay: Bool
     let delay: Int?
-    let onTestDelay: () -> Void
+    let onTestActiveNode: () -> Void
+    let onPrepareTestTarget: () -> Void
     let onSelect: () -> Void
 
     var body: some View {
@@ -1115,12 +1165,17 @@ private struct GroupNodeGridCell: View {
             }
         }
         .contextMenu {
-            Button(action: onTestDelay) {
+            Button(action: onTestActiveNode) {
                 Label(isTestingDelay ? "正在测速" : "测试此节点延迟",
                       systemImage: isTestingDelay ? "hourglass" : "speedometer")
             }
             .disabled(!canTest || isTestingDelay)
         }
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 0, coordinateSpace: .local)
+                .onChanged { _ in onPrepareTestTarget() }
+        )
+        .id(testTarget.id)
     }
 
     private var card: some View {
