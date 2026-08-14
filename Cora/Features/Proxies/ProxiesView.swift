@@ -459,7 +459,7 @@ struct ProxiesView: View {
     private func dismissExpandedGroup(_ name: String) {
         guard expanded.contains(name) else { return }
         withAnimation(.easeOut(duration: 0.16)) {
-            expanded.remove(name)
+            _ = expanded.remove(name)
         }
         gridScrollRequest = nil
         gridRestoreAnchors.removeValue(forKey: name)
@@ -656,14 +656,16 @@ private struct StrategyGroupListPanel: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            if isExpanded {
-                GroupExpandedHeader(group: group,
-                                    isTesting: isTesting,
-                                    canTest: canTest,
-                                    onToggle: onToggle,
-                                    onTest: onTest)
-            } else {
-                GroupCompactHeader(group: group, onToggle: onToggle)
+            Group {
+                if isExpanded {
+                    GroupExpandedHeader(group: group,
+                                        isTesting: isTesting,
+                                        canTest: canTest,
+                                        onToggle: onToggle,
+                                        onTest: onTest)
+                } else {
+                    GroupCompactHeader(group: group, onToggle: onToggle)
+                }
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
