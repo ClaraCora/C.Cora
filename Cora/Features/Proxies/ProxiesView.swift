@@ -52,6 +52,14 @@ struct ProxiesView: View {
             .onChange(of: isSearchPresented) { _, presented in
                 if !presented { searchText = "" }
             }
+            .onChange(of: layoutRawValue) { _, value in
+                guard ProxyNodeLayout(rawValue: value) == .grid else { return }
+                // A list can have several groups open at once. Grid mode has one
+                // expansion row, so retain the first group in configuration order.
+                let retained = controller.groups.first(where: { expanded.contains($0.name) })?.name
+                expanded = retained.map { [$0] } ?? []
+                gridScrollRequest = nil
+            }
         }
     }
 
@@ -77,6 +85,13 @@ struct ProxiesView: View {
 
     private var nodeLayout: ProxyNodeLayout {
         ProxyNodeLayout(rawValue: layoutRawValue) ?? .list
+    }
+
+    private var activeGridGroupName: String? {
+        guard nodeLayout == .grid,
+              normalizedSearch.isEmpty,
+              expanded.count == 1 else { return nil }
+        return expanded.first
     }
 
     private var layoutMenu: some View {
@@ -209,6 +224,7 @@ struct ProxiesView: View {
             Array(results[index..<min(index + 2, results.count)])
         }
         let upwardExpansionStart = max(0, rows.count - 3)
+        let activeGroupName = activeGridGroupName
         return GeometryReader { viewport in
             ScrollViewReader { proxy in
                 ScrollView {
@@ -247,6 +263,8 @@ struct ProxiesView: View {
                                         GroupGridCard(
                                             group: result.group,
                                             gradientIndex: groupGradient(for: result.group.name),
+                                            isInteractionLocked: activeGroupName != nil &&
+                                                activeGroupName != result.group.name,
                                             onToggle: {
                                                 toggleGridGroup(result.group.name,
                                                                 rowIndex: rowIndex,
@@ -293,9 +311,15 @@ struct ProxiesView: View {
                                 .accessibilityHidden(true)
                         }
                     }
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        guard let name = activeGroupName,
+                              let rowIndex = gridRowIndex(for: name) else { return }
+                        closeGridGroup(name, rowIndex: rowIndex)
+                    }
                 }
                     .padding(.horizontal, 14)
-                    .padding(.vertical, 10)
+                    .padding(.vertical, 6)
                 }
                 .coordinateSpace(name: GridCoordinateSpace.name)
                 .background(Color.clear)
@@ -307,13 +331,13 @@ struct ProxiesView: View {
                 }
                 .task(id: gridScrollRequest) {
                     guard let request = gridScrollRequest else { return }
-                    // Wait for the expanded/collapsed stack to finish one layout pass so
-                    // ScrollViewReader targets the new geometry instead of the old row.
-                    await Task.yield()
-                    try? await Task.sleep(nanoseconds: 80_000_000)
-                    guard !Task.isCancelled else { return }
-                    withAnimation(.easeOut(duration: 0.18)) {
-                        proxy.scrollTo(request.targetID, anchor: request.anchor)
+                    // Re-apply the target after the expanded panel has completed layout.
+                    for delay in [60_000_000, 180_000_000] {
+                        try? await Task.sleep(nanoseconds: delay)
+                        guard !Task.isCancelled else { return }
+                        withAnimation(.easeOut(duration: 0.16)) {
+                            proxy.scrollTo(request.targetID, anchor: request.anchor)
+                        }
                     }
                 }
             }
@@ -343,6 +367,7 @@ struct ProxiesView: View {
                                onToggle: @escaping () -> Void) -> some View {
         GroupExpandedPanel(
             group: result.group,
+            allGroups: controller.groups,
             isTesting: controller.testing.contains(result.group.name),
             canTest: controller.isRuntimeAvailable,
             selecting: controller.selecting[result.group.name],
@@ -412,12 +437,7 @@ struct ProxiesView: View {
         }
 
         if expanded.contains(name) {
-            let restoreAnchor = gridRestoreAnchors.removeValue(forKey: name) ?? .center
-            withAnimation(.easeOut(duration: 0.18)) {
-                expanded.remove(name)
-            }
-            gridScrollRequest = GridScrollRequest(targetID: gridRowID(rowIndex),
-                                                  anchor: restoreAnchor)
+            closeGridGroup(name, rowIndex: rowIndex)
             return
         }
 
@@ -434,6 +454,23 @@ struct ProxiesView: View {
         // partially behind the navigation/tab bars.
         gridScrollRequest = GridScrollRequest(targetID: expandedPanelID(for: name),
                                               anchor: .top)
+    }
+
+    private func closeGridGroup(_ name: String, rowIndex: Int) {
+        guard expanded.contains(name) else { return }
+        let restoreAnchor = gridRestoreAnchors.removeValue(forKey: name) ?? .center
+        withAnimation(.easeOut(duration: 0.16)) {
+            expanded.remove(name)
+        }
+        gridScrollRequest = GridScrollRequest(targetID: gridRowID(rowIndex),
+                                              anchor: restoreAnchor)
+    }
+
+    private func gridRowIndex(for name: String) -> Int? {
+        guard let index = displayedGroups.firstIndex(where: { $0.group.name == name }) else {
+            return nil
+        }
+        return index / 2
     }
 
     private func openGridGroup(_ name: String) {
@@ -890,6 +927,7 @@ private struct ProxyNodeListRow: View {
 private struct GroupGridCard: View {
     let group: ProxyGroup
     let gradientIndex: Int
+    let isInteractionLocked: Bool
     let onToggle: () -> Void
     let onGradient: (Int) -> Void
     let onRandomizeAll: (() -> Void)?
@@ -904,11 +942,13 @@ private struct GroupGridCard: View {
             GradientMenu(selected: gradientIndex, onSelect: onGradient,
                          onRandomizeAll: onRandomizeAll)
         }
+        .allowsHitTesting(!isInteractionLocked)
     }
 }
 
 private struct GroupExpandedPanel: View {
     let group: ProxyGroup
+    let allGroups: [ProxyGroup]
     let isTesting: Bool
     let canTest: Bool
     let selecting: String?
@@ -923,7 +963,7 @@ private struct GroupExpandedPanel: View {
     let onSelect: (String) -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 6) {
             GroupExpandedHeader(group: group,
                                 isTesting: isTesting,
                                 canTest: canTest,
@@ -941,6 +981,9 @@ private struct GroupExpandedPanel: View {
             ], spacing: 8) {
                 ForEach(group.nodes) { item in
                     GroupNodeGridCell(node: item,
+                                      referencedGroup: allGroups.first {
+                                          $0.name == item.name && $0.name != group.name
+                                      },
                                       isCurrent: item.name == group.now,
                                       isSelecting: selecting == item.name,
                                       isSelectionBlocked: selecting != nil,
@@ -953,29 +996,32 @@ private struct GroupExpandedPanel: View {
                 }
             }
         }
-        .padding(10)
+        .padding(8)
         .background(GroupGradient.background(for: gradientIndex))
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .animation(.easeOut(duration: 0.16), value: group.id)
+        .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .onTapGesture { }
     }
 }
 
 private struct GroupCompactHeader: View {
     let group: ProxyGroup
     let onToggle: () -> Void
+    var compact = false
 
     var body: some View {
         Button(action: onToggle) {
             HStack(spacing: 9) {
                 GroupIcon(url: group.icon)
-                VStack(alignment: .leading, spacing: 3) {
+                VStack(alignment: .leading, spacing: compact ? 1 : 3) {
                     Text(group.name).font(.headline).lineLimit(1)
                     Text(group.now.isEmpty ? "未选择" : group.now)
-                        .font(.caption).foregroundStyle(.secondary).lineLimit(2)
-                        .frame(minHeight: 30, alignment: .topLeading)
+                        .font(.caption).foregroundStyle(.secondary).lineLimit(compact ? 1 : 2)
+                        .frame(minHeight: compact ? 17 : 30, alignment: .topLeading)
                 }
             }
-            .frame(maxWidth: .infinity, minHeight: 54, alignment: .leading)
+            .frame(maxWidth: .infinity, minHeight: compact ? 44 : 54, alignment: .leading)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -992,7 +1038,7 @@ private struct GroupExpandedHeader: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            GroupCompactHeader(group: group, onToggle: onToggle)
+            GroupCompactHeader(group: group, onToggle: onToggle, compact: true)
             Button(action: onTest) {
                 Image(systemName: isTesting ? "hourglass" : "speedometer")
                     .font(.system(size: 16, weight: .semibold))
@@ -1001,7 +1047,7 @@ private struct GroupExpandedHeader: View {
             .buttonStyle(SpeedTestButtonStyle())
             .foregroundStyle(Color.accentColor)
             .disabled(isTesting || !canTest)
-            .frame(width: 56, height: 56)
+            .frame(width: 44, height: 44)
             .contentShape(Rectangle())
             .zIndex(2)
             .accessibilityLabel("测试\(group.name)延迟")
@@ -1011,6 +1057,7 @@ private struct GroupExpandedHeader: View {
 
 private struct GroupNodeGridCell: View {
     let node: ProxyGroupNode
+    let referencedGroup: ProxyGroup?
     let isCurrent: Bool
     let isSelecting: Bool
     let isSelectionBlocked: Bool
@@ -1046,12 +1093,21 @@ private struct GroupNodeGridCell: View {
     }
 
     private var card: some View {
-        VStack(alignment: .leading, spacing: 2) {
+        VStack(alignment: .leading, spacing: 1) {
             HStack(alignment: .top, spacing: 6) {
-                Text(node.name)
-                    .font(.subheadline.weight(isCurrent ? .semibold : .regular))
-                    .lineLimit(2)
-                    .frame(minHeight: 36, alignment: .topLeading)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(referencedGroup?.name ?? node.name)
+                        .font(.subheadline.weight(isCurrent ? .semibold : .regular))
+                        .lineLimit(referencedGroup == nil ? 2 : 1)
+                        .frame(minHeight: referencedGroup == nil ? 34 : 18,
+                               alignment: .topLeading)
+                    if let referencedGroup {
+                        Text(referencedGroup.now.isEmpty ? "未选择" : referencedGroup.now)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
                     .frame(maxWidth: .infinity, alignment: .leading)
                 if isSelecting {
                     ProgressView().controlSize(.mini)
@@ -1059,19 +1115,18 @@ private struct GroupNodeGridCell: View {
                     Image(systemName: "checkmark.circle.fill").foregroundStyle(Color.accentColor)
                 }
             }
-            Spacer(minLength: 0)
             HStack {
                 Spacer()
                 if isTestingDelay {
                     ProgressView().controlSize(.mini)
                 } else {
-                    DelayBadge(delay: delay)
+                    DelayBadge(delay: delay, compact: true)
                 }
             }
         }
         .padding(.horizontal, 8)
-        .padding(.vertical, 6)
-        .frame(maxWidth: .infinity, minHeight: 76, alignment: .topLeading)
+        .padding(.vertical, 4)
+        .frame(maxWidth: .infinity, minHeight: 64, alignment: .topLeading)
         .background {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .fill(isCurrent
@@ -1179,6 +1234,12 @@ private struct DelayBadge: View {
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     let delay: Int?
+    let compact: Bool
+
+    init(delay: Int?, compact: Bool = false) {
+        self.delay = delay
+        self.compact = compact
+    }
 
     var body: some View {
         HStack(spacing: 5) {
@@ -1191,7 +1252,7 @@ private struct DelayBadge: View {
         .foregroundStyle(color)
         .font(.caption.monospacedDigit().weight(.medium))
         .padding(.horizontal, 7)
-        .padding(.vertical, 3)
+        .padding(.vertical, compact ? 1 : 3)
         .background(Capsule().fill(color.opacity(0.10)))
         .frame(minWidth: dynamicTypeSize.isAccessibilitySize ? nil : 66,
                alignment: .trailing)

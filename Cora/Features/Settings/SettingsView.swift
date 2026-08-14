@@ -13,7 +13,11 @@ struct SettingsView: View {
                         NavigationLink {
                             SubscriptionsView()
                         } label: {
-                            Label("配置", systemImage: "doc.text")
+                            HStack(spacing: 12) {
+                                SettingsSymbol(systemImage: "doc.text")
+                                Text("配置").font(.body.weight(.medium))
+                            }
+                            .padding(.vertical, 4)
                         }
                         if !core.configNotices.isEmpty {
                             SettingsInfoRow(
@@ -27,11 +31,10 @@ struct SettingsView: View {
                             systemImage: "externaldrive.connected.to.line.below",
                             message: "查看所有配置引用的远程 Proxy Provider 与 Rule Provider。Proxy Provider 可离线缓存；Rule Provider 需连接当前配置后更新。",
                             destination: RemoteResourcesView())
-                        HStack {
-                            Label {
+                        HStack(spacing: 12) {
+                            SettingsSymbol(systemImage: "network.badge.shield.half.filled")
+                            VStack(alignment: .leading, spacing: 2) {
                                 InfoLabel(title: "订阅 UA", message: "拉取订阅时发送的 User-Agent。不同机场可能根据 UA 返回不同配置格式，修改后重新拉取订阅生效。")
-                            } icon: {
-                                Image(systemName: "network.badge.shield.half.filled")
                             }
                             Spacer()
                             TextField("clash-meta", text: $settings.subscriptionUA)
@@ -50,7 +53,7 @@ struct SettingsView: View {
                             message: "管理内核日志、IPv6、配置覆盖和诊断信息。",
                             destination: KernelSettingsView())
                         SettingsNavigationRow(
-                            title: "GEO 与 ASN",
+                            title: "GEO、ASN",
                             systemImage: "globe.americas",
                             message: "管理 GEO/ASN 规则数据和更新方式。",
                             destination: GeoSettingsView())
@@ -68,8 +71,9 @@ struct SettingsView: View {
                     .listRowBackground(AppListRowBackground())
 
                     Section {
-                        HStack {
-                            Label("App 版本", systemImage: "info.circle")
+                        HStack(spacing: 12) {
+                            SettingsSymbol(systemImage: "info.circle")
+                            Text("App 版本").font(.body.weight(.medium))
                             Spacer()
                             Text(appVersion)
                                 .foregroundStyle(.secondary)
@@ -80,6 +84,9 @@ struct SettingsView: View {
                 }
                 .scrollContentBackground(.hidden)
                 .background(Color.clear)
+                .listStyle(.insetGrouped)
+                .listSectionSpacing(18)
+                .listRowSeparatorTint(Color.primary.opacity(0.08))
             }
             .navigationTitle("设置")
             .task { await core.refreshStatus() }
@@ -418,7 +425,7 @@ private struct GeoSettingsView: View {
         }
         .scrollContentBackground(.hidden)
         .background(AppAmbientBackground())
-        .navigationTitle("GEO 与 ASN")
+        .navigationTitle("GEO、ASN")
         .navigationBarTitleDisplayMode(.inline)
         .task(id: refreshID) { await refreshInstalledInfo() }
     }
@@ -473,11 +480,27 @@ private struct SettingsNavigationRow<Destination: View>: View {
         NavigationLink {
             destination
         } label: {
-            HStack(spacing: 8) {
-                Label(title, systemImage: systemImage)
+            HStack(spacing: 12) {
+                SettingsSymbol(systemImage: systemImage)
+                Text(title)
+                    .font(.body.weight(.medium))
                 InfoButton(message: message, accessibilityLabel: "查看\(title)说明")
             }
+            .padding(.vertical, 4)
         }
+    }
+}
+
+private struct SettingsSymbol: View {
+    let systemImage: String
+
+    var body: some View {
+        Image(systemName: systemImage)
+            .font(.system(size: 15, weight: .semibold))
+            .foregroundStyle(Color.accentColor)
+            .frame(width: 30, height: 30)
+            .background(Color.accentColor.opacity(0.13),
+                        in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 }
 
