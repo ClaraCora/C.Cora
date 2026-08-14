@@ -11,6 +11,8 @@ struct ProxiesView: View {
     @State private var gridRestoreAnchors: [String: UnitPoint] = [:]
     @State private var gridScrollRequest: GridScrollRequest?
     @State private var expandedPanelFrames: [String: CGRect] = [:]
+    @State private var lastStrategyScrollOffset: CGFloat?
+    @State private var toolbarControlsVisible = true
     @State private var searchText = ""
     @State private var isSearchPresented = false
     @State private var groupGradients: [String: Int] = [:]
@@ -26,7 +28,7 @@ struct ProxiesView: View {
             .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                if showsSearch || canRefresh {
+                if toolbarControlsVisible && (showsSearch || canRefresh) {
                     ToolbarItemGroup(placement: .topBarTrailing) {
                         if showsSearch {
                             layoutMenu
@@ -43,6 +45,7 @@ struct ProxiesView: View {
                     }
                 }
             }
+            .animation(.easeOut(duration: 0.16), value: toolbarControlsVisible)
             .task(id: LoadContext(status: core.status.rawValue,
                                   subscriptionID: subscriptions.selectedID,
                                   configurationUpdatedAt: subscriptions.selected?.updatedAt,
@@ -60,6 +63,8 @@ struct ProxiesView: View {
                 expanded = retained.map { [$0] } ?? []
                 gridScrollRequest = nil
                 expandedPanelFrames = [:]
+                lastStrategyScrollOffset = nil
+                toolbarControlsVisible = true
             }
         }
     }
@@ -162,6 +167,7 @@ struct ProxiesView: View {
 
         return ScrollView {
             LazyVStack(alignment: .leading, spacing: 10) {
+                strategyScrollOffsetMarker
                 if !controller.isRuntimeAvailable {
                     Label("VPN 未连接。选择会保存，并在下次连接时生效；测速需连接后使用。",
                           systemImage: "checkmark.circle")
@@ -204,6 +210,8 @@ struct ProxiesView: View {
         .onPreferenceChange(ExpandedPanelFramePreferenceKey.self) { frames in
             expandedPanelFrames = frames
         }
+        .onPreferenceChange(StrategyScrollOffsetPreferenceKey.self,
+                            perform: updateToolbarVisibility(for:))
         .scrollContentBackground(.hidden)
         .background(Color.clear)
         .refreshable { await reload() }
@@ -253,6 +261,7 @@ struct ProxiesView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 14) {
+                strategyScrollOffsetMarker
                 if !controller.isRuntimeAvailable {
                     Label("VPN 未连接。选择会保存，并在下次连接时生效；测速需连接后使用。",
                           systemImage: "checkmark.circle")
@@ -350,6 +359,8 @@ struct ProxiesView: View {
                 .onPreferenceChange(ExpandedPanelFramePreferenceKey.self) { frames in
                     expandedPanelFrames = frames
                 }
+                .onPreferenceChange(StrategyScrollOffsetPreferenceKey.self,
+                                    perform: updateToolbarVisibility(for:))
                 .task(id: gridScrollRequest) {
                     guard let request = gridScrollRequest else { return }
                     // Re-apply the target after the expanded panel has completed layout.
@@ -459,10 +470,11 @@ struct ProxiesView: View {
 
     private func dismissExpandedGroup(_ name: String) {
         guard expanded.contains(name) else { return }
+        let restoreRequest = gridRestoreRequest(for: name)
         withAnimation(.easeOut(duration: 0.16)) {
             _ = expanded.remove(name)
         }
-        gridScrollRequest = nil
+        gridScrollRequest = restoreRequest
         gridRestoreAnchors.removeValue(forKey: name)
         expandedPanelFrames = [:]
     }
@@ -534,6 +546,47 @@ struct ProxiesView: View {
         let availableTravel = viewportHeight - frame.height
         let relativeY = min(max(frame.minY / availableTravel, 0), 1)
         gridRestoreAnchors[name] = UnitPoint(x: 0.5, y: relativeY)
+    }
+
+    private func gridRestoreRequest(for name: String) -> GridScrollRequest? {
+        guard nodeLayout == .grid,
+              let rowIndex = gridRowIndex(for: name),
+              let anchor = gridRestoreAnchors[name] else { return nil }
+        return GridScrollRequest(targetID: gridRowID(rowIndex), anchor: anchor)
+    }
+
+    private func gridRowIndex(for name: String) -> Int? {
+        guard let index = displayedGroups.firstIndex(where: { $0.group.name == name }) else {
+            return nil
+        }
+        return index / 2
+    }
+
+    private var strategyScrollOffsetMarker: some View {
+        GeometryReader { geometry in
+            Color.clear.preference(
+                key: StrategyScrollOffsetPreferenceKey.self,
+                value: geometry.frame(in: .named(StrategyCoordinateSpace.name)).minY)
+        }
+        .frame(height: 0)
+        .accessibilityHidden(true)
+    }
+
+    private func updateToolbarVisibility(for offset: CGFloat) {
+        guard let previousOffset = lastStrategyScrollOffset else {
+            lastStrategyScrollOffset = offset
+            return
+        }
+
+        let delta = offset - previousOffset
+        guard abs(delta) >= 5 else { return }
+        let shouldShow = delta > 0
+        if shouldShow != toolbarControlsVisible {
+            withAnimation(.easeOut(duration: 0.16)) {
+                toolbarControlsVisible = shouldShow
+            }
+        }
+        lastStrategyScrollOffset = offset
     }
 
     private func reload() async {
@@ -625,6 +678,14 @@ private struct ExpandedPanelFramePreferenceKey: PreferenceKey {
     static func reduce(value: inout [String: CGRect],
                        nextValue: () -> [String: CGRect]) {
         value.merge(nextValue(), uniquingKeysWith: { _, latest in latest })
+    }
+}
+
+private struct StrategyScrollOffsetPreferenceKey: PreferenceKey {
+    static var defaultValue: CGFloat = .zero
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
     }
 }
 
