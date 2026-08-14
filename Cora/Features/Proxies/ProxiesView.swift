@@ -260,7 +260,11 @@ struct ProxiesView: View {
         return GeometryReader { viewport in
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 14) {
+                    VStack(alignment: .leading, spacing: 0) {
+                        strategyScrollOffsetReporter
+                            .frame(height: 0)
+
+                        LazyVStack(alignment: .leading, spacing: 14) {
                 if !controller.isRuntimeAvailable {
                     Label("VPN 未连接。选择会保存，并在下次连接时生效；测速需连接后使用。",
                           systemImage: "checkmark.circle")
@@ -343,9 +347,8 @@ struct ProxiesView: View {
                                 .accessibilityHidden(true)
                         }
                     }
-                    .background {
-                        strategyScrollOffsetReporter
-                    }
+                        }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .coordinateSpace(name: GridCoordinateSpace.name)
                     .padding(.horizontal, 14)
