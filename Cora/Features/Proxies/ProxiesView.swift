@@ -8,9 +8,13 @@ struct ProxiesView: View {
     @StateObject private var controller = ProxyController()
     @State private var expanded: Set<String> = []
     @State private var gridRowFrames: [Int: CGRect] = [:]
+    @State private var gridCardFrames: [String: CGRect] = [:]
     @State private var gridRestoreAnchors: [String: UnitPoint] = [:]
     @State private var gridScrollRequest: GridScrollRequest?
     @State private var expandedPanelFrames: [String: CGRect] = [:]
+    @State private var gridExpansion: GridExpansionState?
+    @State private var pendingGridGroupName: String?
+    @State private var gridExpansionCorrectionKey: String?
     @State private var toolbarControlsVisible = true
     @State private var searchText = ""
     @State private var isSearchPresented = false
@@ -69,6 +73,15 @@ struct ProxiesView: View {
                 if !presented { searchText = "" }
                 toolbarControlsVisible = true
             }
+            .onChange(of: searchText) { _, value in
+                guard !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      gridExpansion != nil else { return }
+                gridExpansion = nil
+                gridExpansionCorrectionKey = nil
+                gridScrollRequest = nil
+                expanded = []
+                expandedPanelFrames = [:]
+            }
             .onChange(of: layoutRawValue) { _, value in
                 // Both layouts share one expansion model. Keep a single valid group
                 // when switching layouts so neither view inherits stale open rows.
@@ -76,6 +89,9 @@ struct ProxiesView: View {
                 expanded = retained.map { [$0] } ?? []
                 gridScrollRequest = nil
                 expandedPanelFrames = [:]
+                gridExpansion = nil
+                pendingGridGroupName = ProxyNodeLayout(rawValue: value) == .grid ? retained : nil
+                gridExpansionCorrectionKey = nil
                 toolbarControlsVisible = true
                 activeNodeTestTarget = nil
             }
@@ -268,95 +284,40 @@ struct ProxiesView: View {
             Array(results[index..<min(index + 2, results.count)])
         }
         let upwardExpansionStart = max(0, rows.count - 3)
-        let activeGroupName = activeExpandedGroupName
+        let activeGroupName = gridExpansion?.groupName
         return GeometryReader { viewport in
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 14) {
-                if !controller.isRuntimeAvailable {
-                    Label("VPN 未连接。选择会保存，并在下次连接时生效；测速需连接后使用。",
-                          systemImage: "checkmark.circle")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 16)
-                }
-                if let error = controller.error {
-                    Label(error, systemImage: "exclamationmark.triangle.fill")
-                        .font(.footnote)
-                        .foregroundStyle(.orange)
-                        .padding(.horizontal, 16)
-                }
-                if results.isEmpty {
-                    ContentUnavailableView.search(text: searchText)
-                } else {
-                        ForEach(Array(rows.enumerated()), id: \.offset) { rowIndex, row in
-                            let expandsUpward = rowIndex >= upwardExpansionStart
-                            VStack(alignment: .leading, spacing: 12) {
-                                if expandsUpward,
-                                   let expandedGroup = row.first(where: { $0.isExpanded }) {
-                                    expandedPanel(for: expandedGroup) {
-                                        toggleGridGroup(expandedGroup.group.name,
-                                                        rowIndex: rowIndex,
-                                                        viewportHeight: viewport.size.height)
-                                    }
-                                        .id(expandedPanelID(for: expandedGroup.group.name))
-                                }
-
-                                HStack(alignment: .top, spacing: 12) {
-                                    ForEach(row) { result in
-                                        GroupGridCard(
-                                            group: result.group,
-                                            gradientIndex: groupGradient(for: result.group.name),
-                                            isInteractionLocked: activeGroupName != nil &&
-                                                activeGroupName != result.group.name,
-                                            onToggle: {
-                                                toggleGridGroup(result.group.name,
-                                                                rowIndex: rowIndex,
-                                                                viewportHeight: viewport.size.height)
-                                            },
-                                            onGradient: { setGradient($0, for: result.group.name) },
-                                            onRandomizeAll: randomizeAllGradients)
-                                            .frame(maxWidth: .infinity)
-                                    }
-                                    if row.count == 1 {
-                                        Color.clear
-                                            .frame(maxWidth: .infinity, minHeight: 76)
-                                            .accessibilityHidden(true)
-                                    }
-                                }
-                                .id(gridRowID(rowIndex))
-                                .background {
-                                    GeometryReader { rowGeometry in
-                                        Color.clear.preference(
-                                            key: GridRowFramePreferenceKey.self,
-                                            value: [
-                                                rowIndex: rowGeometry.frame(
-                                                    in: .named(GridCoordinateSpace.name))
-                                            ])
-                                    }
-                                }
-                                if !expandsUpward,
-                                   let expandedGroup = row.first(where: { $0.isExpanded }) {
-                                    expandedPanel(for: expandedGroup) {
-                                        toggleGridGroup(expandedGroup.group.name,
-                                                        rowIndex: rowIndex,
-                                                        viewportHeight: viewport.size.height)
-                                    }
-                                        .id(expandedPanelID(for: expandedGroup.group.name))
-                                }
+                        if !controller.isRuntimeAvailable {
+                            Label("VPN 未连接。选择会保存，并在下次连接时生效；测速需连接后使用。",
+                                  systemImage: "checkmark.circle")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 16)
+                        }
+                        if let error = controller.error {
+                            Label(error, systemImage: "exclamationmark.triangle.fill")
+                                .font(.footnote)
+                                .foregroundStyle(.orange)
+                                .padding(.horizontal, 16)
+                        }
+                        if results.isEmpty {
+                            ContentUnavailableView.search(text: searchText)
+                        } else {
+                            ForEach(Array(rows.enumerated()), id: \.offset) { rowIndex, row in
+                                gridRow(row,
+                                        rowIndex: rowIndex,
+                                        searchExpandsUpward: rowIndex >= upwardExpansionStart,
+                                        viewportSize: viewport.size,
+                                        activeGroupName: activeGroupName)
+                                    .id(gridRowID(rowIndex))
                             }
                         }
-                        // The tab bar can cover the last row when the content is shorter
-                        // than the viewport. Keep enough inert content below the grid so
-                        // an expanded panel can always be scrolled into the safe area.
-                        if !expanded.isEmpty {
-                            Color.clear
-                                .frame(height: max(260, viewport.size.height + 80))
-                                .accessibilityHidden(true)
-                        }
+                        Color.clear
+                            .frame(height: 24)
+                            .accessibilityHidden(true)
                     }
-                }
-                .coordinateSpace(name: GridCoordinateSpace.name)
                     .padding(.horizontal, 14)
                     .padding(.vertical, 6)
                 }
@@ -367,18 +328,27 @@ struct ProxiesView: View {
                         gridRowFrames = frames
                     }
                 }
+                .onPreferenceChange(GridCardFramePreferenceKey.self) { frames in
+                    if gridCardFrames != frames {
+                        gridCardFrames = frames
+                    }
+                    openPendingGridGroupIfPossible(frames: frames,
+                                                   viewportSize: viewport.size)
+                }
                 .onPreferenceChange(ExpandedPanelFramePreferenceKey.self) { frames in
-                    expandedPanelFrames = frames
+                    if expandedPanelFrames != frames {
+                        expandedPanelFrames = frames
+                    }
+                    correctGridExpansionIfNeeded(frames: frames,
+                                                 viewportSize: viewport.size)
                 }
                 .task(id: gridScrollRequest) {
                     guard let request = gridScrollRequest else { return }
-                    // Re-apply the target after the expanded panel has completed layout.
-                    for delay in [UInt64(60_000_000), UInt64(180_000_000)] {
-                        try? await Task.sleep(nanoseconds: delay)
-                        guard !Task.isCancelled else { return }
-                        withAnimation(.easeOut(duration: 0.16)) {
-                            proxy.scrollTo(request.targetID, anchor: request.anchor)
-                        }
+                    await Task.yield()
+                    try? await Task.sleep(nanoseconds: 40_000_000)
+                    guard !Task.isCancelled else { return }
+                    withAnimation(.easeOut(duration: 0.18)) {
+                        proxy.scrollTo(request.targetID, anchor: request.anchor)
                     }
                 }
             }
@@ -388,6 +358,94 @@ struct ProxiesView: View {
         .contentShape(Rectangle())
         .simultaneousGesture(gridDismissGesture(activeGroupName))
         .simultaneousGesture(strategyToolbarGesture())
+    }
+
+    private func gridRow(_ row: [DisplayedProxyGroup],
+                         rowIndex: Int,
+                         searchExpandsUpward: Bool,
+                         viewportSize: CGSize,
+                         activeGroupName: String?) -> some View {
+        let activeExpansion = gridExpansion.flatMap { expansion in
+            expansion.rowIndex == rowIndex ? expansion : nil
+        }
+        let activeResult = activeExpansion.flatMap { expansion in
+            row.first { $0.group.name == expansion.groupName }
+        }
+        let searchResult = normalizedSearch.isEmpty
+            ? nil
+            : row.first(where: { $0.isExpanded })
+
+        return VStack(alignment: .leading, spacing: 12) {
+            if let expansion = activeExpansion, let activeResult {
+                expandedPanel(for: activeResult,
+                              transitionAnchor: expansion.transitionAnchor) {
+                    toggleGridGroup(activeResult.group.name,
+                                    rowIndex: rowIndex,
+                                    viewportSize: viewportSize)
+                }
+                .id(expandedPanelID(for: activeResult.group.name))
+            } else {
+                if searchExpandsUpward, let searchResult {
+                    expandedPanel(for: searchResult) {
+                        toggleGridGroup(searchResult.group.name,
+                                        rowIndex: rowIndex,
+                                        viewportSize: viewportSize)
+                    }
+                    .id(expandedPanelID(for: searchResult.group.name))
+                }
+
+                gridCardsRow(row,
+                             rowIndex: rowIndex,
+                             viewportSize: viewportSize,
+                             activeGroupName: activeGroupName)
+
+                if !searchExpandsUpward, let searchResult {
+                    expandedPanel(for: searchResult) {
+                        toggleGridGroup(searchResult.group.name,
+                                        rowIndex: rowIndex,
+                                        viewportSize: viewportSize)
+                    }
+                    .id(expandedPanelID(for: searchResult.group.name))
+                }
+            }
+        }
+    }
+
+    private func gridCardsRow(_ row: [DisplayedProxyGroup],
+                              rowIndex: Int,
+                              viewportSize: CGSize,
+                              activeGroupName: String?) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            ForEach(row) { result in
+                GroupGridCard(
+                    group: result.group,
+                    gradientIndex: groupGradient(for: result.group.name),
+                    isInteractionLocked: activeGroupName != nil &&
+                        activeGroupName != result.group.name,
+                    onToggle: {
+                        toggleGridGroup(result.group.name,
+                                        rowIndex: rowIndex,
+                                        viewportSize: viewportSize)
+                    },
+                    onGradient: { setGradient($0, for: result.group.name) },
+                    onRandomizeAll: randomizeAllGradients)
+                    .frame(maxWidth: .infinity)
+            }
+            if row.count == 1 {
+                Color.clear
+                    .frame(maxWidth: .infinity, minHeight: 76)
+                    .accessibilityHidden(true)
+            }
+        }
+        .background {
+            GeometryReader { rowGeometry in
+                Color.clear.preference(
+                    key: GridRowFramePreferenceKey.self,
+                    value: [
+                        rowIndex: rowGeometry.frame(in: .named(StrategyCoordinateSpace.name))
+                    ])
+            }
+        }
     }
 
     private func randomizeAllGradients() {
@@ -409,8 +467,9 @@ struct ProxiesView: View {
 
     @ViewBuilder
     private func expandedPanel(for result: DisplayedProxyGroup,
+                               transitionAnchor: UnitPoint? = nil,
                                onToggle: @escaping () -> Void) -> some View {
-        GroupExpandedPanel(
+        let panel = GroupExpandedPanel(
             group: result.group,
             allGroups: controller.groups,
             isTesting: controller.testing.contains(result.group.name),
@@ -435,6 +494,14 @@ struct ProxiesView: View {
                     value: [result.group.name: geometry.frame(
                         in: .named(StrategyCoordinateSpace.name))])
             }
+        }
+
+        if let transitionAnchor {
+            panel.transition(
+                .scale(scale: 0.96, anchor: transitionAnchor)
+                    .combined(with: .opacity))
+        } else {
+            panel
         }
     }
 
@@ -497,11 +564,17 @@ struct ProxiesView: View {
     private func dismissExpandedGroup(_ name: String) {
         guard expanded.contains(name) else { return }
         let restoreRequest = gridRestoreRequest(for: name)
+        let closesGridExpansion = gridExpansion?.groupName == name
         withAnimation(.easeOut(duration: 0.16)) {
             _ = expanded.remove(name)
+            if closesGridExpansion {
+                gridExpansion = nil
+            }
         }
         gridScrollRequest = restoreRequest
         gridRestoreAnchors.removeValue(forKey: name)
+        gridExpansionCorrectionKey = nil
+        pendingGridGroupName = nil
         expandedPanelFrames = [:]
     }
 
@@ -525,41 +598,78 @@ struct ProxiesView: View {
 
     private func toggleGridGroup(_ name: String,
                                  rowIndex: Int,
-                                 viewportHeight: CGFloat) {
+                                 viewportSize: CGSize) {
         guard normalizedSearch.isEmpty else {
+            pendingGridGroupName = name
+            gridExpansion = nil
+            gridExpansionCorrectionKey = nil
+            expanded = []
             searchText = ""
-            openGridGroup(name)
             return
         }
 
-        if expanded.contains(name) {
+        if gridExpansion?.groupName == name || expanded.contains(name) {
             dismissExpandedGroup(name)
             return
         }
 
-        saveGridRestoreAnchor(for: name,
-                              rowIndex: rowIndex,
-                              viewportHeight: viewportHeight)
-        withAnimation(.easeOut(duration: 0.18)) {
-            // A grid row has room for one detail panel. Keeping one explicit expansion
-            // also avoids Set ordering from choosing an unrelated scroll target.
-            expanded = [name]
-        }
-        // Scroll to the panel itself. This is important for the final rows: their
-        // panel is rendered above the cards, so anchoring the row leaves the panel
-        // partially behind the navigation/tab bars.
-        gridScrollRequest = GridScrollRequest(targetID: expandedPanelID(for: name),
-                                              anchor: .top)
-    }
-
-    private func openGridGroup(_ name: String) {
-        guard controller.groups.contains(where: { $0.name == name }) else {
-            expanded = [name]
+        guard let cardFrame = gridCardFrames[name] else {
+            pendingGridGroupName = name
             return
         }
-        expanded = [name]
-        gridScrollRequest = GridScrollRequest(targetID: expandedPanelID(for: name),
-                                              anchor: .top)
+
+        activateGridGroup(name,
+                          rowIndex: rowIndex,
+                          cardFrame: cardFrame,
+                          viewportSize: viewportSize)
+    }
+
+    private func activateGridGroup(_ name: String,
+                                   rowIndex: Int,
+                                   cardFrame: CGRect,
+                                   viewportSize: CGSize) {
+        guard controller.groups.contains(where: { $0.name == name }) else { return }
+        saveGridRestoreAnchor(for: name,
+                              rowIndex: rowIndex,
+                              viewportHeight: viewportSize.height)
+        gridExpansionCorrectionKey = nil
+        gridScrollRequest = nil
+        expandedPanelFrames = [:]
+        pendingGridGroupName = nil
+        withAnimation(.easeOut(duration: 0.18)) {
+            gridExpansion = GridExpansionState(groupName: name,
+                                               rowIndex: rowIndex,
+                                               cardFrame: cardFrame,
+                                               viewportSize: viewportSize)
+            expanded = [name]
+        }
+    }
+
+    private func openPendingGridGroupIfPossible(frames: [String: CGRect],
+                                                viewportSize: CGSize) {
+        guard let name = pendingGridGroupName,
+              normalizedSearch.isEmpty,
+              let cardFrame = frames[name],
+              let rowIndex = gridRowIndex(for: name) else { return }
+        activateGridGroup(name,
+                          rowIndex: rowIndex,
+                          cardFrame: cardFrame,
+                          viewportSize: viewportSize)
+    }
+
+    private func correctGridExpansionIfNeeded(frames: [String: CGRect],
+                                              viewportSize: CGSize) {
+        guard let expansion = gridExpansion,
+              let panelFrame = frames[expansion.groupName],
+              panelFrame.height > 0 else { return }
+        let correctionKey = expansion.correctionKey(panelHeight: panelFrame.height,
+                                                    viewportSize: viewportSize)
+        guard gridExpansionCorrectionKey != correctionKey else { return }
+        gridExpansionCorrectionKey = correctionKey
+        gridScrollRequest = GridScrollRequest(
+            targetID: expandedPanelID(for: expansion.groupName),
+            anchor: expansion.scrollAnchor(panelHeight: panelFrame.height,
+                                           viewportHeight: viewportSize.height))
     }
 
     private func saveGridRestoreAnchor(for name: String,
@@ -608,6 +718,25 @@ struct ProxiesView: View {
     private func reload() async {
         await controller.load()
         assignMissingGradients()
+        if let expansion = gridExpansion {
+            guard let index = controller.groups.firstIndex(where: {
+                $0.name == expansion.groupName
+            }) else {
+                gridExpansion = nil
+                gridExpansionCorrectionKey = nil
+                expanded = []
+                expandedPanelFrames = [:]
+                return
+            }
+            let updatedRowIndex = index / 2
+            if updatedRowIndex != expansion.rowIndex {
+                gridExpansion = nil
+                gridExpansionCorrectionKey = nil
+                expanded = []
+                pendingGridGroupName = expansion.groupName
+                expandedPanelFrames = [:]
+            }
+        }
     }
 
     private func loadGroupGradients() {
@@ -672,8 +801,67 @@ private struct GridScrollRequest: Hashable {
     }
 }
 
-private enum GridCoordinateSpace {
-    static let name = "proxy-grid-viewport"
+private struct GridExpansionState {
+    enum HorizontalSide {
+        case leading
+        case trailing
+    }
+
+    enum VerticalDirection {
+        case down
+        case up
+    }
+
+    let groupName: String
+    let rowIndex: Int
+    let cardFrame: CGRect
+    let horizontalSide: HorizontalSide
+    let verticalDirection: VerticalDirection
+
+    init(groupName: String,
+         rowIndex: Int,
+         cardFrame: CGRect,
+         viewportSize: CGSize) {
+        self.groupName = groupName
+        self.rowIndex = rowIndex
+        self.cardFrame = cardFrame
+        self.horizontalSide = cardFrame.midX <= viewportSize.width / 2
+            ? .leading
+            : .trailing
+        self.verticalDirection = cardFrame.midY <= viewportSize.height / 2
+            ? .down
+            : .up
+    }
+
+    var transitionAnchor: UnitPoint {
+        switch (horizontalSide, verticalDirection) {
+        case (.leading, .down): return .topLeading
+        case (.trailing, .down): return .topTrailing
+        case (.leading, .up): return .bottomLeading
+        case (.trailing, .up): return .bottomTrailing
+        }
+    }
+
+    func correctionKey(panelHeight: CGFloat, viewportSize: CGSize) -> String {
+        "\(groupName)|\(rowIndex)|\(Int(panelHeight.rounded()))|" +
+            "\(Int(viewportSize.width.rounded()))x\(Int(viewportSize.height.rounded()))"
+    }
+
+    func scrollAnchor(panelHeight: CGFloat, viewportHeight: CGFloat) -> UnitPoint {
+        let availableTravel = viewportHeight - panelHeight
+        guard availableTravel > 1 else {
+            return verticalDirection == .down ? .top : .bottom
+        }
+
+        let relativeY: CGFloat
+        switch verticalDirection {
+        case .down:
+            relativeY = cardFrame.minY / availableTravel
+        case .up:
+            relativeY = (cardFrame.maxY - panelHeight) / availableTravel
+        }
+        return UnitPoint(x: 0.5, y: min(max(relativeY, 0), 1))
+    }
 }
 
 private enum StrategyCoordinateSpace {
@@ -684,6 +872,15 @@ private struct GridRowFramePreferenceKey: PreferenceKey {
     static var defaultValue: [Int: CGRect] = [:]
 
     static func reduce(value: inout [Int: CGRect], nextValue: () -> [Int: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, latest in latest })
+    }
+}
+
+private struct GridCardFramePreferenceKey: PreferenceKey {
+    static var defaultValue: [String: CGRect] = [:]
+
+    static func reduce(value: inout [String: CGRect],
+                       nextValue: () -> [String: CGRect]) {
         value.merge(nextValue(), uniquingKeysWith: { _, latest in latest })
     }
 }
@@ -1015,6 +1212,14 @@ private struct GroupGridCard: View {
         .contextMenu {
             GradientMenu(selected: gradientIndex, onSelect: onGradient,
                          onRandomizeAll: onRandomizeAll)
+        }
+        .background {
+            GeometryReader { geometry in
+                Color.clear.preference(
+                    key: GridCardFramePreferenceKey.self,
+                    value: [group.name: geometry.frame(
+                        in: .named(StrategyCoordinateSpace.name))])
+            }
         }
         .allowsHitTesting(!isInteractionLocked)
     }
