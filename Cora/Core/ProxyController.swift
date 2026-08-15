@@ -272,6 +272,12 @@ final class ProxyController: ObservableObject {
         return configured.isEmpty ? SettingsStore.defaultDelayTestURL : configured
     }
 
+    private var directDelayTestURL: String {
+        let configured = SettingsStore.shared.directDelayTestURL
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return configured.isEmpty ? SettingsStore.defaultDirectDelayTestURL : configured
+    }
+
     private var delayTestTimeoutMilliseconds: Int {
         SettingsStore.shared.delayTestTimeout * 1_000
     }
@@ -289,6 +295,7 @@ final class ProxyController: ObservableObject {
         }
         let result = await CoreStateManager.shared.sendMessage(
             ["cmd": "groupDelay", "group": name, "url": delayTestURL,
+             "directURL": directDelayTestURL,
              "timeout": delayTestTimeoutMilliseconds])
         guard session == sessionGeneration else { return }
         switch result {
@@ -326,6 +333,7 @@ final class ProxyController: ObservableObject {
         }
         let result = await CoreStateManager.shared.sendMessage(
             ["cmd": "proxyDelay", "name": name, "group": group ?? "",
+             "directURL": directDelayTestURL,
              "url": delayTestURL, "timeout": delayTestTimeoutMilliseconds])
         guard session == sessionGeneration else { return }
         switch result {

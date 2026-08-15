@@ -315,7 +315,7 @@ struct ProxiesView: View {
                             }
                         }
                         Color.clear
-                            .frame(height: 24)
+                            .frame(height: gridFooterHeight(viewport: viewport))
                             .accessibilityHidden(true)
                     }
                     .padding(.horizontal, 14)
@@ -358,6 +358,22 @@ struct ProxiesView: View {
         .contentShape(Rectangle())
         .simultaneousGesture(gridDismissGesture(activeGroupName))
         .simultaneousGesture(strategyToolbarGesture())
+    }
+
+    private func gridFooterHeight(viewport: GeometryProxy) -> CGFloat {
+        guard let expansion = gridExpansion else {
+            return 24
+        }
+        guard let panelHeight = expandedPanelFrames[expansion.groupName]?.height,
+              panelHeight > 0 else {
+            return 120
+        }
+        let safeAreaClearance = viewport.safeAreaInsets.bottom + 72
+        let minimumClearance = max(120, safeAreaClearance)
+        // Keep enough trailing content for a single expanded GLOBAL row to move
+        // above the tab bar, while avoiding a full-screen spacer for normal rows.
+        return max(minimumClearance,
+                   viewport.size.height - panelHeight + minimumClearance)
     }
 
     private func gridRow(_ row: [DisplayedProxyGroup],

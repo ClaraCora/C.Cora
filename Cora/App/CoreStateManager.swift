@@ -113,6 +113,7 @@ final class CoreStateManager: ObservableObject {
         defer { isBusy = false }
         lastError = nil
         do {
+            AppGroupState.vpnAutoConnectSuspended = false
             // 先确定当前配置，GEO/ASN 下载地址与所需数据库均从该配置解析。
             let yaml = SubscriptionStore.shared.activeYAML
             // GEO 首次下载与定时更新在主 App 完成，避免 NE 启动阶段联网和冲高内存。
@@ -130,6 +131,9 @@ final class CoreStateManager: ObservableObject {
                 excludeDeviceCommunication: s.excludeDeviceCommunication,
                 enforceRoutes: s.enforceRoutes)
             try await tunnel.start(configYAML: yaml, settingsJSON: settings, protocolOptions: opts)
+            if s.alwaysOnVPN {
+                try await tunnel.setOnDemandEnabled(true)
+            }
             syncWidget(true)
         } catch {
             lastError = error.localizedDescription
@@ -139,8 +143,34 @@ final class CoreStateManager: ObservableObject {
     /// 显式断开（UI / 快捷指令共用）。断开后同步磁贴状态。
     func disconnect() {
         guard isActive else { return }
-        tunnel.stop()
+        let shouldSuspend = SettingsStore.shared.alwaysOnVPN
+        AppGroupState.vpnAutoConnectSuspended = shouldSuspend
+        Task {
+            if shouldSuspend {
+                try? await tunnel.setOnDemandEnabled(false)
+            }
+            tunnel.stop()
+        }
         syncWidget(false)
+    }
+
+    /// 设置页切换自动连接时调用。关闭只撤销自动连接，不强制断开当前 VPN。
+    func setAlwaysOnVPN(_ enabled: Bool) async {
+        do {
+            if enabled {
+                AppGroupState.vpnAutoConnectSuspended = false
+                try await tunnel.setOnDemandEnabled(true)
+            } else {
+                AppGroupState.vpnAutoConnectSuspended = false
+                try await tunnel.setOnDemandEnabled(false)
+            }
+            SettingsStore.shared.alwaysOnVPN = enabled
+        } catch {
+            lastError = error.localizedDescription
+            if enabled {
+                SettingsStore.shared.alwaysOnVPN = false
+            }
+        }
     }
 
     /// 写共享状态 + 请求刷新控制中心磁贴（乐观，NE 启停后还会再写一次确认）。

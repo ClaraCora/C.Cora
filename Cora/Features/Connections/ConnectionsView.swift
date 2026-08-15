@@ -366,7 +366,7 @@ private struct ConnectionTrafficHeader: View {
     }
 }
 
-private struct ConnectionListView: View {
+struct ConnectionListView: View {
     let title: String
     let entries: [ConnectionHistoryEntry]
     @ObservedObject var controller: ConnectionsController

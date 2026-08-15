@@ -146,6 +146,23 @@ final class TunnelManager {
         manager?.connection.stopVPNTunnel()
     }
 
+    /// 配置 iOS Connect On Demand。真正的受监管设备 Always-On 仍由 MDM 管理，
+    /// 普通 App 使用该能力实现重启和网络变化后的系统自动重连。
+    func setOnDemandEnabled(_ enabled: Bool) async throws {
+        guard let mgr = try await loadSavedManager() else {
+            throw NSError(domain: "Cora.TunnelManager", code: -2,
+                          userInfo: [NSLocalizedDescriptionKey: "请先连接一次 VPN，再启用自动连接"])
+        }
+        // A user can disable the profile from Settings or the control center;
+        // keep the saved profile usable so a later manual start is still allowed.
+        mgr.isEnabled = true
+        mgr.isOnDemandEnabled = enabled
+        mgr.onDemandRules = enabled ? [NEOnDemandRuleConnect()] : []
+        try await mgr.saveToPreferences()
+        try await mgr.loadFromPreferences()
+        manager = mgr
+    }
+
     /// 读取当前连接状态（用于 UI 初始化时同步）。
     func currentStatus() async -> NEVPNStatus {
         if let manager, Self.isCoraManager(manager) {

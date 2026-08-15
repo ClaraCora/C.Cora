@@ -34,6 +34,10 @@ final class SettingsStore: ObservableObject {
     @Published var logLevel: String { didSet { d.set(logLevel, forKey: K.logLevel) } }
     /// 策略组与节点测速使用的 HTTP(S) 地址，仅由主 App 的测速 IPC 使用，无需重连。
     @Published var delayTestURL: String { didSet { d.set(delayTestURL, forKey: K.delayTestURL) } }
+    /// DIRECT/国内直连节点使用的测速地址，仅由主 App 的测速 IPC 使用。
+    @Published var directDelayTestURL: String {
+        didSet { d.set(directDelayTestURL, forKey: K.directDelayTestURL) }
+    }
     /// 让各策略组使用同一测速地址，默认开启并在下次连接时写入内核配置。
     @Published var unifiedDelay: Bool { didSet { d.set(unifiedDelay, forKey: K.unifiedDelay) } }
     /// 策略组与节点测速的 IPC 超时（秒）。仅影响主 App 测速，无需重连。
@@ -80,6 +84,16 @@ final class SettingsStore: ObservableObject {
     @Published var excludeDeviceCommunication: Bool { didSet { d.set(excludeDeviceCommunication, forKey: K.exDev) } }
     /// 强制路由（即使 includeAllNetworks 关，也强制按规则路由）。
     @Published var enforceRoutes: Bool { didSet { d.set(enforceRoutes, forKey: K.enforce) } }
+    /// 使用 iOS Connect On Demand 在重启或网络变化后自动连接。
+    @Published var alwaysOnVPN: Bool {
+        didSet {
+            d.set(alwaysOnVPN, forKey: K.alwaysOnVPN)
+            AppGroupState.alwaysOnVPNEnabled = alwaysOnVPN
+            if !alwaysOnVPN {
+                AppGroupState.vpnAutoConnectSuspended = false
+            }
+        }
+    }
 
     static let stackOptions = ["gvisor", "system", "mixed"]
     static let logLevelOptions = ["silent", "error", "warning", "info", "debug"]
@@ -93,6 +107,8 @@ final class SettingsStore: ObservableObject {
     static let defaultASNURL =
         "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/GeoLite2-ASN.mmdb"
     static let defaultDelayTestURL = "https://www.gstatic.com/generate_204"
+    static let defaultDirectDelayTestURL =
+        "https://connectivitycheck.platform.hicloud.com/generate_204"
 
     private let d = UserDefaults.standard
     private enum K {
@@ -105,12 +121,14 @@ final class SettingsStore: ObservableObject {
         static let geoAuto = "set.geoAuto", geoInterval = "set.geoInterval"
         static let logLevel = "set.logLevel"
         static let delayTestURL = "set.delayTestURL"
+        static let directDelayTestURL = "set.directDelayTestURL"
         static let unifiedDelay = "set.unifiedDelay"
         static let delayTestTimeout = "set.delayTestTimeout"
         static let mixedPort = "set.mixedPort"
         static let blockDirectSTUN = "set.blockDirectSTUN"
         static let inclAll = "set.inclAll", exCell = "set.exCell", exAPNs = "set.exAPNs"
         static let exDev = "set.exDev", enforce = "set.enforce"
+        static let alwaysOnVPN = "set.alwaysOnVPN"
         static let subUA = "set.subUA"
     }
 
@@ -129,6 +147,8 @@ final class SettingsStore: ObservableObject {
         geoUpdateInterval = gi == 0 ? 24 : gi
         logLevel = d.string(forKey: K.logLevel) ?? "info"
         delayTestURL = d.string(forKey: K.delayTestURL) ?? Self.defaultDelayTestURL
+        directDelayTestURL = d.string(forKey: K.directDelayTestURL)
+            ?? Self.defaultDirectDelayTestURL
         unifiedDelay = d.object(forKey: K.unifiedDelay) as? Bool ?? true
         let delayTimeout = d.integer(forKey: K.delayTestTimeout)
         delayTestTimeout = delayTimeout == 0 ? 5 : min(max(delayTimeout, 1), 60)
@@ -139,7 +159,9 @@ final class SettingsStore: ObservableObject {
         excludeAPNs = d.object(forKey: K.exAPNs) as? Bool ?? true
         excludeDeviceCommunication = d.object(forKey: K.exDev) as? Bool ?? true
         enforceRoutes = d.object(forKey: K.enforce) as? Bool ?? false
+        alwaysOnVPN = d.object(forKey: K.alwaysOnVPN) as? Bool ?? false
         subscriptionUA = d.string(forKey: K.subUA) ?? "clash-meta"
+        AppGroupState.alwaysOnVPNEnabled = alwaysOnVPN
     }
 
     /// 序列化为下发给 NE 的 JSON。

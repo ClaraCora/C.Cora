@@ -306,9 +306,25 @@ private struct DelayTestSettingsView: View {
 
             Section {
                 VStack(alignment: .leading, spacing: 6) {
-                    InfoLabel(title: "测速地址", message: "策略组与单节点测速都会请求此 HTTP 或 HTTPS 地址。留空时使用 Google generate_204；修改后立即用于下一次测速。")
+                    InfoLabel(title: "代理节点测速地址", message: "普通代理节点的策略组与单节点测速使用此 HTTP 或 HTTPS 地址。留空时使用默认地址；修改后立即用于下一次测速。")
                     TextField(SettingsStore.defaultDelayTestURL,
                               text: $settings.delayTestURL,
+                              axis: .vertical)
+                        .font(.footnote.monospaced())
+                        .keyboardType(.URL)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .lineLimit(1...3)
+                }
+                .padding(.vertical, 2)
+            }
+            .listRowBackground(AppListRowBackground())
+
+            Section {
+                VStack(alignment: .leading, spacing: 6) {
+                    InfoLabel(title: "国内直连测速地址", message: "DIRECT 或最终落到 DIRECT 的国内直连策略使用此地址。留空时使用默认地址；不会改变普通代理节点的测速地址。")
+                    TextField(SettingsStore.defaultDirectDelayTestURL,
+                              text: $settings.directDelayTestURL,
                               axis: .vertical)
                         .font(.footnote.monospaced())
                         .keyboardType(.URL)
@@ -448,6 +464,7 @@ private struct GeoSettingsView: View {
 
 private struct TunnelRouteSettingsView: View {
     @EnvironmentObject private var settings: SettingsStore
+    @EnvironmentObject private var core: CoreStateManager
 
     var body: some View {
         Form {
@@ -460,6 +477,14 @@ private struct TunnelRouteSettingsView: View {
                 if #available(iOS 17.4, *) {
                     InfoToggleRow(title: "排除设备间通信", message: "将本地设备间通信排除在隧道之外，保留 AirDrop 和附近设备连接。", isOn: $settings.excludeDeviceCommunication)
                 }
+                InfoToggleRow(
+                    title: "VPN 始终开启",
+                    message: "使用 iOS Connect On Demand，在重启或网络变化后自动连接。通过 Cora 控制中心按钮关闭时会暂停自动连接；苹果受监管设备的真正 Always-On VPN 仍需 MDM。",
+                    isOn: Binding(
+                        get: { settings.alwaysOnVPN },
+                        set: { value in
+                            Task { await core.setAlwaysOnVPN(value) }
+                        }))
             }
             .listRowBackground(AppListRowBackground())
         }

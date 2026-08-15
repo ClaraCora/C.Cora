@@ -42,7 +42,7 @@ struct RootView: View {
 
     private var tabs: some View {
         TabView {
-            ConnectView()
+            ConnectView(connections: connections)
                 .tabItem { Label("总览", systemImage: "gauge.with.dots.needle.67percent") }
             ProxiesView()
                 .tabItem { Label("策略", systemImage: "slider.horizontal.3") }

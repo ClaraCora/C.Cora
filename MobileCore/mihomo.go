@@ -2035,12 +2035,14 @@ func SelectProxy(group, name string) error {
 }
 
 // GroupDelay 对策略组里所有节点做延迟测试（等价 REST GET /group/{name}/delay），
-// 返回 {<节点名>: 毫秒} 的 JSON；失败返回 {"error":...}。
-// 对应 Swift 侧 `MihomoGroupDelay(_:_:_:)`。
-func GroupDelay(group, url string, timeoutMs int) string {
+// DIRECT 链路使用 directURL，其余节点使用 url。返回 {<节点名>: 毫秒} 的 JSON；
+// 失败返回 {"error":...}。
+// 对应 Swift 侧 `MihomoGroupDelay(_:_:_:_:)`。
+func GroupDelay(group, url, directURL string, timeoutMs int) string {
 	configApplyMu.RLock()
 	defer configApplyMu.RUnlock()
-	p, exist := tunnel.Proxies()[group]
+	proxies := tunnel.Proxies()
+	p, exist := proxies[group]
 	if !exist {
 		return `{"error":"策略组不存在"}`
 	}
@@ -2050,6 +2052,9 @@ func GroupDelay(group, url string, timeoutMs int) string {
 	}
 	if url == "" {
 		url = "https://www.gstatic.com/generate_204"
+	}
+	if directURL == "" {
+		directURL = url
 	}
 	if timeoutMs <= 0 {
 		timeoutMs = 5000
@@ -2069,7 +2074,8 @@ func GroupDelay(group, url string, timeoutMs int) string {
 		wait.Add(1)
 		go func() {
 			defer wait.Done()
-			delay, testErr := proxy.URLTest(ctx, url, expectedStatus)
+			testURL := delayURLForProxy(proxy, url, directURL, proxies)
+			delay, testErr := proxy.URLTest(ctx, testURL, expectedStatus)
 			if testErr == nil && delay > 0 {
 				delayMu.Lock()
 				dm[proxy.Name()] = delay
@@ -2089,11 +2095,13 @@ func GroupDelay(group, url string, timeoutMs int) string {
 }
 
 // ProxyDelay 对单个代理做延迟测试，供策略页节点卡片的长按菜单使用。
-// 返回 {"delay": 毫秒}，超时为 0；其他失败返回 {"error": ...}。
-func ProxyDelay(name, group, url string, timeoutMs int) string {
+// DIRECT 链路使用 directURL，其余节点使用 url。返回 {"delay": 毫秒}，超时为 0；
+// 其他失败返回 {"error": ...}。
+func ProxyDelay(name, group, url, directURL string, timeoutMs int) string {
 	configApplyMu.RLock()
 	defer configApplyMu.RUnlock()
-	p, exist := tunnel.Proxies()[name]
+	proxies := tunnel.Proxies()
+	p, exist := proxies[name]
 	if !exist && strings.TrimSpace(group) != "" {
 		if parent, ok := tunnel.Proxies()[group]; ok {
 			if proxyGroup, ok := parent.Adapter().(outboundgroup.ProxyGroup); ok {
@@ -2113,6 +2121,9 @@ func ProxyDelay(name, group, url string, timeoutMs int) string {
 	if url == "" {
 		url = "https://www.gstatic.com/generate_204"
 	}
+	if directURL == "" {
+		directURL = url
+	}
 	if timeoutMs <= 0 {
 		timeoutMs = 5000
 	}
@@ -2120,7 +2131,8 @@ func ProxyDelay(name, group, url string, timeoutMs int) string {
 	defer cancel()
 
 	var expectedStatus utils.IntRanges[uint16]
-	delay, err := p.URLTest(ctx, url, expectedStatus)
+	delay, err := p.URLTest(ctx,
+		delayURLForProxy(p, url, directURL, proxies), expectedStatus)
 	if err != nil {
 		if proxyDelayTimedOut(ctx, err) {
 			return `{"delay":0}`
@@ -2135,6 +2147,49 @@ func ProxyDelay(name, group, url string, timeoutMs int) string {
 		return `{"error":"marshal: ` + err.Error() + `"}`
 	}
 	return string(out)
+}
+
+// delayURLForProxy follows the currently selected member of a strategy group.
+// This makes a group such as "国内直连" use the domestic endpoint when its
+// effective route is DIRECT, without relying on user-visible names.
+func delayURLForProxy(proxy C.Proxy,
+	proxyURL string,
+	directURL string,
+	all map[string]C.Proxy) string {
+	if proxyUsesDirect(proxy, all, map[string]bool{}) {
+		return directURL
+	}
+	return proxyURL
+}
+
+func proxyUsesDirect(proxy C.Proxy,
+	all map[string]C.Proxy,
+	visited map[string]bool) bool {
+	if proxy == nil {
+		return false
+	}
+	name := proxy.Name()
+	if visited[name] {
+		return false
+	}
+	visited[name] = true
+	if proxy.Type() == C.Direct {
+		return true
+	}
+	group, ok := proxy.Adapter().(outboundgroup.ProxyGroup)
+	if !ok {
+		return false
+	}
+	selected := group.Now()
+	for _, member := range group.Proxies() {
+		if member.Name() == selected {
+			return proxyUsesDirect(member, all, visited)
+		}
+	}
+	if member, ok := all[selected]; ok {
+		return proxyUsesDirect(member, all, visited)
+	}
+	return false
 }
 
 func proxyDelayTimedOut(ctx context.Context, err error) bool {

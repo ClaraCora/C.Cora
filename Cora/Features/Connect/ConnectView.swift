@@ -5,6 +5,7 @@ import Charts
 struct ConnectView: View {
     @EnvironmentObject private var core: CoreStateManager
     @EnvironmentObject private var kernel: KernelController
+    @ObservedObject var connections: ConnectionsController
 
     var body: some View {
         NavigationStack {
@@ -23,6 +24,8 @@ struct ConnectView: View {
                                                samples: kernel.samples)
                         }
 
+                        OverviewConnectionLinks(controller: connections)
+
                     }
                     .padding(.horizontal, 16)
                     .padding(.top, 28)
@@ -34,6 +37,74 @@ struct ConnectView: View {
             .navigationBarTitleDisplayMode(.inline)
             .task { await core.refreshStatus() }
         }
+    }
+}
+
+private struct OverviewConnectionLinks: View {
+    @ObservedObject var controller: ConnectionsController
+
+    var body: some View {
+        LazyVGrid(columns: [
+            GridItem(.flexible(), spacing: 10),
+            GridItem(.flexible(), spacing: 10),
+        ], spacing: 10) {
+            NavigationLink {
+                ConnectionListView(title: "全部连接",
+                                   entries: controller.history,
+                                   controller: controller,
+                                   showsRetentionNote: true)
+            } label: {
+                OverviewConnectionCard(title: "全部连接",
+                                        value: controller.historySummary.recordCount,
+                                        symbol: "point.3.connected.trianglepath.dotted",
+                                        tint: .blue)
+            }
+            .buttonStyle(.plain)
+
+            NavigationLink {
+                ConnectionListView(title: "活跃连接",
+                                   entries: controller.history.filter(\.isActive),
+                                   controller: controller,
+                                   initialStatus: .active)
+            } label: {
+                OverviewConnectionCard(title: "活跃连接",
+                                        value: controller.historySummary.activeCount,
+                                        symbol: "bolt.horizontal.circle",
+                                        tint: .green)
+            }
+            .buttonStyle(.plain)
+        }
+    }
+}
+
+private struct OverviewConnectionCard: View {
+    let title: String
+    let value: Int
+    let symbol: String
+    let tint: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Image(systemName: symbol)
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(tint)
+            Text(title)
+                .font(.subheadline.weight(.medium))
+                .foregroundStyle(.secondary)
+            Text(value.formatted())
+                .font(.title2.monospacedDigit().weight(.semibold))
+                .foregroundStyle(.primary)
+        }
+        .frame(maxWidth: .infinity, minHeight: 96, alignment: .leading)
+        .padding(14)
+        .background(.regularMaterial,
+                    in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(tint.opacity(0.14), lineWidth: 1)
+        }
+        .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .accessibilityElement(children: .combine)
     }
 }
 

@@ -34,6 +34,14 @@ private func startVPN(_ manager: NETunnelProviderManager) async throws {
     try manager.connection.startVPNTunnel()
 }
 
+private func setOnDemand(_ enabled: Bool,
+                         manager: NETunnelProviderManager) async throws {
+    manager.isOnDemandEnabled = enabled
+    manager.onDemandRules = enabled ? [NEOnDemandRuleConnect()] : []
+    try await manager.saveToPreferences()
+    try await manager.loadFromPreferences()
+}
+
 /// 控制中心「代理开关」磁贴。
 struct VPNControlWidget: ControlWidget {
     static let kind = ControlWidgetKind.vpn
@@ -93,8 +101,17 @@ struct ToggleVPNIntent: SetValueIntent {
             try? await mgr.loadFromPreferences()
         }
         if value {
+            AppGroupState.vpnAutoConnectSuspended = false
+            if AppGroupState.alwaysOnVPNEnabled {
+                try await setOnDemand(true, manager: mgr)
+            }
             try await startVPN(mgr)
         } else {
+            AppGroupState.vpnAutoConnectSuspended = AppGroupState.alwaysOnVPNEnabled
+            // App Group entitlements may be stripped by a re-signing certificate,
+            // so do not rely on the shared preference to decide this. A manual
+            // control-center shutdown must always suspend Connect On Demand.
+            try? await setOnDemand(false, manager: mgr)
             mgr.connection.stopVPNTunnel()
         }
         // 乐观写入共享状态并刷新磁贴，让开关立刻翻到目标态（NE 启停后会再写一次确认）。
