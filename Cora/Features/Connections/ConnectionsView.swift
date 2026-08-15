@@ -893,7 +893,7 @@ private extension Array {
     }
 }
 
-private enum ConnectionStatusFilter: String, CaseIterable, Identifiable {
+enum ConnectionStatusFilter: String, CaseIterable, Identifiable {
     case all
     case active
     case ended
