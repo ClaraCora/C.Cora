@@ -226,7 +226,7 @@ final class CoreStateManager: ObservableObject {
             syncWidget(true)
         } catch {
             let newError = error.localizedDescription
-            guard stopped else {
+            if !stopped {
                 // 停止超时不等于旧运行时已经退出；仅在确认它最终断开后才允许回滚。
                 do {
                     try await tunnel.stopAndWaitUntilDisconnected(timeout: 2)
@@ -234,7 +234,7 @@ final class CoreStateManager: ObservableObject {
                 } catch {
                     stopped = false
                 }
-                guard stopped else {
+                if !stopped {
                     lastError = "配置重载失败：" + newError
                     return false
                 }
