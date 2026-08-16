@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import Foundation
 import NetworkExtension
 import WidgetKit
 
@@ -22,6 +23,9 @@ final class CoreStateManager: ObservableObject {
     /// 是否正在执行启停（防抖，避免重复点击）。
     @Published private(set) var isBusy = false
 
+    /// 是否正在把新订阅配置应用到运行中的 VPN。
+    @Published private(set) var isReloadingConfiguration = false
+
     /// 最近一次错误信息（用于 UI 提示）。
     @Published var lastError: String?
 
@@ -33,6 +37,10 @@ final class CoreStateManager: ObservableObject {
 
     private let tunnel = TunnelManager()
     private var statusObserver: NSObjectProtocol?
+    private var reloadRequested = false
+    private var pendingReloadSnapshot: String?
+    private var pendingReloadHasSnapshot = false
+    private var lastReloadSucceeded = true
 
     private init() {
         // NE 会把已连接状态同步到 App Group。主 App 被系统重新拉起时先用它恢复界面和
@@ -114,23 +122,8 @@ final class CoreStateManager: ObservableObject {
         lastError = nil
         do {
             AppGroupState.vpnAutoConnectSuspended = false
-            // 先确定当前配置，GEO/ASN 下载地址与所需数据库均从该配置解析。
-            let yaml = SubscriptionStore.shared.activeYAML
-            // GEO 首次下载与定时更新在主 App 完成，避免 NE 启动阶段联网和冲高内存。
-            try await GeoDatabaseManager.shared.prepareForConnection(configYAML: yaml)
-            // App 主动连接时明确下发配置意图：nil=使用内建 DIRECT，不复活旧订阅缓存。
-            let settings = SettingsStore.shared.asJSON(
-                geoAvailable: AppGroup.containerURL != nil,
-                applyOverrides: SubscriptionStore.shared.activeOverridesEnabled,
-                proxySelections: SubscriptionStore.shared.activeProxySelections)
+            try await startCurrentConfiguration()
             let s = SettingsStore.shared
-            let opts = TunnelManager.ProtocolOptions(
-                includeAllNetworks: s.includeAllNetworks,
-                excludeCellularServices: s.excludeCellularServices,
-                excludeAPNs: s.excludeAPNs,
-                excludeDeviceCommunication: s.excludeDeviceCommunication,
-                enforceRoutes: s.enforceRoutes)
-            try await tunnel.start(configYAML: yaml, settingsJSON: settings, protocolOptions: opts)
             if s.alwaysOnVPN {
                 try await tunnel.setOnDemandEnabled(true)
             }
@@ -138,6 +131,142 @@ final class CoreStateManager: ObservableObject {
         } catch {
             lastError = error.localizedDescription
         }
+    }
+
+    /// 使用当前订阅和设置构造一次完整的 NE 启动请求。
+    /// `configYAML` 仅用于失败回滚；正常连接和重载都明确传入当前订阅内容。
+    private func startCurrentConfiguration(configYAML: String? = nil,
+                                           useCurrentConfiguration: Bool = true) async throws {
+        let yaml = useCurrentConfiguration ? SubscriptionStore.shared.activeYAML : configYAML
+        // GEO 首次下载与定时更新在主 App 完成，避免 NE 启动阶段联网和冲高内存。
+        try await GeoDatabaseManager.shared.prepareForConnection(configYAML: yaml)
+        let settings = SettingsStore.shared.asJSON(
+            geoAvailable: AppGroup.containerURL != nil,
+            applyOverrides: SubscriptionStore.shared.activeOverridesEnabled,
+            proxySelections: SubscriptionStore.shared.activeProxySelections)
+        let s = SettingsStore.shared
+        let opts = TunnelManager.ProtocolOptions(
+            includeAllNetworks: s.includeAllNetworks,
+            excludeCellularServices: s.excludeCellularServices,
+            excludeAPNs: s.excludeAPNs,
+            excludeDeviceCommunication: s.excludeDeviceCommunication,
+            enforceRoutes: s.enforceRoutes)
+        try await tunnel.start(configYAML: yaml, settingsJSON: settings, protocolOptions: opts)
+    }
+
+    /// 在运行中的 VPN 上应用刚刚成功下载的当前订阅。
+    ///
+    /// 采用完整 stop/start，而不是在同一 NE 进程内叠加第二个 mihomo 运行时：
+    /// stopTunnel 完成并经过状态确认后才会启动新配置，从根上限制内存峰值。
+    /// 多次刷新在重载期间会合并为下一轮，避免并发重启。
+    @discardableResult
+    func reloadActiveConfigurationIfNeeded(changedSubscriptionID: UUID,
+                                           previousYAML: String?) async -> Bool {
+        guard SubscriptionStore.shared.selectedID == changedSubscriptionID else { return true }
+        guard status == .connected || status == .reasserting else { return true }
+
+        reloadRequested = true
+        pendingReloadSnapshot = previousYAML
+        pendingReloadHasSnapshot = true
+        if isReloadingConfiguration {
+            // 让正在进行的 stop/start 消化这次最新请求，再把最终结果返回给调用方。
+            while isReloadingConfiguration {
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+            return lastReloadSucceeded
+        }
+
+        isReloadingConfiguration = true
+        isBusy = true
+        var allSucceeded = true
+        defer {
+            lastReloadSucceeded = allSucceeded
+            isReloadingConfiguration = false
+            isBusy = false
+            reloadRequested = false
+            pendingReloadSnapshot = nil
+            pendingReloadHasSnapshot = false
+        }
+
+        while reloadRequested {
+            reloadRequested = false
+            let oldYAML = pendingReloadHasSnapshot ? pendingReloadSnapshot : nil
+            pendingReloadSnapshot = nil
+            pendingReloadHasSnapshot = false
+            allSucceeded = await performConfigurationReload(previousYAML: oldYAML)
+                && allSucceeded
+        }
+        return allSucceeded
+    }
+
+    private func performConfigurationReload(previousYAML: String?) async -> Bool {
+        guard status == .connected || status == .reasserting else { return true }
+
+        let alwaysOn = SettingsStore.shared.alwaysOnVPN
+        var stopped = false
+        lastError = nil
+        do {
+            // 防止 Connect On Demand 在 stop/start 间隙抢先拉起旧配置。
+            if alwaysOn {
+                try await tunnel.setOnDemandEnabled(false)
+            }
+
+            try await tunnel.stopAndWaitUntilDisconnected()
+            stopped = true
+            syncWidget(false)
+
+            try await startCurrentConfiguration()
+            guard await tunnel.waitUntilConnected() else {
+                throw NSError(domain: "Cora.CoreStateManager", code: -20,
+                              userInfo: [NSLocalizedDescriptionKey: "新配置启动后未进入已连接状态"])
+            }
+            if alwaysOn && !AppGroupState.vpnAutoConnectSuspended {
+                try await tunnel.setOnDemandEnabled(true)
+            }
+            syncWidget(true)
+        } catch {
+            let newError = error.localizedDescription
+            guard stopped else {
+                // 停止超时不等于旧运行时已经退出；仅在确认它最终断开后才允许回滚。
+                do {
+                    try await tunnel.stopAndWaitUntilDisconnected(timeout: 2)
+                    stopped = true
+                } catch {
+                    stopped = false
+                }
+                guard stopped else {
+                    lastError = "配置重载失败：" + newError
+                    return false
+                }
+                syncWidget(false)
+            }
+
+            // 启动阶段失败时也先确认失败的 NE 已退出，再尝试回滚，
+            // 避免回滚启动与失败运行时重叠。
+            try? await tunnel.stopAndWaitUntilDisconnected()
+
+            // 新配置失败时，旧配置仍在内存中的副本只保留这一份；新 NE 已确认退出后才回滚。
+            do {
+                try await startCurrentConfiguration(configYAML: previousYAML,
+                                                    useCurrentConfiguration: false)
+                guard await tunnel.waitUntilConnected() else {
+                    throw NSError(domain: "Cora.CoreStateManager", code: -21,
+                                  userInfo: [NSLocalizedDescriptionKey: "旧配置恢复后未进入已连接状态"])
+                }
+                if alwaysOn && !AppGroupState.vpnAutoConnectSuspended {
+                    try await tunnel.setOnDemandEnabled(true)
+                }
+                syncWidget(true)
+                lastError = "新配置加载失败，已恢复旧配置：" + newError
+                return false
+            } catch {
+                lastError = "配置重载失败且旧配置恢复失败：" + newError
+                    + "；" + error.localizedDescription
+                syncWidget(false)
+                return false
+            }
+        }
+        return true
     }
 
     /// 显式断开（UI / 快捷指令共用）。断开后同步磁贴状态。

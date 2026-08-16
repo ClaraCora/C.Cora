@@ -138,6 +138,7 @@ final class SubscriptionStore: ObservableObject {
     private var refreshGenerations: [UUID: Int] = [:]
     private var activeRefreshes: [UUID: ActiveSubscriptionRefresh] = [:]
     private var activeRefreshCount = 0
+    private var pendingRuntimeApplyYAML: [UUID: String] = [:]
     private init() { load() }
 
     /// 当前选中的订阅原文。固定覆写由 NE 按该配置的开关统一应用。
@@ -239,6 +240,9 @@ final class SubscriptionStore: ObservableObject {
         }
 
         let previousURL = subscriptions[i].url
+        let previousYAML = subscriptions[i].yaml
+        let previousSubscription = subscriptions[i]
+        let previousProviderCache = Self.loadProviderCache(id)
         let request = makeRequest(url: remoteURL)
         let (generation, task) = beginRefresh(id, request: request)
         lastError = nil
@@ -261,6 +265,11 @@ final class SubscriptionStore: ObservableObject {
             if Self.hasRemoteProxyProviders(payload.yaml) {
                 await refreshProxyProviders(id, updateRuntime: false)
             }
+            await applyUpdatedConfigurationIfNeeded(subscriptionID: id,
+                                                    previousYAML: previousYAML,
+                                                    previousSubscription: previousSubscription,
+                                                    previousProviderCache: previousProviderCache,
+                                                    expectedYAML: payload.yaml)
         } catch is CancellationError {
             return
         } catch {
@@ -291,13 +300,22 @@ final class SubscriptionStore: ObservableObject {
 
     /// 重新拉取某订阅的配置 YAML。
     func refresh(_ id: UUID) async {
-        guard let idx = subscriptions.firstIndex(where: { $0.id == id }) else { return }
+        _ = await refresh(id, applyRuntime: true)
+    }
+
+    /// 重新拉取某订阅的配置 YAML，并可延迟到批量刷新全部完成后再应用运行时。
+    @discardableResult
+    private func refresh(_ id: UUID, applyRuntime: Bool) async -> Bool {
+        guard let idx = subscriptions.firstIndex(where: { $0.id == id }) else { return false }
         let urlString = subscriptions[idx].url
-        guard !urlString.isEmpty else { lastError = "本地配置无需刷新"; return }
+        guard !urlString.isEmpty else { lastError = "本地配置无需刷新"; return false }
         guard let url = Self.remoteURL(urlString) else {
             lastError = "订阅地址必须是有效的 HTTP/HTTPS 链接"
-            return
+            return false
         }
+        let previousYAML = subscriptions[idx].yaml
+        let previousSubscription = subscriptions[idx]
+        let previousProviderCache = Self.loadProviderCache(id)
 
         let request = makeRequest(url: url)
         let (generation, task) = beginRefresh(id, request: request)
@@ -307,7 +325,7 @@ final class SubscriptionStore: ObservableObject {
         do {
             let payload = try await task.value
             guard isCurrentRefresh(id, generation: generation, url: urlString),
-                  let i = subscriptions.firstIndex(where: { $0.id == id }) else { return }
+                  let i = subscriptions.firstIndex(where: { $0.id == id }) else { return false }
             apply(payload, to: &subscriptions[i], resetMissingUsage: false)
             if subscriptions[i].autoNamed, let title = payload.title {
                 subscriptions[i].name = title
@@ -316,11 +334,20 @@ final class SubscriptionStore: ObservableObject {
             if Self.hasRemoteProxyProviders(payload.yaml) {
                 await refreshProxyProviders(id, updateRuntime: false)
             }
+            if applyRuntime {
+                await applyUpdatedConfigurationIfNeeded(subscriptionID: id,
+                                                        previousYAML: previousYAML,
+                                                        previousSubscription: previousSubscription,
+                                                        previousProviderCache: previousProviderCache,
+                                                        expectedYAML: payload.yaml)
+            }
+            return true
         } catch is CancellationError {
-            return
+            return false
         } catch {
-            guard isCurrentRefresh(id, generation: generation, url: urlString) else { return }
+            guard isCurrentRefresh(id, generation: generation, url: urlString) else { return false }
             lastError = "拉取失败：\(error.localizedDescription)"
+            return false
         }
     }
 
@@ -329,14 +356,70 @@ final class SubscriptionStore: ObservableObject {
         let remotes = subscriptions.filter { !$0.isLocal }.map { ($0.id, $0.name) }
         guard !remotes.isEmpty else { return }
 
+        let selectedBeforeRefresh = selectedID
+        let previousYAML = selectedBeforeRefresh.flatMap { id in
+            subscriptions.first(where: { $0.id == id })?.yaml
+        }
+        let previousSubscription = selectedBeforeRefresh.flatMap { id in
+            subscriptions.first(where: { $0.id == id })
+        }
+        let previousProviderCache = selectedBeforeRefresh.map { Self.loadProviderCache($0) }
         var failures: [String] = []
+        var selectedWasUpdated = false
         for (id, name) in remotes {
-            await refresh(id)
+            let updated = await refresh(id, applyRuntime: false)
+            if updated && id == selectedBeforeRefresh { selectedWasUpdated = true }
             if let error = lastError {
                 failures.append("\(name)：\(error)")
             }
         }
+        if selectedWasUpdated, let selectedBeforeRefresh {
+            await applyUpdatedConfigurationIfNeeded(subscriptionID: selectedBeforeRefresh,
+                                                    previousYAML: previousYAML,
+                                                    previousSubscription: previousSubscription,
+                                                    previousProviderCache: previousProviderCache ?? [:],
+                                                    expectedYAML: subscriptions.first(where: {
+                                                        $0.id == selectedBeforeRefresh
+                                                    })?.yaml ?? "")
+            if let runtimeError = CoreStateManager.shared.lastError {
+                failures.append("运行配置：\(runtimeError)")
+            }
+        }
         lastError = failures.isEmpty ? nil : failures.joined(separator: "\n")
+    }
+
+    private func applyUpdatedConfigurationIfNeeded(subscriptionID: UUID,
+                                                   previousYAML: String?,
+                                                   previousSubscription: Subscription?,
+                                                   previousProviderCache: [String: String],
+                                                   expectedYAML: String) async {
+        guard selectedID == subscriptionID else { return }
+        // 连续刷新时只允许最后一次请求执行持久化回滚，避免较早请求覆盖更新后的订阅。
+        pendingRuntimeApplyYAML[subscriptionID] = expectedYAML
+        let runtimeWasActive = CoreStateManager.shared.status == .connected
+            || CoreStateManager.shared.status == .reasserting
+        let reloadSucceeded = await CoreStateManager.shared.reloadActiveConfigurationIfNeeded(
+            changedSubscriptionID: subscriptionID,
+            previousYAML: previousYAML)
+        if runtimeWasActive, !reloadSucceeded, let previousSubscription,
+           let index = subscriptions.firstIndex(where: { $0.id == subscriptionID }),
+           subscriptions[index].yaml == expectedYAML,
+           pendingRuntimeApplyYAML[subscriptionID] == expectedYAML {
+            subscriptions[index] = previousSubscription
+            if previousProviderCache.isEmpty {
+                removeProviderCache(subscriptionID)
+            } else {
+                try? Self.saveProviderCache(previousProviderCache, id: subscriptionID)
+            }
+            providerCacheRevision &+= 1
+            save()
+            pendingRuntimeApplyYAML.removeValue(forKey: subscriptionID)
+        } else if pendingRuntimeApplyYAML[subscriptionID] == expectedYAML {
+            pendingRuntimeApplyYAML.removeValue(forKey: subscriptionID)
+        }
+        if runtimeWasActive, let runtimeError = CoreStateManager.shared.lastError {
+            lastError = runtimeError
+        }
     }
 
     /// 刷新订阅声明的 HTTP proxy-providers。连接中时先让运行内核原地更新，

@@ -2768,6 +2768,10 @@ func Stop() {
 	coreStartedAt = time.Time{}
 	CloseAllConnections()
 	executor.Shutdown()
+	// 旧运行时必须在下一次 StartWithConfig 前尽量归还 Go 堆页，
+	// 避免完整 stop/start 重载在 NE 中形成短暂的内存峰值。
+	runtime.GC()
+	debug.FreeOSMemory()
 }
 
 func storePhysicalInterface(name string) {

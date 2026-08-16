@@ -1,4 +1,5 @@
 import Foundation
+import Foundation
 import NetworkExtension
 
 /// 负责与系统 VPN 子系统打交道：安装/加载 VPN 描述文件、启停隧道、上报状态。
@@ -30,6 +31,7 @@ final class TunnelManager {
     private static let startupPollNanoseconds: UInt64 = 250_000_000
     private static let startupPollCount = 40
     private static let initialTransitionGracePolls = 8
+    private static let shutdownPollNanoseconds: UInt64 = 100_000_000
 
     /// 加载（或创建）Cora 的 VPN 描述文件。
     /// iOS 要求 VPN 配置先 saveToPreferences 落到「设置 > VPN」里，用户授权一次后方可启动。
@@ -144,6 +146,52 @@ final class TunnelManager {
     /// 停止隧道。
     func stop() {
         manager?.connection.stopVPNTunnel()
+    }
+
+    /// 停止隧道并等待 Network Extension 完成 stopTunnel 回调。
+    ///
+    /// 配置重载必须等旧的 mihomo executor、连接和 DNS 资源释放后再启动，
+    /// 否则新旧运行时会在短时间内同时占用 NE 内存，容易触发 Jetsam。
+    func stopAndWaitUntilDisconnected(timeout: TimeInterval = 15) async throws {
+        let mgr = try await loadSavedManager()
+        guard let connection = mgr?.connection else { return }
+
+        switch connection.status {
+        case .disconnected, .invalid:
+            return
+        default:
+            connection.stopVPNTunnel()
+        }
+
+        let deadline = Date().addingTimeInterval(max(1, timeout))
+        while connection.status != .disconnected && connection.status != .invalid {
+            if Date() >= deadline {
+                throw Self.startupError("等待旧 VPN 完全退出超时")
+            }
+            try await Task.sleep(nanoseconds: Self.shutdownPollNanoseconds)
+        }
+
+        // 状态切到 disconnected 后，给系统一个很短的机会完成 provider 的收尾。
+        // 这里不启动新任务，也不复制配置数据，只避免 stopTunnel 的尾部工作与新启动重叠。
+        try await Task.sleep(nanoseconds: Self.shutdownPollNanoseconds * 2)
+    }
+
+    /// 等待已经启动的隧道真正进入 connected。用于配置重载，避免仍处于 connecting
+    /// 时就把重载标记为成功，导致失败无法自动回滚。
+    func waitUntilConnected(timeout: TimeInterval = 20) async -> Bool {
+        guard let connection = manager?.connection else { return false }
+        let deadline = Date().addingTimeInterval(max(1, timeout))
+        while Date() < deadline {
+            switch connection.status {
+            case .connected:
+                return true
+            case .disconnected, .disconnecting, .invalid:
+                return false
+            default:
+                try? await Task.sleep(nanoseconds: Self.shutdownPollNanoseconds)
+            }
+        }
+        return connection.status == .connected
     }
 
     /// 配置 iOS Connect On Demand。真正的受监管设备 Always-On 仍由 MDM 管理，
