@@ -28,13 +28,25 @@ struct ConnectionHistoryRecord: Identifiable, Sendable {
     let rulePayload: String
 
     var strategyName: String {
+        Self.normalizedStrategyName(chains)
+    }
+
+    var hostName: String {
+        Self.normalizedHostName(host: host, sniffHost: sniffHost, destinationIP: destinationIP)
+    }
+
+    static func normalizedStrategyName(_ chains: [String]) -> String {
         let value = chains.last?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return value.isEmpty ? "DIRECT" : value
     }
 
-    var hostName: String {
-        let value = host.isEmpty ? (sniffHost.isEmpty ? destinationIP : sniffHost) : host
-        return value.isEmpty ? "Unknown" : value
+    static func normalizedHostName(host: String,
+                                   sniffHost: String,
+                                   destinationIP: String) -> String {
+        let value = [host, sniffHost, destinationIP]
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty } ?? ""
+        return value.isEmpty ? "未知" : value
     }
 
     struct CoreSnapshot: Sendable {
@@ -158,6 +170,70 @@ struct ConnectionHistoryRecord: Identifiable, Sendable {
             return date
         }
         return try? Date.ISO8601FormatStyle().parse(value)
+    }
+}
+
+/// A bounded database-side filter used by record detail pages.
+/// Keeping the filter here lets both the App and the Network Extension share
+/// the same column names without transferring the complete history into RAM.
+struct ConnectionHistoryQuery: Equatable, Hashable, Sendable {
+    let strategyName: String?
+    let hostName: String?
+    let network: String?
+    let isActive: Bool?
+    let searchText: String?
+
+    init(strategyName: String? = nil,
+         hostName: String? = nil,
+         network: String? = nil,
+         isActive: Bool? = nil,
+         searchText: String? = nil) {
+        let strategy = strategyName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let host = hostName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedNetwork = network?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let normalizedSearch = searchText?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        self.strategyName = strategy?.isEmpty == true ? nil : strategy
+        self.hostName = host?.isEmpty == true ? nil : host
+        self.network = normalizedNetwork?.isEmpty == true ? nil : normalizedNetwork
+        self.isActive = isActive
+        self.searchText = normalizedSearch?.isEmpty == true ? nil : normalizedSearch
+    }
+
+    static let all = ConnectionHistoryQuery()
+
+    var isUnfiltered: Bool {
+        strategyName == nil && hostName == nil && network == nil
+            && isActive == nil && searchText == nil
+    }
+
+    fileprivate var sqlPredicate: (clause: String, values: [String]) {
+        var clauses: [String] = []
+        var values: [String] = []
+        if let strategyName {
+            clauses.append("strategy_name = ?")
+            values.append(strategyName)
+        }
+        if let hostName {
+            clauses.append("host_name = ?")
+            values.append(hostName)
+        }
+        if let network {
+            clauses.append("LOWER(network) = ?")
+            values.append(network)
+        }
+        if let isActive {
+            clauses.append("is_active = \(isActive ? 1 : 0)")
+        }
+        if let searchText {
+            clauses.append("(LOWER(host) LIKE ? OR LOWER(sniff_host) LIKE ? "
+                           + "OR LOWER(destination_ip) LIKE ? OR LOWER(source_ip) LIKE ? "
+                           + "OR LOWER(process) LIKE ? OR LOWER(process_path) LIKE ? "
+                           + "OR LOWER(strategy_name) LIKE ? OR LOWER(host_name) LIKE ? "
+                           + "OR LOWER(rule) LIKE ? OR LOWER(rule_payload) LIKE ?)")
+            let pattern = "%\(searchText)%"
+            values.append(contentsOf: Array(repeating: pattern, count: 10))
+        }
+        return (clauses.isEmpty ? "" : "WHERE " + clauses.joined(separator: " AND "), values)
     }
 }
 
@@ -365,18 +441,21 @@ final class ConnectionHistoryStore: @unchecked Sendable {
         }
     }
 
-    func fetchPage(offset: Int, limit: Int = ConnectionHistoryStore.defaultPageSize)
-        -> [ConnectionHistoryRecord] {
+    func fetchPage(offset: Int,
+                   limit: Int = ConnectionHistoryStore.defaultPageSize,
+                   query: ConnectionHistoryQuery = .all) -> [ConnectionHistoryRecord] {
         queue.sync {
             guard database != nil else { return [] }
             let safeOffset = max(0, offset)
             let safeLimit = min(max(1, limit), 250)
+            let predicate = query.sqlPredicate
             let sql = """
                 SELECT id, started_at, ended_at, is_active, upload, download, network,
                        connection_type, source_ip, source_port, destination_ip,
                        destination_port, host, sniff_host, process, process_path, chains,
                        rule, rule_payload
                 FROM connection_history
+                \(predicate.clause)
                 ORDER BY is_active DESC,
                          CASE WHEN is_active = 1 THEN started_at
                               ELSE COALESCE(ended_at, started_at) END DESC,
@@ -387,8 +466,12 @@ final class ConnectionHistoryStore: @unchecked Sendable {
                 var statement: OpaquePointer?
                 try prepare(sql, into: &statement)
                 defer { sqlite3_finalize(statement) }
-                sqlite3_bind_int(statement, 1, Int32(safeLimit))
-                sqlite3_bind_int(statement, 2, Int32(safeOffset))
+                for (index, value) in predicate.values.enumerated() {
+                    bindText(value, to: statement, index: Int32(index + 1))
+                }
+                let limitIndex = Int32(predicate.values.count + 1)
+                sqlite3_bind_int(statement, limitIndex, Int32(safeLimit))
+                sqlite3_bind_int(statement, limitIndex + 1, Int32(safeOffset))
                 var result: [ConnectionHistoryRecord] = []
                 while sqlite3_step(statement) == SQLITE_ROW {
                     if let record = record(from: statement) { result.append(record) }
@@ -400,14 +483,16 @@ final class ConnectionHistoryStore: @unchecked Sendable {
         }
     }
 
-    func summary() -> ConnectionHistorySummary {
+    func summary(for query: ConnectionHistoryQuery = .all) -> ConnectionHistorySummary {
         queue.sync {
             guard database != nil else { return .empty }
+            let predicate = query.sqlPredicate
             let totalsSQL = "SELECT COUNT(*), COALESCE(SUM(is_active), 0), "
-                + "COALESCE(SUM(upload), 0), COALESCE(SUM(download), 0) FROM connection_history"
-            guard let totals = row(for: totalsSQL) else { return .empty }
-            let strategies = aggregateLocked(column: "strategy_name", limit: 64)
-            let hosts = aggregateLocked(column: "host_name", limit: 5)
+                + "COALESCE(SUM(upload), 0), COALESCE(SUM(download), 0) "
+                + "FROM connection_history \(predicate.clause)"
+            guard let totals = row(for: totalsSQL, bindings: predicate.values) else { return .empty }
+            let strategies = aggregateLocked(column: "strategy_name", limit: 64, query: query)
+            let hosts = aggregateLocked(column: "host_name", limit: 5, query: query)
             return ConnectionHistorySummary(recordCount: Int(totals.int(0)),
                                             activeCount: Int(totals.int(1)),
                                             uploadTotal: totals.int(2),
@@ -451,10 +536,21 @@ final class ConnectionHistoryStore: @unchecked Sendable {
                 rule_payload TEXT NOT NULL
             )
             """)
+        // Older builds used different fallback labels. Normalize those labels
+        // in place so old and new records share the same aggregate buckets.
+        try execute("UPDATE connection_history SET strategy_name = 'DIRECT' "
+                    + "WHERE strategy_name IS NULL OR strategy_name = ''")
+        try execute("UPDATE connection_history SET host_name = '未知' "
+                    + "WHERE host_name IS NULL OR host_name = '' "
+                    + "OR host_name IN ('Unknown', '未知目标')")
         try execute("CREATE INDEX IF NOT EXISTS history_started_index "
                     + "ON connection_history(is_active, started_at DESC)")
         try execute("CREATE INDEX IF NOT EXISTS history_ended_index "
                     + "ON connection_history(ended_at ASC)")
+        try execute("CREATE INDEX IF NOT EXISTS history_strategy_index "
+                    + "ON connection_history(strategy_name, is_active, started_at DESC)")
+        try execute("CREATE INDEX IF NOT EXISTS history_host_index "
+                    + "ON connection_history(host_name, is_active, started_at DESC)")
     }
 
     private func upsertLocked(_ record: ConnectionHistoryRecord) throws {
@@ -577,15 +673,22 @@ final class ConnectionHistoryStore: @unchecked Sendable {
         return main + wal
     }
 
-    private func aggregateLocked(column: String, limit: Int) -> [ConnectionHistoryTrafficVolume] {
+    private func aggregateLocked(column: String,
+                                 limit: Int,
+                                 query: ConnectionHistoryQuery = .all)
+        -> [ConnectionHistoryTrafficVolume] {
         guard column == "strategy_name" || column == "host_name" else { return [] }
+        let predicate = query.sqlPredicate
         let sql = "SELECT \(column), COALESCE(SUM(upload), 0), COALESCE(SUM(download), 0) "
-            + "FROM connection_history GROUP BY \(column) "
+            + "FROM connection_history \(predicate.clause) GROUP BY \(column) "
             + "ORDER BY (SUM(upload) + SUM(download)) DESC, \(column) ASC LIMIT \(limit)"
         do {
             var statement: OpaquePointer?
             try prepare(sql, into: &statement)
             defer { sqlite3_finalize(statement) }
+            for (index, value) in predicate.values.enumerated() {
+                bindText(value, to: statement, index: Int32(index + 1))
+            }
             var values: [ConnectionHistoryTrafficVolume] = []
             while sqlite3_step(statement) == SQLITE_ROW {
                 values.append(ConnectionHistoryTrafficVolume(
@@ -625,11 +728,14 @@ final class ConnectionHistoryStore: @unchecked Sendable {
             rulePayload: text(statement, index: 18))
     }
 
-    private func row(for sql: String) -> SQLiteRow? {
+    private func row(for sql: String, bindings: [String] = []) -> SQLiteRow? {
         do {
             var statement: OpaquePointer?
             try prepare(sql, into: &statement)
             defer { sqlite3_finalize(statement) }
+            for (index, value) in bindings.enumerated() {
+                bindText(value, to: statement, index: Int32(index + 1))
+            }
             guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
             return SQLiteRow(statement: statement)
         } catch {

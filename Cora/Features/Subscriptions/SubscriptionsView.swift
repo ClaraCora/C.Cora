@@ -54,6 +54,11 @@ struct SubscriptionsView: View {
             .listRowBackground(AppListRowBackground())
 
             Section("配置选项") {
+                SettingsNavigationRow(
+                    title: "远程资源",
+                    systemImage: "externaldrive.connected.to.line.below",
+                    message: "查看配置引用的节点来源和规则来源。节点来源可离线缓存；规则来源需连接当前配置后更新。",
+                    destination: RemoteResourcesView())
                 if !core.configNotices.isEmpty {
                     SettingsInfoRow(
                         title: "配置提示",
@@ -61,11 +66,6 @@ struct SubscriptionsView: View {
                         tint: .orange,
                         message: core.configNotices.joined(separator: "\n\n"))
                 }
-                SettingsNavigationRow(
-                    title: "远程资源",
-                    systemImage: "externaldrive.connected.to.line.below",
-                    message: "查看配置引用的节点来源和规则来源。节点来源可离线缓存；规则来源需连接当前配置后更新。",
-                    destination: RemoteResourcesView())
                 HStack(spacing: 12) {
                     SettingsSymbol(systemImage: "network.badge.shield.half.filled")
                     InfoLabel(title: "订阅请求 UA", message: "拉取订阅时发送的 User-Agent。不同服务可能根据 UA 返回不同配置格式，修改后重新拉取订阅生效。")

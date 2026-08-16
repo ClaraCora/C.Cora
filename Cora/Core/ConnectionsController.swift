@@ -152,6 +152,13 @@ struct ActiveConnection: Codable, Identifiable, Sendable {
         return metadata.destinationIP.isEmpty ? "未知目标" : metadata.destinationIP
     }
 
+    /// The canonical key used by SQLite traffic aggregates and detail filters.
+    var trafficHostName: String {
+        ConnectionHistoryRecord.normalizedHostName(host: metadata.host,
+                                                    sniffHost: metadata.sniffHost,
+                                                    destinationIP: metadata.destinationIP)
+    }
+
     var destinationAddress: String {
         joinedAddress(ip: metadata.destinationIP, port: metadata.destinationPort)
     }
@@ -524,6 +531,29 @@ final class ConnectionsController: ObservableObject {
         historySummary = historyStore.summary()
     }
 
+    /// Loads one bounded page for a strategy/host detail screen. The filter is
+    /// executed in SQLite so opening a detail view never materializes the full
+    /// retained history in the App process.
+    func historyPage(for query: ConnectionHistoryQuery,
+                     offset: Int,
+                     limit: Int = ConnectionHistoryStore.defaultFetchPageSize)
+        -> [ConnectionHistoryEntry] {
+        if let historyStore {
+            return historyStore.fetchPage(offset: offset, limit: limit, query: query)
+                .map(historyEntry)
+        }
+
+        // App Group access can be unavailable under an unsigned build. Keep a
+        // bounded fallback using the already-loaded page rather than failing
+        // the record screen or retaining additional history.
+        let filtered = history.filter { query.matches($0) }
+        return Array(filtered.dropFirst(max(0, offset)).prefix(max(1, limit)))
+    }
+
+    func historySummary(for query: ConnectionHistoryQuery) -> ConnectionHistorySummary {
+        historyStore?.summary(for: query) ?? .empty
+    }
+
     func loadMoreHistory() {
         guard !isLoadingMoreHistory, hasMoreHistory, let historyStore else { return }
         isLoadingMoreHistory = true
@@ -562,7 +592,7 @@ final class ConnectionsController: ObservableObject {
 
         for connection in activeConnections {
             let strategyName = connection.strategyName
-            let hostName = connection.destinationTitle.isEmpty ? "未知" : connection.destinationTitle
+            let hostName = connection.trafficHostName
             let previous = activeSamples[connection.id]
             let uploadDelta = previous.map { max(0, connection.upload - $0.upload) } ?? connection.upload
             let downloadDelta = previous.map { max(0, connection.download - $0.download) } ?? connection.download
@@ -697,6 +727,21 @@ final class ConnectionsController: ObservableObject {
         guard let data = try? JSONEncoder().encode(persisted) else { return }
         UserDefaults.standard.set(data, forKey: Self.persistenceKey)
         lastPersistenceDate = now
+    }
+}
+
+private extension ConnectionHistoryQuery {
+    func matches(_ entry: ConnectionHistoryEntry) -> Bool {
+        if let isActive, entry.isActive != isActive { return false }
+        if let network, entry.connection.networkKey != network { return false }
+        if let searchText, !entry.connection.searchableText.contains(searchText) { return false }
+        return matches(entry.connection)
+    }
+
+    func matches(_ connection: ActiveConnection) -> Bool {
+        if let strategyName, connection.strategyName != strategyName { return false }
+        if let hostName, connection.trafficHostName != hostName { return false }
+        return true
     }
 }
 

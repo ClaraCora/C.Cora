@@ -91,8 +91,7 @@ private struct ConnectionOverview: View {
                 }
 
                 NavigationLink {
-                    StrategyTrafficListView(entries: history,
-                                            totals: strategyTotals,
+                    StrategyTrafficListView(totals: strategyTotals,
                                             controller: controller)
                 } label: {
                     VStack(alignment: .leading, spacing: 10) {
@@ -105,7 +104,6 @@ private struct ConnectionOverview: View {
                 VStack(alignment: .leading, spacing: 10) {
                     sectionHeading("主机名", symbol: "network")
                     HostTrafficCard(totals: hostTotals,
-                                    allEntries: history,
                                     controller: controller,
                                     totalTraffic: totalTraffic)
                 }
@@ -194,7 +192,6 @@ private struct StrategyTrafficCard: View {
 
 private struct HostTrafficCard: View {
     let totals: [TrafficAggregate]
-    let allEntries: [ConnectionHistoryEntry]
     @ObservedObject var controller: ConnectionsController
     let totalTraffic: Int64
 
@@ -208,9 +205,6 @@ private struct HostTrafficCard: View {
                 ForEach(Array(totals.enumerated()), id: \.element.id) { index, total in
                     NavigationLink {
                         HostTrafficDetailView(host: total.name,
-                                              entries: allEntries.filter {
-                                                  $0.connection.destinationTitle == total.name
-                                              },
                                               volume: total,
                                               controller: controller)
                     } label: {
@@ -259,7 +253,6 @@ private struct HostTrafficRow: View {
 }
 
 private struct StrategyTrafficListView: View {
-    let entries: [ConnectionHistoryEntry]
     let totals: [TrafficAggregate]
     @ObservedObject var controller: ConnectionsController
 
@@ -267,9 +260,9 @@ private struct StrategyTrafficListView: View {
         List(totals) { total in
             NavigationLink {
                 ConnectionListView(title: total.name,
-                                   entries: entries.filter { $0.connection.strategyName == total.name },
+                                   entries: [],
                                    controller: controller,
-                                   initialStrategy: total.name)
+                                   historyQuery: ConnectionHistoryQuery(strategyName: total.name))
             } label: {
                 VStack(alignment: .leading, spacing: 5) {
                     HStack {
@@ -298,13 +291,21 @@ private struct StrategyTrafficListView: View {
 
 private struct HostTrafficDetailView: View {
     let host: String
-    let entries: [ConnectionHistoryEntry]
     let volume: TrafficAggregate
     @ObservedObject var controller: ConnectionsController
+    private let historyQuery: ConnectionHistoryQuery
+    @State private var entries: [ConnectionHistoryEntry] = []
+    @State private var strategyTotals: [TrafficAggregate] = []
+    @State private var historyOffset = 0
+    @State private var hasMoreHistory = true
+    @State private var isLoadingHistory = false
 
     private var total: Int64 { volume.total }
-    private var strategyTotals: [TrafficAggregate] {
-        trafficTotals(for: entries, role: .strategy) { $0.connection.strategyName }
+    init(host: String, volume: TrafficAggregate, controller: ConnectionsController) {
+        self.host = host
+        self.volume = volume
+        self._controller = ObservedObject(wrappedValue: controller)
+        self.historyQuery = ConnectionHistoryQuery(hostName: host)
     }
 
     var body: some View {
@@ -318,9 +319,11 @@ private struct HostTrafficDetailView: View {
                 ForEach(strategyTotals) { item in
                     NavigationLink {
                         ConnectionListView(title: item.name,
-                                           entries: entries.filter { $0.connection.strategyName == item.name },
+                                           entries: [],
                                            controller: controller,
-                                           initialStrategy: item.name)
+                                           historyQuery: ConnectionHistoryQuery(
+                                               strategyName: item.name,
+                                               hostName: host))
                     } label: {
                         TrafficAggregateRow(item: item)
                     }
@@ -329,8 +332,25 @@ private struct HostTrafficDetailView: View {
             .listRowBackground(AppListRowBackground())
 
             Section("连接") {
-                ForEach(entries) { entry in
-                    ConnectionRecordRow(entry: entry, controller: controller)
+                if entries.isEmpty && isLoadingHistory {
+                    ProgressView("读取连接记录...")
+                } else if entries.isEmpty {
+                    ContentUnavailableView("暂无连接记录", systemImage: "network.slash")
+                } else {
+                    ForEach(entries) { entry in
+                        ConnectionRecordRow(entry: entry, controller: controller)
+                    }
+                    if hasMoreHistory {
+                        HStack {
+                            Spacer()
+                            if isLoadingHistory {
+                                ProgressView().controlSize(.small)
+                            } else {
+                                Button("加载更多") { loadMoreHistory() }
+                            }
+                            Spacer()
+                        }
+                    }
                 }
             }
             .listRowBackground(AppListRowBackground())
@@ -339,6 +359,29 @@ private struct HostTrafficDetailView: View {
         .background(AppAmbientBackground())
         .navigationTitle("主机名")
         .navigationBarTitleDisplayMode(.inline)
+        .task {
+            strategyTotals = trafficTotals(
+                from: controller.historySummary(for: historyQuery).strategyVolumes,
+                role: .strategy)
+            loadMoreHistory(reset: true)
+        }
+    }
+
+    private func loadMoreHistory(reset: Bool = false) {
+        guard !isLoadingHistory else { return }
+        if reset {
+            entries = []
+            historyOffset = 0
+            hasMoreHistory = true
+        }
+        guard hasMoreHistory else { return }
+        isLoadingHistory = true
+        let page = controller.historyPage(for: historyQuery,
+                                          offset: historyOffset)
+        entries.append(contentsOf: page)
+        historyOffset += page.count
+        hasMoreHistory = page.count == ConnectionHistoryStore.defaultFetchPageSize
+        isLoadingHistory = false
     }
 }
 
@@ -370,6 +413,7 @@ struct ConnectionListView: View {
     let title: String
     let entries: [ConnectionHistoryEntry]
     @ObservedObject var controller: ConnectionsController
+    var historyQuery: ConnectionHistoryQuery? = nil
     var initialStatus: ConnectionStatusFilter = .all
     var initialStrategy: String? = nil
     var showsRetentionNote = false
@@ -379,6 +423,10 @@ struct ConnectionListView: View {
     @State private var network: ConnectionNetworkFilter = .all
     @State private var strategy = ""
     @State private var sortOrder: ConnectionSortOrder = .newest
+    @State private var loadedEntries: [ConnectionHistoryEntry] = []
+    @State private var historyOffset = 0
+    @State private var hasMoreQueryHistory = false
+    @State private var isLoadingQueryHistory = false
 
     var body: some View {
         List {
@@ -392,7 +440,10 @@ struct ConnectionListView: View {
             .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0))
             .listRowBackground(Color.clear)
 
-            if filteredEntries.isEmpty {
+            if filteredEntries.isEmpty && isLoadingQueryHistory {
+                ProgressView("读取连接记录...")
+                    .listRowBackground(Color.clear)
+            } else if filteredEntries.isEmpty {
                 ContentUnavailableView(query.isEmpty ? "没有匹配的连接" : "没有搜索结果",
                                        systemImage: "line.3.horizontal.decrease.circle")
                     .listRowBackground(Color.clear)
@@ -402,15 +453,13 @@ struct ConnectionListView: View {
                         .listRowBackground(AppListRowBackground())
                 }
                 if query.isEmpty, status == .all, network == .all, strategy.isEmpty,
-                   controller.hasMoreHistory {
+                   canLoadMoreHistory {
                     HStack {
                         Spacer()
-                        if controller.isLoadingMoreHistory {
+                        if isLoadingQueryHistory || controller.isLoadingMoreHistory {
                             ProgressView().controlSize(.small)
                         } else {
-                            Button("加载更多") {
-                                controller.loadMoreHistory()
-                            }
+                            Button("加载更多") { loadMoreHistory() }
                         }
                         Spacer()
                     }
@@ -441,6 +490,49 @@ struct ConnectionListView: View {
             status = initialStatus
             strategy = initialStrategy ?? ""
         }
+        .task(id: databaseQuery) {
+            guard databaseQuery != nil else { return }
+            loadMoreHistory(reset: true)
+        }
+    }
+
+    private var sourceEntries: [ConnectionHistoryEntry] {
+        historyQuery == nil ? entries : loadedEntries
+    }
+
+    private var canLoadMoreHistory: Bool {
+        historyQuery == nil ? controller.hasMoreHistory : hasMoreQueryHistory
+    }
+
+    private var databaseQuery: ConnectionHistoryQuery? {
+        guard let historyQuery else { return nil }
+        return ConnectionHistoryQuery(
+            strategyName: strategy.isEmpty ? historyQuery.strategyName : strategy,
+            hostName: historyQuery.hostName,
+            network: network == .all ? nil : network.rawValue,
+            isActive: status == .all ? nil : status == .active,
+            searchText: query)
+    }
+
+    private func loadMoreHistory(reset: Bool = false) {
+        if historyQuery == nil {
+            controller.loadMoreHistory()
+            return
+        }
+        guard let databaseQuery, !isLoadingQueryHistory else { return }
+        if reset {
+            loadedEntries = []
+            historyOffset = 0
+            hasMoreQueryHistory = true
+        }
+        guard hasMoreQueryHistory else { return }
+        isLoadingQueryHistory = true
+        let page = controller.historyPage(for: databaseQuery,
+                                          offset: historyOffset)
+        loadedEntries.append(contentsOf: page)
+        historyOffset += page.count
+        hasMoreQueryHistory = page.count == ConnectionHistoryStore.defaultFetchPageSize
+        isLoadingQueryHistory = false
     }
 
     private var filterBar: some View {
@@ -472,12 +564,12 @@ struct ConnectionListView: View {
     }
 
     private var availableStrategies: [String] {
-        Array(Set(entries.map { $0.connection.strategyName })).sorted()
+        Array(Set(sourceEntries.map { $0.connection.strategyName })).sorted()
     }
 
     private var filteredEntries: [ConnectionHistoryEntry] {
         let needle = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let filtered = entries.filter { entry in
+        let filtered = sourceEntries.filter { entry in
             status.matches(entry)
                 && network.matches(entry.connection)
                 && (strategy.isEmpty || entry.connection.strategyName == strategy)
