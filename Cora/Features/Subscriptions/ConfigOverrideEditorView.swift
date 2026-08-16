@@ -29,7 +29,7 @@ struct ConfigOverrideSettingsView: View {
             .listRowBackground(AppListRowBackground())
 
             Section {
-                Button("恢复默认覆写设置", role: .destructive) {
+                Button("恢复默认配置", role: .destructive) {
                     showRestoreConfirmation = true
                 }
             }
@@ -37,10 +37,10 @@ struct ConfigOverrideSettingsView: View {
         }
         .scrollContentBackground(.hidden)
         .background(AppAmbientBackground())
-        .navigationTitle("固定覆写")
+        .navigationTitle("配置覆写")
         .navigationBarTitleDisplayMode(.inline)
-        .confirmationDialog("恢复所有默认覆写设置？", isPresented: $showRestoreConfirmation) {
-            Button("恢复默认设置", role: .destructive) {
+        .confirmationDialog("恢复所有默认配置？", isPresented: $showRestoreConfirmation) {
+            Button("恢复默认配置", role: .destructive) {
                 overrides.restoreDefaults()
             }
         }
@@ -53,7 +53,8 @@ private struct OverrideCategoryLabel: View {
     let enabled: Bool
 
     var body: some View {
-        Label {
+        HStack(spacing: 12) {
+            SettingsSymbol(systemImage: systemImage)
             HStack {
                 Text(title)
                 Spacer()
@@ -61,9 +62,8 @@ private struct OverrideCategoryLabel: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-        } icon: {
-            Image(systemName: systemImage)
         }
+        .padding(.vertical, 3)
     }
 }
 
@@ -73,7 +73,7 @@ private struct DNSOverrideSettingsView: View {
     var body: some View {
         Form {
             Section {
-                Toggle("覆写 DNS", isOn: $overrides.overwriteDNS)
+                Toggle("使用 DNS 设置", isOn: $overrides.overwriteDNS)
             }
             .listRowBackground(AppListRowBackground())
 
@@ -88,8 +88,8 @@ private struct DNSOverrideSettingsView: View {
                 }
                 Toggle("DoH H3 优先", isOn: $overrides.dnsPreferH3)
                 Toggle("使用系统 Hosts", isOn: $overrides.dnsUseSystemHosts)
-                Toggle("使用 Hosts", isOn: $overrides.dnsUseHosts)
-                NavigationLink("添加 Hosts") {
+                Toggle("使用内置 Hosts", isOn: $overrides.dnsUseHosts)
+                NavigationLink("编辑 Hosts") {
                     HostOverridesView()
                 }
             }
@@ -116,7 +116,7 @@ private struct DNSOverrideSettingsView: View {
                 Button("载入常见过滤内容") {
                     overrides.fakeIPFilter = ConfigOverrideStore.commonFakeIPFilter
                 }
-                Toggle("遵守 Rules 规则", isOn: $overrides.dnsRespectRules)
+                Toggle("遵循分流规则", isOn: $overrides.dnsRespectRules)
             }
             .disabled(!overrides.overwriteDNS)
             .listRowBackground(AppListRowBackground())
@@ -127,14 +127,14 @@ private struct DNSOverrideSettingsView: View {
                 nameserverLink("代理域名解析服务器", values: $overrides.proxyNameservers)
                 nameserverLink("直连域名解析服务器", values: $overrides.directNameservers)
                 nameserverLink("Fallback 域名解析服务器", values: $overrides.fallbackNameservers)
-                Toggle("Fallback GeoIP", isOn: $overrides.fallbackGeoIP)
+                Toggle("备用 GeoIP", isOn: $overrides.fallbackGeoIP)
             }
             .disabled(!overrides.overwriteDNS)
             .listRowBackground(AppListRowBackground())
         }
         .scrollContentBackground(.hidden)
         .background(AppAmbientBackground())
-        .navigationTitle("DNS 覆写")
+        .navigationTitle("DNS 设置")
         .navigationBarTitleDisplayMode(.inline)
     }
 
@@ -154,7 +154,7 @@ private struct SnifferOverrideSettingsView: View {
     var body: some View {
         Form {
             Section {
-                Toggle("覆写嗅探", isOn: $overrides.overwriteSniffer)
+                Toggle("使用嗅探设置", isOn: $overrides.overwriteSniffer)
                 Toggle("启用嗅探", isOn: $overrides.snifferEnabled)
                     .disabled(!overrides.overwriteSniffer)
             }
@@ -199,7 +199,7 @@ private struct SnifferOverrideSettingsView: View {
         }
         .scrollContentBackground(.hidden)
         .background(AppAmbientBackground())
-        .navigationTitle("嗅探覆写")
+        .navigationTitle("流量嗅探")
         .navigationBarTitleDisplayMode(.inline)
     }
 }
@@ -210,16 +210,16 @@ private struct TunOverrideSettingsView: View {
     var body: some View {
         Form {
             Section {
-                Toggle("覆写 TUN", isOn: $overrides.overwriteTun)
+                Toggle("使用隧道设置", isOn: $overrides.overwriteTun)
             }
             .listRowBackground(AppListRowBackground())
             Section {
                 NavigationLink {
-                    StringListEditorView(title: "DNS 劫持",
+                    StringListEditorView(title: "DNS 接管规则",
                                          values: $overrides.tunDNSHijack,
                                          placeholder: "如 any:53")
                 } label: {
-                    ListSettingLabel(title: "DNS 劫持", count: overrides.tunDNSHijack.count)
+                    ListSettingLabel(title: "DNS 接管规则", count: overrides.tunDNSHijack.count)
                 }
                 Toggle("严格路由", isOn: $overrides.tunStrictRoute)
                 Toggle("ICMP 转发", isOn: $overrides.tunICMPForwarding)
@@ -229,7 +229,7 @@ private struct TunOverrideSettingsView: View {
         }
         .scrollContentBackground(.hidden)
         .background(AppAmbientBackground())
-        .navigationTitle("TUN 覆写")
+        .navigationTitle("隧道设置")
         .navigationBarTitleDisplayMode(.inline)
     }
 }

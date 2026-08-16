@@ -1,56 +1,93 @@
 import SwiftUI
 
-/// 订阅管理页：添加订阅链接 / 新建本地配置、查看详情、刷新、删除、选择当前生效。
+/// 配置与订阅页：管理配置列表，并提供现有的远程资源、订阅 UA 和配置覆写入口。
 struct SubscriptionsView: View {
     @EnvironmentObject private var store: SubscriptionStore
+    @EnvironmentObject private var settings: SettingsStore
+    @EnvironmentObject private var core: CoreStateManager
     @State private var showAddRemote = false
     @State private var showAddLocal = false
     @State private var editingSub: Subscription?
 
     var body: some View {
         List {
-            if store.subscriptions.isEmpty {
-                ContentUnavailableView("还没有配置",
-                    systemImage: "tray",
-                    description: Text("点右上角 + 添加订阅链接，或新建一个本地配置"))
-                    .listRowBackground(Color.clear)
-            }
+            Section("配置") {
+                if store.subscriptions.isEmpty {
+                    ContentUnavailableView("还没有配置",
+                        systemImage: "tray",
+                        description: Text("点右上角 + 添加订阅链接，或新建一个本地配置"))
+                        .listRowBackground(Color.clear)
+                }
 
-            ForEach(store.subscriptions) { sub in
-                NavigationLink {
-                    SubscriptionDetailView(subID: sub.id)
-                } label: {
-                    SubscriptionRow(sub: sub, isSelected: sub.id == store.selectedID)
-                }
-                .listRowBackground(AppListRowBackground())
-                .swipeActions(edge: .trailing) {
-                    Button(role: .destructive) {
-                        store.remove(sub.id)
-                    } label: { Label("删除", systemImage: "trash") }
-                    if !sub.isLocal {
-                        Button {
-                            Task { await store.refresh(sub.id) }
-                        } label: { Label("刷新", systemImage: "arrow.clockwise") }
-                        .tint(.blue)
-                        Button {
-                            editingSub = sub
-                        } label: { Label("编辑", systemImage: "pencil") }
-                        .tint(.orange)
+                ForEach(store.subscriptions) { sub in
+                    NavigationLink {
+                        SubscriptionDetailView(subID: sub.id)
+                    } label: {
+                        SubscriptionRow(sub: sub, isSelected: sub.id == store.selectedID)
                     }
-                }
-                .swipeActions(edge: .leading) {
-                    if sub.id != store.selectedID {
-                        Button {
-                            store.select(sub.id)
-                        } label: { Label("设为当前", systemImage: "checkmark.circle") }
-                        .tint(.green)
+                    .listRowBackground(AppListRowBackground())
+                    .swipeActions(edge: .trailing) {
+                        Button(role: .destructive) {
+                            store.remove(sub.id)
+                        } label: { Label("删除", systemImage: "trash") }
+                        if !sub.isLocal {
+                            Button {
+                                Task { await store.refresh(sub.id) }
+                            } label: { Label("刷新", systemImage: "arrow.clockwise") }
+                            .tint(.blue)
+                            Button {
+                                editingSub = sub
+                            } label: { Label("编辑", systemImage: "pencil") }
+                            .tint(.orange)
+                        }
+                    }
+                    .swipeActions(edge: .leading) {
+                        if sub.id != store.selectedID {
+                            Button {
+                                store.select(sub.id)
+                            } label: { Label("设为当前", systemImage: "checkmark.circle") }
+                            .tint(.green)
+                        }
                     }
                 }
             }
+            .listRowBackground(AppListRowBackground())
+
+            Section("配置选项") {
+                if !core.configNotices.isEmpty {
+                    SettingsInfoRow(
+                        title: "配置提示",
+                        systemImage: "exclamationmark.triangle.fill",
+                        tint: .orange,
+                        message: core.configNotices.joined(separator: "\n\n"))
+                }
+                SettingsNavigationRow(
+                    title: "远程资源",
+                    systemImage: "externaldrive.connected.to.line.below",
+                    message: "查看配置引用的节点来源和规则来源。节点来源可离线缓存；规则来源需连接当前配置后更新。",
+                    destination: RemoteResourcesView())
+                HStack(spacing: 12) {
+                    SettingsSymbol(systemImage: "network.badge.shield.half.filled")
+                    InfoLabel(title: "订阅请求 UA", message: "拉取订阅时发送的 User-Agent。不同服务可能根据 UA 返回不同配置格式，修改后重新拉取订阅生效。")
+                    Spacer()
+                    TextField("clash-meta", text: $settings.subscriptionUA)
+                        .multilineTextAlignment(.trailing)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                        .frame(maxWidth: 180)
+                }
+                SettingsNavigationRow(
+                    title: "配置覆写",
+                    systemImage: "slider.horizontal.3",
+                    message: "为当前配置选择是否应用 Cora 的 DNS、嗅探和 TUN 设置。",
+                    destination: ConfigOverrideSettingsView())
+            }
+            .listRowBackground(AppListRowBackground())
         }
         .scrollContentBackground(.hidden)
         .background(AppAmbientBackground())
-        .navigationTitle("配置")
+        .navigationTitle("配置与订阅")
+        .task { await core.refreshStatus() }
         .toolbar {
             ToolbarItem(placement: .topBarLeading) {
                 Button {

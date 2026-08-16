@@ -44,7 +44,7 @@ struct SubscriptionDetailView: View {
         Section("信息") {
             LabeledContent("类型", value: sub.isLocal ? "本地配置" : "远程订阅")
             LabeledContent("节点数", value: "\(sub.nodeCount)")
-            LabeledContent("固定覆写", value: sub.overrideEnabled ? "已启用" : "未启用")
+            LabeledContent("配置覆写", value: sub.overrideEnabled ? "已启用" : "未启用")
             if !sub.isLocal {
                 LabeledContent("链接") {
                     Text(sub.url).foregroundStyle(.secondary)
@@ -136,7 +136,7 @@ struct SubscriptionDetailView: View {
                 get: { sub.overrideEnabled },
                 set: { store.setOverrideEnabled(sub.id, enabled: $0) }
             )) {
-                Label("启用覆写", systemImage: "slider.horizontal.3")
+                Label("启用配置覆写", systemImage: "slider.horizontal.3")
             }
         }
     }

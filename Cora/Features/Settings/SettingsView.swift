@@ -1,8 +1,7 @@
 import SwiftUI
 
-/// 设置页：按功能类型组织设置，详细说明通过名称后的信息按钮按需查看。
+/// 设置页：按功能类型组织现有设置，详细说明通过名称后的信息按钮按需查看。
 struct SettingsView: View {
-    @EnvironmentObject private var settings: SettingsStore
     @EnvironmentObject private var core: CoreStateManager
     var body: some View {
         NavigationStack {
@@ -10,62 +9,34 @@ struct SettingsView: View {
                 AppAmbientBackground()
                 Form {
                     Section {
-                        NavigationLink {
-                            SubscriptionsView()
-                        } label: {
-                            HStack(spacing: 12) {
-                                SettingsSymbol(systemImage: "doc.text")
-                                Text("配置").font(.body.weight(.medium))
-                            }
-                            .padding(.vertical, 4)
-                        }
-                        if !core.configNotices.isEmpty {
-                            SettingsInfoRow(
-                                title: "配置提示",
-                                systemImage: "exclamationmark.triangle.fill",
-                                tint: .orange,
-                                message: core.configNotices.joined(separator: "\n\n"))
-                        }
                         SettingsNavigationRow(
-                            title: "远程资源",
-                            systemImage: "externaldrive.connected.to.line.below",
-                            message: "查看所有配置引用的远程 Proxy Provider 与 Rule Provider。Proxy Provider 可离线缓存；Rule Provider 需连接当前配置后更新。",
-                            destination: RemoteResourcesView())
-                        HStack(spacing: 12) {
-                            SettingsSymbol(systemImage: "network.badge.shield.half.filled")
-                            VStack(alignment: .leading, spacing: 2) {
-                                InfoLabel(title: "订阅 UA", message: "拉取订阅时发送的 User-Agent。不同机场可能根据 UA 返回不同配置格式，修改后重新拉取订阅生效。")
-                            }
-                            Spacer()
-                            TextField("clash-meta", text: $settings.subscriptionUA)
-                                .multilineTextAlignment(.trailing)
-                                .autocorrectionDisabled()
-                                .textInputAutocapitalization(.never)
-                                .frame(maxWidth: 180)
-                        }
+                            title: "配置与订阅",
+                            systemImage: "doc.text.magnifyingglass",
+                            message: "管理远程订阅、本地配置、远程资源和配置覆写。",
+                            destination: SubscriptionsView())
                     }
                     .listRowBackground(AppListRowBackground())
 
                     Section {
                         SettingsNavigationRow(
-                            title: "内核设置",
+                            title: "内核运行",
                             systemImage: "gearshape.2",
-                            message: "管理内核日志、IPv6、配置覆盖和诊断信息。",
+                            message: "设置内核运行参数，并查看连接诊断。",
                             destination: KernelSettingsView())
                         SettingsNavigationRow(
-                            title: "GEO、ASN",
+                            title: "规则数据",
                             systemImage: "globe.americas",
-                            message: "管理 GEO/ASN 规则数据和更新方式。",
+                            message: "管理 GEO、GeoSite 和 ASN 规则数据。",
                             destination: GeoSettingsView())
                         SettingsNavigationRow(
-                            title: "隧道路由",
+                            title: "隧道与隐私",
                             systemImage: "arrow.triangle.branch",
-                            message: "管理 VPN 接管范围和系统服务排除项。",
+                            message: "设置流量接管范围、系统服务排除和防泄露选项。",
                             destination: TunnelRouteSettingsView())
                         SettingsNavigationRow(
-                            title: "延迟测试",
+                            title: "测速",
                             systemImage: "speedometer",
-                            message: "管理策略组与单节点测速的统一地址和超时。",
+                            message: "设置测速地址和测速超时时间。",
                             destination: DelayTestSettingsView())
                     }
                     .listRowBackground(AppListRowBackground())
@@ -101,7 +72,7 @@ struct SettingsView: View {
     }
 }
 
-private struct RemoteResourcesView: View {
+struct RemoteResourcesView: View {
     @EnvironmentObject private var subscriptions: SubscriptionStore
     @EnvironmentObject private var core: CoreStateManager
     @State private var resultMessage: String?
@@ -109,16 +80,16 @@ private struct RemoteResourcesView: View {
     var body: some View {
         Form {
             remoteSection(kind: .proxyProvider,
-                          title: "Proxy Provider",
-                          emptyMessage: "没有远程 Proxy Provider",
+                          title: "节点来源",
+                          emptyMessage: "没有远程节点来源",
                           isBatchRefreshing: proxyResources.contains {
                               subscriptions.refreshingResourceIDs.contains($0.id)
                           },
                           batchAction: refreshAllProxyProviders)
 
             remoteSection(kind: .ruleProvider,
-                          title: "Rule Provider",
-                          emptyMessage: "没有远程 Rule Provider",
+                          title: "规则来源",
+                          emptyMessage: "没有远程规则来源",
                           isBatchRefreshing: ruleResources.contains {
                               subscriptions.refreshingResourceIDs.contains($0.id)
                           },
@@ -203,7 +174,7 @@ private struct RemoteResourcesView: View {
             }
         } footer: {
             if kind == .ruleProvider && !canBatchUpdateRules && !sectionResources.isEmpty {
-                Text("Rule Provider 由运行中的内核加载。连接对应的当前配置后可更新。")
+                Text("规则来源由运行中的内核加载。连接对应的当前配置后可更新。")
             }
         }
         .listRowBackground(AppListRowBackground())
@@ -227,12 +198,12 @@ private struct RemoteResourcesView: View {
 
     private func refreshAllProxyProviders() async {
         await subscriptions.refreshAllProxyProviders()
-        resultMessage = subscriptions.lastError ?? "Proxy Provider 已全部刷新"
+        resultMessage = subscriptions.lastError ?? "节点来源已全部刷新"
     }
 
     private func refreshAllRuleProviders() async {
         await subscriptions.refreshAllRuleProviders()
-        resultMessage = subscriptions.lastError ?? "当前配置的 Rule Provider 已全部更新"
+        resultMessage = subscriptions.lastError ?? "当前配置的规则来源已全部更新"
     }
 }
 
@@ -286,7 +257,7 @@ private struct DelayTestSettingsView: View {
         Form {
             Section {
                 InfoToggleRow(
-                    title: "统一测试地址",
+                    title: "统一测速地址",
                     message: "让 mihomo 的策略组使用统一的测速地址。关闭时保留配置内各策略组自带的测速地址；主 App 手动测速仍使用下方地址。",
                     isOn: $settings.unifiedDelay)
 
@@ -306,7 +277,7 @@ private struct DelayTestSettingsView: View {
 
             Section {
                 VStack(alignment: .leading, spacing: 6) {
-                    InfoLabel(title: "代理节点测速地址", message: "普通代理节点的策略组与单节点测速使用此 HTTP 或 HTTPS 地址。留空时使用默认地址；修改后立即用于下一次测速。")
+                    InfoLabel(title: "代理测速地址", message: "普通代理节点的策略组与单节点测速使用此 HTTP 或 HTTPS 地址。留空时使用默认地址；修改后立即用于下一次测速。")
                     TextField(SettingsStore.defaultDelayTestURL,
                               text: $settings.delayTestURL,
                               axis: .vertical)
@@ -322,7 +293,7 @@ private struct DelayTestSettingsView: View {
 
             Section {
                 VStack(alignment: .leading, spacing: 6) {
-                    InfoLabel(title: "国内直连测速地址", message: "DIRECT 或最终落到 DIRECT 的国内直连策略使用此地址。留空时使用默认地址；不会改变普通代理节点的测速地址。")
+                    InfoLabel(title: "直连测速地址", message: "DIRECT 或最终落到 DIRECT 的国内直连策略使用此地址。留空时使用默认地址；不会改变普通代理节点的测速地址。")
                     TextField(SettingsStore.defaultDirectDelayTestURL,
                               text: $settings.directDelayTestURL,
                               axis: .vertical)
@@ -338,7 +309,7 @@ private struct DelayTestSettingsView: View {
         }
         .scrollContentBackground(.hidden)
         .background(AppAmbientBackground())
-        .navigationTitle("延迟测试")
+        .navigationTitle("测速")
         .navigationBarTitleDisplayMode(.inline)
     }
 }
@@ -357,10 +328,10 @@ private struct KernelSettingsView: View {
                 } label: {
                     InfoLabel(title: "日志级别", message: "控制内核输出的日志详细程度。修改后重新连接 VPN 生效。")
                 }
-                InfoToggleRow(title: "启用 IPv6", message: "允许隧道处理 IPv6 流量。部分网络或配置不支持 IPv6 时可以关闭。", isOn: $settings.ipv6)
+                InfoToggleRow(title: "IPv6", message: "允许隧道处理 IPv6 流量。部分网络或配置不支持 IPv6 时可以关闭。", systemImage: "network", isOn: $settings.ipv6)
                 HStack {
                     Label {
-                        InfoLabel(title: "混合代理端口", message: "在本机回环监听 HTTP+SOCKS 混合代理端口，设为 0 表示关闭。")
+                        InfoLabel(title: "本机代理端口", message: "在本机回环监听 HTTP+SOCKS 混合代理端口，设为 0 表示关闭。")
                     } icon: {
                         Image(systemName: "point.3.connected.trianglepath.dotted")
                     }
@@ -371,11 +342,6 @@ private struct KernelSettingsView: View {
                         .multilineTextAlignment(.trailing)
                         .frame(width: 90)
                 }
-                NavigationLink {
-                    ConfigOverrideSettingsView()
-                } label: {
-                    InfoLabel(title: "覆盖设置", message: "为配置文件选择是否应用 Cora 的固定 DNS、嗅探和 TUN 设置。")
-                }
             }
             .listRowBackground(AppListRowBackground())
 
@@ -384,7 +350,7 @@ private struct KernelSettingsView: View {
                     KernelStatusView()
                 } label: {
                     HStack {
-                        Text("内核状态")
+                        InfoLabel(title: "连接诊断", message: "检查 App 与隧道扩展之间的控制通道和当前内核响应。")
                         Spacer()
                         if isCheckingKernel {
                             ProgressView().controlSize(.small)
@@ -406,7 +372,7 @@ private struct KernelSettingsView: View {
         }
         .scrollContentBackground(.hidden)
         .background(AppAmbientBackground())
-        .navigationTitle("内核设置")
+        .navigationTitle("内核运行")
         .navigationBarTitleDisplayMode(.inline)
         .task(id: core.status.rawValue) { await refreshKernelAvailability() }
     }
@@ -441,7 +407,7 @@ private struct GeoSettingsView: View {
         }
         .scrollContentBackground(.hidden)
         .background(AppAmbientBackground())
-        .navigationTitle("GEO、ASN")
+        .navigationTitle("规则数据")
         .navigationBarTitleDisplayMode(.inline)
         .task(id: refreshID) { await refreshInstalledInfo() }
     }
@@ -468,18 +434,31 @@ private struct TunnelRouteSettingsView: View {
 
     var body: some View {
         Form {
-            Section {
-                InfoToggleRow(title: "接管所有网络", message: "将系统默认排除的流量也纳入隧道。只有需要完整 VPN 覆盖时才建议开启。", isOn: $settings.includeAllNetworks)
-                InfoToggleRow(title: "强制路由", message: "即使未接管所有网络，也强制按规则路由隧道流量。", isOn: $settings.enforceRoutes)
-                InfoToggleRow(title: "阻止常见 WebRTC STUN 直连", message: "仅阻止常见公网 STUN 探测端点以降低 WebRTC 泄露风险，不封锁普通 DIRECT 的语音、视频和 P2P 流量。", isOn: $settings.blockDirectSTUN)
-                InfoToggleRow(title: "排除蜂窝服务", message: "将蜂窝网络服务排除在隧道之外，避免影响系统电话和运营商服务。", isOn: $settings.excludeCellularServices)
-                InfoToggleRow(title: "排除 APNs 推送", message: "将 Apple 推送服务排除在隧道之外，保持系统通知稳定。", isOn: $settings.excludeAPNs)
+            Section("流量接管") {
+                InfoToggleRow(title: "接管全部流量", message: "将系统默认排除的流量也纳入隧道。只有需要完整 VPN 覆盖时才建议开启。", systemImage: "network", isOn: $settings.includeAllNetworks)
+                InfoToggleRow(title: "强制路由", message: "即使未接管全部流量，也强制按规则路由隧道流量。", systemImage: "arrow.triangle.branch", isOn: $settings.enforceRoutes)
+            }
+            .listRowBackground(AppListRowBackground())
+
+            Section("系统服务") {
+                InfoToggleRow(title: "排除蜂窝服务", message: "将蜂窝网络服务排除在隧道之外，避免影响系统电话和运营商服务。", systemImage: "antenna.radiowaves.left.and.right", isOn: $settings.excludeCellularServices)
+                InfoToggleRow(title: "排除 Apple 推送", message: "将 Apple 推送服务排除在隧道之外，保持系统通知稳定。", systemImage: "bell.badge", isOn: $settings.excludeAPNs)
                 if #available(iOS 17.4, *) {
-                    InfoToggleRow(title: "排除设备间通信", message: "将本地设备间通信排除在隧道之外，保留 AirDrop 和附近设备连接。", isOn: $settings.excludeDeviceCommunication)
+                    InfoToggleRow(title: "排除设备间通信", message: "将本地设备间通信排除在隧道之外，保留 AirDrop 和附近设备连接。", systemImage: "person.2", isOn: $settings.excludeDeviceCommunication)
                 }
+            }
+            .listRowBackground(AppListRowBackground())
+
+            Section("隐私防护") {
+                InfoToggleRow(title: "防止 WebRTC 泄露", message: "仅阻止常见公网 STUN 探测端点以降低 WebRTC 泄露风险，不封锁普通 DIRECT 的语音、视频和 P2P 流量。", systemImage: "lock.shield", isOn: $settings.blockDirectSTUN)
+            }
+            .listRowBackground(AppListRowBackground())
+
+            Section("自动连接") {
                 InfoToggleRow(
-                    title: "VPN 始终开启",
+                    title: "自动连接 VPN",
                     message: "使用 iOS Connect On Demand，在重启或网络变化后自动连接。通过 Cora 控制中心按钮关闭时会暂停自动连接；苹果受监管设备的真正 Always-On VPN 仍需 MDM。",
+                    systemImage: "bolt.shield",
                     isOn: Binding(
                         get: { settings.alwaysOnVPN },
                         set: { value in
@@ -490,12 +469,12 @@ private struct TunnelRouteSettingsView: View {
         }
         .scrollContentBackground(.hidden)
         .background(AppAmbientBackground())
-        .navigationTitle("隧道路由")
+        .navigationTitle("隧道与隐私")
         .navigationBarTitleDisplayMode(.inline)
     }
 }
 
-private struct SettingsNavigationRow<Destination: View>: View {
+struct SettingsNavigationRow<Destination: View>: View {
     let title: String
     let systemImage: String
     let message: String
@@ -516,16 +495,21 @@ private struct SettingsNavigationRow<Destination: View>: View {
     }
 }
 
-private struct SettingsSymbol: View {
+struct SettingsSymbol: View {
     let systemImage: String
 
     var body: some View {
         Image(systemName: systemImage)
             .font(.system(size: 15, weight: .semibold))
+            .symbolRenderingMode(.hierarchical)
             .foregroundStyle(Color.accentColor)
             .frame(width: 30, height: 30)
-            .background(Color.accentColor.opacity(0.13),
-                        in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .background(.thinMaterial,
+                        in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .stroke(Color.accentColor.opacity(0.16), lineWidth: 0.6)
+            }
     }
 }
 
@@ -536,7 +520,7 @@ private struct GeoSettingsContent: View {
 
     var body: some View {
         Group {
-            Toggle("启用 geo 规则", isOn: $settings.geoEnabled)
+            Toggle("使用 GEO 规则", isOn: $settings.geoEnabled)
             if settings.geoEnabled {
                 if AppGroup.containerURL == nil {
                     Label("签名未授予 \(AppGroup.identifier)，连接时会自动忽略 GEO/ASN 规则。",
@@ -549,17 +533,17 @@ private struct GeoSettingsContent: View {
                         .font(.caption)
                         .foregroundStyle(.green)
                 }
-                Picker("加载器", selection: $settings.geoLoader) {
+                Picker("加载方式", selection: $settings.geoLoader) {
                     ForEach(SettingsStore.geoLoaderOptions, id: \.self) { Text($0).tag($0) }
                 }
-                Toggle("Geodata 模式（GeoIP.dat）", isOn: $settings.geodataMode)
+                Toggle("GeoIP 数据格式", isOn: $settings.geodataMode)
                 Toggle("忽略 GEO 取反规则", isOn: $settings.ignoreGeoNegation)
                 if settings.geodataMode {
-                    GeoURLField(title: "备用 GeoIP.dat 地址", text: $settings.geoIPDatURL)
+                    GeoURLField(title: "GeoIP 下载地址", text: $settings.geoIPDatURL)
                 } else {
-                    GeoURLField(title: "备用 MMDB 地址", text: $settings.geoMMDBURL)
+                    GeoURLField(title: "MMDB 下载地址", text: $settings.geoMMDBURL)
                 }
-                GeoURLField(title: "备用 GeoSite.dat 地址", text: $settings.geoSiteURL)
+                GeoURLField(title: "GeoSite 下载地址", text: $settings.geoSiteURL)
                 Toggle("自动更新", isOn: $settings.geoAutoUpdate)
                 if settings.geoAutoUpdate {
                     Stepper("更新间隔 \(settings.geoUpdateInterval) 小时",
@@ -569,7 +553,7 @@ private struct GeoSettingsContent: View {
                     Task { await updateGeo() }
                 } label: {
                     HStack {
-                        Label("下载 / 更新 GEO 与 ASN 数据", systemImage: "arrow.down.circle")
+                        Label("立即更新规则数据", systemImage: "arrow.down.circle")
                         Spacer()
                         if geoDatabase.isUpdating { ProgressView() }
                     }
@@ -624,7 +608,7 @@ private struct GeoURLField: View {
     }
 }
 
-private struct InfoLabel: View {
+struct InfoLabel: View {
     let title: String
     let message: String
     @State private var showingInfo = false
@@ -637,7 +621,7 @@ private struct InfoLabel: View {
     }
 }
 
-private struct InfoButton: View {
+struct InfoButton: View {
     let message: String
     var accessibilityLabel = "查看说明"
     @State private var showingInfo = false
@@ -667,7 +651,7 @@ private struct InfoButton: View {
     }
 }
 
-private struct SettingsInfoRow: View {
+struct SettingsInfoRow: View {
     let title: String
     let systemImage: String
     let tint: Color
@@ -683,13 +667,24 @@ private struct SettingsInfoRow: View {
     }
 }
 
-private struct InfoToggleRow: View {
+struct InfoToggleRow: View {
     let title: String
     let message: String
+    let systemImage: String?
     @Binding var isOn: Bool
+
+    init(title: String, message: String, systemImage: String? = nil, isOn: Binding<Bool>) {
+        self.title = title
+        self.message = message
+        self.systemImage = systemImage
+        self._isOn = isOn
+    }
 
     var body: some View {
         HStack(spacing: 8) {
+            if let systemImage {
+                SettingsSymbol(systemImage: systemImage)
+            }
             InfoLabel(title: title, message: message)
             Spacer(minLength: 8)
             Toggle("", isOn: $isOn)
