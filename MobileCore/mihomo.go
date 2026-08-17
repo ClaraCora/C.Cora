@@ -66,6 +66,7 @@ const maxRunLogLineBytes = 64 << 10
 const (
 	maxScriptRequestBodyBytes    = 32 << 10
 	maxScriptResponseBodyBytes   = 256 << 10
+	maxScriptResponseHeaderBytes = 32 << 10
 	maxScriptRequestTimeoutMs    = 15_000
 	maxScriptRequestCountPerRun  = 12
 )
@@ -2318,9 +2319,23 @@ func ScriptFetch(requestJSON string) string {
 	if truncated {
 		data = data[:maxScriptResponseBodyBytes]
 	}
+	headers := make(map[string]string, len(resp.Header))
+	headerBytes := 0
+	for key, values := range resp.Header {
+		if len(key) > 256 || len(values) == 0 {
+			continue
+		}
+		value := strings.Join(values, ", ")
+		if len(value) > 8<<10 || headerBytes+len(key)+len(value) > maxScriptResponseHeaderBytes {
+			continue
+		}
+		headers[key] = value
+		headerBytes += len(key) + len(value)
+	}
 	return marshalJSON(map[string]any{
 		"ok":        true,
 		"status":    resp.StatusCode,
+		"headers":   headers,
 		"body":      string(data),
 		"truncated": truncated,
 	})

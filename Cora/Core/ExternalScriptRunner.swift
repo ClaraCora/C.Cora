@@ -355,7 +355,12 @@ private final class ScriptExecution: @unchecked Sendable {
                         if let error = object["error"] as? String {
                             callback.call(withArguments: [error, NSNull(), ""])
                         } else {
-                            let response: NSDictionary = ["status": object["status"] as? Int ?? 0]
+                            let status = object["status"] as? Int ?? 0
+                            let response: NSDictionary = [
+                                "status": status,
+                                "statusCode": status,
+                                "headers": object["headers"] as? [String: String] ?? [:],
+                            ]
                             callback.call(withArguments: [NSNull(), response, object["body"] as? String ?? ""])
                         }
                     }
