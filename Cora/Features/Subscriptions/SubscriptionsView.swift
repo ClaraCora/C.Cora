@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// 配置与订阅页：管理配置列表，并提供现有的远程资源、订阅 UA 和配置覆写入口。
+/// 配置与订阅页：管理配置列表，并提供订阅 UA 和配置覆写入口。
 struct SubscriptionsView: View {
     @EnvironmentObject private var store: SubscriptionStore
     @EnvironmentObject private var settings: SettingsStore
@@ -54,11 +54,6 @@ struct SubscriptionsView: View {
             .listRowBackground(AppListRowBackground())
 
             Section("配置选项") {
-                SettingsNavigationRow(
-                    title: "远程资源",
-                    systemImage: "externaldrive.connected.to.line.below",
-                    message: "查看配置引用的节点来源和规则来源。节点来源可离线缓存；规则来源需连接当前配置后更新。",
-                    destination: RemoteResourcesView())
                 if !core.configNotices.isEmpty {
                     SettingsInfoRow(
                         title: "配置提示",

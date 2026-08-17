@@ -2036,7 +2036,7 @@ func SelectProxy(group, name string) error {
 
 // GroupDelay 对策略组里所有节点做延迟测试（等价 REST GET /group/{name}/delay），
 // DIRECT 链路使用 directURL，其余节点使用 url。返回 {<节点名>: 毫秒} 的 JSON；
-// 失败返回 {"error":...}。
+// 每个成员都会出现在结果中，失败或超时使用 0。
 // 对应 Swift 侧 `MihomoGroupDelay(_:_:_:_:)`。
 func GroupDelay(group, url, directURL string, timeoutMs int) string {
 	configApplyMu.RLock()
@@ -2066,10 +2066,14 @@ func GroupDelay(group, url, directURL string, timeoutMs int) string {
 	// Some automatic groups ignore the URL supplied to ProxyGroup.URLTest and
 	// use their configured health-check URL. Test their resolved members here so
 	// the app's configured URL applies uniformly to every group type.
-	dm := make(map[string]uint16)
+	members := g.Proxies()
+	dm := make(map[string]uint16, len(members))
+	for _, proxy := range members {
+		dm[proxy.Name()] = 0
+	}
 	var delayMu sync.Mutex
 	var wait sync.WaitGroup
-	for _, proxy := range g.Proxies() {
+	for _, proxy := range members {
 		proxy := proxy
 		wait.Add(1)
 		go func() {
@@ -2084,9 +2088,6 @@ func GroupDelay(group, url, directURL string, timeoutMs int) string {
 		}()
 	}
 	wait.Wait()
-	if len(dm) == 0 {
-		return `{"error":"测速地址不可达或全部节点超时"}`
-	}
 	out, err := json.Marshal(dm)
 	if err != nil {
 		return `{"error":"marshal: ` + err.Error() + `"}`

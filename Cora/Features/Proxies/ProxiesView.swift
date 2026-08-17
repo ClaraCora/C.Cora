@@ -62,6 +62,14 @@ struct ProxiesView: View {
             .onAppear {
                 toolbarControlsVisible = true
             }
+            .onChange(of: core.status) { _, status in
+                guard status == .connecting || status == .reasserting else { return }
+                controller.resetSession()
+                expanded = []
+                activeNodeTestTarget = nil
+                gridExpansion = nil
+                expandedPanelFrames = [:]
+            }
             .task(id: LoadContext(status: core.status.rawValue,
                                   subscriptionID: subscriptions.selectedID,
                                   configurationUpdatedAt: subscriptions.selected?.updatedAt,

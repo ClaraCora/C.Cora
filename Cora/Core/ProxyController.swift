@@ -65,9 +65,9 @@ final class ProxyController: ObservableObject {
     @Published private(set) var isRuntimeAvailable = false
     @Published var error: String?
 
-    /// 节点延迟（毫秒），node 名 → ms。0/缺失表示未测或超时。
-    /// 持久化到磁盘：重连/重启后仍展示上次结果，下一次测速成功才覆盖。
-    @Published private(set) var delays: [String: Int] = ProxyController.loadCachedDelays()
+    /// 节点延迟（毫秒），node 名 → ms。0 表示本次测速超时，缺失表示本次连接尚未测速。
+    /// 结果只属于当前 VPN 会话，重连时由 `resetSession()` 清空。
+    @Published private(set) var delays: [String: Int] = [:]
     /// 正在测速的策略组名。
     @Published private(set) var testing: Set<String> = []
     /// 正在单独测速的节点，以策略组和节点名共同标识。
@@ -76,24 +76,6 @@ final class ProxyController: ObservableObject {
     @Published private(set) var selecting: [String: String] = [:]
     private var loadGeneration = 0
     private var sessionGeneration = 0
-
-    // MARK: - 延迟缓存持久化
-
-    private static var delaysFileURL: URL {
-        let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        return dir.appendingPathComponent("proxy-delays.json")
-    }
-
-    private static func loadCachedDelays() -> [String: Int] {
-        guard let data = try? Data(contentsOf: delaysFileURL),
-              let dict = try? JSONDecoder().decode([String: Int].self, from: data) else { return [:] }
-        return dict
-    }
-
-    private func saveDelays() {
-        guard let data = try? JSONEncoder().encode(delays) else { return }
-        try? data.write(to: Self.delaysFileURL, options: .atomic)
-    }
 
     func load() async {
         loadGeneration &+= 1
@@ -132,7 +114,6 @@ final class ProxyController: ObservableObject {
             self.error = "拿不到节点：\(reason)"
             mode = "rule"
             groups = []
-            // 保留 delays 缓存：瞬时失败不该清掉已测结果
             return
         case .ok(let data):
             guard let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
@@ -194,13 +175,10 @@ final class ProxyController: ObservableObject {
                 }
                 groups = ordered
             }
-            // 缓存修剪：丢掉当前配置里已不存在的节点，避免换订阅后展示旧延迟。
-            let knownNodes = Set(groups.flatMap { $0.all })
-            let pruned = delays.filter { knownNodes.contains($0.key) }
-            if pruned.count != delays.count { delays = pruned }
         }
     }
 
+    /// 结束当前测速会话并清除所有延迟结果。旧的异步 IPC 回来后会因代数变化被丢弃。
     func resetSession() {
         loadGeneration &+= 1
         sessionGeneration &+= 1
@@ -210,7 +188,7 @@ final class ProxyController: ObservableObject {
         hasLoaded = false
         isRuntimeAvailable = false
         error = nil
-        // delays 保留：缓存跨会话生效，下一次测速或 load 修剪时更新
+        delays = [:]
         testing = []
         testingNodes = []
         selecting = [:]
@@ -282,12 +260,19 @@ final class ProxyController: ObservableObject {
         SettingsStore.shared.delayTestTimeout * 1_000
     }
 
-    /// 对某策略组做延迟测试（IPC groupDelay），结果并入 delays。
+    /// 对某策略组做延迟测试（IPC groupDelay）。每个成员都会收到成功延迟或 0（超时），
+    /// 因而不会继续显示上一次测速的旧结果。
     func testGroup(_ name: String) async {
         guard isRuntimeAvailable, !testing.contains(name) else { return }
         let session = sessionGeneration
         error = nil
         testing.insert(name)
+        let memberNames = groups.first(where: { $0.name == name })?.all ?? []
+        var cleared = delays
+        for node in memberNames {
+            cleared.removeValue(forKey: node)
+        }
+        delays = cleared
         defer {
             if session == sessionGeneration {
                 testing.remove(name)
@@ -309,11 +294,15 @@ final class ProxyController: ObservableObject {
                 return
             }
             var updated = delays
+            for node in memberNames {
+                updated[node] = (dict[node] as? NSNumber)?.intValue ?? 0
+            }
             for (node, ms) in dict {
-                if let value = (ms as? NSNumber)?.intValue { updated[node] = value }
+                if let value = (ms as? NSNumber)?.intValue, !memberNames.contains(node) {
+                    updated[node] = value
+                }
             }
             delays = updated
-            saveDelays()
         case .failure(let reason):
             self.error = "测速失败：\(reason)"
         }
@@ -326,6 +315,7 @@ final class ProxyController: ObservableObject {
         let session = sessionGeneration
         error = nil
         testingNodes.insert(testingKey)
+        delays.removeValue(forKey: name)
         defer {
             if session == sessionGeneration {
                 testingNodes.remove(testingKey)
@@ -351,7 +341,6 @@ final class ProxyController: ObservableObject {
                 return
             }
             delays[name] = delay
-            saveDelays()
         case .failure(let reason):
             self.error = "测速失败：\(reason)"
         }

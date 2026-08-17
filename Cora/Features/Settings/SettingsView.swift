@@ -12,8 +12,17 @@ struct SettingsView: View {
                         SettingsNavigationRow(
                             title: "配置与订阅",
                             systemImage: "doc.text.magnifyingglass",
-                            message: "管理远程订阅、本地配置、远程资源和配置覆写。",
+                            message: "管理远程订阅、本地配置和配置覆写。",
                             destination: SubscriptionsView())
+                    }
+                    .listRowBackground(AppListRowBackground())
+
+                    Section {
+                        SettingsNavigationRow(
+                            title: "远程资源",
+                            systemImage: "externaldrive.connected.to.line.below",
+                            message: "查看配置引用的节点来源和规则来源。节点来源可离线缓存；规则来源需连接当前配置后更新。",
+                            destination: RemoteResourcesView())
                     }
                     .listRowBackground(AppListRowBackground())
 
@@ -66,7 +75,7 @@ struct SettingsView: View {
 
     private var appVersion: String {
         let bundle = Bundle.main
-        let version = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0.1"
+        let version = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0.2"
         let build = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1"
         return "\(version) (\(build))"
     }
