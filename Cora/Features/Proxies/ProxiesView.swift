@@ -565,7 +565,12 @@ struct ProxiesView: View {
 
     private func consumeNodeTestTarget() -> ProxyNodeTestTarget? {
         defer { activeNodeTestTarget = nil }
-        return activeNodeTestTarget
+        guard let target = activeNodeTestTarget,
+              let group = controller.groups.first(where: { $0.name == target.groupName }),
+              group.nodes.contains(where: {
+                  $0.id == target.nodeID && $0.name == target.nodeName
+              }) else { return nil }
+        return target
     }
 
     private func testActiveNodeDelay() {
@@ -977,6 +982,47 @@ private struct ProxyNodeTestTarget: Hashable {
     let nodeID: ProxyGroupNode.ID
 }
 
+private struct ProxyNodeInteractionModifier: ViewModifier {
+    private static let maximumTapDuration: TimeInterval = 0.30
+    private static let maximumTapMovement: CGFloat = 10
+
+    let onTouchBegan: () -> Void
+    let onTap: () -> Void
+
+    @GestureState private var touchStartedAt: Date?
+
+    func body(content: Content) -> some View {
+        content.simultaneousGesture(
+            DragGesture(minimumDistance: 0, coordinateSpace: .local)
+                .updating($touchStartedAt) { value, startedAt, _ in
+                    if startedAt == nil {
+                        startedAt = value.time
+                    }
+                }
+                .onChanged { value in
+                    onTouchBegan()
+                }
+                .onEnded { value in
+                    guard let startedAt = touchStartedAt else { return }
+                    let duration = value.time.timeIntervalSince(startedAt)
+                    let movement = hypot(value.translation.width,
+                                         value.translation.height)
+                    guard duration <= Self.maximumTapDuration,
+                          movement <= Self.maximumTapMovement else { return }
+                    onTap()
+                }
+        )
+    }
+}
+
+private extension View {
+    func proxyNodeInteraction(onTouchBegan: @escaping () -> Void,
+                              onTap: @escaping () -> Void) -> some View {
+        modifier(ProxyNodeInteractionModifier(onTouchBegan: onTouchBegan,
+                                              onTap: onTap))
+    }
+}
+
 private struct StrategyGroupListPanel: View {
     let group: ProxyGroup
     let allGroups: [ProxyGroup]
@@ -1210,10 +1256,10 @@ private struct ProxyNodeListRow: View {
     var body: some View {
         row
         .contentShape(Rectangle())
-        .onTapGesture(perform: selectIfAllowed)
         .accessibilityAddTraits(selectable && !isCurrent ? .isButton : [])
         .accessibilityAddTraits(isCurrent ? .isSelected : [])
         .accessibilityHint(selectable && !isCurrent ? "双击切换到此节点" : "")
+        .accessibilityAction { selectIfAllowed() }
         .contextMenu {
             Button(action: onTestDelay) {
                 Label(isTestingDelay ? "正在测速" : "测试此节点延迟",
@@ -1225,10 +1271,8 @@ private struct ProxyNodeListRow: View {
             }
             .disabled(!canTest)
         }
-        .simultaneousGesture(
-            DragGesture(minimumDistance: 0, coordinateSpace: .local)
-                .onChanged { _ in onPrepareTestTarget() }
-        )
+        .proxyNodeInteraction(onTouchBegan: onPrepareTestTarget,
+                              onTap: selectIfAllowed)
         .id(testTarget)
     }
 
@@ -1458,10 +1502,10 @@ private struct GroupNodeGridCell: View {
     var body: some View {
         card
         .contentShape(Rectangle())
-        .onTapGesture(perform: selectIfAllowed)
         .accessibilityAddTraits(selectable && !isCurrent ? .isButton : [])
         .accessibilityAddTraits(isCurrent ? .isSelected : [])
         .accessibilityHint(selectable && !isCurrent ? "双击切换到此节点" : "")
+        .accessibilityAction { selectIfAllowed() }
         .contextMenu {
             Button(action: onTestDelay) {
                 Label(isTestingDelay ? "正在测速" : "测试此节点延迟",
@@ -1473,10 +1517,8 @@ private struct GroupNodeGridCell: View {
             }
             .disabled(!canTest)
         }
-        .simultaneousGesture(
-            DragGesture(minimumDistance: 0, coordinateSpace: .local)
-                .onChanged { _ in onPrepareTestTarget() }
-        )
+        .proxyNodeInteraction(onTouchBegan: onPrepareTestTarget,
+                              onTap: selectIfAllowed)
         .id(testTarget)
     }
 
