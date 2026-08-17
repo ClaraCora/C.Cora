@@ -50,6 +50,47 @@ struct ProxyGroup: Identifiable {
     var selectable: Bool { type.caseInsensitiveCompare("Selector") == .orderedSame }
 }
 
+/// 将引用策略组解析为当前实际出口节点。延迟只存实际节点，显示时再把结果映射回引用项，
+/// 使“总模式 -> 地区分组 -> 节点”的多个入口始终展示同一条测速结果。
+enum ProxyDelayResolver {
+    /// 返回延迟查询优先级：实际节点优先，其次是引用链上的分组名（兼容旧会话数据）。
+    static func keys(for name: String, groups: [ProxyGroup]) -> [String] {
+        var lookup: [String: ProxyGroup] = [:]
+        for group in groups {
+            lookup[group.name] = group
+        }
+
+        var current = name
+        var path = [name]
+        var visited: Set<String> = [name]
+        while let group = lookup[current] {
+            let selected = group.now.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !selected.isEmpty, visited.insert(selected).inserted else { break }
+            current = selected
+            path.append(selected)
+        }
+
+        var result = [current]
+        for alias in path.reversed() where !result.contains(alias) {
+            result.append(alias)
+        }
+        return result
+    }
+
+    static func storageKey(for name: String, groups: [ProxyGroup]) -> String {
+        keys(for: name, groups: groups).first ?? name
+    }
+
+    static func delay(for name: String,
+                      groups: [ProxyGroup],
+                      delays: [String: Int]) -> Int? {
+        for key in keys(for: name, groups: groups) {
+            if let value = delays[key] { return value }
+        }
+        return nil
+    }
+}
+
 /// 策略组查询与节点切换：经统一控制通道直连 NE 内核
 /// （queryProxies / selectProxy / groupDelay），不走 HTTP API。
 ///
@@ -298,9 +339,12 @@ final class ProxyController: ObservableObject {
         error = nil
         testing.insert(name)
         let memberNames = groups.first(where: { $0.name == name })?.all ?? []
+        let memberDelayKeys = Set(memberNames.map {
+            ProxyDelayResolver.storageKey(for: $0, groups: groups)
+        })
         var cleared = delays
-        for node in memberNames {
-            cleared.removeValue(forKey: node)
+        for key in memberDelayKeys {
+            cleared.removeValue(forKey: key)
         }
         delays = cleared
         persistDelays()
@@ -326,11 +370,13 @@ final class ProxyController: ObservableObject {
             }
             var updated = delays
             for node in memberNames {
-                updated[node] = (dict[node] as? NSNumber)?.intValue ?? 0
+                let key = ProxyDelayResolver.storageKey(for: node, groups: groups)
+                updated[key] = (dict[node] as? NSNumber)?.intValue ?? 0
             }
             for (node, ms) in dict {
                 if let value = (ms as? NSNumber)?.intValue, !memberNames.contains(node) {
-                    updated[node] = value
+                    let key = ProxyDelayResolver.storageKey(for: node, groups: groups)
+                    updated[key] = value
                 }
             }
             delays = updated
@@ -347,7 +393,8 @@ final class ProxyController: ObservableObject {
         let session = sessionGeneration
         error = nil
         testingNodes.insert(testingKey)
-        delays.removeValue(forKey: name)
+        let delayKey = ProxyDelayResolver.storageKey(for: name, groups: groups)
+        delays.removeValue(forKey: delayKey)
         persistDelays()
         defer {
             if session == sessionGeneration {
@@ -373,7 +420,7 @@ final class ProxyController: ObservableObject {
                 self.error = "测速失败：响应缺少延迟"
                 return
             }
-            delays[name] = delay
+            delays[delayKey] = delay
             persistDelays()
         case .failure(let reason):
             self.error = "测速失败：\(reason)"

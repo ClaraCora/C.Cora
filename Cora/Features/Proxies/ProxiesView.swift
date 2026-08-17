@@ -1013,7 +1013,9 @@ private struct StrategyGroupListPanel: View {
                             testTarget: testTarget,
                             isTestingDelay: testingNodes.contains(
                                 ProxyNodeTestKey(group: group.name, node: item.name)),
-                            delay: delays[item.name],
+                            delay: ProxyDelayResolver.delay(for: item.name,
+                                                            groups: allGroups,
+                                                            delays: delays),
                             onTestActiveNode: onTestActiveNode,
                             onPrepareTestTarget: { onPrepareTestTarget(testTarget) },
                             onSelect: { onSelect(item.name) })
@@ -1310,7 +1312,9 @@ private struct GroupExpandedPanel: View {
                                       testTarget: testTarget,
                                       isTestingDelay: testingNodes.contains(
                                           ProxyNodeTestKey(group: group.name, node: item.name)),
-                                      delay: delays[item.name],
+                                      delay: ProxyDelayResolver.delay(for: item.name,
+                                                                      groups: allGroups,
+                                                                      delays: delays),
                                       onTestActiveNode: onTestActiveNode,
                                       onPrepareTestTarget: { onPrepareTestTarget(testTarget) },
                                       onSelect: { onSelect(item.name) })
