@@ -66,7 +66,7 @@ const maxRunLogLineBytes = 64 << 10
 const (
 	maxScriptRequestBodyBytes    = 32 << 10
 	maxScriptResponseBodyBytes   = 256 << 10
-	maxScriptRequestTimeoutMs    = 10_000
+	maxScriptRequestTimeoutMs    = 15_000
 	maxScriptRequestCountPerRun  = 12
 )
 

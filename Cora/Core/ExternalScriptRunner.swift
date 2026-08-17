@@ -19,6 +19,11 @@ struct UnlockTestResult: Identifiable, Sendable {
     let message: String
 }
 
+enum ExternalScriptLimits {
+    static let maxRequestTimeoutMilliseconds = 15_000
+    static let maxExecutionSeconds: TimeInterval = 45
+}
+
 /// Downloads and caches only the signed script selected by the Cora manifest.
 /// The app never bundles the detection logic itself.
 @MainActor
@@ -51,11 +56,38 @@ final class ExternalScriptStore {
         let id: String
         let version: String
         let sha256: String
+        let updatedAt: Date?
     }
 
-    private init() {}
+    @Published private(set) var cachedVersion: String?
+    @Published private(set) var cachedUpdatedAt: Date?
+    @Published private(set) var isUpdating = false
+    @Published private(set) var updateMessage: String?
+
+    private init() {
+        refreshCacheState()
+    }
 
     func loadUnlockScript() async throws -> ExternalDetectionScript {
+        if let cached = validCachedScript() {
+            publishCacheState(cached.metadata)
+            return metadata(from: cached.metadata)
+        }
+        return try await refreshUnlockScript()
+    }
+
+    /// 设置页调用的显式更新。签名或下载失败时保留旧缓存。
+    func refreshUnlockScript() async throws -> ExternalDetectionScript {
+        if isUpdating {
+            if let cached = validCachedScript() {
+                return metadata(from: cached.metadata)
+            }
+            throw ScriptLoadError.updateInProgress
+        }
+        isUpdating = true
+        updateMessage = nil
+        defer { isUpdating = false }
+
         do {
             let manifestData = try await Self.download(Self.manifestURL, maxBytes: 256 * 1024)
             let signatureData = try await Self.download(Self.signatureURL, maxBytes: 8 * 1024)
@@ -70,44 +102,59 @@ final class ExternalScriptStore {
             guard Self.sha256(scriptData) == entry.sha256.lowercased() else {
                 throw ScriptLoadError.hashMismatch
             }
-            try Self.save(scriptData: scriptData,
-                          metadata: CachedScript(id: entry.id, version: entry.version, sha256: entry.sha256))
+            let cached = CachedScript(id: entry.id,
+                                      version: entry.version,
+                                      sha256: entry.sha256,
+                                      updatedAt: Date())
+            try Self.save(scriptData: scriptData, metadata: cached)
+            publishCacheState(cached)
+            updateMessage = "脚本已更新"
             return ExternalDetectionScript(id: entry.id, name: entry.name,
                                            version: entry.version, scriptURL: entry.scriptURL,
                                            sha256: entry.sha256)
         } catch {
-            guard let cached = Self.loadCachedMetadata(),
-                  let data = Self.loadCachedScript(),
-                  Self.sha256(data) == cached.sha256.lowercased() else {
-                throw error
-            }
-            return ExternalDetectionScript(
-                id: cached.id,
-                name: "节点解锁检测",
-                version: cached.version,
-                scriptURL: Self.manifestURL,
-                sha256: cached.sha256)
+            updateMessage = "更新失败：\(error.localizedDescription)"
+            throw error
         }
     }
 
+    func refreshCacheState() {
+        publishCacheState(Self.loadCachedMetadata())
+    }
+
     func scriptSource() -> (script: String, metadata: ExternalDetectionScript)? {
+        guard let cached = validCachedScript(),
+              let source = String(data: cached.data, encoding: .utf8) else { return nil }
+        return (source, metadata(from: cached.metadata))
+    }
+
+    private func validCachedScript() -> (metadata: CachedScript, data: Data)? {
         guard let metadata = Self.loadCachedMetadata(),
               let data = Self.loadCachedScript(),
-              Self.sha256(data) == metadata.sha256.lowercased(),
-              let source = String(data: data, encoding: .utf8) else { return nil }
-        return (source, ExternalDetectionScript(id: metadata.id,
-                                                 name: "节点解锁检测",
-                                                 version: metadata.version,
-                                                 scriptURL: Self.manifestURL,
-                                                 sha256: metadata.sha256))
+              Self.sha256(data) == metadata.sha256.lowercased() else { return nil }
+        return (metadata, data)
+    }
+
+    private func metadata(from cached: CachedScript) -> ExternalDetectionScript {
+        ExternalDetectionScript(id: cached.id,
+                                name: "节点解锁检测",
+                                version: cached.version,
+                                scriptURL: Self.manifestURL,
+                                sha256: cached.sha256)
+    }
+
+    private func publishCacheState(_ metadata: CachedScript?) {
+        cachedVersion = metadata?.version
+        cachedUpdatedAt = metadata?.updatedAt
     }
 
     private static func download(_ url: URL, maxBytes: Int64) async throws -> Data {
         var request = URLRequest(url: url)
         request.setValue("Cora/1.0", forHTTPHeaderField: "User-Agent")
+        request.timeoutInterval = 15
         let download = try await BoundedHTTPDownloader.download(for: request,
                                                                   maxBytes: maxBytes,
-                                                                  resourceTimeout: 30)
+                                                                  resourceTimeout: 15)
         defer { try? FileManager.default.removeItem(at: download.fileURL) }
         return try Data(contentsOf: download.fileURL, options: .mappedIfSafe)
     }
@@ -145,12 +192,14 @@ final class ExternalScriptStore {
         case invalidManifest
         case signatureMismatch
         case hashMismatch
+        case updateInProgress
 
         var errorDescription: String? {
             switch self {
             case .invalidManifest: return "检测脚本清单无效"
             case .signatureMismatch: return "检测脚本清单签名不匹配"
             case .hashMismatch: return "检测脚本摘要不匹配"
+            case .updateInProgress: return "检测脚本正在更新"
             }
         }
     }
@@ -213,8 +262,7 @@ private final class ScriptExecution: @unchecked Sendable {
 
     func start() async throws -> UnlockTestResult {
         try await withCheckedThrowingContinuation { continuation in
-            queue.async { [weak self] in
-                guard let self else { return }
+            queue.async { [self] in
                 self.evaluate { result in
                     continuation.resume(with: result)
                 }
@@ -225,12 +273,27 @@ private final class ScriptExecution: @unchecked Sendable {
     private func evaluate(completion: @escaping (Result<UnlockTestResult, Error>) -> Void) {
         let js = JSContext()!
         context = js
+        let fail: (String) -> Void = { [weak self] message in
+            self?.queue.async { [weak self] in
+                guard let self, !self.completed else { return }
+                self.completed = true
+                completion(.failure(ScriptExecutionError.runtime(message)))
+            }
+        }
         js.exceptionHandler = { _, exception in
             if let exception {
                 NSLog("Cora script exception: %@", exception.toString())
             }
+            fail(exception?.toString() ?? "脚本运行异常")
         }
         js.setObject(["params": ["node": nodeName]], forKeyedSubscript: "$environment" as NSString)
+        let console = JSValue(newObjectIn: js)
+        let log: @convention(block) (JSValue) -> Void = { _ in }
+        console?.setObject(log, forKeyedSubscript: "log" as NSString)
+        console?.setObject(log, forKeyedSubscript: "info" as NSString)
+        console?.setObject(log, forKeyedSubscript: "warn" as NSString)
+        console?.setObject(log, forKeyedSubscript: "error" as NSString)
+        js.setObject(console, forKeyedSubscript: "console" as NSString)
         let httpClient = JSValue(newObjectIn: js)
         let get: @convention(block) (NSDictionary, JSValue) -> Void = { [weak self] options, callback in
             self?.fetch(method: "GET", options: options, callback: callback)
@@ -245,9 +308,11 @@ private final class ScriptExecution: @unchecked Sendable {
             self?.finish(value: value, completion: completion)
         }
         js.setObject(done, forKeyedSubscript: "$done" as NSString)
-        js.evaluateScript(source)
-        queue.asyncAfter(deadline: .now() + 30) { [weak self] in
-            guard let self, !self.completed else { return }
+        if js.evaluateScript(source) == nil {
+            fail("脚本无法执行")
+        }
+        queue.asyncAfter(deadline: .now() + ExternalScriptLimits.maxExecutionSeconds) { [self] in
+            guard !self.completed else { return }
             self.completed = true
             completion(.failure(ScriptExecutionError.timeout))
         }
@@ -271,7 +336,8 @@ private final class ScriptExecution: @unchecked Sendable {
             "url": values["url"] as? String ?? "",
             "headers": values["headers"] as? [String: String] ?? [:],
             "body": values["body"] as? String ?? "",
-            "timeout": min(max((values["timeout"] as? NSNumber)?.intValue ?? 5_000, 500), 10_000),
+            "timeout": min(max((values["timeout"] as? NSNumber)?.intValue ?? 5_000, 500),
+                            ExternalScriptLimits.maxRequestTimeoutMilliseconds),
             "allowRedirect": (values["auto-redirect"] as? NSNumber)?.boolValue ?? true,
         ]
         queue.async { [weak self] in
@@ -322,5 +388,12 @@ private final class ScriptExecution: @unchecked Sendable {
 
 private enum ScriptExecutionError: LocalizedError {
     case timeout
-    var errorDescription: String? { "解锁检测超时" }
+    case runtime(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .timeout: return "解锁检测超时（脚本总时限 45 秒）"
+        case .runtime(let message): return "脚本运行失败：\(message)"
+        }
+    }
 }

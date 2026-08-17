@@ -52,6 +52,15 @@ struct SettingsView: View {
                     .listRowBackground(AppListRowBackground())
 
                     Section {
+                        SettingsNavigationRow(
+                            title: "检测脚本",
+                            systemImage: "play.tv",
+                            message: "管理节点解锁检测脚本。脚本在 Cora 外部仓库维护，更新前会校验签名和摘要。",
+                            destination: UnlockScriptSettingsView())
+                    }
+                    .listRowBackground(AppListRowBackground())
+
+                    Section {
                         HStack(spacing: 12) {
                             SettingsSymbol(systemImage: "info.circle")
                             Text("App 版本").font(.body.weight(.medium))
@@ -331,6 +340,76 @@ private struct RemoteResourceContentView: View {
                 .padding(.vertical, 8)
                 .background(.bar)
             }
+        }
+    }
+}
+
+private struct UnlockScriptSettingsView: View {
+    @ObservedObject private var scripts = ExternalScriptStore.shared
+
+    var body: some View {
+        Form {
+            Section {
+                HStack {
+                    InfoLabel(title: "当前版本", message: "长按节点或分组进行解锁测试时使用本地已验证的脚本版本。")
+                    Spacer()
+                    Text(scripts.cachedVersion ?? "未下载")
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+
+                HStack {
+                    Text("上次更新")
+                    Spacer()
+                    if let date = scripts.cachedUpdatedAt {
+                        Text(date, style: .date)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("尚未更新")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                Button {
+                    Task { await updateScript() }
+                } label: {
+                    HStack {
+                        Label("检查并更新脚本", systemImage: "arrow.down.circle")
+                        Spacer()
+                        if scripts.isUpdating {
+                            ProgressView()
+                        }
+                    }
+                }
+                .disabled(scripts.isUpdating)
+
+                if let message = scripts.updateMessage {
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(message.hasPrefix("更新失败") ? .red : .secondary)
+                }
+            }
+            .listRowBackground(AppListRowBackground())
+
+            Section {
+                Text("脚本只允许通过受限的 mihomo 节点请求访问检测地址，不会把检测逻辑编译进 App。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .listRowBackground(AppListRowBackground())
+        }
+        .scrollContentBackground(.hidden)
+        .background(AppAmbientBackground())
+        .navigationTitle("检测脚本")
+        .navigationBarTitleDisplayMode(.inline)
+        .task { scripts.refreshCacheState() }
+    }
+
+    private func updateScript() async {
+        do {
+            _ = try await scripts.refreshUnlockScript()
+        } catch {
+            // ExternalScriptStore publishes the verified failure reason and keeps the old cache.
         }
     }
 }

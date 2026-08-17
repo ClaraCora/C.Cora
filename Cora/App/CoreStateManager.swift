@@ -324,6 +324,12 @@ final class CoreStateManager: ObservableObject {
         case "groupDelay", "proxyDelay":
             let milliseconds = (request["timeout"] as? NSNumber)?.doubleValue ?? 5_000
             timeout = max(10, milliseconds / 1_000 + 5)
+        case "scriptFetch":
+            let nestedRequest = request["request"] as? [String: Any]
+            let milliseconds = (nestedRequest?["timeout"] as? NSNumber)?.doubleValue ?? 5_000
+            // Leave a small IPC margin around the mihomo request itself. The
+            // script runner caps the nested request at 15 seconds.
+            timeout = min(20, max(10, milliseconds / 1_000 + 3))
         case "updateProxyProviders", "updateProxyProvider",
              "updateRuleProviders", "updateRuleProvider":
             timeout = 120
