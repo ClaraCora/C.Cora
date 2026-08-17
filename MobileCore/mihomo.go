@@ -12,14 +12,13 @@ import (
 	"bytes"
 	"container/heap"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/netip"
-	stdHTTP "net/http"
+	stdHTTP "github.com/metacubex/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -2265,9 +2264,6 @@ func ScriptFetch(requestJSON string) string {
 	if err != nil {
 		return marshalJSON(map[string]any{"ok": false, "error": "TLS 配置失败"})
 	}
-	if tlsConfig == nil {
-		tlsConfig = &tls.Config{}
-	}
 	transport := &stdHTTP.Transport{
 		DialContext: func(dialCtx context.Context, _, address string) (net.Conn, error) {
 			if _, _, splitErr := net.SplitHostPort(address); splitErr != nil {
@@ -2299,10 +2295,11 @@ func ScriptFetch(requestJSON string) string {
 	if request.Body != "" && method != stdHTTP.MethodHead {
 		body = strings.NewReader(request.Body)
 	}
-	req, err := stdHTTP.NewRequestWithContext(ctx, method, rawURL, body)
+	req, err := stdHTTP.NewRequest(method, rawURL, body)
 	if err != nil {
 		return marshalJSON(map[string]any{"ok": false, "error": "请求构造失败"})
 	}
+	req = req.WithContext(ctx)
 	for key, value := range request.Headers {
 		if strings.TrimSpace(key) != "" && len(value) <= 4096 {
 			req.Header.Set(key, value)
