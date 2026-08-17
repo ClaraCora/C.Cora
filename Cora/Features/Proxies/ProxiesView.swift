@@ -300,7 +300,7 @@ struct ProxiesView: View {
             onPrepareTestTarget: prepareNodeTestTarget,
             onGradient: { setGradient($0, for: group.name) },
             onRandomizeAll: randomizeAllGradients,
-            onSelect: { name in Task { await controller.select(group: group.name, name: name) } })
+            onSelect: { name in selectNode(name, in: group.name) })
             .background {
                 if result.isExpanded {
                     GeometryReader { geometry in
@@ -537,9 +537,7 @@ struct ProxiesView: View {
             onPrepareTestTarget: prepareNodeTestTarget,
             onGradient: { setGradient($0, for: result.group.name) },
             onRandomizeAll: randomizeAllGradients,
-            onSelect: { name in
-                Task { await controller.select(group: result.group.name, name: name) }
-            })
+            onSelect: { name in selectNode(name, in: result.group.name) })
         .background {
             GeometryReader { geometry in
                 Color.clear.preference(
@@ -561,6 +559,11 @@ struct ProxiesView: View {
     private func prepareNodeTestTarget(_ target: ProxyNodeTestTarget) {
         guard activeNodeTestTarget != target else { return }
         activeNodeTestTarget = target
+    }
+
+    private func selectNode(_ name: String, in group: String) {
+        activeNodeTestTarget = nil
+        Task { await controller.select(group: group, name: name) }
     }
 
     private func consumeNodeTestTarget() -> ProxyNodeTestTarget? {
@@ -982,44 +985,20 @@ private struct ProxyNodeTestTarget: Hashable {
     let nodeID: ProxyGroupNode.ID
 }
 
-private struct ProxyNodeInteractionModifier: ViewModifier {
-    private static let maximumTapDuration: TimeInterval = 0.30
-    private static let maximumTapMovement: CGFloat = 10
-
+private struct ProxyNodeTestTargetModifier: ViewModifier {
     let onTouchBegan: () -> Void
-    let onTap: () -> Void
-
-    @GestureState private var touchStartedAt: Date?
 
     func body(content: Content) -> some View {
         content.simultaneousGesture(
             DragGesture(minimumDistance: 0, coordinateSpace: .local)
-                .updating($touchStartedAt) { value, startedAt, _ in
-                    if startedAt == nil {
-                        startedAt = value.time
-                    }
-                }
-                .onChanged { value in
-                    onTouchBegan()
-                }
-                .onEnded { value in
-                    guard let startedAt = touchStartedAt else { return }
-                    let duration = value.time.timeIntervalSince(startedAt)
-                    let movement = hypot(value.translation.width,
-                                         value.translation.height)
-                    guard duration <= Self.maximumTapDuration,
-                          movement <= Self.maximumTapMovement else { return }
-                    onTap()
-                }
+                .onChanged { _ in onTouchBegan() }
         )
     }
 }
 
 private extension View {
-    func proxyNodeInteraction(onTouchBegan: @escaping () -> Void,
-                              onTap: @escaping () -> Void) -> some View {
-        modifier(ProxyNodeInteractionModifier(onTouchBegan: onTouchBegan,
-                                              onTap: onTap))
+    func prepareProxyNodeTestTarget(_ action: @escaping () -> Void) -> some View {
+        modifier(ProxyNodeTestTargetModifier(onTouchBegan: action))
     }
 }
 
@@ -1254,30 +1233,43 @@ private struct ProxyNodeListRow: View {
     let onSelect: () -> Void
 
     var body: some View {
-        row
-        .contentShape(Rectangle())
-        .accessibilityAddTraits(selectable && !isCurrent ? .isButton : [])
-        .accessibilityAddTraits(isCurrent ? .isSelected : [])
-        .accessibilityHint(selectable && !isCurrent ? "双击切换到此节点" : "")
-        .accessibilityAction { selectIfAllowed() }
-        .contextMenu {
-            Button(action: onTestDelay) {
-                Label(isTestingDelay ? "正在测速" : "测试此节点延迟",
-                      systemImage: isTestingDelay ? "hourglass" : "speedometer")
+        interactionContent
+            .contentShape(Rectangle())
+            .accessibilityAddTraits(isCurrent ? .isSelected : [])
+            .contextMenu {
+                Button(action: onTestDelay) {
+                    Label(isTestingDelay ? "正在测速" : "测试此节点延迟",
+                          systemImage: isTestingDelay ? "hourglass" : "speedometer")
+                }
+                .disabled(!canTest || isTestingDelay)
+                Button(action: onTestUnlock) {
+                    Label("解锁测试", systemImage: "play.tv")
+                }
+                .disabled(!canTest)
             }
-            .disabled(!canTest || isTestingDelay)
-            Button(action: onTestUnlock) {
-                Label("解锁测试", systemImage: "play.tv")
+            .prepareProxyNodeTestTarget(onPrepareTestTarget)
+            .id(testTarget)
+    }
+
+    @ViewBuilder
+    private var interactionContent: some View {
+        if canSelect {
+            Button(action: selectIfAllowed) {
+                row
             }
-            .disabled(!canTest)
+            .buttonStyle(.plain)
+            .accessibilityHint("双击切换到此节点")
+        } else {
+            row
         }
-        .proxyNodeInteraction(onTouchBegan: onPrepareTestTarget,
-                              onTap: selectIfAllowed)
-        .id(testTarget)
+    }
+
+    private var canSelect: Bool {
+        selectable && !isCurrent && !isSelectionBlocked
     }
 
     private func selectIfAllowed() {
-        guard selectable, !isCurrent, !isSelectionBlocked else { return }
+        guard canSelect else { return }
         onSelect()
     }
 
@@ -1500,30 +1492,43 @@ private struct GroupNodeGridCell: View {
     let onSelect: () -> Void
 
     var body: some View {
-        card
-        .contentShape(Rectangle())
-        .accessibilityAddTraits(selectable && !isCurrent ? .isButton : [])
-        .accessibilityAddTraits(isCurrent ? .isSelected : [])
-        .accessibilityHint(selectable && !isCurrent ? "双击切换到此节点" : "")
-        .accessibilityAction { selectIfAllowed() }
-        .contextMenu {
-            Button(action: onTestDelay) {
-                Label(isTestingDelay ? "正在测速" : "测试此节点延迟",
-                      systemImage: isTestingDelay ? "hourglass" : "speedometer")
+        interactionContent
+            .contentShape(Rectangle())
+            .accessibilityAddTraits(isCurrent ? .isSelected : [])
+            .contextMenu {
+                Button(action: onTestDelay) {
+                    Label(isTestingDelay ? "正在测速" : "测试此节点延迟",
+                          systemImage: isTestingDelay ? "hourglass" : "speedometer")
+                }
+                .disabled(!canTest || isTestingDelay)
+                Button(action: onTestUnlock) {
+                    Label("解锁测试", systemImage: "play.tv")
+                }
+                .disabled(!canTest)
             }
-            .disabled(!canTest || isTestingDelay)
-            Button(action: onTestUnlock) {
-                Label("解锁测试", systemImage: "play.tv")
+            .prepareProxyNodeTestTarget(onPrepareTestTarget)
+            .id(testTarget)
+    }
+
+    @ViewBuilder
+    private var interactionContent: some View {
+        if canSelect {
+            Button(action: selectIfAllowed) {
+                card
             }
-            .disabled(!canTest)
+            .buttonStyle(.plain)
+            .accessibilityHint("双击切换到此节点")
+        } else {
+            card
         }
-        .proxyNodeInteraction(onTouchBegan: onPrepareTestTarget,
-                              onTap: selectIfAllowed)
-        .id(testTarget)
+    }
+
+    private var canSelect: Bool {
+        selectable && !isCurrent && !isSelectionBlocked
     }
 
     private func selectIfAllowed() {
-        guard selectable, !isCurrent, !isSelectionBlocked else { return }
+        guard canSelect else { return }
         onSelect()
     }
 
