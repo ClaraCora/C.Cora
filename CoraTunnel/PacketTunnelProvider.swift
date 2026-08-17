@@ -111,6 +111,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // 每次启动清空 ne.log，避免历史残留干扰排查
         // 隧道建立前先抓物理网络 DNS；隧道起来后系统主解析器会变成隧道自己的 DNS。
         FileLog.reset()
+        // 每次真正启动隧道都创建新的延迟会话；App 重新打开时可从该快照恢复。
+        let delaySessionID = ProxyDelayStore.beginSession()
+        FileLog.write("延迟测试会话已开始：\(delaySessionID)")
         let initialSystemDNS = SystemDNS.excludingTunnel(SystemDNS.currentServers())
         replaceSystemDNSServers(initialSystemDNS)
         FileLog.write("system DNS = \(initialSystemDNS)")
@@ -305,6 +308,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             connectionHistoryRecorder.stop()
             memoryDiagnostics.stop(event: "stop")
             MihomoStop()
+            // 断开才清空延迟快照；App 进程退出或进入后台不会触发这里。
+            ProxyDelayStore.clear()
         }
         completionHandler()
     }

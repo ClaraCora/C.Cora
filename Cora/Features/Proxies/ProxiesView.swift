@@ -63,12 +63,23 @@ struct ProxiesView: View {
                 toolbarControlsVisible = true
             }
             .onChange(of: core.status) { _, status in
-                guard status == .connecting || status == .reasserting else { return }
-                controller.resetSession()
-                expanded = []
-                activeNodeTestTarget = nil
-                gridExpansion = nil
-                expandedPanelFrames = [:]
+                switch status {
+                case .connecting:
+                    // NE 会在 startTunnel 中创建新的持久化会话；这里先停止旧的异步任务。
+                    controller.resetSession()
+                    expanded = []
+                    activeNodeTestTarget = nil
+                    gridExpansion = nil
+                    expandedPanelFrames = [:]
+                case .disconnected, .invalid:
+                    controller.clearDisconnectedSession()
+                    expanded = []
+                    activeNodeTestTarget = nil
+                    gridExpansion = nil
+                    expandedPanelFrames = [:]
+                default:
+                    break
+                }
             }
             .task(id: LoadContext(status: core.status.rawValue,
                                   subscriptionID: subscriptions.selectedID,

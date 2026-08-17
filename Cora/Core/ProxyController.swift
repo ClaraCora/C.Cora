@@ -66,8 +66,8 @@ final class ProxyController: ObservableObject {
     @Published var error: String?
 
     /// 节点延迟（毫秒），node 名 → ms。0 表示本次测速超时，缺失表示本次连接尚未测速。
-    /// 结果只属于当前 VPN 会话，重连时由 `resetSession()` 清空。
-    @Published private(set) var delays: [String: Int] = [:]
+    /// 结果属于当前 VPN 会话，App 重启时从 App Group 快照恢复。
+    @Published private(set) var delays: [String: Int]
     /// 正在测速的策略组名。
     @Published private(set) var testing: Set<String> = []
     /// 正在单独测速的节点，以策略组和节点名共同标识。
@@ -76,8 +76,16 @@ final class ProxyController: ObservableObject {
     @Published private(set) var selecting: [String: String] = [:]
     private var loadGeneration = 0
     private var sessionGeneration = 0
+    private var delaySessionID: String?
+
+    init() {
+        let snapshot = ProxyDelayStore.load()
+        delaySessionID = snapshot?.sessionID
+        delays = snapshot?.delays ?? [:]
+    }
 
     func load() async {
+        reconcileDelaySession()
         loadGeneration &+= 1
         let generation = loadGeneration
         isLoading = true
@@ -178,7 +186,7 @@ final class ProxyController: ObservableObject {
         }
     }
 
-    /// 结束当前测速会话并清除所有延迟结果。旧的异步 IPC 回来后会因代数变化被丢弃。
+    /// 结束当前界面测速任务并清除内存结果。NE 负责创建/删除持久化会话快照。
     func resetSession() {
         loadGeneration &+= 1
         sessionGeneration &+= 1
@@ -189,9 +197,31 @@ final class ProxyController: ObservableObject {
         isRuntimeAvailable = false
         error = nil
         delays = [:]
+        delaySessionID = ProxyDelayStore.load()?.sessionID
         testing = []
         testingNodes = []
         selecting = [:]
+    }
+
+    /// 断开状态由 App 观察到时的兜底清理；正常情况下 NE stopTunnel 已先清理。
+    func clearDisconnectedSession() {
+        resetSession()
+        delaySessionID = nil
+        ProxyDelayStore.clear()
+    }
+
+    private func reconcileDelaySession() {
+        let snapshot = ProxyDelayStore.load()
+        guard snapshot?.sessionID != delaySessionID else { return }
+        delaySessionID = snapshot?.sessionID
+        delays = snapshot?.delays ?? [:]
+        testing = []
+        testingNodes = []
+    }
+
+    private func persistDelays() {
+        guard let delaySessionID else { return }
+        ProxyDelayStore.save(delays, sessionID: delaySessionID)
     }
 
     /// 在某策略组选定节点。连接中走 IPC；断开时保存到订阅，下次连接恢复。
@@ -273,6 +303,7 @@ final class ProxyController: ObservableObject {
             cleared.removeValue(forKey: node)
         }
         delays = cleared
+        persistDelays()
         defer {
             if session == sessionGeneration {
                 testing.remove(name)
@@ -303,6 +334,7 @@ final class ProxyController: ObservableObject {
                 }
             }
             delays = updated
+            persistDelays()
         case .failure(let reason):
             self.error = "测速失败：\(reason)"
         }
@@ -316,6 +348,7 @@ final class ProxyController: ObservableObject {
         error = nil
         testingNodes.insert(testingKey)
         delays.removeValue(forKey: name)
+        persistDelays()
         defer {
             if session == sessionGeneration {
                 testingNodes.remove(testingKey)
@@ -341,6 +374,7 @@ final class ProxyController: ObservableObject {
                 return
             }
             delays[name] = delay
+            persistDelays()
         case .failure(let reason):
             self.error = "测速失败：\(reason)"
         }
