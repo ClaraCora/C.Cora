@@ -12,12 +12,15 @@ import (
 	"bytes"
 	"container/heap"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/netip"
+	stdHTTP "net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -32,6 +35,7 @@ import (
 	"github.com/metacubex/mihomo/adapter/inbound"
 	"github.com/metacubex/mihomo/adapter/outboundgroup"
 	"github.com/metacubex/mihomo/common/utils"
+	"github.com/metacubex/mihomo/component/ca"
 	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/geodata"
 	"github.com/metacubex/mihomo/component/iface"
@@ -59,6 +63,13 @@ const minimumTunnelMTU = 576
 const maxRunLogBytes int64 = 2 << 20
 
 const maxRunLogLineBytes = 64 << 10
+
+const (
+	maxScriptRequestBodyBytes    = 32 << 10
+	maxScriptResponseBodyBytes   = 256 << 10
+	maxScriptRequestTimeoutMs    = 10_000
+	maxScriptRequestCountPerRun  = 12
+)
 
 const controlProtocolVersion = 1
 
@@ -2148,6 +2159,224 @@ func ProxyDelay(name, group, url, directURL string, timeoutMs int) string {
 		return `{"error":"marshal: ` + err.Error() + `"}`
 	}
 	return string(out)
+}
+
+// RuleProviderContent returns the exact bytes currently loaded by one HTTP
+// rule provider. The provider vehicle owns the cache path, so this never
+// performs a second network request and cannot replace the running rules.
+func RuleProviderContent(name string, maxBytes int) string {
+	configApplyMu.RLock()
+	defer configApplyMu.RUnlock()
+	provider, ok := tunnel.RuleProviders()[strings.TrimSpace(name)]
+	if !ok {
+		return marshalJSON(map[string]any{"ok": false, "error": "规则来源不存在"})
+	}
+	vehicleProvider, ok := provider.(interface{ Vehicle() P.Vehicle })
+	if !ok {
+		return marshalJSON(map[string]any{"ok": false, "error": "当前内核不支持读取规则来源原文"})
+	}
+	path := vehicleProvider.Vehicle().Path()
+	if path == "" {
+		return marshalJSON(map[string]any{"ok": false, "error": "规则来源尚未落盘"})
+	}
+	if maxBytes <= 0 || maxBytes > 1<<20 {
+		maxBytes = 1 << 20
+	}
+	info, statErr := os.Stat(path)
+	if statErr != nil {
+		return marshalJSON(map[string]any{"ok": false, "error": "规则来源尚未更新"})
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return marshalJSON(map[string]any{"ok": false, "error": "读取规则来源失败"})
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, int64(maxBytes)+1))
+	if err != nil {
+		return marshalJSON(map[string]any{"ok": false, "error": "读取规则来源失败"})
+	}
+	truncated := len(data) > maxBytes
+	if truncated {
+		data = data[:maxBytes]
+	}
+	return marshalJSON(map[string]any{
+		"ok":        true,
+		"content":  string(data),
+		"size":     info.Size(),
+		"updatedAt": info.ModTime().UTC().Format(time.RFC3339),
+		"truncated": truncated,
+	})
+}
+
+type scriptFetchRequest struct {
+	Name         string            `json:"name"`
+	Group        string            `json:"group"`
+	Method       string            `json:"method"`
+	URL          string            `json:"url"`
+	Headers      map[string]string `json:"headers"`
+	Body         string            `json:"body"`
+	TimeoutMs    int               `json:"timeout"`
+	AllowRedirect bool             `json:"allowRedirect"`
+}
+
+// ScriptFetch is the only network primitive exposed to Cora's JavaScript
+// runner. It is intentionally HTTPS-only and always dials the named mihomo
+// proxy; it never uses the system URLSession or the currently selected group.
+func ScriptFetch(requestJSON string) string {
+	var request scriptFetchRequest
+	if err := json.Unmarshal([]byte(requestJSON), &request); err != nil {
+		return marshalJSON(map[string]any{"ok": false, "error": "请求参数无效"})
+	}
+	if len(request.Body) > maxScriptRequestBodyBytes {
+		return marshalJSON(map[string]any{"ok": false, "error": "脚本请求体超过大小限制"})
+	}
+	rawURL := strings.TrimSpace(request.URL)
+	u, err := url.Parse(rawURL)
+	if err != nil || !strings.EqualFold(u.Scheme, "https") || u.Hostname() == "" || u.User != nil {
+		return marshalJSON(map[string]any{"ok": false, "error": "脚本只允许 HTTPS 请求"})
+	}
+	method := strings.ToUpper(strings.TrimSpace(request.Method))
+	if method == "" {
+		method = stdHTTP.MethodGet
+	}
+	switch method {
+	case stdHTTP.MethodGet, stdHTTP.MethodPost, stdHTTP.MethodHead:
+	default:
+		return marshalJSON(map[string]any{"ok": false, "error": "脚本只允许 GET、POST、HEAD"})
+	}
+	proxies := tunnel.Proxies()
+	proxy, err := resolveScriptProxy(request.Name, request.Group, proxies)
+	if err != nil {
+		return marshalJSON(map[string]any{"ok": false, "error": err.Error()})
+	}
+	if proxy.Type() == C.Direct || proxy.Type() == C.Reject || proxy.Type() == C.RejectDrop {
+		return marshalJSON(map[string]any{"ok": false, "error": "目标不是可用于解锁测试的代理节点"})
+	}
+	if request.TimeoutMs <= 0 || request.TimeoutMs > maxScriptRequestTimeoutMs {
+		request.TimeoutMs = maxScriptRequestTimeoutMs
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(request.TimeoutMs)*time.Millisecond)
+	defer cancel()
+	port := u.Port()
+	if port == "" {
+		port = "443"
+	}
+	tlsConfig, err := ca.GetTLSConfig(ca.Option{})
+	if err != nil {
+		return marshalJSON(map[string]any{"ok": false, "error": "TLS 配置失败"})
+	}
+	if tlsConfig == nil {
+		tlsConfig = &tls.Config{}
+	}
+	transport := &stdHTTP.Transport{
+		DialContext: func(dialCtx context.Context, _, address string) (net.Conn, error) {
+			if _, _, splitErr := net.SplitHostPort(address); splitErr != nil {
+				address = net.JoinHostPort(address, port)
+			}
+			var metadata C.Metadata
+			if metadataErr := metadata.SetRemoteAddress(address); metadataErr != nil {
+				return nil, metadataErr
+			}
+			return proxy.DialContext(dialCtx, &metadata)
+		},
+		DisableKeepAlives: true,
+		TLSClientConfig: tlsConfig,
+		TLSHandshakeTimeout: time.Duration(request.TimeoutMs) * time.Millisecond,
+	}
+	client := &stdHTTP.Client{Transport: transport}
+	if !request.AllowRedirect {
+		client.CheckRedirect = func(*stdHTTP.Request, []*stdHTTP.Request) error { return stdHTTP.ErrUseLastResponse }
+	} else {
+		client.CheckRedirect = func(next *stdHTTP.Request, via []*stdHTTP.Request) error {
+			if len(via) >= 4 || next.URL == nil || !strings.EqualFold(next.URL.Scheme, "https") {
+				return stdHTTP.ErrUseLastResponse
+			}
+			return nil
+		}
+	}
+	defer client.CloseIdleConnections()
+	var body io.Reader
+	if request.Body != "" && method != stdHTTP.MethodHead {
+		body = strings.NewReader(request.Body)
+	}
+	req, err := stdHTTP.NewRequestWithContext(ctx, method, rawURL, body)
+	if err != nil {
+		return marshalJSON(map[string]any{"ok": false, "error": "请求构造失败"})
+	}
+	for key, value := range request.Headers {
+		if strings.TrimSpace(key) != "" && len(value) <= 4096 {
+			req.Header.Set(key, value)
+		}
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return marshalJSON(map[string]any{"ok": false, "error": "节点请求超时或失败"})
+	}
+	defer resp.Body.Close()
+	data, readErr := io.ReadAll(io.LimitReader(resp.Body, maxScriptResponseBodyBytes+1))
+	if readErr != nil {
+		return marshalJSON(map[string]any{"ok": false, "error": "读取响应失败"})
+	}
+	truncated := len(data) > maxScriptResponseBodyBytes
+	if truncated {
+		data = data[:maxScriptResponseBodyBytes]
+	}
+	return marshalJSON(map[string]any{
+		"ok":        true,
+		"status":    resp.StatusCode,
+		"body":      string(data),
+		"truncated": truncated,
+	})
+}
+
+func resolveScriptProxy(name, group string, proxies map[string]C.Proxy) (C.Proxy, error) {
+	return resolveScriptProxyDepth(name, group, proxies, map[string]bool{}, 0)
+}
+
+func resolveScriptProxyDepth(name, group string, proxies map[string]C.Proxy, visited map[string]bool, depth int) (C.Proxy, error) {
+	if depth > 12 {
+		return nil, fmt.Errorf("策略组引用层级过深")
+	}
+	name = strings.TrimSpace(name)
+	group = strings.TrimSpace(group)
+	if name != "" {
+		if proxy, ok := proxies[name]; ok {
+			if visited[name] {
+				return nil, fmt.Errorf("策略组引用存在循环")
+			}
+			if proxyGroup, ok := proxy.Adapter().(outboundgroup.ProxyGroup); ok {
+				selected := strings.TrimSpace(proxyGroup.Now())
+				if selected == "" {
+					return nil, fmt.Errorf("策略组没有当前节点")
+				}
+				visited[name] = true
+				return resolveScriptProxyDepth(selected, name, proxies, visited, depth+1)
+			}
+			return proxy, nil
+		}
+		if parent, ok := proxies[group]; ok {
+			if proxyGroup, ok := parent.Adapter().(outboundgroup.ProxyGroup); ok {
+				for _, member := range proxyGroup.Proxies() {
+					if member.Name() == name {
+						return member, nil
+					}
+				}
+			}
+		}
+		return nil, fmt.Errorf("节点不存在")
+	}
+	if parent, ok := proxies[group]; ok {
+		proxyGroup, ok := parent.Adapter().(outboundgroup.ProxyGroup)
+		if !ok {
+			return nil, fmt.Errorf("目标不是策略组")
+		}
+		selected := strings.TrimSpace(proxyGroup.Now())
+		if selected == "" {
+			return nil, fmt.Errorf("策略组没有当前节点")
+		}
+		return resolveScriptProxyDepth(selected, group, proxies, visited, depth+1)
+	}
+	return nil, fmt.Errorf("没有指定测试节点")
 }
 
 // delayURLForProxy follows the currently selected member of a strategy group.

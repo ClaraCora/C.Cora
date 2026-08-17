@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// 设置页：按功能类型组织现有设置，详细说明通过名称后的信息按钮按需查看。
 struct SettingsView: View {
@@ -85,6 +86,8 @@ struct RemoteResourcesView: View {
     @EnvironmentObject private var subscriptions: SubscriptionStore
     @EnvironmentObject private var core: CoreStateManager
     @State private var resultMessage: String?
+    @State private var selectedContent: RemoteResourceContent?
+    @State private var contentError: String?
 
     var body: some View {
         Form {
@@ -116,6 +119,17 @@ struct RemoteResourcesView: View {
             Button("好") { resultMessage = nil }
         } message: {
             Text(resultMessage ?? "")
+        }
+        .sheet(item: $selectedContent) { content in
+            RemoteResourceContentView(content: content)
+        }
+        .alert("查看资源内容", isPresented: Binding(
+            get: { contentError != nil },
+            set: { if !$0 { contentError = nil } }
+        )) {
+            Button("好") { contentError = nil }
+        } message: {
+            Text(contentError ?? "")
         }
     }
 
@@ -150,6 +164,11 @@ struct RemoteResourcesView: View {
                         canRefresh: resource.kind == .proxyProvider ||
                             subscriptions.runtimeCanUpdateRules(for: resource.subscriptionID))
                     .contextMenu {
+                        Button {
+                            Task { await showContent(resource) }
+                        } label: {
+                            Label("查看资源内容", systemImage: "doc.text.magnifyingglass")
+                        }
                         Button {
                             Task { await refresh(resource) }
                         } label: {
@@ -205,6 +224,16 @@ struct RemoteResourcesView: View {
         resultMessage = subscriptions.lastError ?? "\(resource.name) 已刷新"
     }
 
+    private func showContent(_ resource: RemoteResource) async {
+        let result = await subscriptions.readRemoteResourceContent(resource)
+        switch result {
+        case .content(let content):
+            selectedContent = content
+        case .unavailable(let message):
+            contentError = message
+        }
+    }
+
     private func refreshAllProxyProviders() async {
         await subscriptions.refreshAllProxyProviders()
         resultMessage = subscriptions.lastError ?? "节点来源已全部刷新"
@@ -256,6 +285,53 @@ private struct RemoteResourceRow: View {
         }
         .padding(.vertical, 3)
         .contentShape(Rectangle())
+    }
+}
+
+private struct RemoteResourceContentView: View {
+    let content: RemoteResourceContent
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            ScrollView([.vertical, .horizontal]) {
+                Text(content.content)
+                    .font(.system(.footnote, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(16)
+            }
+            .background(AppAmbientBackground())
+            .navigationTitle(content.resourceName)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("完成") { dismiss() }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        UIPasteboard.general.string = content.content
+                    } label: {
+                        Image(systemName: "doc.on.doc")
+                    }
+                    .accessibilityLabel("复制资源内容")
+                }
+            }
+            .safeAreaInset(edge: .bottom) {
+                HStack(spacing: 8) {
+                    Label(content.kind == .proxyProvider ? "节点来源" : "规则来源",
+                          systemImage: content.kind == .proxyProvider ? "point.3.connected.trianglepath.dotted" : "list.bullet.rectangle.portrait")
+                    Text(ByteCountFormatter.string(fromByteCount: content.size, countStyle: .file))
+                    if content.isTruncated { Text("已截断") }
+                    Spacer()
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                .background(.bar)
+            }
+        }
     }
 }
 

@@ -20,6 +20,7 @@ struct ProxiesView: View {
     @State private var isSearchPresented = false
     @State private var groupGradients: [String: Int] = [:]
     @State private var activeNodeTestTarget: ProxyNodeTestTarget?
+    @StateObject private var unlockTests = UnlockTestController.shared
     @AppStorage("proxyNodeLayout") private var layoutRawValue = ProxyNodeLayout.grid.rawValue
     @AppStorage("proxyGroupGradients") private var gradientStorage = "{}"
 
@@ -58,6 +59,17 @@ struct ProxiesView: View {
                     .clipped()
                     .animation(.easeOut(duration: 0.16), value: toolbarControlsVisible)
                 }
+            }
+            .sheet(item: $unlockTests.result) { result in
+                UnlockTestResultView(result: result)
+            }
+            .alert("解锁测试", isPresented: Binding(
+                get: { unlockTests.error != nil },
+                set: { if !$0 { unlockTests.error = nil } }
+            )) {
+                Button("好") { unlockTests.error = nil }
+            } message: {
+                Text(unlockTests.error ?? "")
             }
             .onAppear {
                 toolbarControlsVisible = true
@@ -454,6 +466,7 @@ struct ProxiesView: View {
             ForEach(row) { result in
                 GroupGridCard(
                     group: result.group,
+                    canTest: controller.isRuntimeAvailable,
                     gradientIndex: groupGradient(for: result.group.name),
                     isInteractionLocked: activeGroupName != nil &&
                         activeGroupName != result.group.name,
@@ -981,6 +994,15 @@ private struct StrategyGroupListPanel: View {
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
             .contextMenu {
+                Button {
+                    Task {
+                        await UnlockTestController.shared.run(nodeName: group.now,
+                                                              groupName: group.name)
+                    }
+                } label: {
+                    Label("测试当前节点解锁", systemImage: "play.tv")
+                }
+                .disabled(!canTest || group.now.isEmpty)
                 GradientMenu(selected: gradientIndex,
                              onSelect: onGradient,
                              onRandomizeAll: onRandomizeAll)
@@ -1188,6 +1210,15 @@ private struct ProxyNodeListRow: View {
                       systemImage: isTestingDelay ? "hourglass" : "speedometer")
             }
             .disabled(!canTest || isTestingDelay)
+            Button {
+                Task {
+                    await UnlockTestController.shared.run(nodeName: node,
+                                                          groupName: testTarget.groupName)
+                }
+            } label: {
+                Label("解锁测试", systemImage: "play.tv")
+            }
+            .disabled(!canTest)
         }
         .simultaneousGesture(
             DragGesture(minimumDistance: 0, coordinateSpace: .local)
@@ -1234,6 +1265,7 @@ private struct ProxyNodeListRow: View {
 
 private struct GroupGridCard: View {
     let group: ProxyGroup
+    let canTest: Bool
     let gradientIndex: Int
     let isInteractionLocked: Bool
     let onToggle: () -> Void
@@ -1247,6 +1279,15 @@ private struct GroupGridCard: View {
         .background(GroupGradient.background(for: gradientIndex))
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         .contextMenu {
+            Button {
+                Task {
+                    await UnlockTestController.shared.run(nodeName: group.now,
+                                                          groupName: group.name)
+                }
+            } label: {
+                Label("测试当前节点解锁", systemImage: "play.tv")
+            }
+            .disabled(!canTest || group.now.isEmpty)
             GradientMenu(selected: gradientIndex, onSelect: onGradient,
                          onRandomizeAll: onRandomizeAll)
         }
@@ -1287,6 +1328,15 @@ private struct GroupExpandedPanel: View {
                                 onToggle: onToggle,
                                 onTest: onTest)
             .contextMenu {
+                Button {
+                    Task {
+                        await UnlockTestController.shared.run(nodeName: group.now,
+                                                              groupName: group.name)
+                    }
+                } label: {
+                    Label("测试当前节点解锁", systemImage: "play.tv")
+                }
+                .disabled(!canTest || group.now.isEmpty)
                 GradientMenu(selected: gradientIndex,
                              onSelect: onGradient,
                              onRandomizeAll: onRandomizeAll)
@@ -1414,6 +1464,15 @@ private struct GroupNodeGridCell: View {
                       systemImage: isTestingDelay ? "hourglass" : "speedometer")
             }
             .disabled(!canTest || isTestingDelay)
+            Button {
+                Task {
+                    await UnlockTestController.shared.run(nodeName: node.name,
+                                                          groupName: testTarget.groupName)
+                }
+            } label: {
+                Label("解锁测试", systemImage: "play.tv")
+            }
+            .disabled(!canTest)
         }
         .simultaneousGesture(
             DragGesture(minimumDistance: 0, coordinateSpace: .local)
@@ -1493,6 +1552,42 @@ private struct GradientMenu: View {
                 Divider()
                 Button(action: onRandomizeAll) {
                     Label("全部随机图案", systemImage: "shuffle")
+                }
+            }
+        }
+    }
+}
+
+private struct UnlockTestResultView: View {
+    let result: UnlockTestResult
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(result.title)
+                            .font(.title3.weight(.semibold))
+                        Text("节点：\(result.nodeName)")
+                        if !result.groupName.isEmpty { Text("分组：\(result.groupName)") }
+                        Text("脚本版本：\(result.scriptVersion)")
+                    }
+                    .foregroundStyle(.secondary)
+
+                    Text(result.message)
+                        .font(.system(.subheadline, design: .rounded))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .padding(20)
+            }
+            .background(AppAmbientBackground())
+            .navigationTitle("解锁测试")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("完成") { dismiss() }
                 }
             }
         }

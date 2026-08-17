@@ -613,6 +613,22 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             ipcQueue.async {
                 reply(Data(MihomoProxyDelay(name, group, url, directURL, timeout).utf8))
             }
+        case "readRuleProvider":
+            let name = (obj?["name"] as? String) ?? ""
+            let maxBytes = (obj?["maxBytes"] as? NSNumber)?.intValue ?? (1 * 1024 * 1024)
+            ipcQueue.async {
+                reply(Data(MihomoRuleProviderContent(name, maxBytes).utf8))
+            }
+        case "scriptFetch":
+            guard let request = obj?["request"] as? [String: Any],
+                  let requestData = try? JSONSerialization.data(withJSONObject: request),
+                  let requestJSON = String(data: requestData, encoding: .utf8) else {
+                reply(Self.jsonData(["ok": false, "error": "脚本请求参数无效"]))
+                return
+            }
+            ipcQueue.async {
+                reply(Data(MihomoScriptFetch(requestJSON).utf8))
+            }
         case "connections":
             let limit = (obj?["limit"] as? NSNumber)?.intValue ?? 200
             ipcQueue.async {

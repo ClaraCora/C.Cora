@@ -608,6 +608,68 @@ final class SubscriptionStore: ObservableObject {
         return json
     }
 
+    /// 读取 App 侧已验证的 Proxy Provider 原文，不触发网络请求。
+    func cachedResourceContent(_ resource: RemoteResource) -> RemoteResourceContentResult {
+        guard resource.kind == .proxyProvider else {
+            return .unavailable("规则来源需要连接当前配置后读取")
+        }
+        let cache = Self.loadProviderCache(resource.subscriptionID)
+        guard let payload = cache[resource.name] else {
+            return .unavailable("该节点来源还没有本地缓存，请先刷新资源")
+        }
+        let attributes = try? FileManager.default.attributesOfItem(
+            atPath: Self.providerCacheURL(resource.subscriptionID).path)
+        let updatedAt = attributes?[.modificationDate] as? Date
+        return .content(RemoteResourceContent(
+            id: resource.id,
+            resourceName: resource.name,
+            subscriptionName: resource.subscriptionName,
+            kind: resource.kind,
+            sourceURL: resource.url,
+            content: payload,
+            size: Int64(payload.utf8.count),
+            updatedAt: updatedAt,
+            isTruncated: false))
+    }
+
+    /// 读取运行中 mihomo 实际使用的 Rule Provider 文件。不会重新下载或更新规则。
+    func readRemoteResourceContent(_ resource: RemoteResource) async -> RemoteResourceContentResult {
+        if resource.kind == .proxyProvider {
+            return cachedResourceContent(resource)
+        }
+        guard runtimeCanUpdateRules(for: resource.subscriptionID) else {
+            return .unavailable("连接当前配置后才能读取规则来源内容")
+        }
+        let result = await CoreStateManager.shared.sendMessage([
+            "cmd": "readRuleProvider",
+            "name": resource.name,
+            "maxBytes": 1 * 1024 * 1024,
+        ])
+        switch result {
+        case .failure(let reason):
+            return .unavailable(reason)
+        case .ok(let data):
+            guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+                return .unavailable("运行内核返回了无法识别的内容")
+            }
+            guard (object["ok"] as? Bool) == true,
+                  let content = object["content"] as? String else {
+                return .unavailable((object["error"] as? String) ?? "规则来源内容不可用")
+            }
+            let updatedAt = (object["updatedAt"] as? String).flatMap { ISO8601DateFormatter().date(from: $0) }
+            return .content(RemoteResourceContent(
+                id: resource.id,
+                resourceName: resource.name,
+                subscriptionName: resource.subscriptionName,
+                kind: resource.kind,
+                sourceURL: resource.url,
+                content: content,
+                size: (object["size"] as? NSNumber)?.int64Value ?? Int64(content.utf8.count),
+                updatedAt: updatedAt,
+                isTruncated: (object["truncated"] as? Bool) ?? false))
+        }
+    }
+
     private func updateNodeCount(_ id: UUID, providerPayloads: [String: String]) {
         guard let index = subscriptions.firstIndex(where: { $0.id == id }),
               let payloadData = try? JSONEncoder().encode(providerPayloads),

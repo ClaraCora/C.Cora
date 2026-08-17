@@ -30,6 +30,15 @@ enum MihomoCore {
         return nil
     }
 
+    static func ruleProviderContent(name: String, maxBytes: Int = 1 << 20) -> Data {
+        Data(MihomoRuleProviderContent(name, maxBytes).utf8)
+    }
+
+    /// 受限脚本请求桥：JSON 输入/输出，网络始终由运行中的 mihomo 经指定节点执行。
+    static func scriptFetch(requestJSON: String) -> Data {
+        Data(MihomoScriptFetch(requestJSON).utf8)
+    }
+
     static func offlineProxySnapshot(configYAML: String,
                                      providerPayloadsJSON: String,
                                      selectionsJSON: String) -> Data {
