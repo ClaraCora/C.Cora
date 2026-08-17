@@ -1,6 +1,7 @@
+import Combine
 import CryptoKit
 import Foundation
-import JavaScriptCore
+@preconcurrency import JavaScriptCore
 
 struct ExternalDetectionScript: Codable, Sendable {
     let id: String
@@ -27,7 +28,7 @@ enum ExternalScriptLimits {
 /// Downloads and caches only the signed script selected by the Cora manifest.
 /// The app never bundles the detection logic itself.
 @MainActor
-final class ExternalScriptStore {
+final class ExternalScriptStore: ObservableObject {
     static let shared = ExternalScriptStore()
 
     private static let manifestURL = URL(string: "https://raw.githubusercontent.com/ClaraCora/lo/main/cora/manifest.json")!
