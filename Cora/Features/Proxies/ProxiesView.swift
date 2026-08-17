@@ -19,7 +19,6 @@ struct ProxiesView: View {
     @State private var searchText = ""
     @State private var isSearchPresented = false
     @State private var groupGradients: [String: Int] = [:]
-    @State private var activeNodeTestTarget: ProxyNodeTestTarget?
     @StateObject private var unlockTests = UnlockTestController.shared
     @AppStorage("proxyNodeLayout") private var layoutRawValue = ProxyNodeLayout.grid.rawValue
     @AppStorage("proxyGroupGradients") private var gradientStorage = "{}"
@@ -80,13 +79,11 @@ struct ProxiesView: View {
                     // NE 会在 startTunnel 中创建新的持久化会话；这里先停止旧的异步任务。
                     controller.resetSession()
                     expanded = []
-                    activeNodeTestTarget = nil
                     gridExpansion = nil
                     expandedPanelFrames = [:]
                 case .disconnected, .invalid:
                     controller.clearDisconnectedSession()
                     expanded = []
-                    activeNodeTestTarget = nil
                     gridExpansion = nil
                     expandedPanelFrames = [:]
                 default:
@@ -124,7 +121,6 @@ struct ProxiesView: View {
                 pendingGridGroupName = ProxyNodeLayout(rawValue: value) == .grid ? retained : nil
                 gridExpansionCorrectionKey = nil
                 toolbarControlsVisible = true
-                activeNodeTestTarget = nil
             }
         }
     }
@@ -294,7 +290,6 @@ struct ProxiesView: View {
             onTest: { Task { await controller.testGroup(group.name) } },
             onTestNodeDelay: testNodeDelay,
             onTestNodeUnlock: testNodeUnlock,
-            onPrepareTestTarget: prepareNodeTestTarget,
             onGradient: { setGradient($0, for: group.name) },
             onRandomizeAll: randomizeAllGradients,
             onSelect: { name in Task { await controller.select(group: group.name, name: name) } })
@@ -531,7 +526,6 @@ struct ProxiesView: View {
             onTest: { Task { await controller.testGroup(result.group.name) } },
             onTestNodeDelay: testNodeDelay,
             onTestNodeUnlock: testNodeUnlock,
-            onPrepareTestTarget: prepareNodeTestTarget,
             onGradient: { setGradient($0, for: result.group.name) },
             onRandomizeAll: randomizeAllGradients,
             onSelect: { name in
@@ -555,29 +549,13 @@ struct ProxiesView: View {
         }
     }
 
-    private func prepareNodeTestTarget(_ target: ProxyNodeTestTarget) {
-        guard activeNodeTestTarget != target else { return }
-        activeNodeTestTarget = target
-    }
-
-    /// Lazy SwiftUI containers can retain a context menu's first action closure.
-    /// Prefer the target captured when the long press began, while retaining the
-    /// action's own target as a fallback if the preparation gesture did not fire.
-    private func consumeNodeTestTarget(fallback: ProxyNodeTestTarget) -> ProxyNodeTestTarget {
-        let target = activeNodeTestTarget ?? fallback
-        activeNodeTestTarget = nil
-        return target
-    }
-
-    private func testNodeDelay(_ fallback: ProxyNodeTestTarget) {
-        let target = consumeNodeTestTarget(fallback: fallback)
+    private func testNodeDelay(_ target: ProxyNodeTestTarget) {
         Task {
             await controller.testNode(target.nodeName, in: target.groupName)
         }
     }
 
-    private func testNodeUnlock(_ fallback: ProxyNodeTestTarget) {
-        let target = consumeNodeTestTarget(fallback: fallback)
+    private func testNodeUnlock(_ target: ProxyNodeTestTarget) {
         Task {
             await unlockTests.run(nodeName: target.nodeName,
                                   groupName: target.groupName)
@@ -966,12 +944,10 @@ private struct DisplayedProxyGroup: Identifiable {
     var id: String { group.id }
 }
 
-private struct ProxyNodeTestTarget: Hashable, Identifiable {
+private struct ProxyNodeTestTarget: Hashable {
     let groupName: String
     let nodeName: String
     let nodeID: ProxyGroupNode.ID
-
-    var id: ProxyGroupNode.ID { nodeID }
 }
 
 private struct StrategyGroupListPanel: View {
@@ -990,7 +966,6 @@ private struct StrategyGroupListPanel: View {
     let onTest: () -> Void
     let onTestNodeDelay: (ProxyNodeTestTarget) -> Void
     let onTestNodeUnlock: (ProxyNodeTestTarget) -> Void
-    let onPrepareTestTarget: (ProxyNodeTestTarget) -> Void
     let onGradient: (Int) -> Void
     let onRandomizeAll: () -> Void
     let onSelect: (String) -> Void
@@ -1057,7 +1032,6 @@ private struct StrategyGroupListPanel: View {
                                                             delays: delays),
                             onTestDelay: { onTestNodeDelay(testTarget) },
                             onTestUnlock: { onTestNodeUnlock(testTarget) },
-                            onPrepareTestTarget: { onPrepareTestTarget(testTarget) },
                             onSelect: { onSelect(item.name) })
                         .padding(.horizontal, 14)
                         .padding(.vertical, 7)
@@ -1201,9 +1175,7 @@ private struct ProxyNodeListRow: View {
     let delay: Int?
     let onTestDelay: () -> Void
     let onTestUnlock: () -> Void
-    let onPrepareTestTarget: () -> Void
     let onSelect: () -> Void
-    @State private var suppressSelectionUntil = Date.distantPast
 
     var body: some View {
         row
@@ -1223,24 +1195,12 @@ private struct ProxyNodeListRow: View {
             }
             .disabled(!canTest)
         }
-        .simultaneousGesture(
-            LongPressGesture(minimumDuration: 0.30, maximumDistance: 16)
-                .onEnded { _ in prepareContextMenu() }
-        )
-        .id(testTarget.id)
+        .id(testTarget)
     }
 
     private func selectIfAllowed() {
-        guard selectable, !isCurrent, !isSelectionBlocked,
-              Date() >= suppressSelectionUntil else { return }
+        guard selectable, !isCurrent, !isSelectionBlocked else { return }
         onSelect()
-    }
-
-    private func prepareContextMenu() {
-        // Some iOS versions let the underlying tap finish when a context menu
-        // opens. Suppress only that gesture's trailing tap, not later taps.
-        suppressSelectionUntil = Date().addingTimeInterval(1.0)
-        onPrepareTestTarget()
     }
 
     private var row: some View {
@@ -1331,7 +1291,6 @@ private struct GroupExpandedPanel: View {
     let onTest: () -> Void
     let onTestNodeDelay: (ProxyNodeTestTarget) -> Void
     let onTestNodeUnlock: (ProxyNodeTestTarget) -> Void
-    let onPrepareTestTarget: (ProxyNodeTestTarget) -> Void
     let onGradient: (Int) -> Void
     let onRandomizeAll: (() -> Void)?
     let onSelect: (String) -> Void
@@ -1383,7 +1342,6 @@ private struct GroupExpandedPanel: View {
                                                                       delays: delays),
                                       onTestDelay: { onTestNodeDelay(testTarget) },
                                       onTestUnlock: { onTestNodeUnlock(testTarget) },
-                                      onPrepareTestTarget: { onPrepareTestTarget(testTarget) },
                                       onSelect: { onSelect(item.name) })
                 }
             }
@@ -1458,9 +1416,7 @@ private struct GroupNodeGridCell: View {
     let delay: Int?
     let onTestDelay: () -> Void
     let onTestUnlock: () -> Void
-    let onPrepareTestTarget: () -> Void
     let onSelect: () -> Void
-    @State private var suppressSelectionUntil = Date.distantPast
 
     var body: some View {
         card
@@ -1480,22 +1436,12 @@ private struct GroupNodeGridCell: View {
             }
             .disabled(!canTest)
         }
-        .simultaneousGesture(
-            LongPressGesture(minimumDuration: 0.30, maximumDistance: 16)
-                .onEnded { _ in prepareContextMenu() }
-        )
-        .id(testTarget.id)
+        .id(testTarget)
     }
 
     private func selectIfAllowed() {
-        guard selectable, !isCurrent, !isSelectionBlocked,
-              Date() >= suppressSelectionUntil else { return }
+        guard selectable, !isCurrent, !isSelectionBlocked else { return }
         onSelect()
-    }
-
-    private func prepareContextMenu() {
-        suppressSelectionUntil = Date().addingTimeInterval(1.0)
-        onPrepareTestTarget()
     }
 
     private var card: some View {
