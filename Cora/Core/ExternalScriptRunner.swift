@@ -211,6 +211,8 @@ final class UnlockTestController: ObservableObject {
     static let shared = UnlockTestController()
 
     @Published private(set) var isRunning = false
+    @Published private(set) var runningNodeName: String?
+    @Published private(set) var runningGroupName: String?
     @Published var result: UnlockTestResult?
     @Published var error: String?
 
@@ -224,8 +226,15 @@ final class UnlockTestController: ObservableObject {
             return
         }
         isRunning = true
+        runningNodeName = nodeName
+        runningGroupName = groupName
+        result = nil
         error = nil
-        defer { isRunning = false }
+        defer {
+            isRunning = false
+            runningNodeName = nil
+            runningGroupName = nil
+        }
         do {
             let store = ExternalScriptStore.shared
             _ = try await store.loadUnlockScript()

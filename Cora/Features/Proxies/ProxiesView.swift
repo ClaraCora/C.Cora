@@ -29,7 +29,20 @@ struct ProxiesView: View {
             ZStack {
                 AppAmbientBackground()
                 navigationContent
+
+                if unlockTests.isRunning || unlockTests.result != nil {
+                    UnlockTestOverlay(
+                        isRunning: unlockTests.isRunning,
+                        nodeName: unlockTests.runningNodeName ?? unlockTests.result?.nodeName ?? "",
+                        groupName: unlockTests.runningGroupName ?? unlockTests.result?.groupName ?? "",
+                        result: unlockTests.result,
+                        onDismiss: { unlockTests.result = nil })
+                        .transition(.opacity)
+                        .zIndex(20)
+                }
             }
+            .animation(.easeOut(duration: 0.18), value: unlockTests.isRunning)
+            .animation(.easeOut(duration: 0.18), value: unlockTests.result?.id)
             .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -59,9 +72,6 @@ struct ProxiesView: View {
                     .clipped()
                     .animation(.easeOut(duration: 0.16), value: toolbarControlsVisible)
                 }
-            }
-            .sheet(item: $unlockTests.result) { result in
-                UnlockTestResultView(result: result)
             }
             .alert("解锁测试", isPresented: Binding(
                 get: { unlockTests.error != nil },
@@ -986,19 +996,50 @@ private struct ProxyNodeTestTarget: Hashable {
 }
 
 private struct ProxyNodeTestTargetModifier: ViewModifier {
+    private static let maximumTapDuration: TimeInterval = 0.22
+    private static let maximumTapMovement: CGFloat = 10
+
     let onTouchBegan: () -> Void
+    let onTap: () -> Void
+
+    @State private var touchStartedAt: Date?
+    @State private var maximumMovement: CGFloat = 0
 
     func body(content: Content) -> some View {
         content.simultaneousGesture(
             DragGesture(minimumDistance: 0, coordinateSpace: .local)
-                .onChanged { _ in onTouchBegan() }
+                .onChanged { value in
+                    if touchStartedAt == nil {
+                        touchStartedAt = value.time
+                        maximumMovement = 0
+                        onTouchBegan()
+                    }
+                    maximumMovement = max(
+                        maximumMovement,
+                        hypot(value.translation.width, value.translation.height))
+                }
+                .onEnded { value in
+                    guard let startedAt = touchStartedAt else { return }
+                    let duration = value.time.timeIntervalSince(startedAt)
+                    let movement = max(
+                        maximumMovement,
+                        hypot(value.translation.width, value.translation.height))
+                    let shouldTap = duration <= Self.maximumTapDuration &&
+                        movement <= Self.maximumTapMovement
+
+                    touchStartedAt = nil
+                    maximumMovement = 0
+                    if shouldTap { onTap() }
+                }
         )
     }
 }
 
 private extension View {
-    func prepareProxyNodeTestTarget(_ action: @escaping () -> Void) -> some View {
-        modifier(ProxyNodeTestTargetModifier(onTouchBegan: action))
+    func proxyNodeInteraction(onTouchBegan: @escaping () -> Void,
+                              onTap: @escaping () -> Void) -> some View {
+        modifier(ProxyNodeTestTargetModifier(onTouchBegan: onTouchBegan,
+                                             onTap: onTap))
     }
 }
 
@@ -1233,9 +1274,12 @@ private struct ProxyNodeListRow: View {
     let onSelect: () -> Void
 
     var body: some View {
-        interactionContent
+        row
             .contentShape(Rectangle())
+            .accessibilityAddTraits(selectable && !isCurrent ? .isButton : [])
             .accessibilityAddTraits(isCurrent ? .isSelected : [])
+            .accessibilityHint(selectable && !isCurrent ? "双击切换到此节点" : "")
+            .accessibilityAction { selectIfAllowed() }
             .contextMenu {
                 Button(action: onTestDelay) {
                     Label(isTestingDelay ? "正在测速" : "测试此节点延迟",
@@ -1247,21 +1291,9 @@ private struct ProxyNodeListRow: View {
                 }
                 .disabled(!canTest)
             }
-            .prepareProxyNodeTestTarget(onPrepareTestTarget)
+            .proxyNodeInteraction(onTouchBegan: onPrepareTestTarget,
+                                  onTap: selectIfAllowed)
             .id(testTarget)
-    }
-
-    @ViewBuilder
-    private var interactionContent: some View {
-        if canSelect {
-            Button(action: selectIfAllowed) {
-                row
-            }
-            .buttonStyle(.plain)
-            .accessibilityHint("双击切换到此节点")
-        } else {
-            row
-        }
     }
 
     private var canSelect: Bool {
@@ -1492,9 +1524,12 @@ private struct GroupNodeGridCell: View {
     let onSelect: () -> Void
 
     var body: some View {
-        interactionContent
+        card
             .contentShape(Rectangle())
+            .accessibilityAddTraits(canSelect ? .isButton : [])
             .accessibilityAddTraits(isCurrent ? .isSelected : [])
+            .accessibilityHint(canSelect ? "双击切换到此节点" : "")
+            .accessibilityAction { selectIfAllowed() }
             .contextMenu {
                 Button(action: onTestDelay) {
                     Label(isTestingDelay ? "正在测速" : "测试此节点延迟",
@@ -1506,21 +1541,9 @@ private struct GroupNodeGridCell: View {
                 }
                 .disabled(!canTest)
             }
-            .prepareProxyNodeTestTarget(onPrepareTestTarget)
+            .proxyNodeInteraction(onTouchBegan: onPrepareTestTarget,
+                                  onTap: selectIfAllowed)
             .id(testTarget)
-    }
-
-    @ViewBuilder
-    private var interactionContent: some View {
-        if canSelect {
-            Button(action: selectIfAllowed) {
-                card
-            }
-            .buttonStyle(.plain)
-            .accessibilityHint("双击切换到此节点")
-        } else {
-            card
-        }
     }
 
     private var canSelect: Bool {
@@ -1609,39 +1632,152 @@ private struct GradientMenu: View {
     }
 }
 
-private struct UnlockTestResultView: View {
-    let result: UnlockTestResult
-    @Environment(\.dismiss) private var dismiss
+private struct UnlockTestOverlay: View {
+    let isRunning: Bool
+    let nodeName: String
+    let groupName: String
+    let result: UnlockTestResult?
+    let onDismiss: () -> Void
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(result.title)
-                            .font(.title3.weight(.semibold))
-                        Text("节点：\(result.nodeName)")
-                        if !result.groupName.isEmpty { Text("分组：\(result.groupName)") }
-                        Text("脚本版本：\(result.scriptVersion)")
-                    }
-                    .foregroundStyle(.secondary)
+        ZStack {
+            Color.black.opacity(0.3)
+                .ignoresSafeArea()
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    guard !isRunning, result != nil else { return }
+                    onDismiss()
+                }
 
-                    Text(result.message)
-                        .font(.system(.subheadline, design: .rounded))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .padding(20)
-            }
-            .background(AppAmbientBackground())
-            .navigationTitle("解锁测试")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("完成") { dismiss() }
-                }
+            dialog
+                .padding(.horizontal, 24)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityAddTraits(.isModal)
+    }
+
+    private var dialog: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            if isRunning {
+                runningContent
+            } else if let result {
+                resultContent(result)
             }
         }
+        .padding(20)
+        .frame(maxWidth: 360)
+        .background(.regularMaterial,
+                    in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .stroke(Color.primary.opacity(0.1), lineWidth: 1)
+        }
+        .shadow(color: Color.black.opacity(0.2), radius: 24, y: 10)
+    }
+
+    private var runningContent: some View {
+        VStack(spacing: 16) {
+            UnlockTestRunningIndicator(reduceMotion: reduceMotion)
+
+            VStack(spacing: 5) {
+                Text("正在检测解锁")
+                    .font(.headline)
+                Text(nodeName.isEmpty ? "当前节点" : nodeName)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.center)
+            }
+
+            HStack(spacing: 8) {
+                ProgressView()
+                    .controlSize(.small)
+                Text("正在检测节点能力，最多需要约 45 秒")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("正在检测节点 \(nodeName) 的解锁能力")
+    }
+
+    private func resultContent(_ result: UnlockTestResult) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: "lock.shield.fill")
+                    .font(.system(size: 24, weight: .semibold))
+                    .foregroundStyle(Color.accentColor)
+                    .frame(width: 32, height: 32)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(result.title)
+                        .font(.headline)
+                        .lineLimit(2)
+                    Text(result.nodeName)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                Button(action: onDismiss) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 22))
+                        .symbolRenderingMode(.hierarchical)
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
+                .accessibilityLabel("关闭解锁测试结果")
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                if !result.groupName.isEmpty {
+                    Label(result.groupName, systemImage: "square.stack.3d.up")
+                }
+                Label("脚本 \(result.scriptVersion)", systemImage: "doc.text")
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+
+            Divider()
+
+            ScrollView {
+                Text(result.message)
+                    .font(.system(.subheadline, design: .rounded))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxHeight: 320)
+        }
+    }
+}
+
+private struct UnlockTestRunningIndicator: View {
+    let reduceMotion: Bool
+    @State private var isPulsing = false
+
+    var body: some View {
+        Image(systemName: "lock.shield.fill")
+            .font(.system(size: 36, weight: .semibold))
+            .foregroundStyle(Color.accentColor)
+            .frame(width: 56, height: 56)
+            .background(Color.accentColor.opacity(0.12), in: Circle())
+            .scaleEffect(isPulsing ? 1.06 : 0.96)
+            .onAppear {
+                guard !reduceMotion else {
+                    isPulsing = false
+                    return
+                }
+                withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) {
+                    isPulsing = true
+                }
+            }
     }
 }
 
