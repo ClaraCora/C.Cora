@@ -292,7 +292,8 @@ struct ProxiesView: View {
             gradientIndex: groupGradient(for: group.name),
             onToggle: { toggleListGroup(group.name) },
             onTest: { Task { await controller.testGroup(group.name) } },
-            onTestActiveNode: testActiveNode,
+            onTestNodeDelay: testNodeDelay,
+            onTestNodeUnlock: testNodeUnlock,
             onPrepareTestTarget: prepareNodeTestTarget,
             onGradient: { setGradient($0, for: group.name) },
             onRandomizeAll: randomizeAllGradients,
@@ -528,7 +529,8 @@ struct ProxiesView: View {
             gradientIndex: groupGradient(for: result.group.name),
             onToggle: onToggle,
             onTest: { Task { await controller.testGroup(result.group.name) } },
-            onTestActiveNode: testActiveNode,
+            onTestNodeDelay: testNodeDelay,
+            onTestNodeUnlock: testNodeUnlock,
             onPrepareTestTarget: prepareNodeTestTarget,
             onGradient: { setGradient($0, for: result.group.name) },
             onRandomizeAll: randomizeAllGradients,
@@ -559,12 +561,26 @@ struct ProxiesView: View {
     }
 
     /// Lazy SwiftUI containers can retain a context menu's first action closure.
-    /// Resolve the target from page state when the action actually runs.
-    private func testActiveNode() {
-        guard let target = activeNodeTestTarget else { return }
+    /// Prefer the target captured when the long press began, while retaining the
+    /// action's own target as a fallback if the preparation gesture did not fire.
+    private func consumeNodeTestTarget(fallback: ProxyNodeTestTarget) -> ProxyNodeTestTarget {
+        let target = activeNodeTestTarget ?? fallback
         activeNodeTestTarget = nil
+        return target
+    }
+
+    private func testNodeDelay(_ fallback: ProxyNodeTestTarget) {
+        let target = consumeNodeTestTarget(fallback: fallback)
         Task {
             await controller.testNode(target.nodeName, in: target.groupName)
+        }
+    }
+
+    private func testNodeUnlock(_ fallback: ProxyNodeTestTarget) {
+        let target = consumeNodeTestTarget(fallback: fallback)
+        Task {
+            await unlockTests.run(nodeName: target.nodeName,
+                                  groupName: target.groupName)
         }
     }
 
@@ -972,7 +988,8 @@ private struct StrategyGroupListPanel: View {
     let gradientIndex: Int
     let onToggle: () -> Void
     let onTest: () -> Void
-    let onTestActiveNode: () -> Void
+    let onTestNodeDelay: (ProxyNodeTestTarget) -> Void
+    let onTestNodeUnlock: (ProxyNodeTestTarget) -> Void
     let onPrepareTestTarget: (ProxyNodeTestTarget) -> Void
     let onGradient: (Int) -> Void
     let onRandomizeAll: () -> Void
@@ -1038,7 +1055,8 @@ private struct StrategyGroupListPanel: View {
                             delay: ProxyDelayResolver.delay(for: item.name,
                                                             groups: allGroups,
                                                             delays: delays),
-                            onTestActiveNode: onTestActiveNode,
+                            onTestDelay: { onTestNodeDelay(testTarget) },
+                            onTestUnlock: { onTestNodeUnlock(testTarget) },
                             onPrepareTestTarget: { onPrepareTestTarget(testTarget) },
                             onSelect: { onSelect(item.name) })
                         .padding(.horizontal, 14)
@@ -1181,51 +1199,48 @@ private struct ProxyNodeListRow: View {
     let testTarget: ProxyNodeTestTarget
     let isTestingDelay: Bool
     let delay: Int?
-    let onTestActiveNode: () -> Void
+    let onTestDelay: () -> Void
+    let onTestUnlock: () -> Void
     let onPrepareTestTarget: () -> Void
     let onSelect: () -> Void
+    @State private var suppressSelectionUntil = Date.distantPast
 
     var body: some View {
-        ZStack {
-            if selectable && !isCurrent {
-                Button(action: onSelect) {
-                    row
-                }
-                .buttonStyle(.plain)
-                .disabled(isSelectionBlocked)
-                .accessibilityHint("双击切换到此节点")
-            } else if isCurrent {
-                row
-                    .accessibilityAddTraits(.isSelected)
-                    .onTapGesture { }
-            } else {
-                row
-                    .onTapGesture { }
-            }
-        }
+        row
         .contentShape(Rectangle())
+        .onTapGesture(perform: selectIfAllowed)
+        .accessibilityAddTraits(selectable && !isCurrent ? .isButton : [])
+        .accessibilityAddTraits(isCurrent ? .isSelected : [])
+        .accessibilityHint(selectable && !isCurrent ? "双击切换到此节点" : "")
         .contextMenu {
-            Button(action: onTestActiveNode) {
+            Button(action: onTestDelay) {
                 Label(isTestingDelay ? "正在测速" : "测试此节点延迟",
                       systemImage: isTestingDelay ? "hourglass" : "speedometer")
             }
             .disabled(!canTest || isTestingDelay)
-            Button {
-                Task {
-                    await UnlockTestController.shared.run(nodeName: node,
-                                                          groupName: testTarget.groupName)
-                }
-            } label: {
+            Button(action: onTestUnlock) {
                 Label("解锁测试", systemImage: "play.tv")
             }
             .disabled(!canTest)
         }
         .simultaneousGesture(
-            DragGesture(minimumDistance: 0, coordinateSpace: .local)
-                .onChanged { _ in onPrepareTestTarget() }
+            LongPressGesture(minimumDuration: 0.30, maximumDistance: 16)
+                .onEnded { _ in prepareContextMenu() }
         )
         .id(testTarget.id)
-        .contentShape(Rectangle())
+    }
+
+    private func selectIfAllowed() {
+        guard selectable, !isCurrent, !isSelectionBlocked,
+              Date() >= suppressSelectionUntil else { return }
+        onSelect()
+    }
+
+    private func prepareContextMenu() {
+        // Some iOS versions let the underlying tap finish when a context menu
+        // opens. Suppress only that gesture's trailing tap, not later taps.
+        suppressSelectionUntil = Date().addingTimeInterval(1.0)
+        onPrepareTestTarget()
     }
 
     private var row: some View {
@@ -1314,7 +1329,8 @@ private struct GroupExpandedPanel: View {
     let gradientIndex: Int
     let onToggle: () -> Void
     let onTest: () -> Void
-    let onTestActiveNode: () -> Void
+    let onTestNodeDelay: (ProxyNodeTestTarget) -> Void
+    let onTestNodeUnlock: (ProxyNodeTestTarget) -> Void
     let onPrepareTestTarget: (ProxyNodeTestTarget) -> Void
     let onGradient: (Int) -> Void
     let onRandomizeAll: (() -> Void)?
@@ -1365,7 +1381,8 @@ private struct GroupExpandedPanel: View {
                                       delay: ProxyDelayResolver.delay(for: item.name,
                                                                       groups: allGroups,
                                                                       delays: delays),
-                                      onTestActiveNode: onTestActiveNode,
+                                      onTestDelay: { onTestNodeDelay(testTarget) },
+                                      onTestUnlock: { onTestNodeUnlock(testTarget) },
                                       onPrepareTestTarget: { onPrepareTestTarget(testTarget) },
                                       onSelect: { onSelect(item.name) })
                 }
@@ -1439,46 +1456,46 @@ private struct GroupNodeGridCell: View {
     let testTarget: ProxyNodeTestTarget
     let isTestingDelay: Bool
     let delay: Int?
-    let onTestActiveNode: () -> Void
+    let onTestDelay: () -> Void
+    let onTestUnlock: () -> Void
     let onPrepareTestTarget: () -> Void
     let onSelect: () -> Void
+    @State private var suppressSelectionUntil = Date.distantPast
 
     var body: some View {
-        ZStack {
-            if selectable && !isCurrent {
-                Button(action: onSelect) { card }
-                    .buttonStyle(.plain)
-                    .disabled(isSelectionBlocked)
-            } else if isCurrent {
-                card
-                    .accessibilityAddTraits(.isSelected)
-                    .onTapGesture { }
-            } else {
-                card
-                    .onTapGesture { }
-            }
-        }
+        card
+        .contentShape(Rectangle())
+        .onTapGesture(perform: selectIfAllowed)
+        .accessibilityAddTraits(selectable && !isCurrent ? .isButton : [])
+        .accessibilityAddTraits(isCurrent ? .isSelected : [])
+        .accessibilityHint(selectable && !isCurrent ? "双击切换到此节点" : "")
         .contextMenu {
-            Button(action: onTestActiveNode) {
+            Button(action: onTestDelay) {
                 Label(isTestingDelay ? "正在测速" : "测试此节点延迟",
                       systemImage: isTestingDelay ? "hourglass" : "speedometer")
             }
             .disabled(!canTest || isTestingDelay)
-            Button {
-                Task {
-                    await UnlockTestController.shared.run(nodeName: node.name,
-                                                          groupName: testTarget.groupName)
-                }
-            } label: {
+            Button(action: onTestUnlock) {
                 Label("解锁测试", systemImage: "play.tv")
             }
             .disabled(!canTest)
         }
         .simultaneousGesture(
-            DragGesture(minimumDistance: 0, coordinateSpace: .local)
-                .onChanged { _ in onPrepareTestTarget() }
+            LongPressGesture(minimumDuration: 0.30, maximumDistance: 16)
+                .onEnded { _ in prepareContextMenu() }
         )
         .id(testTarget.id)
+    }
+
+    private func selectIfAllowed() {
+        guard selectable, !isCurrent, !isSelectionBlocked,
+              Date() >= suppressSelectionUntil else { return }
+        onSelect()
+    }
+
+    private func prepareContextMenu() {
+        suppressSelectionUntil = Date().addingTimeInterval(1.0)
+        onPrepareTestTarget()
     }
 
     private var card: some View {
