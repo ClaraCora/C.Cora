@@ -209,14 +209,34 @@ struct ProxiesView: View {
     }
 
     private var groupCategoryPicker: some View {
-        Picker("分组类型", selection: $groupCategoryRawValue) {
+        HStack(spacing: 2) {
             ForEach(ProxyGroupCategory.allCases) { category in
-                Label(category.title, systemImage: category.systemImage)
-                    .tag(category.rawValue)
+                Button {
+                    guard groupCategoryRawValue != category.rawValue else { return }
+                    groupCategoryRawValue = category.rawValue
+                } label: {
+                    Image(systemName: category.systemImage)
+                        .font(.system(size: 16, weight: .semibold))
+                        .frame(width: 62, height: 34)
+                        .foregroundStyle(groupCategoryRawValue == category.rawValue
+                                         ? Color.primary
+                                         : Color.secondary)
+                        .background {
+                            if groupCategoryRawValue == category.rawValue {
+                                Capsule(style: .continuous)
+                                    .fill(Color.primary.opacity(0.13))
+                            }
+                        }
+                }
+                .buttonStyle(.plain)
+                .contentShape(Capsule(style: .continuous))
+                .accessibilityLabel(category.title)
+                .accessibilityAddTraits(groupCategoryRawValue == category.rawValue
+                                       ? .isSelected
+                                       : [])
             }
         }
-        .pickerStyle(.segmented)
-        .frame(width: 150)
+        .frame(width: 132, height: 40)
         .accessibilityLabel("分组类型")
         .help("切换策略组或节点组")
     }
