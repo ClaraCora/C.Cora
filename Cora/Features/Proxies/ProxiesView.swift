@@ -23,6 +23,8 @@ struct ProxiesView: View {
     @StateObject private var unlockTests = UnlockTestController.shared
     @AppStorage("proxyNodeLayout") private var layoutRawValue = ProxyNodeLayout.grid.rawValue
     @AppStorage("proxyGroupGradients") private var gradientStorage = "{}"
+    @AppStorage("proxyShowHiddenGroups") private var showHiddenGroups = false
+    @AppStorage("proxyGroupCategory") private var groupCategoryRawValue = ProxyGroupCategory.strategy.rawValue
 
     var body: some View {
         NavigationStack {
@@ -46,8 +48,16 @@ struct ProxiesView: View {
             .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    if !controller.groups.isEmpty {
+                        groupCategoryPicker
+                    }
+                }
                 ToolbarItemGroup(placement: .topBarTrailing) {
                     HStack(spacing: 4) {
+                        if hasHiddenGroups {
+                            hiddenGroupsToggle
+                        }
                         if showsSearch {
                             layoutMenu
 
@@ -128,7 +138,7 @@ struct ProxiesView: View {
             .onChange(of: layoutRawValue) { _, value in
                 // Both layouts share one expansion model. Keep a single valid group
                 // when switching layouts so neither view inherits stale open rows.
-                let retained = controller.groups.first(where: { expanded.contains($0.name) })?.name
+                let retained = visibleGroups.first(where: { expanded.contains($0.name) })?.name
                 expanded = retained.map { [$0] } ?? []
                 gridScrollRequest = nil
                 expandedPanelFrames = [:]
@@ -137,6 +147,12 @@ struct ProxiesView: View {
                 gridExpansionCorrectionKey = nil
                 toolbarControlsVisible = true
                 activeNodeTestTarget = nil
+            }
+            .onChange(of: groupCategoryRawValue) { _, _ in
+                resetDisplayedGroupState()
+            }
+            .onChange(of: showHiddenGroups) { _, _ in
+                resetDisplayedGroupState()
             }
             .onDisappear { activeNodeTestTarget = nil }
         }
@@ -162,6 +178,14 @@ struct ProxiesView: View {
         canRefresh && !controller.groups.isEmpty
     }
 
+    private var hasHiddenGroups: Bool {
+        controller.groups.contains(where: { $0.hidden })
+    }
+
+    private var selectedGroupCategory: ProxyGroupCategory {
+        ProxyGroupCategory(rawValue: groupCategoryRawValue) ?? .strategy
+    }
+
     private var nodeLayout: ProxyNodeLayout {
         ProxyNodeLayout(rawValue: layoutRawValue) ?? .list
     }
@@ -182,6 +206,47 @@ struct ProxiesView: View {
         }
         .accessibilityLabel("切换节点布局")
         .help("切换节点布局")
+    }
+
+    private var groupCategoryPicker: some View {
+        Picker("分组类型", selection: $groupCategoryRawValue) {
+            ForEach(ProxyGroupCategory.allCases) { category in
+                Label(category.title, systemImage: category.systemImage)
+                    .tag(category.rawValue)
+            }
+        }
+        .pickerStyle(.segmented)
+        .frame(width: 150)
+        .accessibilityLabel("分组类型")
+        .help("切换策略组或节点组")
+    }
+
+    private var hiddenGroupsToggle: some View {
+        Toggle(isOn: $showHiddenGroups) {
+            Image(systemName: showHiddenGroups ? "eye" : "eye.slash")
+        }
+        .toggleStyle(.button)
+        .accessibilityLabel(showHiddenGroups ? "隐藏分组已显示" : "显示隐藏分组")
+        .help(showHiddenGroups ? "隐藏分组已显示" : "显示隐藏分组")
+        .frame(width: 44, height: 44)
+    }
+
+    @ViewBuilder private var emptyGroupView: some View {
+        if normalizedSearch.isEmpty {
+            ContentUnavailableView(
+                "没有\(selectedGroupCategory.title)",
+                systemImage: selectedGroupCategory.systemImage,
+                description: Text(emptyGroupDescription))
+        } else {
+            ContentUnavailableView.search(text: searchText)
+        }
+    }
+
+    private var emptyGroupDescription: String {
+        guard hasHiddenGroups, !showHiddenGroups else {
+            return "当前配置没有可显示的\(selectedGroupCategory.title)"
+        }
+        return "当前没有可显示的\(selectedGroupCategory.title)，隐藏分组可通过右上角眼睛按钮显示"
     }
 
     @ViewBuilder private var content: some View {
@@ -258,7 +323,7 @@ struct ProxiesView: View {
                 }
 
                 if results.isEmpty {
-                    ContentUnavailableView.search(text: searchText)
+                    emptyGroupView
                         .frame(maxWidth: .infinity)
                 } else {
                     ForEach(results) { result in
@@ -348,7 +413,7 @@ struct ProxiesView: View {
                                 .padding(.horizontal, 16)
                         }
                         if results.isEmpty {
-                            ContentUnavailableView.search(text: searchText)
+                            emptyGroupView
                         } else {
                             ForEach(Array(rows.enumerated()), id: \.offset) { rowIndex, row in
                                 gridRow(row,
@@ -605,10 +670,31 @@ struct ProxiesView: View {
         searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
+    /// A node group contains only concrete proxy nodes; a strategy group points
+    /// at one or more other groups. Empty groups stay in the strategy category
+    /// until their provider members are available, avoiding category flicker.
+    private var visibleGroups: [ProxyGroup] {
+        let allGroupNames = Set(controller.groups.map(\.name))
+        return controller.groups.filter { group in
+            (showHiddenGroups || !group.hidden) &&
+                groupCategory(for: group, groupNames: allGroupNames) == selectedGroupCategory
+        }
+    }
+
+    private func groupCategory(for group: ProxyGroup,
+                               groupNames: Set<String>) -> ProxyGroupCategory {
+        if group.name.caseInsensitiveCompare("GLOBAL") == .orderedSame || group.all.isEmpty {
+            return .strategy
+        }
+        return group.all.contains { member in
+            member != group.name && groupNames.contains(member)
+        } ? .strategy : .node
+    }
+
     private var displayedGroups: [DisplayedProxyGroup] {
         let query = normalizedSearch
         guard !query.isEmpty else {
-            return controller.groups.map { group in
+            return visibleGroups.map { group in
                 let isExpanded = expanded.contains(group.name)
                 return DisplayedProxyGroup(
                     group: group,
@@ -617,7 +703,7 @@ struct ProxiesView: View {
             }
         }
 
-        return controller.groups.compactMap { group in
+        return visibleGroups.compactMap { group in
             let matchedNodes = group.nodes.filter { item in
                 item.normalizedSearchText.contains(query)
             }
@@ -641,6 +727,19 @@ struct ProxiesView: View {
         }
         gridScrollRequest = nil
         expandedPanelFrames = [:]
+    }
+
+    private func resetDisplayedGroupState() {
+        activeNodeTestTarget = nil
+        expanded = []
+        gridScrollRequest = nil
+        gridRestoreAnchors = [:]
+        gridExpansion = nil
+        pendingGridGroupName = nil
+        gridExpansionCorrectionKey = nil
+        expandedPanelFrames = [:]
+        gridRowFrames = [:]
+        gridCardFrames = [:]
     }
 
     private func dismissExpandedGroup(_ name: String) {
@@ -803,8 +902,15 @@ struct ProxiesView: View {
     private func reload() async {
         await controller.load()
         assignMissingGradients()
+        guard expanded.allSatisfy({ name in
+            visibleGroups.contains(where: { $0.name == name })
+        }) else {
+            resetDisplayedGroupState()
+            return
+        }
         if let expansion = gridExpansion {
-            guard let index = controller.groups.firstIndex(where: {
+            guard visibleGroups.contains(where: { $0.name == expansion.groupName }),
+                  let index = visibleGroups.firstIndex(where: {
                 $0.name == expansion.groupName
             }) else {
                 gridExpansion = nil
@@ -855,6 +961,27 @@ struct ProxiesView: View {
         guard let data = try? JSONEncoder().encode(groupGradients),
               let raw = String(data: data, encoding: .utf8) else { return }
         gradientStorage = raw
+    }
+}
+
+private enum ProxyGroupCategory: String, CaseIterable, Identifiable {
+    case strategy
+    case node
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .strategy: return "策略组"
+        case .node: return "节点组"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .strategy: return "square.stack.3d.up"
+        case .node: return "server.rack"
+        }
     }
 }
 

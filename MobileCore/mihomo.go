@@ -1502,10 +1502,11 @@ func QueryProxies() string {
 			all = append(all, member.Name())
 		}
 		groups[name] = map[string]any{
-			"type": proxy.Type().String(),
-			"now":  group.Now(),
-			"all":  all,
-			"icon": group.Icon(),
+			"type":   proxy.Type().String(),
+			"now":    group.Now(),
+			"all":    all,
+			"icon":   group.Icon(),
+			"hidden": group.Hidden(),
 		}
 	}
 
@@ -1825,6 +1826,7 @@ func OfflineProxySnapshot(configYAML, providerPayloadsJSON, selectionsJSON strin
 		members = uniqueStrings(members)
 		typ, _ := group["type"].(string)
 		icon, _ := group["icon"].(string)
+		hidden, _ := group["hidden"].(bool)
 		now := ""
 		if selected := selections[name]; strings.EqualFold(typ, "select") && containsString(members, selected) {
 			now = selected
@@ -1833,6 +1835,7 @@ func OfflineProxySnapshot(configYAML, providerPayloadsJSON, selectionsJSON strin
 		}
 		groups[name] = map[string]any{
 			"type": offlineGroupType(typ), "now": now, "all": members, "icon": icon,
+			"hidden": hidden,
 		}
 		groupNames = append(groupNames, name)
 	}

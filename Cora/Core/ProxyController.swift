@@ -26,18 +26,21 @@ struct ProxyGroup: Identifiable {
     let now: String       // 当前选中/生效的节点
     let all: [String]     // 成员节点名（按配置顺序）
     let icon: URL?        // 配置里 proxy-groups[].icon，内核经 /proxies 原样回传
+    let hidden: Bool      // 配置里的 hidden: true；缺省为 false
     let nodes: [ProxyGroupNode]
 
     init(name: String,
          type: String,
          now: String,
          all: [String],
-         icon: URL?) {
+         icon: URL?,
+         hidden: Bool) {
         self.name = name
         self.type = type
         self.now = now
         self.all = all
         self.icon = icon
+        self.hidden = hidden
         self.nodes = all.enumerated().map { index, node in
             return ProxyGroupNode(
                 id: .init(group: name, index: index),
@@ -200,7 +203,8 @@ final class ProxyController: ObservableObject {
                                   type: d["type"] as? String ?? "",
                                   now: d["now"] as? String ?? "",
                                   all: all,
-                                  icon: iconStr.isEmpty ? nil : URL(string: iconStr))
+                                  icon: iconStr.isEmpty ? nil : URL(string: iconStr),
+                                  hidden: d["hidden"] as? Bool ?? false)
             }
 
             switch mode {

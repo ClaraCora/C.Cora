@@ -153,6 +153,7 @@ proxy-providers:
 proxy-groups:
   - name: Select
     type: select
+    hidden: true
     proxies: [DIRECT, inline]
     use: [airport]
 rules:
@@ -182,6 +183,9 @@ rules:
 	}
 	if group["now"] != "SG One" {
 		t.Fatalf("offline now = %v, want SG One", group["now"])
+	}
+	if hidden, ok := group["hidden"].(bool); !ok || !hidden {
+		t.Fatalf("offline hidden = %v, want true", group["hidden"])
 	}
 	if got.NodeCount != 3 {
 		t.Fatalf("nodeCount = %v, want 3", got.NodeCount)
