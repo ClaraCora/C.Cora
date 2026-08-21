@@ -2,12 +2,12 @@
 set -euo pipefail
 
 readonly MODULE="github.com/metacubex/gvisor"
-readonly EXPECTED_VERSION="v0.0.0-20251227095601-261ec1326fe8"
+readonly EXPECTED_VERSION="v0.0.0-20260810011720-3cc44cf9ac22"
 readonly SOURCE_REL="pkg/tcpip/transport/tcp/segment_queue.go"
 readonly EXPECTED_SOURCE_SHA="1f1f3c893472009f0f566c7dd783c014d684493bf48750783a2064685db91e7e"
 readonly EXPECTED_PATCHED_SHA="4a4a5566d456d9411a70710824ad4c7f396aec22fcf83ffdf380cd121a8c40f5"
-readonly PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/gvisor-261ec1326fe8-tcp-ack-queue.patch"
-readonly PATCHED_DIR="${RUNNER_TEMP:?}/gvisor-261ec1326fe8-ios-memory-v1"
+readonly PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/gvisor-3cc44cf9ac22-tcp-ack-queue.patch"
+readonly PATCHED_DIR="${RUNNER_TEMP:?}/gvisor-3cc44cf9ac22-ios-memory-v1"
 
 check_sha256() {
   local expected="$1"

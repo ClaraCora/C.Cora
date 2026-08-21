@@ -1,9 +1,9 @@
 # Third-party patches
 
-## mihomo-v1.19.29-connection-close-queue
+## mihomo-v1.19.30-connection-close-queue
 
 - Added: 2026-08-13
-- Upstream module: `github.com/metacubex/mihomo v1.19.29`
+- Upstream module: `github.com/metacubex/mihomo v1.19.30`
 - Patched file: `tunnel/statistic/manager.go`
 - Build tags: default and `with_low_memory`
 
@@ -44,8 +44,8 @@ longer aliased to the live tracker.
 
 Revert the commit that added this section and remove:
 
-- `dependency-patches/mihomo-v1.19.29-connection-close-queue.patch`;
-- `dependency-patches/mihomo-v1.19.29-connection-close-queue-test.patch`;
+- `dependency-patches/mihomo-v1.19.30-connection-close-queue.patch`;
+- `dependency-patches/mihomo-v1.19.30-connection-close-queue-test.patch`;
 - the history patch preparation and verification wiring;
 - `ClosedConnectionsSnapshot` and the Packet Tunnel history recorder.
 
@@ -56,7 +56,7 @@ earlier versions.
 
 - Added: 2026-07-25
 - Upstream modules: `github.com/metacubex/sing v0.5.7`,
-  `github.com/metacubex/mihomo v1.19.29`
+  `github.com/metacubex/mihomo v1.19.30`
 - Patched files: sing `common/buf/alloc.go`, `common/buf/buffer.go`;
   Mihomo `common/pool/alloc.go`
 - Build tags: default and `with_low_memory`
@@ -116,7 +116,7 @@ peak-memory behavior.
 Revert the commit that added this patch. For a manual rollback, remove:
 
 - `dependency-patches/sing-v0.5.7-oversize-buffer-pool.patch`;
-- `dependency-patches/mihomo-v1.19.29-oversize-buffer-pool.patch`;
+- `dependency-patches/mihomo-v1.19.30-oversize-buffer-pool.patch`;
 - `scripts/prepare-ios-sing.sh` and its CI invocation;
 - `scripts/prepare-ios-mihomo.sh` and its CI invocation;
 - the `PATCHED_SING_DIR` wiring in `prepare-ios-sing-shadowsocks2.sh`;
@@ -180,10 +180,10 @@ Revert the commit that added this patch. For a manual rollback, remove:
 
 No configuration or user-data migration is involved.
 
-## sing-tun-v0.4.21-darwin-queue-bounds
+## sing-tun-v0.4.22-darwin-queue-bounds
 
 - Added: 2026-07-25
-- Upstream module: `github.com/metacubex/sing-tun v0.4.21`
+- Upstream module: `github.com/metacubex/sing-tun v0.4.22`
 - Patched files: `internal/fdbased_darwin/processors.go`,
   `tun_darwin_gvisor.go`
 - Build tags: `with_gvisor,with_low_memory`
@@ -191,7 +191,7 @@ No configuration or user-data migration is involved.
 ### Reason
 
 The Darwin fd endpoint receives up to roughly 512 KiB of packets per syscall
-and distributes them to per-processor asynchronous queues. In v0.4.21 those
+and distributes them to per-processor asynchronous queues. In v0.4.22 those
 queues have no length or byte limit. A burst can therefore retain packet views
 faster than gVisor consumes them, which is fatal under the iOS Packet Tunnel
 memory budget. High-throughput multi-stream traffic makes this substantially
@@ -238,17 +238,17 @@ from the patched module, then compiles MobileCore with
 
 Revert the commit that added this patch. For a manual rollback, remove:
 
-- `dependency-patches/sing-tun-v0.4.21-darwin-queue.patch`;
+- `dependency-patches/sing-tun-v0.4.22-darwin-queue.patch`;
 - `scripts/prepare-ios-sing-tun.sh` and its CI invocation;
 - the post-`ApplyConfig` `debug.FreeOSMemory()` call;
 - this section of the patch record.
 
 No configuration or user-data migration is involved.
 
-## gvisor-261ec1326fe8-tcp-pure-ack-queue
+## gvisor-3cc44cf9ac22-tcp-pure-ack-queue
 
 - Added: 2026-07-25
-- Upstream module: `github.com/metacubex/gvisor v0.0.0-20251227095601-261ec1326fe8`
+- Upstream module: `github.com/metacubex/gvisor v0.0.0-20260810011720-3cc44cf9ac22`
 - Patched file: `pkg/tcpip/transport/tcp/segment_queue.go`
 
 ### Reason
@@ -284,7 +284,7 @@ receive-memory reference accounting.
 
 Revert the commit that added this patch. For a manual rollback, remove:
 
-- `dependency-patches/gvisor-261ec1326fe8-tcp-ack-queue.patch`;
+- `dependency-patches/gvisor-3cc44cf9ac22-tcp-ack-queue.patch`;
 - `scripts/prepare-ios-gvisor.sh` and its CI invocation;
 - this section of the patch record.
 
