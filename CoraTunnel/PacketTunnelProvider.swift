@@ -602,7 +602,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             let directURL = (obj?["directURL"] as? String) ?? ""
             let timeout = (obj?["timeout"] as? NSNumber)?.intValue ?? 5000
             ipcQueue.async {
-                reply(Data(MihomoGroupDelay(group, url, directURL, timeout).utf8))
+                let response = MihomoGroupDelay(group, url, directURL, timeout)
+                reply(Self.validatedCoreJSONData(response, command: "groupDelay"))
             }
         case "proxyDelay":
             let name = (obj?["name"] as? String) ?? ""
@@ -611,7 +612,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             let directURL = (obj?["directURL"] as? String) ?? ""
             let timeout = (obj?["timeout"] as? NSNumber)?.intValue ?? 5000
             ipcQueue.async {
-                reply(Data(MihomoProxyDelay(name, group, url, directURL, timeout).utf8))
+                let response = MihomoProxyDelay(name, group, url, directURL, timeout)
+                reply(Self.validatedCoreJSONData(response, command: "proxyDelay"))
             }
         case "readRuleProvider":
             let name = (obj?["name"] as? String) ?? ""
@@ -736,6 +738,21 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private static func jsonData(_ object: [String: Any]) -> Data {
         (try? JSONSerialization.data(withJSONObject: object)) ?? Data(#"{"ok":false}"#.utf8)
+    }
+
+    /// MobileCore control methods promise a JSON object. Keep malformed core
+    /// errors from crossing IPC as opaque text, which would hide the source of
+    /// the failure behind a generic decoding error in the app.
+    private static func validatedCoreJSONData(_ response: String, command: String) -> Data {
+        let data = Data(response.utf8)
+        if let object = try? JSONSerialization.jsonObject(with: data),
+           object is [String: Any] {
+            return data
+        }
+        FileLog.write("\(command)：内核返回无效 JSON，字节数=\(data.count)")
+        return jsonData([
+            "error": "内核返回无效响应（\(command)）",
+        ])
     }
 
     /// 返回当前 Network Extension 进程的物理内存占用。

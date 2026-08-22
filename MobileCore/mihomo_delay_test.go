@@ -2,6 +2,7 @@ package mihomo
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -36,5 +37,22 @@ func TestProxyDelayTimedOut(t *testing.T) {
 				t.Fatalf("proxyDelayTimedOut() = %v, want %v", got, test.want)
 			}
 		})
+	}
+}
+
+func TestProxyDelayErrorResponseEscapesJSON(t *testing.T) {
+	testErr := errors.Join(
+		errors.New(`Get "https://www.gstatic.com/generate_204": TFO probe failed`),
+		errors.New("plain TCP probe failed\ncontext deadline exceeded"),
+	)
+	message := testErr.Error()
+	response := proxyDelayErrorResponse(testErr)
+
+	var decoded map[string]string
+	if err := json.Unmarshal([]byte(response), &decoded); err != nil {
+		t.Fatalf("proxyDelayErrorResponse() returned invalid JSON: %v\n%s", err, response)
+	}
+	if decoded["error"] != message {
+		t.Fatalf("decoded error = %q, want %q", decoded["error"], message)
 	}
 }

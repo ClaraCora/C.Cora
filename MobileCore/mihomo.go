@@ -2197,7 +2197,7 @@ func ProxyDelay(name, group, url, directURL string, timeoutMs int) string {
 		if proxyDelayTimedOut(ctx, err) {
 			return `{"delay":0}`
 		}
-		return `{"error":"` + err.Error() + `"}`
+		return proxyDelayErrorResponse(err)
 	}
 	if delay == 0 {
 		if snellNode {
@@ -2215,6 +2215,10 @@ func ProxyDelay(name, group, url, directURL string, timeoutMs int) string {
 		return `{"error":"marshal: ` + err.Error() + `"}`
 	}
 	return string(out)
+}
+
+func proxyDelayErrorResponse(err error) string {
+	return marshalJSON(map[string]any{"error": err.Error()})
 }
 
 // RuleProviderContent returns the exact bytes currently loaded by one HTTP
