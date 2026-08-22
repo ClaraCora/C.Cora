@@ -351,21 +351,21 @@ func TestSnellAdaptiveTFOSettingDoesNotDisableTFOGlobally(t *testing.T) {
 	}
 
 	dialer.DisableTFO = false
-	setSnellAdaptiveTFO(true, "pdp_ip0", "test")
+	setSnellAdaptiveTFO(true, true, "pdp_ip0", "test")
 	if !dialer.AdaptiveTFOEnabled() {
 		t.Fatal("adaptive TFO should be enabled")
 	}
 	if dialer.DisableTFO {
 		t.Fatal("adaptive mode must not disable TFO globally")
 	}
-	setSnellAdaptiveTFO(true, "en0", "test")
+	setSnellAdaptiveTFO(true, true, "en0", "test")
 	if !dialer.AdaptiveTFOEnabled() {
 		t.Fatal("adaptive setting should remain enabled while Wi-Fi is active")
 	}
 	if dialer.DisableTFO {
 		t.Fatal("Wi-Fi should keep TFO globally enabled")
 	}
-	setSnellAdaptiveTFO(false, "pdp_ip0", "test")
+	setSnellAdaptiveTFO(false, false, "pdp_ip0", "test")
 	if dialer.AdaptiveTFOEnabled() {
 		t.Fatal("adaptive TFO should be disabled")
 	}
@@ -394,6 +394,46 @@ func TestNetworkChangeRequiresReset(t *testing.T) {
 				t.Fatalf("networkChangeRequiresReset() = %v, want %v", got, test.want)
 			}
 		})
+	}
+}
+
+func TestAdaptiveTFOResetForNetworkChange(t *testing.T) {
+	tests := []struct {
+		name      string
+		previous  string
+		current   string
+		requested bool
+		hold      bool
+		want      adaptiveTFOResetMode
+	}{
+		{name: "held duplicate cellular callback", previous: "pdp_ip0", current: "pdp_ip0", hold: true, want: adaptiveTFOResetNone},
+		{name: "held cellular address refresh", previous: "pdp_ip0", current: "pdp_ip0", requested: true, hold: true, want: adaptiveTFOResetNonFallback},
+		{name: "held change cellular interface", previous: "pdp_ip0", current: "pdp_ip1", hold: true, want: adaptiveTFOResetNonFallback},
+		{name: "held leave cellular", previous: "pdp_ip0", current: "en0", hold: true, want: adaptiveTFOResetAll},
+		{name: "held enter cellular", previous: "en0", current: "pdp_ip0", hold: true, want: adaptiveTFOResetAll},
+		{name: "held change wifi interface", previous: "en0", current: "en1", hold: true, want: adaptiveTFOResetAll},
+		{name: "held initial cellular binding", current: "pdp_ip0", hold: true, want: adaptiveTFOResetAll},
+		{name: "held initial wifi binding", current: "en0", hold: true, want: adaptiveTFOResetAll},
+		{name: "cooldown requested refresh", previous: "pdp_ip0", current: "pdp_ip0", requested: true, want: adaptiveTFOResetAll},
+		{name: "cooldown interface change", previous: "pdp_ip0", current: "pdp_ip1", want: adaptiveTFOResetAll},
+		{name: "cooldown duplicate callback", previous: "pdp_ip0", current: "pdp_ip0", want: adaptiveTFOResetNone},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := adaptiveTFOResetForNetworkChange(
+				test.previous, test.current, test.requested, test.hold); got != test.want {
+				t.Fatalf("adaptiveTFOResetForNetworkChange() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestSnellAdaptiveTFOStatusDescribesHoldPolicy(t *testing.T) {
+	if got := snellAdaptiveTFOStatus(true, true, "pdp_ip0"); !strings.Contains(got, "保持普通 TCP") {
+		t.Fatalf("hold status = %q, want persistent ordinary TCP wording", got)
+	}
+	if got := snellAdaptiveTFOStatus(true, false, "pdp_ip0"); !strings.Contains(got, "重新测试 TFO") {
+		t.Fatalf("cooldown status = %q, want retry wording", got)
 	}
 }
 
@@ -759,6 +799,9 @@ func TestParseSettingsGeoDefaultsAndOverride(t *testing.T) {
 	if defaults.CellularSnellCompatibility {
 		t.Error("CellularSnellCompatibility default = true, want false")
 	}
+	if !defaults.SnellAdaptiveTFOHold {
+		t.Error("SnellAdaptiveTFOHold default = false, want true")
+	}
 	if defaults.GeoMMDBURL == "" || defaults.GeoIPDatURL == "" || defaults.GeoSiteURL == "" {
 		t.Error("default GEO download URLs must not be empty")
 	}
@@ -766,6 +809,7 @@ func TestParseSettingsGeoDefaultsAndOverride(t *testing.T) {
 		"geoEnabled": false,
 		"ignoreGeoNegation": true,
 		"cellularSnellCompatibility": true,
+		"snellAdaptiveTFOHoldUntilNetworkChange": false,
 		"geodataMode": false,
 		"geoIPDatURL": "https://example.com/GeoIP.dat",
 		"geoMMDBURL": "https://example.com/geoip.metadb",
@@ -779,6 +823,9 @@ func TestParseSettingsGeoDefaultsAndOverride(t *testing.T) {
 	}
 	if !custom.CellularSnellCompatibility {
 		t.Error("CellularSnellCompatibility override = false, want true")
+	}
+	if custom.SnellAdaptiveTFOHold {
+		t.Error("SnellAdaptiveTFOHold override = true, want false")
 	}
 	if custom.GeodataMode {
 		t.Error("GeodataMode override = true, want false")

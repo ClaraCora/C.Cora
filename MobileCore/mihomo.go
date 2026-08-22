@@ -15,10 +15,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	stdHTTP "github.com/metacubex/http"
 	"io"
 	"net"
 	"net/netip"
-	stdHTTP "github.com/metacubex/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -128,6 +128,7 @@ var (
 	pendingUsesSystemDNS bool
 	coreStartedAt        time.Time
 	snellAdaptiveTFO     bool
+	snellAdaptiveTFOHold bool
 )
 
 // Version 返回「mihomo 内核版本 / Go 运行时版本」。
@@ -344,26 +345,27 @@ func startLogCapture() {
 
 // appSettings 是主 App 下发的设置（JSON）。零值即各项默认。
 type appSettings struct {
-	Stack             string                 `json:"stack"`
-	IPv6              bool                   `json:"ipv6"`
-	GeoEnabled        bool                   `json:"geoEnabled"`
-	GeoLoader         string                 `json:"geoLoader"`
-	GeodataMode       bool                   `json:"geodataMode"`
-	GeoIPDatURL       string                 `json:"geoIPDatURL"`
-	GeoMMDBURL        string                 `json:"geoMMDBURL"`
-	GeoSiteURL        string                 `json:"geoSiteURL"`
-	IgnoreGeoNegation bool                   `json:"ignoreGeoNegation"`
-	GeoAutoUpdate     bool                   `json:"geoAutoUpdate"`
-	GeoUpdateInterval int                    `json:"geoUpdateInterval"`
-	LogLevel          string                 `json:"logLevel"`
-	CellularSnellCompatibility bool          `json:"cellularSnellCompatibility"`
-	UnifiedDelay      bool                   `json:"unifiedDelay"`
-	MixedPort         int                    `json:"mixedPort"`
-	BlockDirectSTUN   bool                   `json:"blockDirectSTUN"`
-	SystemDNS         []string               `json:"systemDNS"`
-	ApplyOverrides    bool                   `json:"applyOverrides"`
-	Overrides         configOverrideSettings `json:"overrides"`
-	ProxySelections   map[string]string      `json:"proxySelections"`
+	Stack                      string                 `json:"stack"`
+	IPv6                       bool                   `json:"ipv6"`
+	GeoEnabled                 bool                   `json:"geoEnabled"`
+	GeoLoader                  string                 `json:"geoLoader"`
+	GeodataMode                bool                   `json:"geodataMode"`
+	GeoIPDatURL                string                 `json:"geoIPDatURL"`
+	GeoMMDBURL                 string                 `json:"geoMMDBURL"`
+	GeoSiteURL                 string                 `json:"geoSiteURL"`
+	IgnoreGeoNegation          bool                   `json:"ignoreGeoNegation"`
+	GeoAutoUpdate              bool                   `json:"geoAutoUpdate"`
+	GeoUpdateInterval          int                    `json:"geoUpdateInterval"`
+	LogLevel                   string                 `json:"logLevel"`
+	CellularSnellCompatibility bool                   `json:"cellularSnellCompatibility"`
+	SnellAdaptiveTFOHold       bool                   `json:"snellAdaptiveTFOHoldUntilNetworkChange"`
+	UnifiedDelay               bool                   `json:"unifiedDelay"`
+	MixedPort                  int                    `json:"mixedPort"`
+	BlockDirectSTUN            bool                   `json:"blockDirectSTUN"`
+	SystemDNS                  []string               `json:"systemDNS"`
+	ApplyOverrides             bool                   `json:"applyOverrides"`
+	Overrides                  configOverrideSettings `json:"overrides"`
+	ProxySelections            map[string]string      `json:"proxySelections"`
 }
 
 type configOverrideSettings struct {
@@ -417,10 +419,11 @@ func parseSettings(settingsJSON string) appSettings {
 		ApplyOverrides: true,
 		GeoEnabled:     true, GeoLoader: "memconservative", GeodataMode: true,
 		IgnoreGeoNegation: false, GeoUpdateInterval: 24,
-		GeoIPDatURL: "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat",
-		GeoMMDBURL:  "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb",
-		GeoSiteURL:  "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat",
-		CellularSnellCompatibility: false}
+		GeoIPDatURL:                "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat",
+		GeoMMDBURL:                 "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb",
+		GeoSiteURL:                 "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat",
+		CellularSnellCompatibility: false,
+		SnellAdaptiveTFOHold:       true}
 	if strings.TrimSpace(settingsJSON) != "" {
 		_ = json.Unmarshal([]byte(settingsJSON), &s)
 	}
@@ -617,11 +620,14 @@ func StartWithConfig(fd int, tunnelMTU int, configYAML string, settingsJSON stri
 	resetError := resetRunLog()
 	st := parseSettings(settingsJSON)
 	snellAdaptiveTFO = st.CellularSnellCompatibility
-	appendRunLog(fmt.Sprintf("StartWithConfig: fd=%d mtu=%d stack=%s ipv6=%v geo=%v(mode=%v,%s,ignoreNegation=%v) log=%s snellAdaptiveTFO=%v",
+	snellAdaptiveTFOHold = st.SnellAdaptiveTFOHold
+	appendRunLog(fmt.Sprintf("StartWithConfig: fd=%d mtu=%d stack=%s ipv6=%v geo=%v(mode=%v,%s,ignoreNegation=%v) log=%s snellAdaptiveTFO=%v snellAdaptiveTFOHold=%v",
 		fd, tunnelMTU, st.Stack, st.IPv6, st.GeoEnabled, st.GeodataMode, st.GeoLoader,
-		st.IgnoreGeoNegation, st.LogLevel, st.CellularSnellCompatibility))
+		st.IgnoreGeoNegation, st.LogLevel, st.CellularSnellCompatibility,
+		st.SnellAdaptiveTFOHold))
 	dialer.ResetAdaptiveTFO()
-	setSnellAdaptiveTFO(st.CellularSnellCompatibility, currentPhysicalInterface(), "启动")
+	setSnellAdaptiveTFO(st.CellularSnellCompatibility,
+		st.SnellAdaptiveTFOHold, currentPhysicalInterface(), "启动")
 	if resetError != nil {
 		appendRunLog("run.log 重置失败: " + resetError.Error())
 	}
@@ -2081,7 +2087,7 @@ func GroupDelay(group, url, directURL string, timeoutMs int) string {
 		interfaceName := currentPhysicalInterface()
 		appendRunLog(fmt.Sprintf("Snell 自适应 TFO：分组测速 %s，Snell 节点=%d，接口=%s，%s",
 			group, len(snellNames), displayInterfaceName(interfaceName),
-			snellAdaptiveTFOStatus(snellAdaptiveTFO, interfaceName)))
+			snellAdaptiveTFOStatus(snellAdaptiveTFO, snellAdaptiveTFOHold, interfaceName)))
 	}
 	if url == "" {
 		url = "https://www.gstatic.com/generate_204"
@@ -2166,7 +2172,7 @@ func ProxyDelay(name, group, url, directURL string, timeoutMs int) string {
 		interfaceName := currentPhysicalInterface()
 		appendRunLog(fmt.Sprintf("Snell 自适应 TFO：单节点测速 %s，接口=%s，%s",
 			name, displayInterfaceName(interfaceName),
-			snellAdaptiveTFOStatus(snellAdaptiveTFO, interfaceName)))
+			snellAdaptiveTFOStatus(snellAdaptiveTFO, snellAdaptiveTFOHold, interfaceName)))
 	}
 	if url == "" {
 		url = "https://www.gstatic.com/generate_204"
@@ -2251,22 +2257,22 @@ func RuleProviderContent(name string, maxBytes int) string {
 	}
 	return marshalJSON(map[string]any{
 		"ok":        true,
-		"content":  string(data),
-		"size":     info.Size(),
+		"content":   string(data),
+		"size":      info.Size(),
 		"updatedAt": info.ModTime().UTC().Format(time.RFC3339),
 		"truncated": truncated,
 	})
 }
 
 type scriptFetchRequest struct {
-	Name         string            `json:"name"`
-	Group        string            `json:"group"`
-	Method       string            `json:"method"`
-	URL          string            `json:"url"`
-	Headers      map[string]string `json:"headers"`
-	Body         string            `json:"body"`
-	TimeoutMs    int               `json:"timeout"`
-	AllowRedirect bool             `json:"allowRedirect"`
+	Name          string            `json:"name"`
+	Group         string            `json:"group"`
+	Method        string            `json:"method"`
+	URL           string            `json:"url"`
+	Headers       map[string]string `json:"headers"`
+	Body          string            `json:"body"`
+	TimeoutMs     int               `json:"timeout"`
+	AllowRedirect bool              `json:"allowRedirect"`
 }
 
 // ScriptFetch is the only network primitive exposed to Cora's JavaScript
@@ -2326,8 +2332,8 @@ func ScriptFetch(requestJSON string) string {
 			}
 			return proxy.DialContext(dialCtx, &metadata)
 		},
-		DisableKeepAlives: true,
-		TLSClientConfig: tlsConfig,
+		DisableKeepAlives:   true,
+		TLSClientConfig:     tlsConfig,
 		TLSHandshakeTimeout: time.Duration(request.TimeoutMs) * time.Millisecond,
 	}
 	client := &stdHTTP.Client{Transport: transport}
@@ -2795,12 +2801,19 @@ func NotifyNetworkChange(name string, systemDNSJSON string, reason string,
 	storePhysicalInterface(name)
 	previous := dialer.DefaultInterface.Load()
 	dialer.DefaultInterface.Store(name)
+	adaptiveTFOReset := adaptiveTFOResetForNetworkChange(
+		previous, name, resetConnections, snellAdaptiveTFOHold)
 	resetConnections = networkChangeRequiresReset(previous, name, resetConnections)
 	if resetConnections {
-		dialer.ResetAdaptiveTFO()
 		iface.FlushCache()
 	}
-	setSnellAdaptiveTFO(snellAdaptiveTFO, name, "网络路径变化")
+	switch adaptiveTFOReset {
+	case adaptiveTFOResetAll:
+		dialer.ResetAdaptiveTFO()
+	case adaptiveTFOResetNonFallback:
+		dialer.ResetAdaptiveTFONonFallback()
+	}
+	setSnellAdaptiveTFO(snellAdaptiveTFO, snellAdaptiveTFOHold, name, "网络路径变化")
 
 	resolverUpdated := false
 	if dnsErr == nil && len(newSystemDNS) > 0 &&
@@ -2848,6 +2861,28 @@ func NotifyNetworkChange(name string, systemDNSJSON string, reason string,
 
 func networkChangeRequiresReset(previous, current string, requested bool) bool {
 	return requested || previous != current
+}
+
+type adaptiveTFOResetMode uint8
+
+const (
+	adaptiveTFOResetNone adaptiveTFOResetMode = iota
+	adaptiveTFOResetNonFallback
+	adaptiveTFOResetAll
+)
+
+// Hold mode preserves only verified ordinary-TCP fallbacks across a cellular
+// refresh. Successful and in-flight TFO observations are path-specific and are
+// revalidated. Leaving or entering cellular starts an entirely new session.
+func adaptiveTFOResetForNetworkChange(previous, current string, requested,
+	holdUntilNetworkChange bool) adaptiveTFOResetMode {
+	if !networkChangeRequiresReset(previous, current, requested) {
+		return adaptiveTFOResetNone
+	}
+	if holdUntilNetworkChange && isCellularInterface(previous) && isCellularInterface(current) {
+		return adaptiveTFOResetNonFallback
+	}
+	return adaptiveTFOResetAll
 }
 
 func parseSystemDNSJSON(raw string) ([]string, error) {
@@ -3054,8 +3089,9 @@ func Stop() {
 	configApplyMu.Lock()
 	defer configApplyMu.Unlock()
 	appendRunLog("Stop: 关闭内核")
-	setSnellAdaptiveTFO(false, "", "内核停止")
+	setSnellAdaptiveTFO(false, false, "", "内核停止")
 	snellAdaptiveTFO = false
+	snellAdaptiveTFOHold = false
 	storePhysicalInterface("")
 	activeDNSConfig = nil
 	activeSystemDNS = nil
@@ -3089,20 +3125,25 @@ func isCellularInterface(name string) bool {
 
 // setSnellAdaptiveTFO controls the bounded per-entrance state machine in the
 // patched Mihomo dialer. It never changes the process-wide DisableTFO switch.
-func setSnellAdaptiveTFO(enabled bool, interfaceName string, reason string) {
+func setSnellAdaptiveTFO(enabled, holdUntilNetworkChange bool, interfaceName string, reason string) {
 	dialer.SetAdaptiveTFOEnabled(enabled)
+	dialer.SetAdaptiveTFOHoldUntilNetworkChange(holdUntilNetworkChange)
 	appendRunLog(fmt.Sprintf("Snell 自适应 TFO：接口=%s，%s（原因：%s）",
-		displayInterfaceName(interfaceName), snellAdaptiveTFOStatus(enabled, interfaceName), reason))
+		displayInterfaceName(interfaceName),
+		snellAdaptiveTFOStatus(enabled, holdUntilNetworkChange, interfaceName), reason))
 }
 
-func snellAdaptiveTFOStatus(enabled bool, interfaceName string) string {
+func snellAdaptiveTFOStatus(enabled, holdUntilNetworkChange bool, interfaceName string) string {
 	if !enabled {
 		return "已关闭，按节点配置使用 TFO"
 	}
 	if !isCellularInterface(interfaceName) {
 		return "待机，Wi-Fi/非蜂窝网络保持原有 TFO 行为"
 	}
-	return "已启用，按入口探测；仅不兼容入口临时回退普通 TCP"
+	if holdUntilNetworkChange {
+		return "已启用，按入口探测；本次 VPN 连接中，不兼容入口保持普通 TCP 到离开蜂窝网络"
+	}
+	return "已启用，按入口探测；不兼容入口冷却后重新测试 TFO"
 }
 
 func displayInterfaceName(name string) string {

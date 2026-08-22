@@ -16,6 +16,9 @@ readonly TFO_OPTIONS_REL="component/dialer/options.go"
 readonly DIALER_REL="component/dialer/dialer.go"
 readonly SNELL_REL="adapter/outbound/snell.go"
 readonly TFO_TEST_REL="component/dialer/tfo_adaptive_test.go"
+readonly SNELL_TFO_TEST_REL="adapter/outbound/snell_adaptive_tfo_test.go"
+readonly SNELL_REPLY_REL="transport/snell/reply_confirmation.go"
+readonly SNELL_REPLY_TEST_REL="transport/snell/reply_confirmation_test.go"
 readonly EXPECTED_SOURCE_SHA="acfdffbbd6050aa0481fe4ea60f0f73a10bca6ed7a6cfbca108e2c1acb0a78f5"
 readonly EXPECTED_PATCHED_SHA="743d8bd6d5990bffc6c4e3bcca85b076f57d5065032495d335d65f02d10fdb44"
 readonly EXPECTED_TEST_SHA="89c8f16770938f8ee4f7503df39e6139620fdacfdcf9a52a5b7eef0977dcb0df"
@@ -25,20 +28,23 @@ readonly EXPECTED_HISTORY_SOURCE_SHA="508daa254d05b6414e899e4eb154cb3b83572d6223
 readonly EXPECTED_HISTORY_PATCHED_SHA="179b38a46b37a6ce04dc28b7bff3a70443b2bc1e6f1d5a6a56a774c51ae8e8d5"
 readonly EXPECTED_HISTORY_TEST_SHA="b27fab6962dbdad97ab7b8d24504e9a636e3e7813a0a5118f77eeed5f7c0522c"
 readonly EXPECTED_TFO_SOURCE_SHA="40b6a958fd8b1e595a49488494a5ee5ab8c98bf82f654469c525eeb69de11fdb"
-readonly EXPECTED_TFO_PATCHED_SHA="770c712310e8654c0940735fcf67e2e0383d00a1f407241a3ee03363e3c7219e"
+readonly EXPECTED_TFO_PATCHED_SHA="f6105df5e593422a3010b88d86f2305e13fadbe7042791a63533b181017d3488"
 readonly EXPECTED_TFO_OPTIONS_SOURCE_SHA="6225560d4f010f5db68f88dc93f61df848c6d0d3258e3183a459c185678c4e07"
 readonly EXPECTED_TFO_OPTIONS_PATCHED_SHA="9218fece2c2e751379297fc7a3444bd1a7d32d3b3de46234b1d3a3ddc8fb34e6"
 readonly EXPECTED_DIALER_SOURCE_SHA="1cd130049e1c8aec826d8eb5a625f4e64d2eccf6f1091b0cca2d1540ec49a531"
 readonly EXPECTED_DIALER_PATCHED_SHA="2e70eef86439a82ddb45149481e49136e2998cce39b2e71bd9e840b4aec968ab"
 readonly EXPECTED_SNELL_SOURCE_SHA="2fe5b01ee473842d383a2f80d89ba079992892cf344ddb9472a64c53590cbe43"
-readonly EXPECTED_SNELL_PATCHED_SHA="cff27c0adb2c3352fff7face1cd524535250f8659a327be0e6565a115e7efc60"
-readonly EXPECTED_TFO_TEST_SHA="32b4f5ad611853f9bc819c084c0a8259b1ca58573e158c4f9c4255e478f73e50"
+readonly EXPECTED_SNELL_PATCHED_SHA="8624de538c38d5b31f83fb0a1068c338e05046ba79393c1c6a2a97918fcf5068"
+readonly EXPECTED_TFO_TEST_SHA="31a815cefbdec9d641712c98fcf149e06fc46cd78c00e373b171b650950677c2"
+readonly EXPECTED_SNELL_TFO_TEST_SHA="0a33aa480699854264b797f835d39c17c853b04fd0ca417f544806529eaddcba"
+readonly EXPECTED_SNELL_REPLY_SHA="61a808c32c0f6c88cdd4edcf2556e83d7b2c6f1d94f705358dd491eaeee95b86"
+readonly EXPECTED_SNELL_REPLY_TEST_SHA="9dee34879638b699ddbc566fce3929923f66f492ce0b4493c840d38e73b09c79"
 readonly PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/mihomo-v1.19.30-oversize-buffer-pool.patch"
 readonly CONFIG_PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/mihomo-v1.19.30-progressive-config-parse.patch"
 readonly HISTORY_PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/mihomo-v1.19.30-connection-close-queue.patch"
 readonly HISTORY_TEST_PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/mihomo-v1.19.30-connection-close-queue-test.patch"
 readonly TFO_PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/mihomo-v1.19.30-snell-adaptive-tfo.patch"
-readonly PATCHED_DIR="${RUNNER_TEMP:?}/mihomo-v1.19.30-ios-cora-v2"
+readonly PATCHED_DIR="${RUNNER_TEMP:?}/mihomo-v1.19.30-ios-cora-v3"
 
 check_sha256() {
   local expected="$1"
@@ -88,10 +94,12 @@ check_sha256 "$EXPECTED_TFO_SOURCE_SHA" "$SOURCE_DIR/$TFO_REL"
 check_sha256 "$EXPECTED_TFO_OPTIONS_SOURCE_SHA" "$SOURCE_DIR/$TFO_OPTIONS_REL"
 check_sha256 "$EXPECTED_DIALER_SOURCE_SHA" "$SOURCE_DIR/$DIALER_REL"
 check_sha256 "$EXPECTED_SNELL_SOURCE_SHA" "$SOURCE_DIR/$SNELL_REL"
-if [[ -e "$SOURCE_DIR/$TFO_TEST_REL" ]]; then
-  echo "Unexpected upstream adaptive TFO test file: $SOURCE_DIR/$TFO_TEST_REL" >&2
-  exit 1
-fi
+for added_rel in "$TFO_TEST_REL" "$SNELL_TFO_TEST_REL" "$SNELL_REPLY_REL" "$SNELL_REPLY_TEST_REL"; do
+  if [[ -e "$SOURCE_DIR/$added_rel" ]]; then
+    echo "Unexpected upstream adaptive TFO file: $SOURCE_DIR/$added_rel" >&2
+    exit 1
+  fi
+done
 
 case "$PATCHED_DIR" in
   "$RUNNER_TEMP"/*) ;;
@@ -134,6 +142,9 @@ check_sha256 "$EXPECTED_TFO_OPTIONS_PATCHED_SHA" "$PATCHED_DIR/$TFO_OPTIONS_REL"
 check_sha256 "$EXPECTED_DIALER_PATCHED_SHA" "$PATCHED_DIR/$DIALER_REL"
 check_sha256 "$EXPECTED_SNELL_PATCHED_SHA" "$PATCHED_DIR/$SNELL_REL"
 check_sha256 "$EXPECTED_TFO_TEST_SHA" "$PATCHED_DIR/$TFO_TEST_REL"
+check_sha256 "$EXPECTED_SNELL_TFO_TEST_SHA" "$PATCHED_DIR/$SNELL_TFO_TEST_REL"
+check_sha256 "$EXPECTED_SNELL_REPLY_SHA" "$PATCHED_DIR/$SNELL_REPLY_REL"
+check_sha256 "$EXPECTED_SNELL_REPLY_TEST_SHA" "$PATCHED_DIR/$SNELL_REPLY_TEST_REL"
 
 go -C "$PATCHED_DIR" mod edit -require="$SING_MODULE@$EXPECTED_SING_VERSION"
 go -C "$PATCHED_DIR" mod edit -replace="$SING_MODULE@$EXPECTED_SING_VERSION=$PATCHED_SING_DIR"

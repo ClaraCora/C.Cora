@@ -5,49 +5,80 @@
 - Added: 2026-08-22
 - Upstream module: `github.com/metacubex/mihomo v1.19.30`
 - Patched files: `component/dialer/tfo.go`, `component/dialer/options.go`,
-  `component/dialer/dialer.go`, `adapter/outbound/snell.go`
+  `component/dialer/dialer.go`, `adapter/outbound/snell.go`; added protocol
+  confirmation helpers and regression tests under `transport/snell`,
+  `component/dialer`, and `adapter/outbound`
 - Build tags: default and `with_low_memory`
 
 ### Reason
 
 On Darwin, Mihomo's `tfo-go` dependency forces TCP Fast Open on and bypasses
 the operating system's native TFO backoff. Some cellular routes silently drop
-the TFO handshake even though ordinary TCP to the same IPv4 endpoint works.
-A process-wide `DisableTFO` workaround restored those routes, but unnecessarily
-disabled TFO for working Snell entrances, including entrances that work on the
-same cellular interface.
+the SYN payload even though `connectx` reports success and ordinary TCP to the
+same IPv4 endpoint works. Treating that local connect result as proof of TFO
+therefore misses the failure: the timeout is only visible when the client waits
+for the Snell protocol reply. A process-wide `DisableTFO` workaround restored
+those routes, but unnecessarily disabled TFO for working Snell entrances,
+including entrances that work on the same cellular interface.
 
 ### Local behavior
 
-The persisted Cora setting formerly named `cellularSnellCompatibility` is now
-shown as `Snell 自适应 TFO`. It opts only Snell dialers with node-level TFO
-enabled into adaptive handling. Other protocols, IPv6, Wi-Fi, and Snell nodes
-without TFO keep upstream behavior. Cora no longer writes Mihomo's global
+The persisted Cora setting formerly named `cellularSnellCompatibility` is shown
+as `Snell 自适应 TFO`. It opts only Snell dialers with node-level TFO enabled
+into adaptive handling. Other protocols, IPv6, Wi-Fi, and Snell nodes without
+TFO keep upstream behavior. Cora never writes Mihomo's process-wide
 `DisableTFO` variable.
 
 On a `pdp_ip*` interface, the first connection to each resolved IPv4
-`address:port` gets a 500 ms TFO probe bounded by the caller's original
-context. If that fails, the same early data is fully written over ordinary TCP.
-Only when ordinary TCP succeeds is that entrance marked incompatible and kept
-on ordinary TCP for ten minutes. It is then probed again, so recovery is
-automatic. If both methods fail, the route is not newly classified as a TFO
-failure. A network-path reset clears all observations.
+`address:port` writes the complete Snell request and waits up to one second for
+a protocol reply. A server `CommandError` still proves that TFO data arrived
+and is preserved as the request error rather than being misclassified as a TFO
+black hole. If no Snell reply arrives, the old socket is closed before a fresh
+ordinary TCP connection is opened. Cora rebuilds every obfs/TLS wrapper and the
+Snell cipher, rewrites the destination header, and classifies the entrance only
+after ordinary TCP receives a Snell reply. Raw encrypted bytes are never
+replayed across connections. The same confirmation path covers TCP, Snell v4
+UDP, active wrapper handshakes, and `reuse=true`; an unconfirmed or fallback
+connection is never returned to the reuse pool. If both methods fail, the route
+is left unclassified.
 
-The state cache retains no sockets, payloads, DNS answers, or goroutines. It is
-limited to 128 entries with least-recently-used eviction. Only one initial or
-cooldown probe runs per entrance; concurrent requests use ordinary TCP while
-that probe is pending. Snell's reuse pool now receives the caller context via
-`GetContext`, and the lazy TFO connection derives its timeout from that caller
-instead of `context.Background`. Mihomo emits log entries only when an entrance
-is first confirmed working, enters fallback, or recovers.
+`蜂窝期间保持普通 TCP` defaults on. Within the current VPN runtime, once an
+entrance is confirmed incompatible, all `pdp_ip*` indices in that continuous
+cellular session share the result and keep that entrance on ordinary TCP until
+Cora observes a real cellular/non-cellular transition. Reconnecting the VPN or
+restarting its Network Extension starts a fresh observation session; the cache
+is deliberately not persisted. This avoids making a new connection absorb a
+periodic failed probe without retaining stale network conclusions on disk. A
+cellular address or `pdp_ip` refresh still clears successful and in-flight
+observations so working entrances are revalidated, but preserves verified
+ordinary-TCP fallbacks. When the option is off, the entrance is eligible for a
+new TFO probe after ten minutes and ordinary network-path resets retain their
+previous behavior. Neither policy interrupts an existing connection merely to
+probe TFO.
+
+The state cache retains no sockets, payloads, DNS answers, timers, or
+goroutines. It is limited to 128 entries with least-recently-used eviction of
+safe observations. In-flight probes, held fallbacks, and fallbacks whose
+ten-minute cooldown has not expired are never evicted; if all 128 slots are
+protected, additional entrances temporarily use ordinary TCP until a slot is
+available. Only one initial or cooldown probe runs per entrance, and concurrent
+requests use ordinary TCP while that probe is pending. Snell's reuse pool now
+receives the caller context via `GetContext`, and the lazy TFO connection derives
+its timeout from that caller instead of `context.Background`. Caller cancellation
+abandons a new probe without claiming ordinary TCP failed; a canceled retry for
+an already incompatible entrance remains safely on ordinary TCP. Logs cover
+probe start, protocol confirmation, ordinary TCP verification, fallback policy,
+recovery, cancellation, and unclassified double failure.
 
 ### Verification
 
-The preparation script verifies exact SHA-256 values for all four upstream and
-patched files plus the added regression test. CI runs the dialer and outbound
-tests in default and low-memory builds. Tests cover TFO success, fallback and
-cached ordinary TCP, cooldown recovery, path reset, dual failure, the 128-entry
-bound, caller cancellation, and single-probe coordination.
+The preparation script verifies exact SHA-256 values for every upstream,
+patched, and added file. CI runs the dialer, Snell transport, and outbound tests
+in default and low-memory builds. Tests cover protocol-confirmed TFO success,
+server errors, fresh ordinary TCP reconstruction, cached and held fallback,
+cooldown recovery, path reset, dual failure, caller cancellation, single-probe
+coordination, non-eviction of active or protected fallback entries, the
+128-entry bound, and UDP/pool integration compilation.
 
 ### Rollback
 
@@ -55,11 +86,13 @@ Revert the commit that added this section and remove:
 
 - `dependency-patches/mihomo-v1.19.30-snell-adaptive-tfo.patch`;
 - its preparation-script SHA and apply wiring;
-- `SetAdaptiveTFOEnabled` / `ResetAdaptiveTFO` calls in MobileCore;
-- the `Snell 自适应 TFO` setting row or restore its earlier diagnostic meaning.
+- `SetAdaptiveTFOEnabled`, `SetAdaptiveTFOHoldUntilNetworkChange`, and
+  `ResetAdaptiveTFO` calls in MobileCore;
+- the `Snell 自适应 TFO` and `蜂窝期间保持普通 TCP` setting rows, or restore
+  the former diagnostic behavior.
 
-The UserDefaults key can remain; older builds already understand it as a
-Boolean and no user data migration is needed.
+Both UserDefaults keys can remain. Older builds continue to understand the
+original Boolean and ignore the new hold-policy key, so no migration is needed.
 
 ## mihomo-v1.19.30-connection-close-queue
 

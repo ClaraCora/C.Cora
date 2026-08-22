@@ -495,9 +495,16 @@ private struct KernelSettingsView: View {
                 InfoToggleRow(title: "IPv6", message: "允许隧道处理 IPv6 流量。部分网络或配置不支持 IPv6 时可以关闭。", systemImage: "network", isOn: $settings.ipv6)
                 InfoToggleRow(
                     title: "Snell 自适应 TFO",
-                    message: "在蜂窝网络上分别测试每个 Snell 入口。仅当某个入口的 TFO 失败而普通 TCP 可用时，临时对该入口回退普通 TCP，其他入口和 Wi-Fi 仍使用 TFO；10 分钟后自动重试。修改后重新连接 VPN 生效。",
+                    message: "在蜂窝网络上分别测试每个 Snell 入口。仅当某个入口的 TFO 失败而普通 TCP 可用时，才对该入口回退普通 TCP，其他入口和 Wi-Fi 仍使用 TFO。修改后重新连接 VPN 生效。",
                     systemImage: "antenna.radiowaves.left.and.right",
                     isOn: $settings.cellularSnellCompatibility)
+                InfoToggleRow(
+                    title: "蜂窝期间保持普通 TCP",
+                    message: "入口确认不兼容后，在本次 VPN 连接中持续使用普通 TCP，直到离开蜂窝网络。关闭后每 10 分钟允许下一条新连接重新测试 TFO。修改后重新连接 VPN 生效。",
+                    systemImage: "arrow.triangle.2.circlepath",
+                    isOn: $settings.snellAdaptiveTFOHoldUntilNetworkChange)
+                    .disabled(!settings.cellularSnellCompatibility)
+                    .opacity(settings.cellularSnellCompatibility ? 1 : 0.45)
                 HStack {
                     Label {
                         InfoLabel(title: "本机代理端口", message: "在本机回环监听 HTTP+SOCKS 混合代理端口，设为 0 表示关闭。")
