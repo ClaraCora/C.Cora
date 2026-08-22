@@ -127,6 +127,7 @@ var (
 	activeUsesSystemDNS  bool
 	pendingUsesSystemDNS bool
 	coreStartedAt        time.Time
+	cellularSnellCompat  bool
 )
 
 // Version 返回「mihomo 内核版本 / Go 运行时版本」。
@@ -355,6 +356,7 @@ type appSettings struct {
 	GeoAutoUpdate     bool                   `json:"geoAutoUpdate"`
 	GeoUpdateInterval int                    `json:"geoUpdateInterval"`
 	LogLevel          string                 `json:"logLevel"`
+	CellularSnellCompatibility bool          `json:"cellularSnellCompatibility"`
 	UnifiedDelay      bool                   `json:"unifiedDelay"`
 	MixedPort         int                    `json:"mixedPort"`
 	BlockDirectSTUN   bool                   `json:"blockDirectSTUN"`
@@ -417,7 +419,8 @@ func parseSettings(settingsJSON string) appSettings {
 		IgnoreGeoNegation: false, GeoUpdateInterval: 24,
 		GeoIPDatURL: "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat",
 		GeoMMDBURL:  "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb",
-		GeoSiteURL:  "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat"}
+		GeoSiteURL:  "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat",
+		CellularSnellCompatibility: false}
 	if strings.TrimSpace(settingsJSON) != "" {
 		_ = json.Unmarshal([]byte(settingsJSON), &s)
 	}
@@ -613,9 +616,11 @@ func StartWithConfig(fd int, tunnelMTU int, configYAML string, settingsJSON stri
 
 	resetError := resetRunLog()
 	st := parseSettings(settingsJSON)
-	appendRunLog(fmt.Sprintf("StartWithConfig: fd=%d mtu=%d stack=%s ipv6=%v geo=%v(mode=%v,%s,ignoreNegation=%v) log=%s",
+	cellularSnellCompat = st.CellularSnellCompatibility
+	appendRunLog(fmt.Sprintf("StartWithConfig: fd=%d mtu=%d stack=%s ipv6=%v geo=%v(mode=%v,%s,ignoreNegation=%v) log=%s cellularSnellCompat=%v",
 		fd, tunnelMTU, st.Stack, st.IPv6, st.GeoEnabled, st.GeodataMode, st.GeoLoader,
-		st.IgnoreGeoNegation, st.LogLevel))
+		st.IgnoreGeoNegation, st.LogLevel, st.CellularSnellCompatibility))
+	setCellularSnellCompatibility(st.CellularSnellCompatibility, currentPhysicalInterface(), "启动")
 	if resetError != nil {
 		appendRunLog("run.log 重置失败: " + resetError.Error())
 	}
@@ -2064,6 +2069,17 @@ func GroupDelay(group, url, directURL string, timeoutMs int) string {
 	if !ok {
 		return `{"error":"不是策略组"}`
 	}
+	compatSnell := false
+	if cellularSnellCompat && isCellularInterface(currentPhysicalInterface()) {
+		for _, member := range g.Proxies() {
+			if member.Type() == C.Snell {
+				compatSnell = true
+				appendRunLog(fmt.Sprintf("Snell 蜂窝兼容测试：分组测速 %s 使用普通 TCP（TFO 已关闭），接口=%s",
+					group, currentPhysicalInterface()))
+				break
+			}
+		}
+	}
 	if url == "" {
 		url = "https://www.gstatic.com/generate_204"
 	}
@@ -2102,6 +2118,16 @@ func GroupDelay(group, url, directURL string, timeoutMs int) string {
 		}()
 	}
 	wait.Wait()
+	if compatSnell {
+		timedOut := 0
+		for _, delay := range dm {
+			if delay == 0 {
+				timedOut++
+			}
+		}
+		appendRunLog(fmt.Sprintf("Snell 蜂窝兼容测试：分组测速 %s 完成，超时 %d/%d",
+			group, timedOut, len(dm)))
+	}
 	out, err := json.Marshal(dm)
 	if err != nil {
 		return `{"error":"marshal: ` + err.Error() + `"}`
@@ -2133,6 +2159,11 @@ func ProxyDelay(name, group, url, directURL string, timeoutMs int) string {
 	if !exist {
 		return `{"error":"节点不存在"}`
 	}
+	compatSnell := cellularSnellCompat && isCellularInterface(currentPhysicalInterface()) && p.Type() == C.Snell
+	if compatSnell {
+		appendRunLog(fmt.Sprintf("Snell 蜂窝兼容测试：单节点测速 %s 使用普通 TCP（TFO 已关闭），接口=%s",
+			name, currentPhysicalInterface()))
+	}
 	if url == "" {
 		url = "https://www.gstatic.com/generate_204"
 	}
@@ -2149,13 +2180,25 @@ func ProxyDelay(name, group, url, directURL string, timeoutMs int) string {
 	delay, err := p.URLTest(ctx,
 		delayURLForProxy(p, url, directURL, proxies), expectedStatus)
 	if err != nil {
+		if compatSnell {
+			appendRunLog(fmt.Sprintf("Snell 蜂窝兼容测试：单节点测速 %s 失败：%v",
+				name, err))
+		}
 		if proxyDelayTimedOut(ctx, err) {
 			return `{"delay":0}`
 		}
 		return `{"error":"` + err.Error() + `"}`
 	}
 	if delay == 0 {
+		if compatSnell {
+			appendRunLog(fmt.Sprintf("Snell 蜂窝兼容测试：单节点测速 %s 超时",
+				name))
+		}
 		return `{"delay":0}`
+	}
+	if compatSnell {
+		appendRunLog(fmt.Sprintf("Snell 蜂窝兼容测试：单节点测速 %s 成功，延迟=%dms",
+			name, delay))
 	}
 	out, err := json.Marshal(map[string]uint16{"delay": delay})
 	if err != nil {
@@ -2748,6 +2791,7 @@ func NotifyNetworkChange(name string, systemDNSJSON string, reason string,
 	storePhysicalInterface(name)
 	previous := dialer.DefaultInterface.Load()
 	dialer.DefaultInterface.Store(name)
+	setCellularSnellCompatibility(cellularSnellCompat, name, "网络路径变化")
 	resetConnections = networkChangeRequiresReset(previous, name, resetConnections)
 	if resetConnections {
 		iface.FlushCache()
@@ -3005,6 +3049,8 @@ func Stop() {
 	configApplyMu.Lock()
 	defer configApplyMu.Unlock()
 	appendRunLog("Stop: 关闭内核")
+	setCellularSnellCompatibility(false, "", "内核停止")
+	cellularSnellCompat = false
 	storePhysicalInterface("")
 	activeDNSConfig = nil
 	activeSystemDNS = nil
@@ -3030,6 +3076,34 @@ func currentPhysicalInterface() string {
 	name := physicalIface
 	interfaceMu.RUnlock()
 	return name
+}
+
+func isCellularInterface(name string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(name)), "pdp_ip")
+}
+
+// setCellularSnellCompatibility applies the opt-in mobile transport probe.
+// Mihomo exposes TFO as a process-wide dialer switch, so this deliberately
+// changes only the socket feature, not node YAML or the selected proxy.
+func setCellularSnellCompatibility(enabled bool, interfaceName string, reason string) {
+	cellular := isCellularInterface(interfaceName)
+	desired := enabled && cellular
+	previous := dialer.DisableTFO
+	dialer.DisableTFO = desired
+	if previous == desired {
+		return
+	}
+	if enabled {
+		if cellular {
+			appendRunLog(fmt.Sprintf("蜂窝 Snell 兼容测试已启用：接口=%s，关闭 TCP Fast Open（原因：%s）",
+				interfaceName, reason))
+		} else {
+			appendRunLog(fmt.Sprintf("蜂窝 Snell 兼容测试待机：接口=%s，Wi-Fi/有线保持 TCP Fast Open（原因：%s）",
+				interfaceName, reason))
+		}
+	} else {
+		appendRunLog(fmt.Sprintf("蜂窝 Snell 兼容测试已关闭：恢复 TCP Fast Open（原因：%s）", reason))
+	}
 }
 
 // appendRunLog 追加一行到 <home>/run.log（封装层自己的标记，便于和内核日志混排）。

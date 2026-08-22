@@ -3,7 +3,7 @@ import Foundation
 /// 内核相关设置（持久化到 UserDefaults）。
 ///
 /// 这些影响 NE 内 mihomo 的启动配置：连接时序列化为 JSON 经 startVPNTunnel(options) 下发，
-/// Go 侧 StartWithConfig 据此覆盖 tun.stack / ipv6 / geo / log-level。
+/// Go 侧 StartWithConfig 据此覆盖 tun.stack / ipv6 / geo / log-level 和蜂窝 Snell 兼容策略。
 /// 因此**修改后需重新连接才生效**。
 @MainActor
 final class SettingsStore: ObservableObject {
@@ -32,6 +32,11 @@ final class SettingsStore: ObservableObject {
     @Published var geoUpdateInterval: Int { didSet { d.set(geoUpdateInterval, forKey: K.geoInterval) } }
     /// 日志等级：silent / error / warning / info / debug。
     @Published var logLevel: String { didSet { d.set(logLevel, forKey: K.logLevel) } }
+    /// 蜂窝网络下的 Snell 兼容测试。启用后内核会在 pdp_ip* 接口关闭 TCP Fast Open，
+    /// 用于排查特定移动入口对 TFO/早期数据不兼容的问题。修改后需重新连接 VPN 生效。
+    @Published var cellularSnellCompatibility: Bool {
+        didSet { d.set(cellularSnellCompatibility, forKey: K.cellularSnellCompatibility) }
+    }
     /// 策略组与节点测速使用的 HTTP(S) 地址，仅由主 App 的测速 IPC 使用，无需重连。
     @Published var delayTestURL: String { didSet { d.set(delayTestURL, forKey: K.delayTestURL) } }
     /// DIRECT/国内直连节点使用的测速地址，仅由主 App 的测速 IPC 使用。
@@ -120,6 +125,7 @@ final class SettingsStore: ObservableObject {
         static let ignoreGeoNegation = "set.ignoreGeoNegation"
         static let geoAuto = "set.geoAuto", geoInterval = "set.geoInterval"
         static let logLevel = "set.logLevel"
+        static let cellularSnellCompatibility = "set.cellularSnellCompatibility"
         static let delayTestURL = "set.delayTestURL"
         static let directDelayTestURL = "set.directDelayTestURL"
         static let unifiedDelay = "set.unifiedDelay"
@@ -146,6 +152,7 @@ final class SettingsStore: ObservableObject {
         let gi = d.integer(forKey: K.geoInterval)
         geoUpdateInterval = gi == 0 ? 24 : gi
         logLevel = d.string(forKey: K.logLevel) ?? "info"
+        cellularSnellCompatibility = d.object(forKey: K.cellularSnellCompatibility) as? Bool ?? false
         delayTestURL = d.string(forKey: K.delayTestURL) ?? Self.defaultDelayTestURL
         directDelayTestURL = d.string(forKey: K.directDelayTestURL)
             ?? Self.defaultDirectDelayTestURL
@@ -181,6 +188,7 @@ final class SettingsStore: ObservableObject {
             "geoAutoUpdate": geoAutoUpdate,
             "geoUpdateInterval": geoUpdateInterval,
             "logLevel": logLevel,
+            "cellularSnellCompatibility": cellularSnellCompatibility,
             "unifiedDelay": unifiedDelay,
             "mixedPort": mixedPort,
             "blockDirectSTUN": blockDirectSTUN,

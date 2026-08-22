@@ -309,6 +309,8 @@ func TestMergeConfigSTUNProtectionKeepsDirectModeSemantics(t *testing.T) {
 func TestNetworkInterfaceUpdates(t *testing.T) {
 	previous := dialer.DefaultInterface.Load()
 	defer dialer.DefaultInterface.Store(previous)
+	previousTFO := dialer.DisableTFO
+	defer func() { dialer.DisableTFO = previousTFO }()
 	previousPhysical := currentPhysicalInterface()
 	defer storePhysicalInterface(previousPhysical)
 
@@ -332,6 +334,31 @@ func TestNetworkInterfaceUpdates(t *testing.T) {
 	}
 	if got := dialer.DefaultInterface.Load(); got != "pdp_ip0" {
 		t.Fatalf("empty network update changed interface to %q", got)
+	}
+}
+
+func TestCellularSnellCompatibilityDisablesTFOOnlyOnCellular(t *testing.T) {
+	previousTFO := dialer.DisableTFO
+	defer func() { dialer.DisableTFO = previousTFO }()
+
+	if !isCellularInterface("pdp_ip0") || !isCellularInterface("PDP_IP1") {
+		t.Fatal("pdp_ip interfaces should be recognized as cellular")
+	}
+	if isCellularInterface("en0") || isCellularInterface("") {
+		t.Fatal("Wi-Fi and empty interfaces should not be recognized as cellular")
+	}
+
+	setCellularSnellCompatibility(true, "pdp_ip0", "test")
+	if !dialer.DisableTFO {
+		t.Fatal("cellular compatibility should disable TFO")
+	}
+	setCellularSnellCompatibility(true, "en0", "test")
+	if dialer.DisableTFO {
+		t.Fatal("Wi-Fi should keep TFO enabled")
+	}
+	setCellularSnellCompatibility(false, "pdp_ip0", "test")
+	if dialer.DisableTFO {
+		t.Fatal("disabled compatibility should keep TFO enabled")
 	}
 }
 
@@ -717,12 +744,16 @@ func TestParseSettingsGeoDefaultsAndOverride(t *testing.T) {
 	if defaults.IgnoreGeoNegation {
 		t.Error("IgnoreGeoNegation default = true, want false")
 	}
+	if defaults.CellularSnellCompatibility {
+		t.Error("CellularSnellCompatibility default = true, want false")
+	}
 	if defaults.GeoMMDBURL == "" || defaults.GeoIPDatURL == "" || defaults.GeoSiteURL == "" {
 		t.Error("default GEO download URLs must not be empty")
 	}
 	custom := parseSettings(`{
 		"geoEnabled": false,
 		"ignoreGeoNegation": true,
+		"cellularSnellCompatibility": true,
 		"geodataMode": false,
 		"geoIPDatURL": "https://example.com/GeoIP.dat",
 		"geoMMDBURL": "https://example.com/geoip.metadb",
@@ -733,6 +764,9 @@ func TestParseSettingsGeoDefaultsAndOverride(t *testing.T) {
 	}
 	if !custom.IgnoreGeoNegation {
 		t.Error("IgnoreGeoNegation override = false, want true")
+	}
+	if !custom.CellularSnellCompatibility {
+		t.Error("CellularSnellCompatibility override = false, want true")
 	}
 	if custom.GeodataMode {
 		t.Error("GeodataMode override = true, want false")

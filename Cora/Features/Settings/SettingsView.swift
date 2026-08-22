@@ -493,6 +493,11 @@ private struct KernelSettingsView: View {
                     InfoLabel(title: "日志级别", message: "控制内核输出的日志详细程度。修改后重新连接 VPN 生效。")
                 }
                 InfoToggleRow(title: "IPv6", message: "允许隧道处理 IPv6 流量。部分网络或配置不支持 IPv6 时可以关闭。", systemImage: "network", isOn: $settings.ipv6)
+                InfoToggleRow(
+                    title: "蜂窝网络 Snell 兼容测试",
+                    message: "仅用于排查特定手机网络入口的 Snell 连接问题。开启后，蜂窝网络会关闭 TCP Fast Open；Wi-Fi 行为不变。修改后重新连接 VPN 生效。",
+                    systemImage: "antenna.radiowaves.left.and.right",
+                    isOn: $settings.cellularSnellCompatibility)
                 HStack {
                     Label {
                         InfoLabel(title: "本机代理端口", message: "在本机回环监听 HTTP+SOCKS 混合代理端口，设为 0 表示关闭。")
