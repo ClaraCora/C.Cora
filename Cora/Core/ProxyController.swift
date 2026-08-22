@@ -53,11 +53,39 @@ struct ProxyGroup: Identifiable {
     var selectable: Bool { type.caseInsensitiveCompare("Selector") == .orderedSame }
 }
 
-/// 将引用策略组解析为当前实际出口节点。延迟只存实际节点，显示时再把结果映射回引用项，
-/// 使“总模式 -> 地区分组 -> 节点”的多个入口始终展示同一条测速结果。
-enum ProxyDelayResolver {
-    /// 返回延迟查询优先级：实际节点优先，其次是引用链上的分组名（兼容旧会话数据）。
-    static func keys(for name: String, groups: [ProxyGroup]) -> [String] {
+struct ProxySelectionResolution {
+    let immediateSelection: String
+    let finalNode: String
+    let path: [String]
+
+    var hasDistinctFinalNode: Bool { finalNode != immediateSelection }
+}
+
+/// 沿策略组当前选择递归找到最终出口。精确匹配组名，并对循环、空引用和过深引用安全降级。
+enum ProxySelectionResolver {
+    private static let maximumDepth = 64
+
+    static func resolve(group: ProxyGroup,
+                        groups: [ProxyGroup]) -> ProxySelectionResolution? {
+        let immediate = group.now
+        guard !immediate.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+        return resolve(name: immediate, groups: groups, initiallyVisited: [group.name])
+    }
+
+    static func resolve(name: String,
+                        groups: [ProxyGroup]) -> ProxySelectionResolution? {
+        resolve(name: name, groups: groups, initiallyVisited: [])
+    }
+
+    private static func resolve(name: String,
+                                groups: [ProxyGroup],
+                                initiallyVisited: Set<String>) -> ProxySelectionResolution? {
+        guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+
         var lookup: [String: ProxyGroup] = [:]
         for group in groups {
             lookup[group.name] = group
@@ -65,16 +93,47 @@ enum ProxyDelayResolver {
 
         var current = name
         var path = [name]
-        var visited: Set<String> = [name]
-        while let group = lookup[current] {
-            let selected = group.now.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !selected.isEmpty, visited.insert(selected).inserted else { break }
+        var visited = initiallyVisited
+        guard visited.insert(name).inserted else {
+            return ProxySelectionResolution(immediateSelection: name,
+                                            finalNode: name,
+                                            path: path)
+        }
+
+        for _ in 0..<maximumDepth {
+            guard let group = lookup[current] else {
+                return ProxySelectionResolution(immediateSelection: name,
+                                                finalNode: current,
+                                                path: path)
+            }
+            let selected = group.now
+            guard !selected.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  visited.insert(selected).inserted else {
+                return ProxySelectionResolution(immediateSelection: name,
+                                                finalNode: name,
+                                                path: path)
+            }
             current = selected
             path.append(selected)
         }
 
-        var result = [current]
-        for alias in path.reversed() where !result.contains(alias) {
+        return ProxySelectionResolution(immediateSelection: name,
+                                        finalNode: name,
+                                        path: path)
+    }
+}
+
+/// 延迟只存实际节点，显示时再把结果映射回引用项，
+/// 使“总模式 -> 地区分组 -> 节点”的多个入口始终展示同一条测速结果。
+enum ProxyDelayResolver {
+    /// 返回延迟查询优先级：实际节点优先，其次是引用链上的分组名（兼容旧会话数据）。
+    static func keys(for name: String, groups: [ProxyGroup]) -> [String] {
+        guard let resolution = ProxySelectionResolver.resolve(name: name, groups: groups) else {
+            return [name]
+        }
+
+        var result = [resolution.finalNode]
+        for alias in resolution.path.reversed() where !result.contains(alias) {
             result.append(alias)
         }
         return result
@@ -103,6 +162,8 @@ enum ProxyDelayResolver {
 final class ProxyController: ObservableObject {
 
     @Published private(set) var groups: [ProxyGroup] = []
+    /// 完整分组图用于递归解析引用；`groups` 仍只包含当前模式需要展示的分组。
+    @Published private(set) var resolutionGroups: [ProxyGroup] = []
     @Published private(set) var mode: String = "rule"
     @Published var isLoading = false
     @Published private(set) var hasLoaded = false
@@ -166,11 +227,13 @@ final class ProxyController: ObservableObject {
             self.error = "拿不到节点：\(reason)"
             mode = "rule"
             groups = []
+            resolutionGroups = []
             return
         case .ok(let data):
             guard let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
                 error = "解析失败（IPC 响应非 JSON）"
                 groups = []
+                resolutionGroups = []
                 return
             }
             mode = ((obj["mode"] as? String) ?? "rule").lowercased()
@@ -183,12 +246,14 @@ final class ProxyController: ObservableObject {
             // 直连模式没有节点页数据，不再额外请求协议详情。
             if runtimeAvailable && mode == "direct" {
                 groups = []
+                resolutionGroups = []
                 return
             }
 
             guard let proxies = obj["proxies"] as? [String: Any] else {
                 error = "解析代理列表失败"
                 groups = []
+                resolutionGroups = []
                 return
             }
 
@@ -207,10 +272,15 @@ final class ProxyController: ObservableObject {
                                   hidden: d["hidden"] as? Bool ?? false)
             }
 
+            let groupLookup = Dictionary(uniqueKeysWithValues: proxies.keys.compactMap { name in
+                makeGroup(name).map { (name, $0) }
+            })
+            resolutionGroups = Array(groupLookup.values)
+
             switch mode {
             case "global":
                 // 全局模式：只看 GLOBAL 组（在它里面选全局出口）
-                groups = makeGroup("GLOBAL").map { [$0] } ?? []
+                groups = groupLookup["GLOBAL"].map { [$0] } ?? []
             case "direct" where runtimeAvailable:
                 groups = []
             default: // rule
@@ -218,12 +288,16 @@ final class ProxyController: ObservableObject {
                 var ordered: [ProxyGroup] = []
                 var seen = Set<String>()
                 for name in order where name != "GLOBAL" {
-                    if let g = makeGroup(name) { ordered.append(g); seen.insert(name) }
+                    if let group = groupLookup[name] {
+                        ordered.append(group)
+                        seen.insert(name)
+                    }
                 }
                 // 兜底：GLOBAL.all 缺失时，补上未收录的策略组
                 if ordered.isEmpty {
-                    for (name, _) in proxies where name != "GLOBAL" && !seen.contains(name) {
-                        if let g = makeGroup(name) { ordered.append(g) }
+                    for (name, group) in groupLookup {
+                        guard name != "GLOBAL", !seen.contains(name) else { continue }
+                        ordered.append(group)
                     }
                 }
                 groups = ordered
@@ -236,6 +310,7 @@ final class ProxyController: ObservableObject {
         loadGeneration &+= 1
         sessionGeneration &+= 1
         groups = []
+        resolutionGroups = []
         mode = "rule"
         isLoading = false
         hasLoaded = false
@@ -344,7 +419,7 @@ final class ProxyController: ObservableObject {
         testing.insert(name)
         let memberNames = groups.first(where: { $0.name == name })?.all ?? []
         let memberDelayKeys = Set(memberNames.map {
-            ProxyDelayResolver.storageKey(for: $0, groups: groups)
+            ProxyDelayResolver.storageKey(for: $0, groups: resolutionGroups)
         })
         var cleared = delays
         for key in memberDelayKeys {
@@ -374,12 +449,12 @@ final class ProxyController: ObservableObject {
             }
             var updated = delays
             for node in memberNames {
-                let key = ProxyDelayResolver.storageKey(for: node, groups: groups)
+                let key = ProxyDelayResolver.storageKey(for: node, groups: resolutionGroups)
                 updated[key] = (dict[node] as? NSNumber)?.intValue ?? 0
             }
             for (node, ms) in dict {
                 if let value = (ms as? NSNumber)?.intValue, !memberNames.contains(node) {
-                    let key = ProxyDelayResolver.storageKey(for: node, groups: groups)
+                    let key = ProxyDelayResolver.storageKey(for: node, groups: resolutionGroups)
                     updated[key] = value
                 }
             }
@@ -397,7 +472,7 @@ final class ProxyController: ObservableObject {
         let session = sessionGeneration
         error = nil
         testingNodes.insert(testingKey)
-        let delayKey = ProxyDelayResolver.storageKey(for: name, groups: groups)
+        let delayKey = ProxyDelayResolver.storageKey(for: name, groups: resolutionGroups)
         delays.removeValue(forKey: delayKey)
         persistDelays()
         defer {

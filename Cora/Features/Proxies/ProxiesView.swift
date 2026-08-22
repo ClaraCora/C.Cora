@@ -1,11 +1,11 @@
 import SwiftUI
 import UIKit
 
-/// 节点页：紧凑展示策略组，展开后可搜索、切换并比较节点延迟。
+/// 策略/节点页：按固定类别展示分组，展开后可搜索、切换并比较节点延迟。
 struct ProxiesView: View {
     @EnvironmentObject private var core: CoreStateManager
-    @EnvironmentObject private var subscriptions: SubscriptionStore
-    @StateObject private var controller = ProxyController()
+    @ObservedObject var controller: ProxyController
+    let category: ProxyGroupCategory
     @State private var expanded: Set<String> = []
     @State private var gridRowFrames: [Int: CGRect] = [:]
     @State private var gridCardFrames: [String: CGRect] = [:]
@@ -24,7 +24,6 @@ struct ProxiesView: View {
     @AppStorage("proxyNodeLayout") private var layoutRawValue = ProxyNodeLayout.grid.rawValue
     @AppStorage("proxyGroupGradients") private var gradientStorage = "{}"
     @AppStorage("proxyShowHiddenGroups") private var showHiddenGroups = false
-    @AppStorage("proxyGroupCategory") private var groupCategoryRawValue = ProxyGroupCategory.strategy.rawValue
 
     var body: some View {
         NavigationStack {
@@ -48,11 +47,6 @@ struct ProxiesView: View {
             .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    if !controller.groups.isEmpty {
-                        groupCategoryPicker
-                    }
-                }
                 ToolbarItemGroup(placement: .topBarTrailing) {
                     HStack(spacing: 4) {
                         if hasHiddenGroups {
@@ -96,29 +90,22 @@ struct ProxiesView: View {
             }
             .onChange(of: core.status) { _, status in
                 switch status {
-                case .connecting:
-                    // NE 会在 startTunnel 中创建新的持久化会话；这里先停止旧的异步任务。
-                    controller.resetSession()
-                    expanded = []
-                    activeNodeTestTarget = nil
-                    gridExpansion = nil
-                    expandedPanelFrames = [:]
-                case .disconnected, .invalid:
-                    controller.clearDisconnectedSession()
-                    expanded = []
-                    activeNodeTestTarget = nil
-                    gridExpansion = nil
-                    expandedPanelFrames = [:]
+                case .connecting, .disconnected, .invalid:
+                    resetDisplayedGroupState()
                 default:
                     break
                 }
             }
-            .task(id: LoadContext(status: core.status.rawValue,
-                                  subscriptionID: subscriptions.selectedID,
-                                  configurationUpdatedAt: subscriptions.selected?.updatedAt,
-                                  providerRevision: subscriptions.providerCacheRevision)) {
+            .task {
                 loadGroupGradients()
-                await reload()
+                assignMissingGradients()
+            }
+            .onChange(of: groupStructureSignature) { _, _ in
+                assignMissingGradients()
+                synchronizeDisplayedGroups()
+            }
+            .onChange(of: gradientStorage) { _, _ in
+                loadGroupGradients()
             }
             .onChange(of: isSearchPresented) { _, presented in
                 if !presented { searchText = "" }
@@ -148,9 +135,6 @@ struct ProxiesView: View {
                 toolbarControlsVisible = true
                 activeNodeTestTarget = nil
             }
-            .onChange(of: groupCategoryRawValue) { _, _ in
-                resetDisplayedGroupState()
-            }
             .onChange(of: showHiddenGroups) { _, _ in
                 resetDisplayedGroupState()
             }
@@ -175,15 +159,18 @@ struct ProxiesView: View {
     }
 
     private var showsSearch: Bool {
-        canRefresh && !controller.groups.isEmpty
+        canRefresh && !visibleGroups.isEmpty
     }
 
     private var hasHiddenGroups: Bool {
-        controller.groups.contains(where: { $0.hidden })
+        let allGroupNames = Set(controller.resolutionGroups.map(\.name))
+        return controller.groups.contains { group in
+            group.hidden && groupCategory(for: group, groupNames: allGroupNames) == category
+        }
     }
 
     private var selectedGroupCategory: ProxyGroupCategory {
-        ProxyGroupCategory(rawValue: groupCategoryRawValue) ?? .strategy
+        category
     }
 
     private var nodeLayout: ProxyNodeLayout {
@@ -208,39 +195,6 @@ struct ProxiesView: View {
         .help("切换节点布局")
     }
 
-    private var groupCategoryPicker: some View {
-        HStack(spacing: 2) {
-            ForEach(ProxyGroupCategory.allCases) { category in
-                Button {
-                    guard groupCategoryRawValue != category.rawValue else { return }
-                    groupCategoryRawValue = category.rawValue
-                } label: {
-                    Image(systemName: category.systemImage)
-                        .font(.system(size: 16, weight: .semibold))
-                        .frame(width: 62, height: 34)
-                        .foregroundStyle(groupCategoryRawValue == category.rawValue
-                                         ? Color.primary
-                                         : Color.secondary)
-                        .background {
-                            if groupCategoryRawValue == category.rawValue {
-                                Capsule(style: .continuous)
-                                    .fill(Color.primary.opacity(0.13))
-                            }
-                        }
-                }
-                .buttonStyle(.plain)
-                .contentShape(Capsule(style: .continuous))
-                .accessibilityLabel(category.title)
-                .accessibilityAddTraits(groupCategoryRawValue == category.rawValue
-                                       ? .isSelected
-                                       : [])
-            }
-        }
-        .frame(width: 132, height: 40)
-        .accessibilityLabel("分组类型")
-        .help("切换策略组或节点组")
-    }
-
     private var hiddenGroupsToggle: some View {
         Toggle(isOn: $showHiddenGroups) {
             Image(systemName: showHiddenGroups ? "eye" : "eye.slash")
@@ -263,6 +217,9 @@ struct ProxiesView: View {
     }
 
     private var emptyGroupDescription: String {
+        if category == .node && controller.mode == "global" {
+            return "全局模式仅使用 GLOBAL 策略组，请在策略页面选择出口"
+        }
         guard hasHiddenGroups, !showHiddenGroups else {
             return "当前配置没有可显示的\(selectedGroupCategory.title)"
         }
@@ -283,11 +240,11 @@ struct ProxiesView: View {
                 systemImage: "arrow.up.forward",
                 description: Text("当前为直连模式，不经过代理节点"))
         } else if controller.groups.isEmpty && (!controller.hasLoaded || controller.isLoading) {
-            ProgressView("加载策略组…")
+            ProgressView("加载\(selectedGroupCategory.title)…")
         } else if controller.groups.isEmpty {
-            ContentUnavailableView("没有策略组",
-                systemImage: "square.stack.3d.up",
-                description: Text("当前配置没有可显示的代理策略组"))
+            ContentUnavailableView("没有\(selectedGroupCategory.title)",
+                systemImage: selectedGroupCategory.systemImage,
+                description: Text("当前配置没有可显示的\(selectedGroupCategory.title)"))
         } else {
             groupList
         }
@@ -378,7 +335,7 @@ struct ProxiesView: View {
         let group = result.group
         return StrategyGroupListPanel(
             group: group,
-            allGroups: controller.groups,
+            allGroups: controller.resolutionGroups,
             visibleNodes: result.nodes,
             isExpanded: result.isExpanded,
             isInteractionLocked: activeGroupName != nil && activeGroupName != group.name,
@@ -565,6 +522,7 @@ struct ProxiesView: View {
             ForEach(row) { result in
                 GroupGridCard(
                     group: result.group,
+                    allGroups: controller.resolutionGroups,
                     canTest: controller.isRuntimeAvailable,
                     gradientIndex: groupGradient(for: result.group.name),
                     isInteractionLocked: activeGroupName != nil &&
@@ -618,7 +576,7 @@ struct ProxiesView: View {
                                onToggle: @escaping () -> Void) -> some View {
         let panel = GroupExpandedPanel(
             group: result.group,
-            allGroups: controller.groups,
+            allGroups: controller.resolutionGroups,
             isTesting: controller.testing.contains(result.group.name),
             canTest: controller.isRuntimeAvailable,
             selecting: controller.selecting[result.group.name],
@@ -690,11 +648,21 @@ struct ProxiesView: View {
         searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
+    /// Tracks category membership and ordering without coupling local presentation
+    /// state to every delay or selection update published by the shared controller.
+    private var groupStructureSignature: [String] {
+        let resolutionNames = controller.resolutionGroups.map(\.name).sorted()
+            .joined(separator: "\u{1E}")
+        return [resolutionNames] + controller.groups.map { group in
+            "\(group.name)\u{1F}\(group.hidden)\u{1F}\(group.all.joined(separator: "\u{1E}"))"
+        }
+    }
+
     /// A node group contains only concrete proxy nodes; a strategy group points
     /// at one or more other groups. Empty groups stay in the strategy category
     /// until their provider members are available, avoiding category flicker.
     private var visibleGroups: [ProxyGroup] {
-        let allGroupNames = Set(controller.groups.map(\.name))
+        let allGroupNames = Set(controller.resolutionGroups.map(\.name))
         return controller.groups.filter { group in
             (showHiddenGroups || !group.hidden) &&
                 groupCategory(for: group, groupNames: allGroupNames) == selectedGroupCategory
@@ -736,7 +704,10 @@ struct ProxiesView: View {
     }
 
     private func groupMetadata(_ group: ProxyGroup) -> String {
-        "\(group.name) \(group.now) \(group.type) \(group.displayType)".lowercased()
+        let finalNode = ProxySelectionResolver.resolve(group: group,
+                                                       groups: controller.resolutionGroups)?.finalNode ?? ""
+        return "\(group.name) \(group.now) \(finalNode) \(group.type) \(group.displayType)"
+            .lowercased()
     }
 
     private func toggleListGroup(_ name: String) {
@@ -922,6 +893,10 @@ struct ProxiesView: View {
     private func reload() async {
         await controller.load()
         assignMissingGradients()
+        synchronizeDisplayedGroups()
+    }
+
+    private func synchronizeDisplayedGroups() {
         guard expanded.allSatisfy({ name in
             visibleGroups.contains(where: { $0.name == name })
         }) else {
@@ -984,7 +959,7 @@ struct ProxiesView: View {
     }
 }
 
-private enum ProxyGroupCategory: String, CaseIterable, Identifiable {
+enum ProxyGroupCategory: String, CaseIterable, Identifiable {
     case strategy
     case node
 
@@ -1012,13 +987,6 @@ private enum ProxyNodeLayout: String {
     var systemImage: String {
         self == .list ? "list.bullet" : "square.grid.2x2"
     }
-}
-
-private struct LoadContext: Hashable {
-    let status: Int
-    let subscriptionID: UUID?
-    let configurationUpdatedAt: Date?
-    let providerRevision: Int
 }
 
 private struct GridScrollRequest: Hashable {
@@ -1216,12 +1184,15 @@ private struct StrategyGroupListPanel: View {
             Group {
                 if isExpanded {
                     GroupExpandedHeader(group: group,
+                                        allGroups: allGroups,
                                         isTesting: isTesting,
                                         canTest: canTest,
                                         onToggle: onToggle,
                                         onTest: onTest)
                 } else {
-                    GroupCompactHeader(group: group, onToggle: onToggle)
+                    GroupCompactHeader(group: group,
+                                       allGroups: allGroups,
+                                       onToggle: onToggle)
                 }
             }
             .padding(.horizontal, 10)
@@ -1489,6 +1460,7 @@ private struct ProxyNodeListRow: View {
 
 private struct GroupGridCard: View {
     let group: ProxyGroup
+    let allGroups: [ProxyGroup]
     let canTest: Bool
     let gradientIndex: Int
     let isInteractionLocked: Bool
@@ -1497,7 +1469,9 @@ private struct GroupGridCard: View {
     let onRandomizeAll: (() -> Void)?
 
     var body: some View {
-        GroupCompactHeader(group: group, onToggle: onToggle)
+        GroupCompactHeader(group: group,
+                           allGroups: allGroups,
+                           onToggle: onToggle)
         .padding(8)
         .frame(maxWidth: .infinity, minHeight: 76, alignment: .leading)
         .background(GroupGradient.background(for: gradientIndex))
@@ -1548,6 +1522,7 @@ private struct GroupExpandedPanel: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             GroupExpandedHeader(group: group,
+                                allGroups: allGroups,
                                 isTesting: isTesting,
                                 canTest: canTest,
                                 onToggle: onToggle,
@@ -1606,8 +1581,20 @@ private struct GroupExpandedPanel: View {
 
 private struct GroupCompactHeader: View {
     let group: ProxyGroup
+    let allGroups: [ProxyGroup]
     let onToggle: () -> Void
     var compact = false
+
+    private var selectionLines: [String] {
+        guard let resolution = ProxySelectionResolver.resolve(group: group,
+                                                              groups: allGroups) else {
+            return ["未选择"]
+        }
+        if resolution.hasDistinctFinalNode {
+            return [resolution.immediateSelection, resolution.finalNode]
+        }
+        return [resolution.immediateSelection]
+    }
 
     var body: some View {
         Button(action: onToggle) {
@@ -1615,9 +1602,24 @@ private struct GroupCompactHeader: View {
                 GroupIcon(url: group.icon)
                 VStack(alignment: .leading, spacing: compact ? 1 : 3) {
                     Text(group.name).font(.headline).lineLimit(1)
-                    Text(group.now.isEmpty ? "未选择" : group.now)
-                        .font(.caption).foregroundStyle(.secondary).lineLimit(compact ? 1 : 2)
-                        .frame(minHeight: compact ? 17 : 30, alignment: .topLeading)
+                    if compact {
+                        Text(selectionLines[0])
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .frame(minHeight: 17, alignment: .topLeading)
+                    } else {
+                        VStack(alignment: .leading, spacing: 0) {
+                            ForEach(Array(selectionLines.enumerated()), id: \.offset) { _, line in
+                                Text(line)
+                                    .lineLimit(1)
+                                    .truncationMode(.tail)
+                            }
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(minHeight: 30, alignment: .topLeading)
+                    }
                 }
             }
             .frame(maxWidth: .infinity, minHeight: compact ? 44 : 54, alignment: .leading)
@@ -1625,11 +1627,15 @@ private struct GroupCompactHeader: View {
         }
         .buttonStyle(.plain)
         .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(group.name)
+        .accessibilityValue(selectionLines.joined(separator: "，"))
     }
 }
 
 private struct GroupExpandedHeader: View {
     let group: ProxyGroup
+    let allGroups: [ProxyGroup]
     let isTesting: Bool
     let canTest: Bool
     let onToggle: () -> Void
@@ -1637,7 +1643,10 @@ private struct GroupExpandedHeader: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            GroupCompactHeader(group: group, onToggle: onToggle, compact: true)
+            GroupCompactHeader(group: group,
+                               allGroups: allGroups,
+                               onToggle: onToggle,
+                               compact: true)
             Button(action: onTest) {
                 Image(systemName: isTesting ? "hourglass" : "speedometer")
                     .font(.system(size: 16, weight: .semibold))
