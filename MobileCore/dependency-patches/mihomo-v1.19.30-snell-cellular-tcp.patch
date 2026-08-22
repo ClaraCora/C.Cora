@@ -1,0 +1,223 @@
+diff --git a/adapter/outbound/snell.go b/adapter/outbound/snell.go
+index c4142ec41aa88506eab4cb847b8005f71d38bbf1..7c14afd2caa1551bd9efe67eca51e87c2c82370b 100644
+--- a/adapter/outbound/snell.go
++++ b/adapter/outbound/snell.go
+@@ -8,6 +8,7 @@ import (
+ 
+ 	N "github.com/metacubex/mihomo/common/net"
+ 	"github.com/metacubex/mihomo/common/structure"
++	"github.com/metacubex/mihomo/component/dialer"
+ 	C "github.com/metacubex/mihomo/constant"
+ 	"github.com/metacubex/mihomo/transport/jls"
+ 	"github.com/metacubex/mihomo/transport/restls"
+@@ -282,7 +283,7 @@ func NewSnell(option SnellOption) (*Snell, error) {
+ 		version:         option.Version,
+ 		reuse:           reuse,
+ 	}
+-	s.dialer = option.NewDialer(s.DialOptions())
++	s.dialer = option.NewDialer(append(s.DialOptions(), dialer.WithSnellCellularTCP(option.Name)))
+ 
+ 	if s.reuse {
+ 		s.pool = snell.NewPool(func(ctx context.Context) (*snell.Snell, error) {
+diff --git a/component/dialer/dialer.go b/component/dialer/dialer.go
+index c4e9c5cee89b4642da9eae6affffd3e069883021..65fff4892376cc85ae49eb3c5a9e2b9057d32479 100644
+--- a/component/dialer/dialer.go
++++ b/component/dialer/dialer.go
+@@ -166,7 +166,7 @@ func dialContext(ctx context.Context, network string, destination netip.Addr, po
+ 		if opt.routingMark != 0 {
+ 			bindMarkToDialer(opt.routingMark, dialer, network, destination)
+ 		}
+-		if opt.tfo && !DisableTFO {
++		if shouldUseTFO(opt) {
+ 			return dialTFO(ctx, *dialer, network, address)
+ 		}
+ 	}
+diff --git a/component/dialer/options.go b/component/dialer/options.go
+index c1c622ddf3b06876fd941cb87976d968537ab59c..d77a3b8f67b52e846123aab1765f816749436ac1 100644
+--- a/component/dialer/options.go
++++ b/component/dialer/options.go
+@@ -32,6 +32,7 @@ func (f NetDialerFunc) DialContext(ctx context.Context, network, address string)
+ 
+ type option struct {
+ 	interfaceName string
++	snellName     string
+ 	fallbackBind  bool
+ 	addrReuse     bool
+ 	routingMark   int
+@@ -103,6 +104,15 @@ func WithTFO(tfo bool) Option {
+ 	}
+ }
+ 
++// WithSnellCellularTCP marks a Snell dialer with its exact proxy name. The
++// embedding application can force only selected Snell nodes to ordinary TCP
++// while the active physical interface is cellular.
++func WithSnellCellularTCP(name string) Option {
++	return func(opt *option) {
++		opt.snellName = name
++	}
++}
++
+ func WithMPTCP(mpTcp bool) Option {
+ 	return func(opt *option) {
+ 		opt.mpTcp = mpTcp
+diff --git a/component/dialer/snell_cellular_tcp.go b/component/dialer/snell_cellular_tcp.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..49f53abbd20e248b9c43a4d0c344dec057f2c8c4
+--- /dev/null
++++ b/component/dialer/snell_cellular_tcp.go
+@@ -0,0 +1,51 @@
++package dialer
++
++import (
++	"strings"
++	"sync/atomic"
++)
++
++type snellCellularTCPNodeSet struct {
++	names map[string]struct{}
++}
++
++const maxSnellCellularTCPNodes = 4096
++
++var snellCellularTCPNodes atomic.Pointer[snellCellularTCPNodeSet]
++
++// SetSnellCellularTCPNodes atomically replaces the exact Snell proxy names
++// that should skip TFO on iOS cellular interfaces. The immutable snapshot
++// keeps the hot dial path lock-free and does not retain connections or data.
++func SetSnellCellularTCPNodes(names []string) {
++	capacity := len(names)
++	if capacity > maxSnellCellularTCPNodes {
++		capacity = maxSnellCellularTCPNodes
++	}
++	snapshot := &snellCellularTCPNodeSet{names: make(map[string]struct{}, capacity)}
++	for _, name := range names {
++		if name != "" {
++			snapshot.names[name] = struct{}{}
++			if len(snapshot.names) == maxSnellCellularTCPNodes {
++				break
++			}
++		}
++	}
++	snellCellularTCPNodes.Store(snapshot)
++}
++
++func shouldUseSnellCellularTCP(name, interfaceName string) bool {
++	if name == "" || !strings.HasPrefix(strings.ToLower(strings.TrimSpace(interfaceName)), "pdp_ip") {
++		return false
++	}
++	snapshot := snellCellularTCPNodes.Load()
++	if snapshot == nil {
++		return false
++	}
++	_, selected := snapshot.names[name]
++	return selected
++}
++
++func shouldUseTFO(opt option) bool {
++	return opt.tfo && !DisableTFO &&
++		!shouldUseSnellCellularTCP(opt.snellName, opt.interfaceName)
++}
+diff --git a/component/dialer/snell_cellular_tcp_test.go b/component/dialer/snell_cellular_tcp_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..6075a826277285313341d7a3a50fa1f000404569
+--- /dev/null
++++ b/component/dialer/snell_cellular_tcp_test.go
+@@ -0,0 +1,98 @@
++package dialer
++
++import (
++	"fmt"
++	"testing"
++)
++
++func TestSnellCellularTCPSelection(t *testing.T) {
++	SetSnellCellularTCPNodes([]string{"problem entrance", "日本-NB"})
++	t.Cleanup(func() { SetSnellCellularTCPNodes(nil) })
++
++	tests := []struct {
++		name          string
++		node          string
++		interfaceName string
++		want          bool
++	}{
++		{name: "selected cellular node", node: "problem entrance", interfaceName: "pdp_ip0", want: true},
++		{name: "cellular interface is case insensitive", node: "日本-NB", interfaceName: " PDP_IP1 ", want: true},
++		{name: "unselected cellular node", node: "normal BGP", interfaceName: "pdp_ip0", want: false},
++		{name: "selected Wi-Fi node", node: "problem entrance", interfaceName: "en0", want: false},
++		{name: "empty node", interfaceName: "pdp_ip0", want: false},
++	}
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			if got := shouldUseSnellCellularTCP(test.node, test.interfaceName); got != test.want {
++				t.Fatalf("shouldUseSnellCellularTCP(%q, %q) = %v, want %v",
++					test.node, test.interfaceName, got, test.want)
++			}
++		})
++	}
++}
++
++func TestSnellCellularTCPSelectionCanBeReplaced(t *testing.T) {
++	SetSnellCellularTCPNodes([]string{"old"})
++	SetSnellCellularTCPNodes([]string{"new", "new", ""})
++	t.Cleanup(func() { SetSnellCellularTCPNodes(nil) })
++
++	if shouldUseSnellCellularTCP("old", "pdp_ip0") {
++		t.Fatal("replaced node remained selected")
++	}
++	if !shouldUseSnellCellularTCP("new", "pdp_ip0") {
++		t.Fatal("new node was not selected")
++	}
++}
++
++func TestSnellCellularTCPSelectionIsExactAndBounded(t *testing.T) {
++	names := make([]string, maxSnellCellularTCPNodes+1)
++	for index := range names {
++		names[index] = fmt.Sprintf("node-%05d", index)
++	}
++	names[0] = " exact name "
++	SetSnellCellularTCPNodes(names)
++	t.Cleanup(func() { SetSnellCellularTCPNodes(nil) })
++
++	if !shouldUseSnellCellularTCP(" exact name ", "pdp_ip0") ||
++		shouldUseSnellCellularTCP("exact name", "pdp_ip0") {
++		t.Fatal("Snell cellular TCP selection must preserve the exact proxy name")
++	}
++	if shouldUseSnellCellularTCP(names[maxSnellCellularTCPNodes], "pdp_ip0") {
++		t.Fatal("Snell cellular TCP selection exceeded its bounded snapshot")
++	}
++}
++
++func TestSnellCellularTCPSelectionControlsTFO(t *testing.T) {
++	SetSnellCellularTCPNodes([]string{"problem entrance"})
++	t.Cleanup(func() { SetSnellCellularTCPNodes(nil) })
++	previousDisableTFO := DisableTFO
++	t.Cleanup(func() { DisableTFO = previousDisableTFO })
++	DisableTFO = false
++
++	selected := applyOptions(
++		WithTFO(true),
++		WithInterface("pdp_ip0"),
++		WithSnellCellularTCP("problem entrance"),
++	)
++	if shouldUseTFO(selected) {
++		t.Fatal("selected cellular Snell node kept TFO enabled")
++	}
++
++	unselected := applyOptions(
++		WithTFO(true),
++		WithInterface("pdp_ip0"),
++		WithSnellCellularTCP("normal BGP"),
++	)
++	if !shouldUseTFO(unselected) {
++		t.Fatal("unselected cellular Snell node lost TFO")
++	}
++
++	wifi := applyOptions(
++		WithTFO(true),
++		WithInterface("en0"),
++		WithSnellCellularTCP("problem entrance"),
++	)
++	if !shouldUseTFO(wifi) {
++		t.Fatal("selected Snell node lost TFO on Wi-Fi")
++	}
++}

@@ -3,7 +3,7 @@ import Foundation
 /// 内核相关设置（持久化到 UserDefaults）。
 ///
 /// 这些影响 NE 内 mihomo 的启动配置：连接时序列化为 JSON 经 startVPNTunnel(options) 下发，
-/// Go 侧 StartWithConfig 据此覆盖 tun.stack / ipv6 / geo / log-level 和 Snell 自适应 TFO 策略。
+/// Go 侧 StartWithConfig 据此覆盖 tun.stack / ipv6 / geo / log-level 和 Snell 蜂窝 TCP 策略。
 /// 因此**修改后需重新连接才生效**。
 @MainActor
 final class SettingsStore: ObservableObject {
@@ -32,18 +32,10 @@ final class SettingsStore: ObservableObject {
     @Published var geoUpdateInterval: Int { didSet { d.set(geoUpdateInterval, forKey: K.geoInterval) } }
     /// 日志等级：silent / error / warning / info / debug。
     @Published var logLevel: String { didSet { d.set(logLevel, forKey: K.logLevel) } }
-    /// 蜂窝网络下按 Snell 实际入口探测 TFO；仅对已确认不兼容的入口回退普通 TCP。
-    /// 保留旧持久化键，避免升级后丢失用户选择。修改后需重新连接 VPN 生效。
-    @Published var cellularSnellCompatibility: Bool {
-        didSet { d.set(cellularSnellCompatibility, forKey: K.cellularSnellCompatibility) }
-    }
-    /// 已确认入口不兼容 TFO 后，在本次 VPN 运行中持续使用普通 TCP，直到离开蜂窝网络。
-    /// 默认开启，避免固定冷却时间结束后的重复探测造成短暂断流。
-    @Published var snellAdaptiveTFOHoldUntilNetworkChange: Bool {
-        didSet {
-            d.set(snellAdaptiveTFOHoldUntilNetworkChange,
-                  forKey: K.snellAdaptiveTFOHoldUntilNetworkChange)
-        }
+    /// 指定在蜂窝网络使用普通 TCP 的 Snell 节点。Wi-Fi 下仍保留节点原有 TFO 行为。
+    /// 节点名按配置原文精确保存；默认空集合，不迁移旧版自适应开关。
+    @Published var snellCellularTCPNodes: Set<String> {
+        didSet { d.set(snellCellularTCPNodes.sorted(), forKey: K.snellCellularTCPNodes) }
     }
     /// 策略组与节点测速使用的 HTTP(S) 地址，仅由主 App 的测速 IPC 使用，无需重连。
     @Published var delayTestURL: String { didSet { d.set(delayTestURL, forKey: K.delayTestURL) } }
@@ -133,9 +125,7 @@ final class SettingsStore: ObservableObject {
         static let ignoreGeoNegation = "set.ignoreGeoNegation"
         static let geoAuto = "set.geoAuto", geoInterval = "set.geoInterval"
         static let logLevel = "set.logLevel"
-        static let cellularSnellCompatibility = "set.cellularSnellCompatibility"
-        static let snellAdaptiveTFOHoldUntilNetworkChange =
-            "set.snellAdaptiveTFOHoldUntilNetworkChange"
+        static let snellCellularTCPNodes = "set.snellCellularTCPNodes"
         static let delayTestURL = "set.delayTestURL"
         static let directDelayTestURL = "set.directDelayTestURL"
         static let unifiedDelay = "set.unifiedDelay"
@@ -162,9 +152,7 @@ final class SettingsStore: ObservableObject {
         let gi = d.integer(forKey: K.geoInterval)
         geoUpdateInterval = gi == 0 ? 24 : gi
         logLevel = d.string(forKey: K.logLevel) ?? "info"
-        cellularSnellCompatibility = d.object(forKey: K.cellularSnellCompatibility) as? Bool ?? false
-        snellAdaptiveTFOHoldUntilNetworkChange =
-            d.object(forKey: K.snellAdaptiveTFOHoldUntilNetworkChange) as? Bool ?? true
+        snellCellularTCPNodes = Set(d.stringArray(forKey: K.snellCellularTCPNodes) ?? [])
         delayTestURL = d.string(forKey: K.delayTestURL) ?? Self.defaultDelayTestURL
         directDelayTestURL = d.string(forKey: K.directDelayTestURL)
             ?? Self.defaultDirectDelayTestURL
@@ -200,8 +188,7 @@ final class SettingsStore: ObservableObject {
             "geoAutoUpdate": geoAutoUpdate,
             "geoUpdateInterval": geoUpdateInterval,
             "logLevel": logLevel,
-            "cellularSnellCompatibility": cellularSnellCompatibility,
-            "snellAdaptiveTFOHoldUntilNetworkChange": snellAdaptiveTFOHoldUntilNetworkChange,
+            "snellCellularTCPNodes": snellCellularTCPNodes.sorted(),
             "unifiedDelay": unifiedDelay,
             "mixedPort": mixedPort,
             "blockDirectSTUN": blockDirectSTUN,

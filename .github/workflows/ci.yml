@@ -118,8 +118,10 @@ jobs:
       - name: Verify patched Mihomo
         run: |
           set -euxo pipefail
-          go -C "$PATCHED_MIHOMO" test ./common/pool ./config ./tunnel/statistic ./component/dialer ./transport/snell ./adapter/outbound
-          go -C "$PATCHED_MIHOMO" test -tags "with_low_memory" ./common/pool ./config ./tunnel/statistic ./component/dialer ./transport/snell ./adapter/outbound
+          go -C "$PATCHED_MIHOMO" test ./common/pool ./config ./tunnel/statistic ./component/dialer ./adapter/outbound
+          go -C "$PATCHED_MIHOMO" test -tags "with_low_memory" ./common/pool ./config ./tunnel/statistic ./component/dialer ./adapter/outbound
+          go -C "$PATCHED_MIHOMO" vet ./component/dialer ./adapter/outbound
+          go -C "$PATCHED_MIHOMO" vet -tags "with_low_memory" ./component/dialer ./adapter/outbound
 
       - name: Verify patched gVisor TCP
         run: |

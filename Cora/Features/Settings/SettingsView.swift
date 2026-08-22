@@ -493,18 +493,11 @@ private struct KernelSettingsView: View {
                     InfoLabel(title: "日志级别", message: "控制内核输出的日志详细程度。修改后重新连接 VPN 生效。")
                 }
                 InfoToggleRow(title: "IPv6", message: "允许隧道处理 IPv6 流量。部分网络或配置不支持 IPv6 时可以关闭。", systemImage: "network", isOn: $settings.ipv6)
-                InfoToggleRow(
-                    title: "Snell 自适应 TFO",
-                    message: "在蜂窝网络上分别测试每个 Snell 入口。仅当某个入口的 TFO 失败而普通 TCP 可用时，才对该入口回退普通 TCP，其他入口和 Wi-Fi 仍使用 TFO。修改后重新连接 VPN 生效。",
+                SettingsNavigationRow(
+                    title: "Snell 蜂窝普通 TCP",
                     systemImage: "antenna.radiowaves.left.and.right",
-                    isOn: $settings.cellularSnellCompatibility)
-                InfoToggleRow(
-                    title: "蜂窝期间保持普通 TCP",
-                    message: "入口确认不兼容后，在本次 VPN 连接中持续使用普通 TCP，直到离开蜂窝网络。关闭后每 10 分钟允许下一条新连接重新测试 TFO。修改后重新连接 VPN 生效。",
-                    systemImage: "arrow.triangle.2.circlepath",
-                    isOn: $settings.snellAdaptiveTFOHoldUntilNetworkChange)
-                    .disabled(!settings.cellularSnellCompatibility)
-                    .opacity(settings.cellularSnellCompatibility ? 1 : 0.45)
+                    message: "手动指定需要在蜂窝网络使用普通 TCP 的 Snell 节点。Wi-Fi 和其他节点保持原有连接方式，修改后重新连接 VPN 生效。",
+                    destination: SnellCellularTCPSettingsView())
                 HStack {
                     Label {
                         InfoLabel(title: "本机代理端口", message: "在本机回环监听 HTTP+SOCKS 混合代理端口，设为 0 表示关闭。")
@@ -568,6 +561,249 @@ private struct KernelSettingsView: View {
             isKernelAvailable = false
         }
         isCheckingKernel = false
+    }
+}
+
+private struct SnellCellularTCPSettingsView: View {
+    @EnvironmentObject private var settings: SettingsStore
+    @EnvironmentObject private var subscriptions: SubscriptionStore
+
+    @State private var availableNodes: [String] = []
+    @State private var isLoading = true
+    @State private var hasLoadedSnapshot = false
+    @State private var loadError: String?
+    @State private var emptyMessage: String?
+    @State private var snapshotWarning: String?
+    @State private var searchText = ""
+
+    var body: some View {
+        Form {
+            Section {
+                SettingsInfoRow(
+                    title: "蜂窝网络专用",
+                    systemImage: "antenna.radiowaves.left.and.right",
+                    tint: .accentColor,
+                    message: "仅在蜂窝网络下让所选 Snell 节点使用普通 TCP。Wi-Fi 下仍按节点原配置使用 TFO；修改后需要重新连接 VPN 才会生效。")
+            }
+            .listRowBackground(AppListRowBackground())
+
+            if isLoading {
+                Section {
+                    HStack(spacing: 10) {
+                        ProgressView()
+                        Text("正在读取 Snell 节点…")
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .accessibilityElement(children: .combine)
+                }
+                .listRowBackground(AppListRowBackground())
+            } else if let loadError {
+                Section {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Label("无法读取节点", systemImage: "exclamationmark.triangle")
+                            .font(.body.weight(.medium))
+                            .foregroundStyle(.red)
+                        Text(loadError)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Button {
+                            Task { await loadSnellNodes() }
+                        } label: {
+                            Label("重新读取", systemImage: "arrow.clockwise")
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
+                .listRowBackground(AppListRowBackground())
+            } else {
+                Section {
+                    if let emptyMessage {
+                        Label(emptyMessage, systemImage: "tray")
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else if filteredAvailableNodes.isEmpty {
+                        Label("没有符合搜索条件的节点", systemImage: "magnifyingglass")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(filteredAvailableNodes, id: \.self) { name in
+                            nodeToggle(name)
+                        }
+                    }
+                } header: {
+                    Text("当前配置")
+                } footer: {
+                    if let snapshotWarning {
+                        Text(snapshotWarning)
+                            .foregroundStyle(.orange)
+                    } else {
+                        Text("开启后，该节点仅在蜂窝网络下跳过 TFO，改用普通 TCP。")
+                    }
+                }
+                .listRowBackground(AppListRowBackground())
+            }
+
+            if !isLoading && !removableSavedNodes.isEmpty {
+                Section {
+                    if filteredRemovableSavedNodes.isEmpty {
+                        Label("没有符合搜索条件的旧选择", systemImage: "magnifyingglass")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(filteredRemovableSavedNodes, id: \.self) { name in
+                            nodeToggle(name)
+                        }
+                    }
+                } header: {
+                    Text(hasLoadedSnapshot ? "当前缓存中未找到" : "已保存的选择")
+                } footer: {
+                    if hasLoadedSnapshot {
+                        Text("这些名称来自以前的选择，可能已被订阅删除、改名，或所在的 Provider 尚未缓存。关闭开关即可移除。")
+                    } else {
+                        Text("当前无法核对这些节点是否仍在配置中，关闭开关即可移除已保存的选择。")
+                    }
+                }
+                .listRowBackground(AppListRowBackground())
+            }
+        }
+        .scrollContentBackground(.hidden)
+        .background(AppAmbientBackground())
+        .navigationTitle("Snell 蜂窝普通 TCP")
+        .navigationBarTitleDisplayMode(.inline)
+        .searchable(text: $searchText, prompt: "搜索 Snell 节点")
+        .task(id: reloadID) { await loadSnellNodes() }
+    }
+
+    private var reloadID: String {
+        let configurationRevision = subscriptions.selected?.updatedAt?.timeIntervalSinceReferenceDate ?? 0
+        return "\(subscriptions.selectedID?.uuidString ?? "none")-\(configurationRevision)-\(subscriptions.providerCacheRevision)"
+    }
+
+    private var availableNodeSet: Set<String> {
+        Set(availableNodes)
+    }
+
+    private var staleNodes: [String] {
+        settings.snellCellularTCPNodes
+            .subtracting(availableNodeSet)
+            .sorted(by: Self.nodeNameOrder)
+    }
+
+    private var removableSavedNodes: [String] {
+        if hasLoadedSnapshot { return staleNodes }
+        return settings.snellCellularTCPNodes.sorted(by: Self.nodeNameOrder)
+    }
+
+    private var filteredAvailableNodes: [String] {
+        filter(availableNodes)
+    }
+
+    private var filteredRemovableSavedNodes: [String] {
+        filter(removableSavedNodes)
+    }
+
+    @ViewBuilder
+    private func nodeToggle(_ name: String) -> some View {
+        Toggle(isOn: selectionBinding(for: name)) {
+            Text(name)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .accessibilityHint("开启后在蜂窝网络使用普通 TCP；修改后重新连接 VPN 生效")
+    }
+
+    private func selectionBinding(for name: String) -> Binding<Bool> {
+        Binding(
+            get: { settings.snellCellularTCPNodes.contains(name) },
+            set: { isSelected in
+                var selection = settings.snellCellularTCPNodes
+                if isSelected {
+                    selection.insert(name)
+                } else {
+                    selection.remove(name)
+                }
+                settings.snellCellularTCPNodes = selection
+            })
+    }
+
+    private func filter(_ nodes: [String]) -> [String] {
+        guard !searchText.isEmpty else { return nodes }
+        return nodes.filter { $0.localizedCaseInsensitiveContains(searchText) }
+    }
+
+    private func loadSnellNodes() async {
+        isLoading = true
+        availableNodes = []
+        hasLoadedSnapshot = false
+        loadError = nil
+        emptyMessage = nil
+        snapshotWarning = nil
+
+        guard let subscription = subscriptions.selected else {
+            isLoading = false
+            emptyMessage = "请先在“配置与订阅”中选择一个配置"
+            return
+        }
+        guard !subscription.yaml.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            isLoading = false
+            emptyMessage = "当前配置还没有可读取的内容"
+            return
+        }
+
+        let providerPayloadsJSON = subscriptions.providerPayloadsJSON(for: subscription.id)
+        let selectionsJSON = Self.jsonString(subscription.proxySelections)
+        let data = await Task.detached(priority: .userInitiated) {
+            MihomoCore.offlineProxySnapshot(
+                configYAML: subscription.yaml,
+                providerPayloadsJSON: providerPayloadsJSON,
+                selectionsJSON: selectionsJSON)
+        }.value
+        guard !Task.isCancelled else { return }
+
+        guard let response = try? JSONDecoder().decode(SnapshotResponse.self, from: data) else {
+            isLoading = false
+            loadError = "离线配置解析返回了无法识别的数据，请重新读取。"
+            return
+        }
+        if let error = response.error, !error.isEmpty {
+            isLoading = false
+            loadError = "配置解析失败：\(error)"
+            return
+        }
+        guard let nodeTypes = response.nodeTypes else {
+            isLoading = false
+            loadError = "内核没有返回节点协议信息，请更新内核后重试。"
+            return
+        }
+
+        availableNodes = nodeTypes.compactMap { name, type in
+            type.caseInsensitiveCompare("snell") == .orderedSame ? name : nil
+        }.sorted(by: Self.nodeNameOrder)
+        hasLoadedSnapshot = true
+        if availableNodes.isEmpty {
+            emptyMessage = "当前配置中没有可选择的 Snell 节点"
+        }
+        if let missingProviders = response.missingProviders,
+           !missingProviders.isEmpty {
+            snapshotWarning = "部分 Provider 尚未缓存：\(missingProviders.joined(separator: "、"))。刷新远程资源后可显示其中的 Snell 节点。"
+        }
+        isLoading = false
+    }
+
+    private static func jsonString(_ value: [String: String]) -> String {
+        guard let data = try? JSONEncoder().encode(value),
+              let string = String(data: data, encoding: .utf8) else { return "{}" }
+        return string
+    }
+
+    private static func nodeNameOrder(_ lhs: String, _ rhs: String) -> Bool {
+        lhs.localizedStandardCompare(rhs) == .orderedAscending
+    }
+
+    private struct SnapshotResponse: Decodable {
+        let nodeTypes: [String: String]?
+        let missingProviders: [String]?
+        let error: String?
     }
 }
 

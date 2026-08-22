@@ -144,7 +144,7 @@ func TestOfflineProxySnapshotCombinesInlineAndCachedProviders(t *testing.T) {
 	configYAML := `
 mode: rule
 proxies:
-  - {name: inline, type: ss, server: 192.0.2.1, port: 443, cipher: aes-128-gcm, password: test}
+  - {name: inline, type: SS, server: 192.0.2.1, port: 443, cipher: aes-128-gcm, password: test}
 proxy-providers:
   airport:
     type: http
@@ -170,6 +170,7 @@ rules:
 		Mode      string                    `json:"mode"`
 		Proxies   map[string]map[string]any `json:"proxies"`
 		Details   map[string]string         `json:"details"`
+		NodeTypes map[string]string         `json:"nodeTypes"`
 		NodeCount int                       `json:"nodeCount"`
 	}
 	if err := json.Unmarshal([]byte(OfflineProxySnapshot(configYAML, string(payloads), `{"Select":"SG One"}`)), &got); err != nil {
@@ -192,6 +193,33 @@ rules:
 	}
 	if !strings.Contains(got.Details["HK One"], "VLESS") || got.Mode != "rule" {
 		t.Fatalf("snapshot details/mode = %+v / %q", got.Details, got.Mode)
+	}
+	for name, wantType := range map[string]string{
+		"inline": "ss", "HK One": "vless", "SG One": "vmess",
+	} {
+		if got.NodeTypes[name] != wantType {
+			t.Errorf("nodeTypes[%q] = %q, want %q", name, got.NodeTypes[name], wantType)
+		}
+	}
+	if _, exists := got.NodeTypes["US One"]; exists {
+		t.Error("filtered provider node US One should not appear in nodeTypes")
+	}
+}
+
+func TestOfflineProxySnapshotMalformedYAMLIncludesEmptyNodeTypes(t *testing.T) {
+	var got struct {
+		NodeTypes map[string]string `json:"nodeTypes"`
+		Error     string            `json:"error"`
+	}
+	encoded := OfflineProxySnapshot("proxies: [", "{}", "{}")
+	if err := json.Unmarshal([]byte(encoded), &got); err != nil {
+		t.Fatalf("OfflineProxySnapshot returned invalid JSON %q: %v", encoded, err)
+	}
+	if got.NodeTypes == nil || len(got.NodeTypes) != 0 {
+		t.Fatalf("nodeTypes = %#v, want a non-nil empty map", got.NodeTypes)
+	}
+	if got.Error == "" {
+		t.Fatal("malformed YAML should return an error")
 	}
 }
 
@@ -335,14 +363,7 @@ func TestNetworkInterfaceUpdates(t *testing.T) {
 	}
 }
 
-func TestSnellAdaptiveTFOSettingDoesNotDisableTFOGlobally(t *testing.T) {
-	previousAdaptive := dialer.AdaptiveTFOEnabled()
-	previousDisableTFO := dialer.DisableTFO
-	defer func() {
-		dialer.SetAdaptiveTFOEnabled(previousAdaptive)
-		dialer.DisableTFO = previousDisableTFO
-	}()
-
+func TestSnellCellularTCPNodeNormalizationAndStatus(t *testing.T) {
 	if !isCellularInterface("pdp_ip0") || !isCellularInterface("PDP_IP1") {
 		t.Fatal("pdp_ip interfaces should be recognized as cellular")
 	}
@@ -350,27 +371,53 @@ func TestSnellAdaptiveTFOSettingDoesNotDisableTFOGlobally(t *testing.T) {
 		t.Fatal("Wi-Fi and empty interfaces should not be recognized as cellular")
 	}
 
-	dialer.DisableTFO = false
-	setSnellAdaptiveTFO(true, true, "pdp_ip0", "test")
-	if !dialer.AdaptiveTFOEnabled() {
-		t.Fatal("adaptive TFO should be enabled")
+	got := normalizeSnellCellularTCPNodes([]string{
+		"  Tokyo CM  ", "Shanghai BGP", "Tokyo CM", "", "   ", "Shanghai BGP",
+	})
+	want := []string{"  Tokyo CM  ", "Shanghai BGP", "Tokyo CM"}
+	if !equalStringSlices(got, want) {
+		t.Fatalf("normalizeSnellCellularTCPNodes() = %v, want %v", got, want)
 	}
-	if dialer.DisableTFO {
-		t.Fatal("adaptive mode must not disable TFO globally")
+
+	setSnellCellularTCPNodes(got)
+	t.Cleanup(func() { setSnellCellularTCPNodes(nil) })
+	if !snellCellularTCPSelected("Tokyo CM") || snellCellularTCPSelected("tokyo cm") {
+		t.Fatal("Snell cellular TCP selection must use the exact normalized node name")
 	}
-	setSnellAdaptiveTFO(true, true, "en0", "test")
-	if !dialer.AdaptiveTFOEnabled() {
-		t.Fatal("adaptive setting should remain enabled while Wi-Fi is active")
+	if !snellCellularTCPSelected("  Tokyo CM  ") || snellCellularTCPSelected("Tokyo CM ") {
+		t.Fatal("Snell cellular TCP selection must preserve surrounding characters")
 	}
-	if dialer.DisableTFO {
-		t.Fatal("Wi-Fi should keep TFO globally enabled")
+	if status := snellCellularTCPStatus("Tokyo CM", "pdp_ip0"); !strings.Contains(status, "普通 TCP") {
+		t.Fatalf("cellular selected status = %q", status)
 	}
-	setSnellAdaptiveTFO(false, false, "pdp_ip0", "test")
-	if dialer.AdaptiveTFOEnabled() {
-		t.Fatal("adaptive TFO should be disabled")
+	if status := snellCellularTCPStatus("Tokyo CM", "en0"); !strings.Contains(status, "按节点配置使用 TFO") {
+		t.Fatalf("Wi-Fi selected status = %q", status)
 	}
-	if dialer.DisableTFO {
-		t.Fatal("disabled adaptive mode should keep TFO globally enabled")
+	if status := snellCellularTCPStatus("Other", "pdp_ip0"); !strings.Contains(status, "未指定") {
+		t.Fatalf("unselected status = %q", status)
+	}
+}
+
+func TestSnellCellularTCPNodeNormalizationIsBounded(t *testing.T) {
+	names := make([]string, maxSnellCellularTCPNodes+2)
+	for index := range names {
+		names[index] = fmt.Sprintf("node-%05d", index)
+	}
+	if got := len(normalizeSnellCellularTCPNodes(names)); got != maxSnellCellularTCPNodes {
+		t.Fatalf("normalized node count = %d, want %d", got, maxSnellCellularTCPNodes)
+	}
+}
+
+func TestProxyDelayErrorResponseIsAlwaysValidJSON(t *testing.T) {
+	encoded := proxyDelayErrorResponse(fmt.Errorf("Snell handshake: EOF\nserver said %q", `try "TCP"`))
+	var got struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(encoded), &got); err != nil {
+		t.Fatalf("proxyDelayErrorResponse returned invalid JSON %q: %v", encoded, err)
+	}
+	if want := "Snell handshake: EOF\nserver said \"try \\\"TCP\\\"\""; got.Error != want {
+		t.Fatalf("error = %q, want %q", got.Error, want)
 	}
 }
 
@@ -394,46 +441,6 @@ func TestNetworkChangeRequiresReset(t *testing.T) {
 				t.Fatalf("networkChangeRequiresReset() = %v, want %v", got, test.want)
 			}
 		})
-	}
-}
-
-func TestAdaptiveTFOResetForNetworkChange(t *testing.T) {
-	tests := []struct {
-		name      string
-		previous  string
-		current   string
-		requested bool
-		hold      bool
-		want      adaptiveTFOResetMode
-	}{
-		{name: "held duplicate cellular callback", previous: "pdp_ip0", current: "pdp_ip0", hold: true, want: adaptiveTFOResetNone},
-		{name: "held cellular address refresh", previous: "pdp_ip0", current: "pdp_ip0", requested: true, hold: true, want: adaptiveTFOResetNonFallback},
-		{name: "held change cellular interface", previous: "pdp_ip0", current: "pdp_ip1", hold: true, want: adaptiveTFOResetNonFallback},
-		{name: "held leave cellular", previous: "pdp_ip0", current: "en0", hold: true, want: adaptiveTFOResetAll},
-		{name: "held enter cellular", previous: "en0", current: "pdp_ip0", hold: true, want: adaptiveTFOResetAll},
-		{name: "held change wifi interface", previous: "en0", current: "en1", hold: true, want: adaptiveTFOResetAll},
-		{name: "held initial cellular binding", current: "pdp_ip0", hold: true, want: adaptiveTFOResetAll},
-		{name: "held initial wifi binding", current: "en0", hold: true, want: adaptiveTFOResetAll},
-		{name: "cooldown requested refresh", previous: "pdp_ip0", current: "pdp_ip0", requested: true, want: adaptiveTFOResetAll},
-		{name: "cooldown interface change", previous: "pdp_ip0", current: "pdp_ip1", want: adaptiveTFOResetAll},
-		{name: "cooldown duplicate callback", previous: "pdp_ip0", current: "pdp_ip0", want: adaptiveTFOResetNone},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			if got := adaptiveTFOResetForNetworkChange(
-				test.previous, test.current, test.requested, test.hold); got != test.want {
-				t.Fatalf("adaptiveTFOResetForNetworkChange() = %v, want %v", got, test.want)
-			}
-		})
-	}
-}
-
-func TestSnellAdaptiveTFOStatusDescribesHoldPolicy(t *testing.T) {
-	if got := snellAdaptiveTFOStatus(true, true, "pdp_ip0"); !strings.Contains(got, "保持普通 TCP") {
-		t.Fatalf("hold status = %q, want persistent ordinary TCP wording", got)
-	}
-	if got := snellAdaptiveTFOStatus(true, false, "pdp_ip0"); !strings.Contains(got, "重新测试 TFO") {
-		t.Fatalf("cooldown status = %q, want retry wording", got)
 	}
 }
 
@@ -796,11 +803,15 @@ func TestParseSettingsGeoDefaultsAndOverride(t *testing.T) {
 	if defaults.IgnoreGeoNegation {
 		t.Error("IgnoreGeoNegation default = true, want false")
 	}
-	if defaults.CellularSnellCompatibility {
-		t.Error("CellularSnellCompatibility default = true, want false")
+	if len(defaults.SnellCellularTCPNodes) != 0 {
+		t.Errorf("SnellCellularTCPNodes default = %v, want empty", defaults.SnellCellularTCPNodes)
 	}
-	if !defaults.SnellAdaptiveTFOHold {
-		t.Error("SnellAdaptiveTFOHold default = false, want true")
+	legacy := parseSettings(`{
+		"cellularSnellCompatibility": true,
+		"snellAdaptiveTFOHoldUntilNetworkChange": true
+	}`)
+	if len(legacy.SnellCellularTCPNodes) != 0 {
+		t.Errorf("legacy adaptive TFO settings selected nodes: %v", legacy.SnellCellularTCPNodes)
 	}
 	if defaults.GeoMMDBURL == "" || defaults.GeoIPDatURL == "" || defaults.GeoSiteURL == "" {
 		t.Error("default GEO download URLs must not be empty")
@@ -808,8 +819,7 @@ func TestParseSettingsGeoDefaultsAndOverride(t *testing.T) {
 	custom := parseSettings(`{
 		"geoEnabled": false,
 		"ignoreGeoNegation": true,
-		"cellularSnellCompatibility": true,
-		"snellAdaptiveTFOHoldUntilNetworkChange": false,
+		"snellCellularTCPNodes": ["Tokyo CM", "Shanghai BGP", "Tokyo CM", ""],
 		"geodataMode": false,
 		"geoIPDatURL": "https://example.com/GeoIP.dat",
 		"geoMMDBURL": "https://example.com/geoip.metadb",
@@ -821,11 +831,8 @@ func TestParseSettingsGeoDefaultsAndOverride(t *testing.T) {
 	if !custom.IgnoreGeoNegation {
 		t.Error("IgnoreGeoNegation override = false, want true")
 	}
-	if !custom.CellularSnellCompatibility {
-		t.Error("CellularSnellCompatibility override = false, want true")
-	}
-	if custom.SnellAdaptiveTFOHold {
-		t.Error("SnellAdaptiveTFOHold override = true, want false")
+	if want := []string{"Shanghai BGP", "Tokyo CM"}; !equalStringSlices(custom.SnellCellularTCPNodes, want) {
+		t.Errorf("SnellCellularTCPNodes = %v, want %v", custom.SnellCellularTCPNodes, want)
 	}
 	if custom.GeodataMode {
 		t.Error("GeodataMode override = true, want false")

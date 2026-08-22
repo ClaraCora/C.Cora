@@ -79,6 +79,8 @@ const maxConnectionSnapshotLimit = 500
 
 const defaultRunLogChunkBytes = 48 << 10
 
+const maxSnellCellularTCPNodes = 4096
+
 // connectionSnapshotHeap keeps only the oldest item at its root, allowing the
 // IPC snapshot to select the newest live connections without allocating a
 // slice proportional to the total number of active trackers.
@@ -119,16 +121,16 @@ var (
 	physicalIface    string
 
 	// 最近一次合并配置时收集的：不适用内容提示 + 各节点协议摘要（供主 App 经 IPC 取用）。
-	configNotices        []string
-	proxyDetailsMap      = map[string]string{}
-	activeDNSConfig      *config.DNS
-	activeGeneralIPv6    bool
-	activeSystemDNS      []string
-	activeUsesSystemDNS  bool
-	pendingUsesSystemDNS bool
-	coreStartedAt        time.Time
-	snellAdaptiveTFO     bool
-	snellAdaptiveTFOHold bool
+	configNotices         []string
+	proxyDetailsMap       = map[string]string{}
+	activeDNSConfig       *config.DNS
+	activeGeneralIPv6     bool
+	activeSystemDNS       []string
+	activeUsesSystemDNS   bool
+	pendingUsesSystemDNS  bool
+	coreStartedAt         time.Time
+	snellCellularTCPMu    sync.RWMutex
+	snellCellularTCPNodes []string
 )
 
 // Version 返回「mihomo 内核版本 / Go 运行时版本」。
@@ -345,27 +347,26 @@ func startLogCapture() {
 
 // appSettings 是主 App 下发的设置（JSON）。零值即各项默认。
 type appSettings struct {
-	Stack                      string                 `json:"stack"`
-	IPv6                       bool                   `json:"ipv6"`
-	GeoEnabled                 bool                   `json:"geoEnabled"`
-	GeoLoader                  string                 `json:"geoLoader"`
-	GeodataMode                bool                   `json:"geodataMode"`
-	GeoIPDatURL                string                 `json:"geoIPDatURL"`
-	GeoMMDBURL                 string                 `json:"geoMMDBURL"`
-	GeoSiteURL                 string                 `json:"geoSiteURL"`
-	IgnoreGeoNegation          bool                   `json:"ignoreGeoNegation"`
-	GeoAutoUpdate              bool                   `json:"geoAutoUpdate"`
-	GeoUpdateInterval          int                    `json:"geoUpdateInterval"`
-	LogLevel                   string                 `json:"logLevel"`
-	CellularSnellCompatibility bool                   `json:"cellularSnellCompatibility"`
-	SnellAdaptiveTFOHold       bool                   `json:"snellAdaptiveTFOHoldUntilNetworkChange"`
-	UnifiedDelay               bool                   `json:"unifiedDelay"`
-	MixedPort                  int                    `json:"mixedPort"`
-	BlockDirectSTUN            bool                   `json:"blockDirectSTUN"`
-	SystemDNS                  []string               `json:"systemDNS"`
-	ApplyOverrides             bool                   `json:"applyOverrides"`
-	Overrides                  configOverrideSettings `json:"overrides"`
-	ProxySelections            map[string]string      `json:"proxySelections"`
+	Stack                 string                 `json:"stack"`
+	IPv6                  bool                   `json:"ipv6"`
+	GeoEnabled            bool                   `json:"geoEnabled"`
+	GeoLoader             string                 `json:"geoLoader"`
+	GeodataMode           bool                   `json:"geodataMode"`
+	GeoIPDatURL           string                 `json:"geoIPDatURL"`
+	GeoMMDBURL            string                 `json:"geoMMDBURL"`
+	GeoSiteURL            string                 `json:"geoSiteURL"`
+	IgnoreGeoNegation     bool                   `json:"ignoreGeoNegation"`
+	GeoAutoUpdate         bool                   `json:"geoAutoUpdate"`
+	GeoUpdateInterval     int                    `json:"geoUpdateInterval"`
+	LogLevel              string                 `json:"logLevel"`
+	SnellCellularTCPNodes []string               `json:"snellCellularTCPNodes"`
+	UnifiedDelay          bool                   `json:"unifiedDelay"`
+	MixedPort             int                    `json:"mixedPort"`
+	BlockDirectSTUN       bool                   `json:"blockDirectSTUN"`
+	SystemDNS             []string               `json:"systemDNS"`
+	ApplyOverrides        bool                   `json:"applyOverrides"`
+	Overrides             configOverrideSettings `json:"overrides"`
+	ProxySelections       map[string]string      `json:"proxySelections"`
 }
 
 type configOverrideSettings struct {
@@ -419,11 +420,9 @@ func parseSettings(settingsJSON string) appSettings {
 		ApplyOverrides: true,
 		GeoEnabled:     true, GeoLoader: "memconservative", GeodataMode: true,
 		IgnoreGeoNegation: false, GeoUpdateInterval: 24,
-		GeoIPDatURL:                "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat",
-		GeoMMDBURL:                 "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb",
-		GeoSiteURL:                 "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat",
-		CellularSnellCompatibility: false,
-		SnellAdaptiveTFOHold:       true}
+		GeoIPDatURL: "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat",
+		GeoMMDBURL:  "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb",
+		GeoSiteURL:  "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat"}
 	if strings.TrimSpace(settingsJSON) != "" {
 		_ = json.Unmarshal([]byte(settingsJSON), &s)
 	}
@@ -442,6 +441,7 @@ func parseSettings(settingsJSON string) appSettings {
 	if s.GeoUpdateInterval <= 0 {
 		s.GeoUpdateInterval = 24
 	}
+	s.SnellCellularTCPNodes = normalizeSnellCellularTCPNodes(s.SnellCellularTCPNodes)
 	if s.GeoIPDatURL == "" {
 		s.GeoIPDatURL = "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat"
 	}
@@ -619,15 +619,11 @@ func StartWithConfig(fd int, tunnelMTU int, configYAML string, settingsJSON stri
 
 	resetError := resetRunLog()
 	st := parseSettings(settingsJSON)
-	snellAdaptiveTFO = st.CellularSnellCompatibility
-	snellAdaptiveTFOHold = st.SnellAdaptiveTFOHold
-	appendRunLog(fmt.Sprintf("StartWithConfig: fd=%d mtu=%d stack=%s ipv6=%v geo=%v(mode=%v,%s,ignoreNegation=%v) log=%s snellAdaptiveTFO=%v snellAdaptiveTFOHold=%v",
+	setSnellCellularTCPNodes(st.SnellCellularTCPNodes)
+	appendRunLog(fmt.Sprintf("StartWithConfig: fd=%d mtu=%d stack=%s ipv6=%v geo=%v(mode=%v,%s,ignoreNegation=%v) log=%s snellCellularTCPNodes=%d",
 		fd, tunnelMTU, st.Stack, st.IPv6, st.GeoEnabled, st.GeodataMode, st.GeoLoader,
-		st.IgnoreGeoNegation, st.LogLevel, st.CellularSnellCompatibility,
-		st.SnellAdaptiveTFOHold))
-	dialer.ResetAdaptiveTFO()
-	setSnellAdaptiveTFO(st.CellularSnellCompatibility,
-		st.SnellAdaptiveTFOHold, currentPhysicalInterface(), "启动")
+		st.IgnoreGeoNegation, st.LogLevel, snellCellularTCPNodeCount()))
+	logSnellCellularTCPState(currentPhysicalInterface(), "启动")
 	if resetError != nil {
 		appendRunLog("run.log 重置失败: " + resetError.Error())
 	}
@@ -1741,7 +1737,10 @@ func providerWrongVehicleResponse(name string) string {
 func OfflineProxySnapshot(configYAML, providerPayloadsJSON, selectionsJSON string) string {
 	var raw map[string]any
 	if err := yaml.Unmarshal([]byte(configYAML), &raw); err != nil {
-		return marshalJSON(map[string]any{"proxies": map[string]any{}, "details": map[string]string{}, "mode": "rule", "error": err.Error()})
+		return marshalJSON(map[string]any{
+			"proxies": map[string]any{}, "details": map[string]string{},
+			"nodeTypes": map[string]string{}, "mode": "rule", "error": err.Error(),
+		})
 	}
 
 	details := map[string]string{}
@@ -1871,8 +1870,20 @@ func OfflineProxySnapshot(configYAML, providerPayloadsJSON, selectionsJSON strin
 	if mode == "" {
 		mode = "rule"
 	}
+	nodeTypes := make(map[string]string, len(inlineTypes)+len(providerNodeTypes))
+	for name, nodeType := range inlineTypes {
+		if normalizedType := strings.ToLower(strings.TrimSpace(nodeType)); normalizedType != "" {
+			nodeTypes[name] = normalizedType
+		}
+	}
+	for name, nodeType := range providerNodeTypes {
+		if normalizedType := strings.ToLower(strings.TrimSpace(nodeType)); normalizedType != "" {
+			nodeTypes[name] = normalizedType
+		}
+	}
 	return marshalJSON(map[string]any{
-		"proxies": groups, "details": details, "mode": strings.ToLower(mode),
+		"proxies": groups, "details": details, "nodeTypes": nodeTypes,
+		"mode":             strings.ToLower(mode),
 		"missingProviders": missingProviders, "nodeCount": len(details),
 	})
 }
@@ -2085,9 +2096,14 @@ func GroupDelay(group, url, directURL string, timeoutMs int) string {
 	}
 	if len(snellNames) > 0 {
 		interfaceName := currentPhysicalInterface()
-		appendRunLog(fmt.Sprintf("Snell 自适应 TFO：分组测速 %s，Snell 节点=%d，接口=%s，%s",
-			group, len(snellNames), displayInterfaceName(interfaceName),
-			snellAdaptiveTFOStatus(snellAdaptiveTFO, snellAdaptiveTFOHold, interfaceName)))
+		manualTCP := 0
+		for name := range snellNames {
+			if snellCellularTCPSelected(name) && isCellularInterface(interfaceName) {
+				manualTCP++
+			}
+		}
+		appendRunLog(fmt.Sprintf("Snell 蜂窝 TCP：分组测速 %s，Snell 节点=%d，普通 TCP=%d，接口=%s",
+			group, len(snellNames), manualTCP, displayInterfaceName(interfaceName)))
 	}
 	if url == "" {
 		url = "https://www.gstatic.com/generate_204"
@@ -2133,7 +2149,7 @@ func GroupDelay(group, url, directURL string, timeoutMs int) string {
 				timedOut++
 			}
 		}
-		appendRunLog(fmt.Sprintf("Snell 自适应 TFO：分组测速 %s 完成，Snell 节点超时 %d/%d",
+		appendRunLog(fmt.Sprintf("Snell 蜂窝 TCP：分组测速 %s 完成，Snell 节点超时 %d/%d",
 			group, timedOut, len(snellNames)))
 	}
 	out, err := json.Marshal(dm)
@@ -2170,9 +2186,9 @@ func ProxyDelay(name, group, url, directURL string, timeoutMs int) string {
 	snellNode := p.Type() == C.Snell
 	if snellNode {
 		interfaceName := currentPhysicalInterface()
-		appendRunLog(fmt.Sprintf("Snell 自适应 TFO：单节点测速 %s，接口=%s，%s",
+		appendRunLog(fmt.Sprintf("Snell 蜂窝 TCP：单节点测速 %s，接口=%s，%s",
 			name, displayInterfaceName(interfaceName),
-			snellAdaptiveTFOStatus(snellAdaptiveTFO, snellAdaptiveTFOHold, interfaceName)))
+			snellCellularTCPStatus(name, interfaceName)))
 	}
 	if url == "" {
 		url = "https://www.gstatic.com/generate_204"
@@ -2191,7 +2207,7 @@ func ProxyDelay(name, group, url, directURL string, timeoutMs int) string {
 		delayURLForProxy(p, url, directURL, proxies), expectedStatus)
 	if err != nil {
 		if snellNode {
-			appendRunLog(fmt.Sprintf("Snell 自适应 TFO：单节点测速 %s 失败：%v",
+			appendRunLog(fmt.Sprintf("Snell 蜂窝 TCP：单节点测速 %s 失败：%v",
 				name, err))
 		}
 		if proxyDelayTimedOut(ctx, err) {
@@ -2201,13 +2217,13 @@ func ProxyDelay(name, group, url, directURL string, timeoutMs int) string {
 	}
 	if delay == 0 {
 		if snellNode {
-			appendRunLog(fmt.Sprintf("Snell 自适应 TFO：单节点测速 %s 超时",
+			appendRunLog(fmt.Sprintf("Snell 蜂窝 TCP：单节点测速 %s 超时",
 				name))
 		}
 		return `{"delay":0}`
 	}
 	if snellNode {
-		appendRunLog(fmt.Sprintf("Snell 自适应 TFO：单节点测速 %s 成功，延迟=%dms",
+		appendRunLog(fmt.Sprintf("Snell 蜂窝 TCP：单节点测速 %s 成功，延迟=%dms",
 			name, delay))
 	}
 	out, err := json.Marshal(map[string]uint16{"delay": delay})
@@ -2805,19 +2821,11 @@ func NotifyNetworkChange(name string, systemDNSJSON string, reason string,
 	storePhysicalInterface(name)
 	previous := dialer.DefaultInterface.Load()
 	dialer.DefaultInterface.Store(name)
-	adaptiveTFOReset := adaptiveTFOResetForNetworkChange(
-		previous, name, resetConnections, snellAdaptiveTFOHold)
 	resetConnections = networkChangeRequiresReset(previous, name, resetConnections)
 	if resetConnections {
 		iface.FlushCache()
 	}
-	switch adaptiveTFOReset {
-	case adaptiveTFOResetAll:
-		dialer.ResetAdaptiveTFO()
-	case adaptiveTFOResetNonFallback:
-		dialer.ResetAdaptiveTFONonFallback()
-	}
-	setSnellAdaptiveTFO(snellAdaptiveTFO, snellAdaptiveTFOHold, name, "网络路径变化")
+	logSnellCellularTCPState(name, "网络路径变化")
 
 	resolverUpdated := false
 	if dnsErr == nil && len(newSystemDNS) > 0 &&
@@ -2865,28 +2873,6 @@ func NotifyNetworkChange(name string, systemDNSJSON string, reason string,
 
 func networkChangeRequiresReset(previous, current string, requested bool) bool {
 	return requested || previous != current
-}
-
-type adaptiveTFOResetMode uint8
-
-const (
-	adaptiveTFOResetNone adaptiveTFOResetMode = iota
-	adaptiveTFOResetNonFallback
-	adaptiveTFOResetAll
-)
-
-// Hold mode preserves only verified ordinary-TCP fallbacks across a cellular
-// refresh. Successful and in-flight TFO observations are path-specific and are
-// revalidated. Leaving or entering cellular starts an entirely new session.
-func adaptiveTFOResetForNetworkChange(previous, current string, requested,
-	holdUntilNetworkChange bool) adaptiveTFOResetMode {
-	if !networkChangeRequiresReset(previous, current, requested) {
-		return adaptiveTFOResetNone
-	}
-	if holdUntilNetworkChange && isCellularInterface(previous) && isCellularInterface(current) {
-		return adaptiveTFOResetNonFallback
-	}
-	return adaptiveTFOResetAll
 }
 
 func parseSystemDNSJSON(raw string) ([]string, error) {
@@ -3093,9 +3079,7 @@ func Stop() {
 	configApplyMu.Lock()
 	defer configApplyMu.Unlock()
 	appendRunLog("Stop: 关闭内核")
-	setSnellAdaptiveTFO(false, false, "", "内核停止")
-	snellAdaptiveTFO = false
-	snellAdaptiveTFOHold = false
+	setSnellCellularTCPNodes(nil)
 	storePhysicalInterface("")
 	activeDNSConfig = nil
 	activeSystemDNS = nil
@@ -3127,27 +3111,78 @@ func isCellularInterface(name string) bool {
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(name)), "pdp_ip")
 }
 
-// setSnellAdaptiveTFO controls the bounded per-entrance state machine in the
-// patched Mihomo dialer. It never changes the process-wide DisableTFO switch.
-func setSnellAdaptiveTFO(enabled, holdUntilNetworkChange bool, interfaceName string, reason string) {
-	dialer.SetAdaptiveTFOEnabled(enabled)
-	dialer.SetAdaptiveTFOHoldUntilNetworkChange(holdUntilNetworkChange)
-	appendRunLog(fmt.Sprintf("Snell 自适应 TFO：接口=%s，%s（原因：%s）",
-		displayInterfaceName(interfaceName),
-		snellAdaptiveTFOStatus(enabled, holdUntilNetworkChange, interfaceName), reason))
+func normalizeSnellCellularTCPNodes(names []string) []string {
+	capacity := len(names)
+	if capacity > maxSnellCellularTCPNodes {
+		capacity = maxSnellCellularTCPNodes
+	}
+	result := make([]string, 0, capacity)
+	seen := make(map[string]struct{}, capacity)
+	for _, name := range names {
+		if strings.TrimSpace(name) == "" {
+			continue
+		}
+		if _, exists := seen[name]; exists {
+			continue
+		}
+		seen[name] = struct{}{}
+		result = append(result, name)
+		if len(result) == maxSnellCellularTCPNodes {
+			break
+		}
+	}
+	sort.Strings(result)
+	return result
 }
 
-func snellAdaptiveTFOStatus(enabled, holdUntilNetworkChange bool, interfaceName string) string {
-	if !enabled {
-		return "已关闭，按节点配置使用 TFO"
+func setSnellCellularTCPNodes(names []string) {
+	snapshot := append([]string(nil), names...)
+	snellCellularTCPMu.Lock()
+	snellCellularTCPNodes = snapshot
+	snellCellularTCPMu.Unlock()
+	dialer.SetSnellCellularTCPNodes(snapshot)
+}
+
+func snellCellularTCPNodeCount() int {
+	snellCellularTCPMu.RLock()
+	count := len(snellCellularTCPNodes)
+	snellCellularTCPMu.RUnlock()
+	return count
+}
+
+func snellCellularTCPSelected(name string) bool {
+	snellCellularTCPMu.RLock()
+	defer snellCellularTCPMu.RUnlock()
+	for _, selected := range snellCellularTCPNodes {
+		if selected == name {
+			return true
+		}
+	}
+	return false
+}
+
+func snellCellularTCPStatus(name, interfaceName string) string {
+	if !snellCellularTCPSelected(name) {
+		return "未指定，按节点配置使用 TFO"
 	}
 	if !isCellularInterface(interfaceName) {
-		return "待机，Wi-Fi/非蜂窝网络保持原有 TFO 行为"
+		return "已指定但当前不是蜂窝网络，按节点配置使用 TFO"
 	}
-	if holdUntilNetworkChange {
-		return "已启用，按入口探测；本次 VPN 连接中，不兼容入口保持普通 TCP 到离开蜂窝网络"
+	return "已指定，使用普通 TCP（TFO 已关闭）"
+}
+
+func logSnellCellularTCPState(interfaceName, reason string) {
+	count := snellCellularTCPNodeCount()
+	mode := "名单为空，所有节点按原配置使用 TFO"
+	if count > 0 {
+		if isCellularInterface(interfaceName) {
+			mode = fmt.Sprintf("%d 个指定 Snell 节点使用普通 TCP", count)
+		} else {
+			mode = fmt.Sprintf("%d 个指定节点待机，Wi-Fi/非蜂窝保持原 TFO", count)
+		}
 	}
-	return "已启用，按入口探测；不兼容入口冷却后重新测试 TFO"
+	appendRunLog(fmt.Sprintf("Snell 蜂窝 TCP：接口=%s，%s（原因：%s）",
+		displayInterfaceName(interfaceName), mode, reason))
 }
 
 func displayInterfaceName(name string) string {
