@@ -1,5 +1,66 @@
 # Third-party patches
 
+## mihomo-v1.19.30-snell-adaptive-tfo
+
+- Added: 2026-08-22
+- Upstream module: `github.com/metacubex/mihomo v1.19.30`
+- Patched files: `component/dialer/tfo.go`, `component/dialer/options.go`,
+  `component/dialer/dialer.go`, `adapter/outbound/snell.go`
+- Build tags: default and `with_low_memory`
+
+### Reason
+
+On Darwin, Mihomo's `tfo-go` dependency forces TCP Fast Open on and bypasses
+the operating system's native TFO backoff. Some cellular routes silently drop
+the TFO handshake even though ordinary TCP to the same IPv4 endpoint works.
+A process-wide `DisableTFO` workaround restored those routes, but unnecessarily
+disabled TFO for working Snell entrances, including entrances that work on the
+same cellular interface.
+
+### Local behavior
+
+The persisted Cora setting formerly named `cellularSnellCompatibility` is now
+shown as `Snell 自适应 TFO`. It opts only Snell dialers with node-level TFO
+enabled into adaptive handling. Other protocols, IPv6, Wi-Fi, and Snell nodes
+without TFO keep upstream behavior. Cora no longer writes Mihomo's global
+`DisableTFO` variable.
+
+On a `pdp_ip*` interface, the first connection to each resolved IPv4
+`address:port` gets a 500 ms TFO probe bounded by the caller's original
+context. If that fails, the same early data is fully written over ordinary TCP.
+Only when ordinary TCP succeeds is that entrance marked incompatible and kept
+on ordinary TCP for ten minutes. It is then probed again, so recovery is
+automatic. If both methods fail, the route is not newly classified as a TFO
+failure. A network-path reset clears all observations.
+
+The state cache retains no sockets, payloads, DNS answers, or goroutines. It is
+limited to 128 entries with least-recently-used eviction. Only one initial or
+cooldown probe runs per entrance; concurrent requests use ordinary TCP while
+that probe is pending. Snell's reuse pool now receives the caller context via
+`GetContext`, and the lazy TFO connection derives its timeout from that caller
+instead of `context.Background`. Mihomo emits log entries only when an entrance
+is first confirmed working, enters fallback, or recovers.
+
+### Verification
+
+The preparation script verifies exact SHA-256 values for all four upstream and
+patched files plus the added regression test. CI runs the dialer and outbound
+tests in default and low-memory builds. Tests cover TFO success, fallback and
+cached ordinary TCP, cooldown recovery, path reset, dual failure, the 128-entry
+bound, caller cancellation, and single-probe coordination.
+
+### Rollback
+
+Revert the commit that added this section and remove:
+
+- `dependency-patches/mihomo-v1.19.30-snell-adaptive-tfo.patch`;
+- its preparation-script SHA and apply wiring;
+- `SetAdaptiveTFOEnabled` / `ResetAdaptiveTFO` calls in MobileCore;
+- the `Snell 自适应 TFO` setting row or restore its earlier diagnostic meaning.
+
+The UserDefaults key can remain; older builds already understand it as a
+Boolean and no user data migration is needed.
+
 ## mihomo-v1.19.30-connection-close-queue
 
 - Added: 2026-08-13

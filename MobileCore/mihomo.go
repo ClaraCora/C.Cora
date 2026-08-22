@@ -127,7 +127,7 @@ var (
 	activeUsesSystemDNS  bool
 	pendingUsesSystemDNS bool
 	coreStartedAt        time.Time
-	cellularSnellCompat  bool
+	snellAdaptiveTFO     bool
 )
 
 // Version 返回「mihomo 内核版本 / Go 运行时版本」。
@@ -616,11 +616,12 @@ func StartWithConfig(fd int, tunnelMTU int, configYAML string, settingsJSON stri
 
 	resetError := resetRunLog()
 	st := parseSettings(settingsJSON)
-	cellularSnellCompat = st.CellularSnellCompatibility
-	appendRunLog(fmt.Sprintf("StartWithConfig: fd=%d mtu=%d stack=%s ipv6=%v geo=%v(mode=%v,%s,ignoreNegation=%v) log=%s cellularSnellCompat=%v",
+	snellAdaptiveTFO = st.CellularSnellCompatibility
+	appendRunLog(fmt.Sprintf("StartWithConfig: fd=%d mtu=%d stack=%s ipv6=%v geo=%v(mode=%v,%s,ignoreNegation=%v) log=%s snellAdaptiveTFO=%v",
 		fd, tunnelMTU, st.Stack, st.IPv6, st.GeoEnabled, st.GeodataMode, st.GeoLoader,
 		st.IgnoreGeoNegation, st.LogLevel, st.CellularSnellCompatibility))
-	setCellularSnellCompatibility(st.CellularSnellCompatibility, currentPhysicalInterface(), "启动")
+	dialer.ResetAdaptiveTFO()
+	setSnellAdaptiveTFO(st.CellularSnellCompatibility, currentPhysicalInterface(), "启动")
 	if resetError != nil {
 		appendRunLog("run.log 重置失败: " + resetError.Error())
 	}
@@ -2069,16 +2070,18 @@ func GroupDelay(group, url, directURL string, timeoutMs int) string {
 	if !ok {
 		return `{"error":"不是策略组"}`
 	}
-	compatSnell := false
-	if cellularSnellCompat && isCellularInterface(currentPhysicalInterface()) {
-		for _, member := range g.Proxies() {
-			if member.Type() == C.Snell {
-				compatSnell = true
-				appendRunLog(fmt.Sprintf("Snell 蜂窝兼容测试：分组测速 %s 使用普通 TCP（TFO 已关闭），接口=%s",
-					group, currentPhysicalInterface()))
-				break
-			}
+	members := g.Proxies()
+	snellNames := make(map[string]struct{})
+	for _, member := range members {
+		if member.Type() == C.Snell {
+			snellNames[member.Name()] = struct{}{}
 		}
+	}
+	if len(snellNames) > 0 {
+		interfaceName := currentPhysicalInterface()
+		appendRunLog(fmt.Sprintf("Snell 自适应 TFO：分组测速 %s，Snell 节点=%d，接口=%s，%s",
+			group, len(snellNames), displayInterfaceName(interfaceName),
+			snellAdaptiveTFOStatus(snellAdaptiveTFO, interfaceName)))
 	}
 	if url == "" {
 		url = "https://www.gstatic.com/generate_204"
@@ -2096,7 +2099,6 @@ func GroupDelay(group, url, directURL string, timeoutMs int) string {
 	// Some automatic groups ignore the URL supplied to ProxyGroup.URLTest and
 	// use their configured health-check URL. Test their resolved members here so
 	// the app's configured URL applies uniformly to every group type.
-	members := g.Proxies()
 	dm := make(map[string]uint16, len(members))
 	for _, proxy := range members {
 		dm[proxy.Name()] = 0
@@ -2118,15 +2120,15 @@ func GroupDelay(group, url, directURL string, timeoutMs int) string {
 		}()
 	}
 	wait.Wait()
-	if compatSnell {
+	if len(snellNames) > 0 {
 		timedOut := 0
-		for _, delay := range dm {
-			if delay == 0 {
+		for name := range snellNames {
+			if dm[name] == 0 {
 				timedOut++
 			}
 		}
-		appendRunLog(fmt.Sprintf("Snell 蜂窝兼容测试：分组测速 %s 完成，超时 %d/%d",
-			group, timedOut, len(dm)))
+		appendRunLog(fmt.Sprintf("Snell 自适应 TFO：分组测速 %s 完成，Snell 节点超时 %d/%d",
+			group, timedOut, len(snellNames)))
 	}
 	out, err := json.Marshal(dm)
 	if err != nil {
@@ -2159,10 +2161,12 @@ func ProxyDelay(name, group, url, directURL string, timeoutMs int) string {
 	if !exist {
 		return `{"error":"节点不存在"}`
 	}
-	compatSnell := cellularSnellCompat && isCellularInterface(currentPhysicalInterface()) && p.Type() == C.Snell
-	if compatSnell {
-		appendRunLog(fmt.Sprintf("Snell 蜂窝兼容测试：单节点测速 %s 使用普通 TCP（TFO 已关闭），接口=%s",
-			name, currentPhysicalInterface()))
+	snellNode := p.Type() == C.Snell
+	if snellNode {
+		interfaceName := currentPhysicalInterface()
+		appendRunLog(fmt.Sprintf("Snell 自适应 TFO：单节点测速 %s，接口=%s，%s",
+			name, displayInterfaceName(interfaceName),
+			snellAdaptiveTFOStatus(snellAdaptiveTFO, interfaceName)))
 	}
 	if url == "" {
 		url = "https://www.gstatic.com/generate_204"
@@ -2180,8 +2184,8 @@ func ProxyDelay(name, group, url, directURL string, timeoutMs int) string {
 	delay, err := p.URLTest(ctx,
 		delayURLForProxy(p, url, directURL, proxies), expectedStatus)
 	if err != nil {
-		if compatSnell {
-			appendRunLog(fmt.Sprintf("Snell 蜂窝兼容测试：单节点测速 %s 失败：%v",
+		if snellNode {
+			appendRunLog(fmt.Sprintf("Snell 自适应 TFO：单节点测速 %s 失败：%v",
 				name, err))
 		}
 		if proxyDelayTimedOut(ctx, err) {
@@ -2190,14 +2194,14 @@ func ProxyDelay(name, group, url, directURL string, timeoutMs int) string {
 		return `{"error":"` + err.Error() + `"}`
 	}
 	if delay == 0 {
-		if compatSnell {
-			appendRunLog(fmt.Sprintf("Snell 蜂窝兼容测试：单节点测速 %s 超时",
+		if snellNode {
+			appendRunLog(fmt.Sprintf("Snell 自适应 TFO：单节点测速 %s 超时",
 				name))
 		}
 		return `{"delay":0}`
 	}
-	if compatSnell {
-		appendRunLog(fmt.Sprintf("Snell 蜂窝兼容测试：单节点测速 %s 成功，延迟=%dms",
+	if snellNode {
+		appendRunLog(fmt.Sprintf("Snell 自适应 TFO：单节点测速 %s 成功，延迟=%dms",
 			name, delay))
 	}
 	out, err := json.Marshal(map[string]uint16{"delay": delay})
@@ -2791,11 +2795,12 @@ func NotifyNetworkChange(name string, systemDNSJSON string, reason string,
 	storePhysicalInterface(name)
 	previous := dialer.DefaultInterface.Load()
 	dialer.DefaultInterface.Store(name)
-	setCellularSnellCompatibility(cellularSnellCompat, name, "网络路径变化")
 	resetConnections = networkChangeRequiresReset(previous, name, resetConnections)
 	if resetConnections {
+		dialer.ResetAdaptiveTFO()
 		iface.FlushCache()
 	}
+	setSnellAdaptiveTFO(snellAdaptiveTFO, name, "网络路径变化")
 
 	resolverUpdated := false
 	if dnsErr == nil && len(newSystemDNS) > 0 &&
@@ -3049,8 +3054,8 @@ func Stop() {
 	configApplyMu.Lock()
 	defer configApplyMu.Unlock()
 	appendRunLog("Stop: 关闭内核")
-	setCellularSnellCompatibility(false, "", "内核停止")
-	cellularSnellCompat = false
+	setSnellAdaptiveTFO(false, "", "内核停止")
+	snellAdaptiveTFO = false
 	storePhysicalInterface("")
 	activeDNSConfig = nil
 	activeSystemDNS = nil
@@ -3082,28 +3087,30 @@ func isCellularInterface(name string) bool {
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(name)), "pdp_ip")
 }
 
-// setCellularSnellCompatibility applies the opt-in mobile transport probe.
-// Mihomo exposes TFO as a process-wide dialer switch, so this deliberately
-// changes only the socket feature, not node YAML or the selected proxy.
-func setCellularSnellCompatibility(enabled bool, interfaceName string, reason string) {
-	cellular := isCellularInterface(interfaceName)
-	desired := enabled && cellular
-	previous := dialer.DisableTFO
-	dialer.DisableTFO = desired
-	if previous == desired {
-		return
+// setSnellAdaptiveTFO controls the bounded per-entrance state machine in the
+// patched Mihomo dialer. It never changes the process-wide DisableTFO switch.
+func setSnellAdaptiveTFO(enabled bool, interfaceName string, reason string) {
+	dialer.SetAdaptiveTFOEnabled(enabled)
+	appendRunLog(fmt.Sprintf("Snell 自适应 TFO：接口=%s，%s（原因：%s）",
+		displayInterfaceName(interfaceName), snellAdaptiveTFOStatus(enabled, interfaceName), reason))
+}
+
+func snellAdaptiveTFOStatus(enabled bool, interfaceName string) string {
+	if !enabled {
+		return "已关闭，按节点配置使用 TFO"
 	}
-	if enabled {
-		if cellular {
-			appendRunLog(fmt.Sprintf("蜂窝 Snell 兼容测试已启用：接口=%s，关闭 TCP Fast Open（原因：%s）",
-				interfaceName, reason))
-		} else {
-			appendRunLog(fmt.Sprintf("蜂窝 Snell 兼容测试待机：接口=%s，Wi-Fi/有线保持 TCP Fast Open（原因：%s）",
-				interfaceName, reason))
-		}
-	} else {
-		appendRunLog(fmt.Sprintf("蜂窝 Snell 兼容测试已关闭：恢复 TCP Fast Open（原因：%s）", reason))
+	if !isCellularInterface(interfaceName) {
+		return "待机，Wi-Fi/非蜂窝网络保持原有 TFO 行为"
 	}
+	return "已启用，按入口探测；仅不兼容入口临时回退普通 TCP"
+}
+
+func displayInterfaceName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "未知"
+	}
+	return name
 }
 
 // appendRunLog 追加一行到 <home>/run.log（封装层自己的标记，便于和内核日志混排）。

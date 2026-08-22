@@ -309,8 +309,6 @@ func TestMergeConfigSTUNProtectionKeepsDirectModeSemantics(t *testing.T) {
 func TestNetworkInterfaceUpdates(t *testing.T) {
 	previous := dialer.DefaultInterface.Load()
 	defer dialer.DefaultInterface.Store(previous)
-	previousTFO := dialer.DisableTFO
-	defer func() { dialer.DisableTFO = previousTFO }()
 	previousPhysical := currentPhysicalInterface()
 	defer storePhysicalInterface(previousPhysical)
 
@@ -337,9 +335,13 @@ func TestNetworkInterfaceUpdates(t *testing.T) {
 	}
 }
 
-func TestCellularSnellCompatibilityDisablesTFOOnlyOnCellular(t *testing.T) {
-	previousTFO := dialer.DisableTFO
-	defer func() { dialer.DisableTFO = previousTFO }()
+func TestSnellAdaptiveTFOSettingDoesNotDisableTFOGlobally(t *testing.T) {
+	previousAdaptive := dialer.AdaptiveTFOEnabled()
+	previousDisableTFO := dialer.DisableTFO
+	defer func() {
+		dialer.SetAdaptiveTFOEnabled(previousAdaptive)
+		dialer.DisableTFO = previousDisableTFO
+	}()
 
 	if !isCellularInterface("pdp_ip0") || !isCellularInterface("PDP_IP1") {
 		t.Fatal("pdp_ip interfaces should be recognized as cellular")
@@ -348,17 +350,27 @@ func TestCellularSnellCompatibilityDisablesTFOOnlyOnCellular(t *testing.T) {
 		t.Fatal("Wi-Fi and empty interfaces should not be recognized as cellular")
 	}
 
-	setCellularSnellCompatibility(true, "pdp_ip0", "test")
-	if !dialer.DisableTFO {
-		t.Fatal("cellular compatibility should disable TFO")
+	dialer.DisableTFO = false
+	setSnellAdaptiveTFO(true, "pdp_ip0", "test")
+	if !dialer.AdaptiveTFOEnabled() {
+		t.Fatal("adaptive TFO should be enabled")
 	}
-	setCellularSnellCompatibility(true, "en0", "test")
 	if dialer.DisableTFO {
-		t.Fatal("Wi-Fi should keep TFO enabled")
+		t.Fatal("adaptive mode must not disable TFO globally")
 	}
-	setCellularSnellCompatibility(false, "pdp_ip0", "test")
+	setSnellAdaptiveTFO(true, "en0", "test")
+	if !dialer.AdaptiveTFOEnabled() {
+		t.Fatal("adaptive setting should remain enabled while Wi-Fi is active")
+	}
 	if dialer.DisableTFO {
-		t.Fatal("disabled compatibility should keep TFO enabled")
+		t.Fatal("Wi-Fi should keep TFO globally enabled")
+	}
+	setSnellAdaptiveTFO(false, "pdp_ip0", "test")
+	if dialer.AdaptiveTFOEnabled() {
+		t.Fatal("adaptive TFO should be disabled")
+	}
+	if dialer.DisableTFO {
+		t.Fatal("disabled adaptive mode should keep TFO globally enabled")
 	}
 }
 

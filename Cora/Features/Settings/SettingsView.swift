@@ -494,8 +494,8 @@ private struct KernelSettingsView: View {
                 }
                 InfoToggleRow(title: "IPv6", message: "允许隧道处理 IPv6 流量。部分网络或配置不支持 IPv6 时可以关闭。", systemImage: "network", isOn: $settings.ipv6)
                 InfoToggleRow(
-                    title: "蜂窝网络 Snell 兼容测试",
-                    message: "仅用于排查特定手机网络入口的 Snell 连接问题。开启后，蜂窝网络会关闭 TCP Fast Open；Wi-Fi 行为不变。修改后重新连接 VPN 生效。",
+                    title: "Snell 自适应 TFO",
+                    message: "在蜂窝网络上分别测试每个 Snell 入口。仅当某个入口的 TFO 失败而普通 TCP 可用时，临时对该入口回退普通 TCP，其他入口和 Wi-Fi 仍使用 TFO；10 分钟后自动重试。修改后重新连接 VPN 生效。",
                     systemImage: "antenna.radiowaves.left.and.right",
                     isOn: $settings.cellularSnellCompatibility)
                 HStack {

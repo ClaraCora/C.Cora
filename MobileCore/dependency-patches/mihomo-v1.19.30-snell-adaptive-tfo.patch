@@ -1,0 +1,658 @@
+diff --git a/adapter/outbound/snell.go b/adapter/outbound/snell.go
+index c4142ec41aa88506eab4cb847b8005f71d38bbf1..ab169ef4e8ceb6a8b6178eb1b30be0922b46afd5 100644
+--- a/adapter/outbound/snell.go
++++ b/adapter/outbound/snell.go
+@@ -8,6 +8,7 @@ import (
+ 
+ 	N "github.com/metacubex/mihomo/common/net"
+ 	"github.com/metacubex/mihomo/common/structure"
++	"github.com/metacubex/mihomo/component/dialer"
+ 	C "github.com/metacubex/mihomo/constant"
+ 	"github.com/metacubex/mihomo/transport/jls"
+ 	"github.com/metacubex/mihomo/transport/restls"
+@@ -101,7 +102,7 @@ func (s *Snell) writeHeaderContext(ctx context.Context, c net.Conn, metadata *C.
+ // DialContext implements C.ProxyAdapter
+ func (s *Snell) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
+ 	if s.reuse {
+-		c, err := s.pool.Get()
++		c, err := s.pool.GetContext(ctx)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+@@ -282,7 +283,8 @@ func NewSnell(option SnellOption) (*Snell, error) {
+ 		version:         option.Version,
+ 		reuse:           reuse,
+ 	}
+-	s.dialer = option.NewDialer(s.DialOptions())
++	dialOptions := append(s.DialOptions(), dialer.WithAdaptiveTFO())
++	s.dialer = option.NewDialer(dialOptions)
+ 
+ 	if s.reuse {
+ 		s.pool = snell.NewPool(func(ctx context.Context) (*snell.Snell, error) {
+diff --git a/component/dialer/dialer.go b/component/dialer/dialer.go
+index c4e9c5cee89b4642da9eae6affffd3e069883021..f25084aab0b520c426f96f4203cd6e528c93e139 100644
+--- a/component/dialer/dialer.go
++++ b/component/dialer/dialer.go
+@@ -167,13 +167,19 @@ func dialContext(ctx context.Context, network string, destination netip.Addr, po
+ 			bindMarkToDialer(opt.routingMark, dialer, network, destination)
+ 		}
+ 		if opt.tfo && !DisableTFO {
+-			return dialTFO(ctx, *dialer, network, address)
++			adaptive := opt.adaptiveTFO && AdaptiveTFOEnabled() &&
++				destination.Is4() && isCellularTFOInterface(opt.interfaceName)
++			return dialTFO(ctx, *dialer, network, address, opt.interfaceName, adaptive)
+ 		}
+ 	}
+ 
+ 	return dialer.DialContext(ctx, network, address)
+ }
+ 
++func isCellularTFOInterface(name string) bool {
++	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(name)), "pdp_ip")
++}
++
+ func ICMPControl(destination netip.Addr) func(network, address string, conn syscall.RawConn) error {
+ 	return func(network, address string, conn syscall.RawConn) error {
+ 		if DefaultSocketHook != nil {
+diff --git a/component/dialer/options.go b/component/dialer/options.go
+index c1c622ddf3b06876fd941cb87976d968537ab59c..9bfa37d0c875d22a0eb0ea58b5f07278beebadfa 100644
+--- a/component/dialer/options.go
++++ b/component/dialer/options.go
+@@ -38,6 +38,7 @@ type option struct {
+ 	network       int
+ 	prefer        int
+ 	tfo           bool
++	adaptiveTFO   bool
+ 	mpTcp         bool
+ 	resolver      resolver.Resolver
+ 	netDialer     NetDialer
+@@ -103,6 +104,14 @@ func WithTFO(tfo bool) Option {
+ 	}
+ }
+ 
++// WithAdaptiveTFO marks a Snell dialer as eligible for per-entrance cellular
++// TFO fallback when the embedding application enables it.
++func WithAdaptiveTFO() Option {
++	return func(opt *option) {
++		opt.adaptiveTFO = true
++	}
++}
++
+ func WithMPTCP(mpTcp bool) Option {
+ 	return func(opt *option) {
+ 		opt.mpTcp = mpTcp
+diff --git a/component/dialer/tfo.go b/component/dialer/tfo.go
+index 76fe94d021964500e26a0fc2811893086d47dd9e..19abba12e305fc7588587b9b98f249f7c6d51cf8 100644
+--- a/component/dialer/tfo.go
++++ b/component/dialer/tfo.go
+@@ -2,15 +2,259 @@ package dialer
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"io"
+ 	"net"
++	"strings"
++	"sync"
++	"sync/atomic"
+ 	"time"
+ 
++	"github.com/metacubex/mihomo/log"
+ 	"github.com/metacubex/tfo-go"
+ )
+ 
+ var DisableTFO = false
+ 
++const (
++	adaptiveTFOProbeTimeout = 500 * time.Millisecond
++	adaptiveTFOCooldown     = 10 * time.Minute
++	adaptiveTFOMaxEntries   = 128
++)
++
++type adaptiveTFOState uint8
++
++const (
++	adaptiveTFOUnknown adaptiveTFOState = iota
++	adaptiveTFOProbing
++	adaptiveTFOWorking
++	adaptiveTFOIncompatible
++)
++
++type adaptiveTFODecision uint8
++
++const (
++	adaptiveTFOUseTCP adaptiveTFODecision = iota
++	adaptiveTFOProbe
++	adaptiveTFOUseTFO
++)
++
++type adaptiveTFOTransition uint8
++
++const (
++	adaptiveTFONoTransition adaptiveTFOTransition = iota
++	adaptiveTFOFirstSuccess
++	adaptiveTFOFallback
++	adaptiveTFORecovered
++)
++
++type adaptiveTFOEntry struct {
++	state      adaptiveTFOState
++	previous   adaptiveTFOState
++	retryAt    time.Time
++	lastAccess uint64
++	revision   uint64
++}
++
++type adaptiveTFOAttempt struct {
++	key        string
++	generation uint64
++	decision   adaptiveTFODecision
++	previous   adaptiveTFOState
++	revision   uint64
++}
++
++type adaptiveTFOCache struct {
++	mu         sync.Mutex
++	entries    map[string]*adaptiveTFOEntry
++	generation uint64
++	access     uint64
++	revision   uint64
++	now        func() time.Time
++	cooldown   time.Duration
++	maxEntries int
++}
++
++func newAdaptiveTFOCache() *adaptiveTFOCache {
++	return &adaptiveTFOCache{
++		entries:    make(map[string]*adaptiveTFOEntry),
++		now:        time.Now,
++		cooldown:   adaptiveTFOCooldown,
++		maxEntries: adaptiveTFOMaxEntries,
++	}
++}
++
++func (c *adaptiveTFOCache) decide(interfaceName, address string) adaptiveTFOAttempt {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++
++	c.access++
++	key := strings.ToLower(strings.TrimSpace(interfaceName)) + "\x00" + address
++	entry, exists := c.entries[key]
++	if !exists {
++		c.evictOldestLocked()
++		entry = &adaptiveTFOEntry{
++			state:      adaptiveTFOProbing,
++			previous:   adaptiveTFOUnknown,
++			lastAccess: c.access,
++			revision:   c.nextRevisionLocked(),
++		}
++		c.entries[key] = entry
++		return adaptiveTFOAttempt{key: key, generation: c.generation, decision: adaptiveTFOProbe,
++			revision: entry.revision}
++	}
++
++	entry.lastAccess = c.access
++	switch entry.state {
++	case adaptiveTFOProbing:
++		return adaptiveTFOAttempt{key: key, generation: c.generation, decision: adaptiveTFOUseTCP,
++			revision: entry.revision}
++	case adaptiveTFOWorking:
++		return adaptiveTFOAttempt{key: key, generation: c.generation, decision: adaptiveTFOUseTFO,
++			previous: adaptiveTFOWorking, revision: entry.revision}
++	case adaptiveTFOIncompatible:
++		if c.now().Before(entry.retryAt) {
++			return adaptiveTFOAttempt{key: key, generation: c.generation, decision: adaptiveTFOUseTCP,
++				previous: adaptiveTFOIncompatible, revision: entry.revision}
++		}
++		entry.state = adaptiveTFOProbing
++		entry.previous = adaptiveTFOIncompatible
++		entry.revision = c.nextRevisionLocked()
++		return adaptiveTFOAttempt{key: key, generation: c.generation, decision: adaptiveTFOProbe,
++			previous: adaptiveTFOIncompatible, revision: entry.revision}
++	default:
++		delete(c.entries, key)
++		return c.decideLocked(interfaceName, address)
++	}
++}
++
++func (c *adaptiveTFOCache) decideLocked(interfaceName, address string) adaptiveTFOAttempt {
++	c.evictOldestLocked()
++	c.access++
++	key := strings.ToLower(strings.TrimSpace(interfaceName)) + "\x00" + address
++	c.entries[key] = &adaptiveTFOEntry{
++		state:      adaptiveTFOProbing,
++		previous:   adaptiveTFOUnknown,
++		lastAccess: c.access,
++		revision:   c.nextRevisionLocked(),
++	}
++	return adaptiveTFOAttempt{key: key, generation: c.generation, decision: adaptiveTFOProbe,
++		revision: c.entries[key].revision}
++}
++
++func (c *adaptiveTFOCache) record(attempt adaptiveTFOAttempt, tfoSucceeded, fallbackSucceeded bool) adaptiveTFOTransition {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++
++	if attempt.generation != c.generation {
++		return adaptiveTFONoTransition
++	}
++	entry, exists := c.entries[attempt.key]
++	if !exists || entry.revision != attempt.revision {
++		return adaptiveTFONoTransition
++	}
++	c.access++
++	entry.lastAccess = c.access
++	if tfoSucceeded {
++		if attempt.decision == adaptiveTFOUseTFO {
++			return adaptiveTFONoTransition
++		}
++		previous := attempt.previous
++		if entry.state == adaptiveTFOProbing {
++			previous = entry.previous
++		}
++		entry.state = adaptiveTFOWorking
++		entry.previous = adaptiveTFOWorking
++		entry.retryAt = time.Time{}
++		entry.revision = c.nextRevisionLocked()
++		if previous == adaptiveTFOIncompatible {
++			return adaptiveTFORecovered
++		}
++		if previous == adaptiveTFOUnknown {
++			return adaptiveTFOFirstSuccess
++		}
++		return adaptiveTFONoTransition
++	}
++	if fallbackSucceeded {
++		wasIncompatible := entry.state == adaptiveTFOIncompatible || entry.previous == adaptiveTFOIncompatible
++		entry.state = adaptiveTFOIncompatible
++		entry.previous = adaptiveTFOIncompatible
++		entry.retryAt = c.now().Add(c.cooldown)
++		entry.revision = c.nextRevisionLocked()
++		if !wasIncompatible || attempt.decision == adaptiveTFOProbe {
++			return adaptiveTFOFallback
++		}
++		return adaptiveTFONoTransition
++	}
++
++	// A path where both TFO and ordinary TCP fail has not proven TFO to be the
++	// cause. Restore the prior state instead of poisoning this entrance.
++	if entry.state == adaptiveTFOProbing {
++		if entry.previous == adaptiveTFOIncompatible {
++			entry.state = adaptiveTFOIncompatible
++			entry.retryAt = c.now().Add(c.cooldown)
++			entry.revision = c.nextRevisionLocked()
++		} else {
++			delete(c.entries, attempt.key)
++		}
++	}
++	return adaptiveTFONoTransition
++}
++
++func (c *adaptiveTFOCache) nextRevisionLocked() uint64 {
++	c.revision++
++	return c.revision
++}
++
++func (c *adaptiveTFOCache) reset() {
++	c.mu.Lock()
++	c.generation++
++	for key := range c.entries {
++		delete(c.entries, key)
++	}
++	c.mu.Unlock()
++}
++
++func (c *adaptiveTFOCache) evictOldestLocked() {
++	if len(c.entries) < c.maxEntries {
++		return
++	}
++	var oldestKey string
++	var oldestAccess uint64
++	first := true
++	for key, entry := range c.entries {
++		if first || entry.lastAccess < oldestAccess {
++			oldestKey = key
++			oldestAccess = entry.lastAccess
++			first = false
++		}
++	}
++	delete(c.entries, oldestKey)
++}
++
++var (
++	adaptiveTFOEnabled atomic.Bool
++	adaptiveTFOStates  = newAdaptiveTFOCache()
++)
++
++// SetAdaptiveTFOEnabled enables per-entrance Snell fallback. Callers must also
++// opt a dialer in with WithAdaptiveTFO; other protocols are never affected.
++func SetAdaptiveTFOEnabled(enabled bool) {
++	if adaptiveTFOEnabled.Swap(enabled) != enabled {
++		adaptiveTFOStates.reset()
++	}
++}
++
++func AdaptiveTFOEnabled() bool {
++	return adaptiveTFOEnabled.Load()
++}
++
++// ResetAdaptiveTFO clears path-specific observations after a network change.
++// It does not retain sockets, payloads, or DNS results.
++func ResetAdaptiveTFO() {
++	adaptiveTFOStates.reset()
++}
++
+ type tfoConn struct {
+ 	net.Conn
+ 	closed bool
+@@ -125,15 +369,94 @@ func (c *tfoConn) WriterReplaceable() bool {
+ 	return c.Conn != nil
+ }
+ 
+-func dialTFO(ctx context.Context, netDialer net.Dialer, network, address string) (net.Conn, error) {
+-	ctx, cancel := context.WithTimeout(context.Background(), DefaultTCPTimeout)
+-	dialer := tfo.Dialer{Dialer: netDialer, DisableTFO: false}
++func dialTFO(ctx context.Context, netDialer net.Dialer, network, address, interfaceName string, adaptive bool) (net.Conn, error) {
++	ctx, cancel := context.WithTimeout(ctx, DefaultTCPTimeout)
++	tfoDialer := tfo.Dialer{Dialer: netDialer, DisableTFO: false}
++	tfoDial := func(ctx context.Context, earlyData []byte) (net.Conn, error) {
++		return tfoDialer.DialContext(ctx, network, address, earlyData)
++	}
++	tcpDial := func(ctx context.Context, earlyData []byte) (net.Conn, error) {
++		return dialTCPWithEarlyData(ctx, netDialer, network, address, earlyData)
++	}
++	dialFn := tfoDial
++	if adaptive {
++		dialFn = func(ctx context.Context, earlyData []byte) (net.Conn, error) {
++			return dialAdaptiveTFO(ctx, interfaceName, address, earlyData, tfoDial, tcpDial)
++		}
++	}
+ 	return &tfoConn{
+ 		dialed: make(chan bool, 1),
+ 		cancel: cancel,
+ 		ctx:    ctx,
+-		dialFn: func(ctx context.Context, earlyData []byte) (net.Conn, error) {
+-			return dialer.DialContext(ctx, network, address, earlyData)
+-		},
++		dialFn: dialFn,
+ 	}, nil
+ }
++
++type earlyDialFunc func(context.Context, []byte) (net.Conn, error)
++
++func dialAdaptiveTFO(ctx context.Context, interfaceName, address string, earlyData []byte,
++	tfoDial, tcpDial earlyDialFunc) (net.Conn, error) {
++	attempt := adaptiveTFOStates.decide(interfaceName, address)
++	if attempt.decision == adaptiveTFOUseTCP {
++		return tcpDial(ctx, earlyData)
++	}
++
++	probeCtx, cancel := context.WithTimeout(ctx, adaptiveTFOProbeTimeout)
++	conn, tfoErr := tfoDial(probeCtx, earlyData)
++	cancel()
++	if tfoErr == nil {
++		logAdaptiveTFOTransition(adaptiveTFOStates.record(attempt, true, false), interfaceName, address, nil)
++		return conn, nil
++	}
++
++	conn, tcpErr := tcpDial(ctx, earlyData)
++	logAdaptiveTFOTransition(adaptiveTFOStates.record(attempt, false, tcpErr == nil), interfaceName, address, tfoErr)
++	if tcpErr == nil {
++		return conn, nil
++	}
++	return nil, errors.Join(tfoErr, tcpErr)
++}
++
++func dialTCPWithEarlyData(ctx context.Context, netDialer net.Dialer, network, address string,
++	earlyData []byte) (net.Conn, error) {
++	conn, err := netDialer.DialContext(ctx, network, address)
++	if err != nil {
++		return nil, err
++	}
++	if len(earlyData) == 0 {
++		return conn, nil
++	}
++	if deadline, ok := ctx.Deadline(); ok {
++		if err := conn.SetWriteDeadline(deadline); err != nil {
++			_ = conn.Close()
++			return nil, err
++		}
++	}
++	written := 0
++	for written < len(earlyData) {
++		n, writeErr := conn.Write(earlyData[written:])
++		written += n
++		if writeErr != nil {
++			_ = conn.Close()
++			return nil, writeErr
++		}
++		if n == 0 {
++			_ = conn.Close()
++			return nil, io.ErrNoProgress
++		}
++	}
++	_ = conn.SetWriteDeadline(time.Time{})
++	return conn, nil
++}
++
++func logAdaptiveTFOTransition(transition adaptiveTFOTransition, interfaceName, address string, tfoErr error) {
++	switch transition {
++	case adaptiveTFOFirstSuccess:
++		log.Infoln("Snell 自适应 TFO：入口 %s（接口 %s）TFO 可用", address, interfaceName)
++	case adaptiveTFOFallback:
++		log.Warnln("Snell 自适应 TFO：入口 %s（接口 %s）TFO 失败，已仅对该入口改用普通 TCP，%s 后重试：%v",
++			address, interfaceName, adaptiveTFOCooldown, tfoErr)
++	case adaptiveTFORecovered:
++		log.Infoln("Snell 自适应 TFO：入口 %s（接口 %s）TFO 已恢复", address, interfaceName)
++	}
++}
+diff --git a/component/dialer/tfo_adaptive_test.go b/component/dialer/tfo_adaptive_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..d65f72dcf9f72c84b50e6872d226c23ce2d8ef36
+--- /dev/null
++++ b/component/dialer/tfo_adaptive_test.go
+@@ -0,0 +1,204 @@
++package dialer
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"net"
++	"testing"
++	"time"
++)
++
++func useTestAdaptiveTFOCache(t *testing.T) *adaptiveTFOCache {
++	t.Helper()
++	previous := adaptiveTFOStates
++	cache := newAdaptiveTFOCache()
++	adaptiveTFOStates = cache
++	t.Cleanup(func() { adaptiveTFOStates = previous })
++	return cache
++}
++
++func testPipeConn(t *testing.T) net.Conn {
++	t.Helper()
++	left, right := net.Pipe()
++	t.Cleanup(func() {
++		_ = left.Close()
++		_ = right.Close()
++	})
++	return left
++}
++
++func TestAdaptiveTFOSuccessKeepsTFO(t *testing.T) {
++	useTestAdaptiveTFOCache(t)
++	tfoCalls := 0
++	tcpCalls := 0
++	tfoDial := func(context.Context, []byte) (net.Conn, error) {
++		tfoCalls++
++		return testPipeConn(t), nil
++	}
++	tcpDial := func(context.Context, []byte) (net.Conn, error) {
++		tcpCalls++
++		return testPipeConn(t), nil
++	}
++
++	for index := 0; index < 2; index++ {
++		conn, err := dialAdaptiveTFO(context.Background(), "pdp_ip0", "192.0.2.1:443", []byte("hello"), tfoDial, tcpDial)
++		if err != nil {
++			t.Fatal(err)
++		}
++		_ = conn.Close()
++	}
++	if tfoCalls != 2 || tcpCalls != 0 {
++		t.Fatalf("TFO calls = %d, TCP calls = %d; want 2, 0", tfoCalls, tcpCalls)
++	}
++}
++
++func TestAdaptiveTFOFallsBackAndCachesIncompatibleEntrance(t *testing.T) {
++	useTestAdaptiveTFOCache(t)
++	tfoCalls := 0
++	tcpCalls := 0
++	tfoDial := func(context.Context, []byte) (net.Conn, error) {
++		tfoCalls++
++		return nil, context.DeadlineExceeded
++	}
++	tcpDial := func(context.Context, []byte) (net.Conn, error) {
++		tcpCalls++
++		return testPipeConn(t), nil
++	}
++
++	for index := 0; index < 2; index++ {
++		conn, err := dialAdaptiveTFO(context.Background(), "pdp_ip0", "192.0.2.2:443", nil, tfoDial, tcpDial)
++		if err != nil {
++			t.Fatal(err)
++		}
++		_ = conn.Close()
++	}
++	if tfoCalls != 1 || tcpCalls != 2 {
++		t.Fatalf("TFO calls = %d, TCP calls = %d; want 1, 2", tfoCalls, tcpCalls)
++	}
++}
++
++func TestAdaptiveTFOCooldownRetriesAndRecovers(t *testing.T) {
++	cache := useTestAdaptiveTFOCache(t)
++	now := time.Unix(1_700_000_000, 0)
++	cache.now = func() time.Time { return now }
++	tfoWorks := false
++	tfoCalls := 0
++	tfoDial := func(context.Context, []byte) (net.Conn, error) {
++		tfoCalls++
++		if !tfoWorks {
++			return nil, context.DeadlineExceeded
++		}
++		return testPipeConn(t), nil
++	}
++	tcpDial := func(context.Context, []byte) (net.Conn, error) {
++		return testPipeConn(t), nil
++	}
++
++	conn, err := dialAdaptiveTFO(context.Background(), "pdp_ip0", "192.0.2.3:443", nil, tfoDial, tcpDial)
++	if err != nil {
++		t.Fatal(err)
++	}
++	_ = conn.Close()
++	now = now.Add(cache.cooldown - time.Second)
++	conn, err = dialAdaptiveTFO(context.Background(), "pdp_ip0", "192.0.2.3:443", nil, tfoDial, tcpDial)
++	if err != nil {
++		t.Fatal(err)
++	}
++	_ = conn.Close()
++	if tfoCalls != 1 {
++		t.Fatalf("TFO retried before cooldown: calls = %d", tfoCalls)
++	}
++
++	tfoWorks = true
++	now = now.Add(2 * time.Second)
++	conn, err = dialAdaptiveTFO(context.Background(), "pdp_ip0", "192.0.2.3:443", nil, tfoDial, tcpDial)
++	if err != nil {
++		t.Fatal(err)
++	}
++	_ = conn.Close()
++	if tfoCalls != 2 {
++		t.Fatalf("TFO calls after cooldown = %d, want 2", tfoCalls)
++	}
++}
++
++func TestAdaptiveTFONetworkResetForgetsEntrance(t *testing.T) {
++	cache := useTestAdaptiveTFOCache(t)
++	attempt := cache.decide("pdp_ip0", "192.0.2.4:443")
++	cache.record(attempt, false, true)
++	if got := cache.decide("pdp_ip0", "192.0.2.4:443").decision; got != adaptiveTFOUseTCP {
++		t.Fatalf("cached decision = %v, want ordinary TCP", got)
++	}
++	cache.reset()
++	if got := cache.decide("pdp_ip0", "192.0.2.4:443").decision; got != adaptiveTFOProbe {
++		t.Fatalf("decision after reset = %v, want TFO probe", got)
++	}
++}
++
++func TestAdaptiveTFOBothFailuresDoNotPoisonEntrance(t *testing.T) {
++	cache := useTestAdaptiveTFOCache(t)
++	failure := errors.New("unreachable")
++	_, err := dialAdaptiveTFO(context.Background(), "pdp_ip0", "192.0.2.5:443", nil,
++		func(context.Context, []byte) (net.Conn, error) { return nil, failure },
++		func(context.Context, []byte) (net.Conn, error) { return nil, failure })
++	if err == nil {
++		t.Fatal("both failed dial methods returned nil error")
++	}
++	if got := cache.decide("pdp_ip0", "192.0.2.5:443").decision; got != adaptiveTFOProbe {
++		t.Fatalf("decision after both failures = %v, want a fresh probe", got)
++	}
++}
++
++func TestAdaptiveTFOCacheIsBounded(t *testing.T) {
++	cache := useTestAdaptiveTFOCache(t)
++	for index := 0; index < adaptiveTFOMaxEntries+20; index++ {
++		cache.decide("pdp_ip0", fmt.Sprintf("192.0.2.%d:443", index))
++	}
++	cache.mu.Lock()
++	count := len(cache.entries)
++	cache.mu.Unlock()
++	if count != adaptiveTFOMaxEntries {
++		t.Fatalf("cache entries = %d, want %d", count, adaptiveTFOMaxEntries)
++	}
++}
++
++func TestAdaptiveTFOOnlyOneInitialProbe(t *testing.T) {
++	cache := useTestAdaptiveTFOCache(t)
++	first := cache.decide("pdp_ip0", "192.0.2.6:443")
++	second := cache.decide("pdp_ip0", "192.0.2.6:443")
++	if first.decision != adaptiveTFOProbe || second.decision != adaptiveTFOUseTCP {
++		t.Fatalf("decisions = %v, %v; want probe, ordinary TCP", first.decision, second.decision)
++	}
++}
++
++func TestAdaptiveTFOStaleSuccessCannotOverrideFallback(t *testing.T) {
++	cache := useTestAdaptiveTFOCache(t)
++	initial := cache.decide("pdp_ip0", "192.0.2.8:443")
++	cache.record(initial, true, false)
++	first := cache.decide("pdp_ip0", "192.0.2.8:443")
++	stale := cache.decide("pdp_ip0", "192.0.2.8:443")
++	if got := cache.record(first, false, true); got != adaptiveTFOFallback {
++		t.Fatalf("fallback transition = %v, want adaptiveTFOFallback", got)
++	}
++	cache.record(stale, true, false)
++	if got := cache.decide("pdp_ip0", "192.0.2.8:443").decision; got != adaptiveTFOUseTCP {
++		t.Fatalf("stale success changed decision to %v, want ordinary TCP", got)
++	}
++}
++
++func TestAdaptiveTFORespectsCallerCancellation(t *testing.T) {
++	useTestAdaptiveTFOCache(t)
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	_, err := dialAdaptiveTFO(ctx, "pdp_ip0", "192.0.2.7:443", nil,
++		func(ctx context.Context, _ []byte) (net.Conn, error) {
++			<-ctx.Done()
++			return nil, ctx.Err()
++		},
++		func(ctx context.Context, _ []byte) (net.Conn, error) {
++			return nil, ctx.Err()
++		})
++	if !errors.Is(err, context.Canceled) {
++		t.Fatalf("error = %v, want context.Canceled", err)
++	}
++}

@@ -81,7 +81,7 @@ jobs:
           PATCHED_SING="$(bash scripts/prepare-ios-sing.sh)"
           printf 'PATCHED_SING=%s\n' "$PATCHED_SING" >> "$GITHUB_ENV"
 
-      - name: Prepare patched Mihomo allocator
+      - name: Prepare patched Mihomo
         run: |
           set -euxo pipefail
           cd MobileCore
@@ -115,11 +115,11 @@ jobs:
           go -C "$PATCHED_SING" test ./common/buf
           go -C "$PATCHED_SING" test -tags "with_low_memory" ./common/buf
 
-      - name: Verify patched Mihomo allocator
+      - name: Verify patched Mihomo
         run: |
           set -euxo pipefail
-          go -C "$PATCHED_MIHOMO" test ./common/pool ./config ./tunnel/statistic
-          go -C "$PATCHED_MIHOMO" test -tags "with_low_memory" ./common/pool ./config ./tunnel/statistic
+          go -C "$PATCHED_MIHOMO" test ./common/pool ./config ./tunnel/statistic ./component/dialer ./adapter/outbound
+          go -C "$PATCHED_MIHOMO" test -tags "with_low_memory" ./common/pool ./config ./tunnel/statistic ./component/dialer ./adapter/outbound
 
       - name: Verify patched gVisor TCP
         run: |
