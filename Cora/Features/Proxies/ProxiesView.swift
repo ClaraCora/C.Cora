@@ -63,14 +63,15 @@ struct ProxiesView: View {
                             .accessibilityLabel("搜索节点")
                             .help("搜索节点")
                         }
-                        if canRefresh {
-                            refreshControl
+                        if showsCurrentSelectionTest {
+                            currentSelectionTestControl
                         }
                     }
                     .opacity(toolbarControlsVisible ? 1 : 0)
                     .allowsHitTesting(toolbarControlsVisible)
                     .accessibilityHidden(!toolbarControlsVisible)
-                    .frame(width: toolbarControlsVisible && (showsSearch || canRefresh) ? nil : 0,
+                    .frame(width: toolbarControlsVisible &&
+                        (hasHiddenGroups || showsSearch || showsCurrentSelectionTest) ? nil : 0,
                            height: 44,
                            alignment: .trailing)
                     .clipped()
@@ -154,12 +155,12 @@ struct ProxiesView: View {
         }
     }
 
-    private var canRefresh: Bool {
-        controller.mode != "direct" || !controller.isRuntimeAvailable
+    private var showsSearch: Bool {
+        !visibleGroups.isEmpty
     }
 
-    private var showsSearch: Bool {
-        canRefresh && !visibleGroups.isEmpty
+    private var showsCurrentSelectionTest: Bool {
+        !visibleGroups.isEmpty
     }
 
     private var hasHiddenGroups: Bool {
@@ -250,22 +251,31 @@ struct ProxiesView: View {
         }
     }
 
-    private var refreshControl: some View {
+    private var currentSelectionTestControl: some View {
         Group {
-            if controller.isLoading {
+            if !controller.testingCurrentSelectionKeys.isEmpty {
                 ProgressView()
                     .controlSize(.small)
             } else {
                 Button {
-                    Task { await reload() }
+                    let targets = currentSelectionTargets
+                    Task { await controller.testCurrentSelections(targets) }
                 } label: {
-                    Image(systemName: "arrow.clockwise")
+                    Image(systemName: "speedometer")
                 }
-                .accessibilityLabel("刷新节点")
-                .help("刷新节点")
+                .disabled(!canTestCurrentSelections)
+                .accessibilityLabel("测试本页当前节点延迟")
+                .help("测试本页当前节点延迟")
             }
         }
         .frame(width: 44, height: 44)
+    }
+
+    private var canTestCurrentSelections: Bool {
+        controller.isRuntimeAvailable &&
+            !currentSelectionTargets.isEmpty &&
+            controller.testing.isEmpty &&
+            controller.testingNodes.isEmpty
     }
 
     @ViewBuilder private var groupList: some View {
@@ -340,10 +350,13 @@ struct ProxiesView: View {
             isExpanded: result.isExpanded,
             isInteractionLocked: activeGroupName != nil && activeGroupName != group.name,
             isTesting: controller.testing.contains(group.name),
-            canTest: controller.isRuntimeAvailable,
+            canTest: controller.isRuntimeAvailable &&
+                controller.testingCurrentSelectionKeys.isEmpty,
             selecting: controller.selecting[group.name],
             testingNodes: controller.testingNodes,
             delays: controller.delays,
+            currentSelectionDelay: currentSelectionDelay(for: group),
+            isTestingCurrentSelection: isTestingCurrentSelection(for: group),
             gradientIndex: groupGradient(for: group.name),
             onToggle: { toggleListGroup(group.name) },
             onTest: { Task { await controller.testGroup(group.name) } },
@@ -523,7 +536,10 @@ struct ProxiesView: View {
                 GroupGridCard(
                     group: result.group,
                     allGroups: controller.resolutionGroups,
-                    canTest: controller.isRuntimeAvailable,
+                    canTest: controller.isRuntimeAvailable &&
+                        controller.testingCurrentSelectionKeys.isEmpty,
+                    currentSelectionDelay: currentSelectionDelay(for: result.group),
+                    isTestingCurrentSelection: isTestingCurrentSelection(for: result.group),
                     gradientIndex: groupGradient(for: result.group.name),
                     isInteractionLocked: activeGroupName != nil &&
                         activeGroupName != result.group.name,
@@ -578,7 +594,8 @@ struct ProxiesView: View {
             group: result.group,
             allGroups: controller.resolutionGroups,
             isTesting: controller.testing.contains(result.group.name),
-            canTest: controller.isRuntimeAvailable,
+            canTest: controller.isRuntimeAvailable &&
+                controller.testingCurrentSelectionKeys.isEmpty,
             selecting: controller.selecting[result.group.name],
             testingNodes: controller.testingNodes,
             delays: controller.delays,
@@ -667,6 +684,45 @@ struct ProxiesView: View {
             (showHiddenGroups || !group.hidden) &&
                 groupCategory(for: group, groupNames: allGroupNames) == selectedGroupCategory
         }
+    }
+
+    /// Batch-test scope follows the cards in this tab and the hidden-group toggle.
+    /// Search is presentation-only and does not silently narrow a page-wide action.
+    private var currentSelectionTargets: [ProxyDelayBatchTarget] {
+        var seen = Set<String>()
+        return visibleGroups.compactMap { group in
+            guard let target = currentSelectionTarget(for: group),
+                  seen.insert(target.key).inserted else { return nil }
+            return target
+        }
+    }
+
+    private func currentSelectionTarget(for group: ProxyGroup) -> ProxyDelayBatchTarget? {
+        guard let resolution = ProxySelectionResolver.resolve(
+            group: group, groups: controller.resolutionGroups) else { return nil }
+        let groupNames = Set(controller.resolutionGroups.map(\.name))
+        guard !groupNames.contains(resolution.finalNode) else { return nil }
+
+        let parent = resolution.path.dropLast().last.flatMap { name in
+            groupNames.contains(name) ? name : nil
+        } ?? group.name
+        let key = ProxyDelayResolver.storageKey(
+            for: group.now, groups: controller.resolutionGroups)
+        guard !key.isEmpty else { return nil }
+        return ProxyDelayBatchTarget(key: key,
+                                     node: resolution.finalNode,
+                                     group: parent)
+    }
+
+    private func currentSelectionDelay(for group: ProxyGroup) -> Int? {
+        ProxyDelayResolver.delay(for: group.now,
+                                 groups: controller.resolutionGroups,
+                                 delays: controller.delays)
+    }
+
+    private func isTestingCurrentSelection(for group: ProxyGroup) -> Bool {
+        guard let target = currentSelectionTarget(for: group) else { return false }
+        return controller.testingCurrentSelectionKeys.contains(target.key)
     }
 
     private func groupCategory(for group: ProxyGroup,
@@ -1169,6 +1225,8 @@ private struct StrategyGroupListPanel: View {
     let selecting: String?
     let testingNodes: Set<ProxyNodeTestKey>
     let delays: [String: Int]
+    let currentSelectionDelay: Int?
+    let isTestingCurrentSelection: Bool
     let gradientIndex: Int
     let onToggle: () -> Void
     let onTest: () -> Void
@@ -1192,6 +1250,8 @@ private struct StrategyGroupListPanel: View {
                 } else {
                     GroupCompactHeader(group: group,
                                        allGroups: allGroups,
+                                       delay: currentSelectionDelay,
+                                       isTestingDelay: isTestingCurrentSelection,
                                        onToggle: onToggle)
                 }
             }
@@ -1462,6 +1522,8 @@ private struct GroupGridCard: View {
     let group: ProxyGroup
     let allGroups: [ProxyGroup]
     let canTest: Bool
+    let currentSelectionDelay: Int?
+    let isTestingCurrentSelection: Bool
     let gradientIndex: Int
     let isInteractionLocked: Bool
     let onToggle: () -> Void
@@ -1471,6 +1533,8 @@ private struct GroupGridCard: View {
     var body: some View {
         GroupCompactHeader(group: group,
                            allGroups: allGroups,
+                           delay: currentSelectionDelay,
+                           isTestingDelay: isTestingCurrentSelection,
                            onToggle: onToggle)
         .padding(8)
         .frame(maxWidth: .infinity, minHeight: 76, alignment: .leading)
@@ -1582,54 +1646,136 @@ private struct GroupExpandedPanel: View {
 private struct GroupCompactHeader: View {
     let group: ProxyGroup
     let allGroups: [ProxyGroup]
+    let delay: Int?
+    let isTestingDelay: Bool
     let onToggle: () -> Void
     var compact = false
 
-    private var selectionLines: [String] {
-        guard let resolution = ProxySelectionResolver.resolve(group: group,
-                                                              groups: allGroups) else {
-            return ["未选择"]
+    private var resolution: ProxySelectionResolution? {
+        ProxySelectionResolver.resolve(group: group, groups: allGroups)
+    }
+
+    private var immediateReference: String? {
+        guard let resolution, resolution.hasDistinctFinalNode else { return nil }
+        return resolution.immediateSelection
+    }
+
+    private var finalSelection: String {
+        resolution?.finalNode ?? "未选择"
+    }
+
+    private var accessibilityValue: String {
+        var values: [String] = []
+        if let immediateReference {
+            values.append("当前分组 \(immediateReference)")
         }
-        if resolution.hasDistinctFinalNode {
-            return [resolution.immediateSelection, resolution.finalNode]
+        values.append("当前节点 \(finalSelection)")
+        if !compact {
+            values.append(isTestingDelay
+                          ? "正在测试延迟"
+                          : DelayBadge.accessibilityText(delay))
         }
-        return [resolution.immediateSelection]
+        return values.joined(separator: "，")
     }
 
     var body: some View {
         Button(action: onToggle) {
-            HStack(spacing: 9) {
-                GroupIcon(url: group.icon)
-                VStack(alignment: .leading, spacing: compact ? 1 : 3) {
-                    Text(group.name).font(.headline).lineLimit(1)
-                    if compact {
-                        Text(selectionLines[0])
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .frame(minHeight: 17, alignment: .topLeading)
-                    } else {
-                        VStack(alignment: .leading, spacing: 0) {
-                            ForEach(Array(selectionLines.enumerated()), id: \.offset) { _, line in
-                                Text(line)
-                                    .lineLimit(1)
-                                    .truncationMode(.tail)
-                            }
-                        }
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .frame(minHeight: 30, alignment: .topLeading)
-                    }
-                }
+            if compact {
+                compactContent
+            } else {
+                collapsedContent
             }
-            .frame(maxWidth: .infinity, minHeight: compact ? 44 : 54, alignment: .leading)
-            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(group.name)
-        .accessibilityValue(selectionLines.joined(separator: "，"))
+        .accessibilityValue(accessibilityValue)
+    }
+
+    private var compactContent: some View {
+        HStack(spacing: 9) {
+            GroupIcon(url: group.icon)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(group.name)
+                    .font(.headline)
+                    .lineLimit(1)
+                Text(resolution?.immediateSelection ?? "未选择")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .frame(minHeight: 17, alignment: .topLeading)
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+        .contentShape(Rectangle())
+    }
+
+    private var collapsedContent: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            HStack(alignment: .top, spacing: 9) {
+                GroupIcon(url: group.icon)
+                VStack(alignment: .leading, spacing: 1) {
+                    HStack(alignment: .firstTextBaseline, spacing: 4) {
+                        Text(group.name)
+                            .font(.headline)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                        Spacer(minLength: 2)
+                        GroupHeaderDelayBadge(delay: delay,
+                                              isTesting: isTestingDelay)
+                    }
+                    if let immediateReference {
+                        Text(immediateReference)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            Text(finalSelection)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(maxWidth: .infinity, minHeight: 54, alignment: .leading)
+        .contentShape(Rectangle())
+    }
+}
+
+private struct GroupHeaderDelayBadge: View {
+    let delay: Int?
+    let isTesting: Bool
+
+    private var tint: Color {
+        isTesting ? .secondary : DelayBadge.tint(delay)
+    }
+
+    var body: some View {
+        HStack(spacing: 4) {
+            if isTesting {
+                ProgressView()
+                    .controlSize(.mini)
+            } else {
+                Circle()
+                    .fill(tint)
+                    .frame(width: 5, height: 5)
+            }
+            Text(isTesting ? "测速" : DelayBadge.shortText(delay))
+        }
+        .font(.caption2.monospacedDigit().weight(.semibold))
+        .foregroundStyle(tint)
+        .padding(.horizontal, 5)
+        .padding(.vertical, 2)
+        .background(Capsule().fill(tint.opacity(0.10)))
+        .fixedSize(horizontal: true, vertical: false)
+        .accessibilityHidden(true)
     }
 }
 
@@ -1645,6 +1791,8 @@ private struct GroupExpandedHeader: View {
         HStack(spacing: 10) {
             GroupCompactHeader(group: group,
                                allGroups: allGroups,
+                               delay: nil,
+                               isTestingDelay: false,
                                onToggle: onToggle,
                                compact: true)
             Button(action: onTest) {

@@ -615,6 +615,21 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 let response = MihomoProxyDelay(name, group, url, directURL, timeout)
                 reply(Self.validatedCoreJSONData(response, command: "proxyDelay"))
             }
+        case "proxyDelays":
+            guard let targets = obj?["targets"] as? [Any],
+                  JSONSerialization.isValidJSONObject(targets),
+                  let targetsData = try? JSONSerialization.data(withJSONObject: targets) else {
+                reply(Self.jsonData(["error": "批量测速目标格式错误"]))
+                return
+            }
+            let targetsJSON = String(decoding: targetsData, as: UTF8.self)
+            let url = (obj?["url"] as? String) ?? ""
+            let directURL = (obj?["directURL"] as? String) ?? ""
+            let timeout = (obj?["timeout"] as? NSNumber)?.intValue ?? 5000
+            ipcQueue.async {
+                let response = MihomoProxyDelays(targetsJSON, url, directURL, timeout)
+                reply(Self.validatedCoreJSONData(response, command: "proxyDelays"))
+            }
         case "readRuleProvider":
             let name = (obj?["name"] as? String) ?? ""
             let maxBytes = (obj?["maxBytes"] as? NSNumber)?.intValue ?? (1 * 1024 * 1024)

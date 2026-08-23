@@ -18,6 +18,15 @@ struct ProxyNodeTestKey: Hashable {
     let node: String
 }
 
+/// One concrete current-selection target for the toolbar batch delay test.
+/// `key` is the shared delay-store key, while `group` is only a lookup context
+/// for provider nodes that are not exposed in mihomo's top-level proxy map.
+struct ProxyDelayBatchTarget: Hashable {
+    let key: String
+    let node: String
+    let group: String
+}
+
 /// 一个策略组。
 struct ProxyGroup: Identifiable {
     var id: String { name }
@@ -177,6 +186,8 @@ final class ProxyController: ObservableObject {
     @Published private(set) var testing: Set<String> = []
     /// 正在单独测速的节点，以策略组和节点名共同标识。
     @Published private(set) var testingNodes: Set<ProxyNodeTestKey> = []
+    /// 顶部批量测速当前覆盖的最终节点 key。卡片据此显示独立加载状态。
+    @Published private(set) var testingCurrentSelectionKeys: Set<String> = []
     /// 正在切换的策略组与目标节点，避免重复点击并给节点行显示进度。
     @Published private(set) var selecting: [String: String] = [:]
     private var loadGeneration = 0
@@ -320,6 +331,7 @@ final class ProxyController: ObservableObject {
         delaySessionID = ProxyDelayStore.load()?.sessionID
         testing = []
         testingNodes = []
+        testingCurrentSelectionKeys = []
         selecting = [:]
     }
 
@@ -337,11 +349,45 @@ final class ProxyController: ObservableObject {
         delays = snapshot?.delays ?? [:]
         testing = []
         testingNodes = []
+        testingCurrentSelectionKeys = []
     }
 
     private func persistDelays() {
         guard let delaySessionID else { return }
         ProxyDelayStore.save(delays, sessionID: delaySessionID)
+    }
+
+    private func clearDelayValues(for keys: Set<String>) {
+        guard !keys.isEmpty else { return }
+        var updated = delays
+        for key in keys {
+            updated.removeValue(forKey: key)
+        }
+        delays = updated
+        persistDelays()
+    }
+
+    private func mergeDelayValues(_ values: [String: Int]) {
+        guard !values.isEmpty else { return }
+        var updated = delays
+        for (key, value) in values {
+            updated[key] = value
+        }
+        delays = updated
+        persistDelays()
+    }
+
+    private func restoreDelayValues(_ previous: [String: Int],
+                                    for keys: Set<String>) {
+        var updated = delays
+        for key in keys {
+            updated.removeValue(forKey: key)
+        }
+        for (key, value) in previous {
+            updated[key] = value
+        }
+        delays = updated
+        persistDelays()
     }
 
     /// 在某策略组选定节点。连接中走 IPC；断开时保存到订阅，下次连接恢复。
@@ -413,7 +459,9 @@ final class ProxyController: ObservableObject {
     /// 对某策略组做延迟测试（IPC groupDelay）。每个成员都会收到成功延迟或 0（超时），
     /// 因而不会继续显示上一次测速的旧结果。
     func testGroup(_ name: String) async {
-        guard isRuntimeAvailable, !testing.contains(name) else { return }
+        guard isRuntimeAvailable,
+              testingCurrentSelectionKeys.isEmpty,
+              !testing.contains(name) else { return }
         let session = sessionGeneration
         error = nil
         testing.insert(name)
@@ -421,12 +469,7 @@ final class ProxyController: ObservableObject {
         let memberDelayKeys = Set(memberNames.map {
             ProxyDelayResolver.storageKey(for: $0, groups: resolutionGroups)
         })
-        var cleared = delays
-        for key in memberDelayKeys {
-            cleared.removeValue(forKey: key)
-        }
-        delays = cleared
-        persistDelays()
+        clearDelayValues(for: memberDelayKeys)
         defer {
             if session == sessionGeneration {
                 testing.remove(name)
@@ -447,19 +490,18 @@ final class ProxyController: ObservableObject {
                 self.error = "测速失败：\(err)"
                 return
             }
-            var updated = delays
+            var values: [String: Int] = [:]
             for node in memberNames {
                 let key = ProxyDelayResolver.storageKey(for: node, groups: resolutionGroups)
-                updated[key] = (dict[node] as? NSNumber)?.intValue ?? 0
+                values[key] = (dict[node] as? NSNumber)?.intValue ?? 0
             }
             for (node, ms) in dict {
                 if let value = (ms as? NSNumber)?.intValue, !memberNames.contains(node) {
                     let key = ProxyDelayResolver.storageKey(for: node, groups: resolutionGroups)
-                    updated[key] = value
+                    values[key] = value
                 }
             }
-            delays = updated
-            persistDelays()
+            mergeDelayValues(values)
         case .failure(let reason):
             self.error = "测速失败：\(reason)"
         }
@@ -468,13 +510,14 @@ final class ProxyController: ObservableObject {
     /// 仅测试一个节点，结果写入与整组测速共用的延迟缓存。
     func testNode(_ name: String, in group: String? = nil) async {
         let testingKey = ProxyNodeTestKey(group: group ?? "", node: name)
-        guard isRuntimeAvailable, !testingNodes.contains(testingKey) else { return }
+        guard isRuntimeAvailable,
+              testingCurrentSelectionKeys.isEmpty,
+              !testingNodes.contains(testingKey) else { return }
         let session = sessionGeneration
         error = nil
         testingNodes.insert(testingKey)
         let delayKey = ProxyDelayResolver.storageKey(for: name, groups: resolutionGroups)
-        delays.removeValue(forKey: delayKey)
-        persistDelays()
+        clearDelayValues(for: [delayKey])
         defer {
             if session == sessionGeneration {
                 testingNodes.remove(testingKey)
@@ -499,9 +542,73 @@ final class ProxyController: ObservableObject {
                 self.error = "测速失败：响应缺少延迟"
                 return
             }
-            delays[delayKey] = delay
-            persistDelays()
+            mergeDelayValues([delayKey: delay])
         case .failure(let reason):
+            self.error = "测速失败：\(reason)"
+        }
+    }
+
+    /// 测试当前页面每张卡片已选中的最终节点。目标按共享延迟 key 去重，
+    /// 与整组测速和单节点测速共用同一份会话缓存与持久化快照。
+    func testCurrentSelections(_ targets: [ProxyDelayBatchTarget]) async {
+        var seen = Set<String>()
+        let uniqueTargets = targets.filter { target in
+            !target.key.isEmpty && !target.node.isEmpty && seen.insert(target.key).inserted
+        }
+        guard isRuntimeAvailable,
+              !uniqueTargets.isEmpty,
+              testing.isEmpty,
+              testingNodes.isEmpty,
+              testingCurrentSelectionKeys.isEmpty else { return }
+
+        let session = sessionGeneration
+        let keys = Set(uniqueTargets.map(\.key))
+        let previousValues = Dictionary(uniqueKeysWithValues: keys.compactMap { key in
+            delays[key].map { (key, $0) }
+        })
+        error = nil
+        testingCurrentSelectionKeys = keys
+        clearDelayValues(for: keys)
+        defer {
+            if session == sessionGeneration {
+                testingCurrentSelectionKeys = []
+            }
+        }
+
+        let payload = uniqueTargets.map { target in
+            ["key": target.key, "name": target.node, "group": target.group]
+        }
+        let result = await CoreStateManager.shared.sendMessage(
+            ["cmd": "proxyDelays", "targets": payload,
+             "count": uniqueTargets.count,
+             "directURL": directDelayTestURL,
+             "url": delayTestURL, "timeout": delayTestTimeoutMilliseconds])
+        guard session == sessionGeneration else { return }
+
+        switch result {
+        case .ok(let data):
+            guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+                restoreDelayValues(previousValues, for: keys)
+                self.error = "测速失败：批量响应非 JSON"
+                return
+            }
+            if let message = object["error"] as? String {
+                restoreDelayValues(previousValues, for: keys)
+                self.error = "测速失败：\(message)"
+                return
+            }
+            guard let rawResults = object["results"] as? [String: Any] else {
+                restoreDelayValues(previousValues, for: keys)
+                self.error = "测速失败：批量响应缺少结果"
+                return
+            }
+            var values: [String: Int] = [:]
+            for target in uniqueTargets {
+                values[target.key] = (rawResults[target.key] as? NSNumber)?.intValue ?? 0
+            }
+            mergeDelayValues(values)
+        case .failure(let reason):
+            restoreDelayValues(previousValues, for: keys)
             self.error = "测速失败：\(reason)"
         }
     }

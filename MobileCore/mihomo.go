@@ -81,6 +81,22 @@ const defaultRunLogChunkBytes = 48 << 10
 
 const maxSnellCellularTCPNodes = 4096
 
+const (
+	maxProxyDelayTargets  = 256
+	proxyDelayWorkerLimit = 6
+)
+
+type proxyDelayTarget struct {
+	Key   string `json:"key"`
+	Name  string `json:"name"`
+	Group string `json:"group"`
+}
+
+type proxyDelayBatchSession struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
 // connectionSnapshotHeap keeps only the oldest item at its root, allowing the
 // IPC snapshot to select the newest live connections without allocating a
 // slice proportional to the total number of active trackers.
@@ -110,15 +126,17 @@ func (items *connectionSnapshotHeap) Pop() any {
 
 // homeDir 是 mihomo 工作目录（= App Group 容器），run.log 也写在这里。
 var (
-	homeDir          string
-	logCaptureMu     sync.Once
-	logFileMu        sync.Mutex
-	runLogFile       *os.File
-	runLogBytes      int64 = -1
-	runLogGeneration int64
-	configApplyMu    sync.RWMutex
-	interfaceMu      sync.RWMutex
-	physicalIface    string
+	homeDir               string
+	logCaptureMu          sync.Once
+	logFileMu             sync.Mutex
+	runLogFile            *os.File
+	runLogBytes           int64 = -1
+	runLogGeneration      int64
+	configApplyMu         sync.RWMutex
+	proxyDelayBatchMu     sync.Mutex
+	activeProxyDelayBatch *proxyDelayBatchSession
+	interfaceMu           sync.RWMutex
+	physicalIface         string
 
 	// 最近一次合并配置时收集的：不适用内容提示 + 各节点协议摘要（供主 App 经 IPC 取用）。
 	configNotices         []string
@@ -132,6 +150,46 @@ var (
 	snellCellularTCPMu    sync.RWMutex
 	snellCellularTCPNodes []string
 )
+
+// lockConfigApplyForWrite cancels the active multi-node delay run before it
+// waits for the configuration write lock. Registration and write-lock entry
+// share proxyDelayBatchMu, closing the race where a new batch could acquire a
+// read lock between cancellation and configApplyMu.Lock.
+func lockConfigApplyForWrite() {
+	proxyDelayBatchMu.Lock()
+	if activeProxyDelayBatch != nil {
+		activeProxyDelayBatch.cancel()
+	}
+	configApplyMu.Lock()
+	proxyDelayBatchMu.Unlock()
+}
+
+func unlockConfigApplyForWrite() {
+	configApplyMu.Unlock()
+}
+
+func beginProxyDelayBatch() *proxyDelayBatchSession {
+	proxyDelayBatchMu.Lock()
+	if activeProxyDelayBatch != nil {
+		activeProxyDelayBatch.cancel()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	session := &proxyDelayBatchSession{ctx: ctx, cancel: cancel}
+	activeProxyDelayBatch = session
+	configApplyMu.RLock()
+	proxyDelayBatchMu.Unlock()
+	return session
+}
+
+func finishProxyDelayBatch(session *proxyDelayBatchSession) {
+	configApplyMu.RUnlock()
+	session.cancel()
+	proxyDelayBatchMu.Lock()
+	if activeProxyDelayBatch == session {
+		activeProxyDelayBatch = nil
+	}
+	proxyDelayBatchMu.Unlock()
+}
 
 // Version 返回「mihomo 内核版本 / Go 运行时版本」。
 // 对应 Swift 侧 `MihomoVersion()`。
@@ -614,8 +672,8 @@ func StartWithConfig(fd int, tunnelMTU int, configYAML string, settingsJSON stri
 			err = fmt.Errorf("mihomo panic: %v", r)
 		}
 	}()
-	configApplyMu.Lock()
-	defer configApplyMu.Unlock()
+	lockConfigApplyForWrite()
+	defer unlockConfigApplyForWrite()
 
 	resetError := resetRunLog()
 	st := parseSettings(settingsJSON)
@@ -2166,30 +2224,167 @@ func ProxyDelay(name, group, url, directURL string, timeoutMs int) string {
 	configApplyMu.RLock()
 	defer configApplyMu.RUnlock()
 	proxies := tunnel.Proxies()
-	p, exist := proxies[name]
-	if !exist && strings.TrimSpace(group) != "" {
-		if parent, ok := tunnel.Proxies()[group]; ok {
-			if proxyGroup, ok := parent.Adapter().(outboundgroup.ProxyGroup); ok {
-				for _, member := range proxyGroup.Proxies() {
-					if member.Name() == name {
-						p = member
-						exist = true
-						break
-					}
-				}
-			}
-		}
-	}
+	p, exist := resolveDelayProxy(name, group, proxies)
 	if !exist {
 		return `{"error":"节点不存在"}`
 	}
-	snellNode := p.Type() == C.Snell
-	if snellNode {
-		interfaceName := currentPhysicalInterface()
-		appendRunLog(fmt.Sprintf("Snell 蜂窝 TCP：单节点测速 %s，接口=%s，%s",
-			name, displayInterfaceName(interfaceName),
-			snellCellularTCPStatus(name, interfaceName)))
+	url, directURL, timeoutMs = normalizeProxyDelayOptions(url, directURL, timeoutMs)
+	delay, err := measureProxyDelay(
+		context.Background(), p, name, proxies, url, directURL, timeoutMs, "单节点测速")
+	if err != nil {
+		if proxyDelayTimedOut(context.Background(), err) {
+			return `{"delay":0}`
+		}
+		return proxyDelayErrorResponse(err)
 	}
+	if delay == 0 {
+		return `{"delay":0}`
+	}
+	out, err := json.Marshal(map[string]uint16{"delay": delay})
+	if err != nil {
+		return `{"error":"marshal: ` + err.Error() + `"}`
+	}
+	return string(out)
+}
+
+// ProxyDelays tests a bounded list of concrete proxy selections. Every target
+// receives its own timeout after leaving the worker queue, so later waves do
+// not lose their request budget while earlier nodes are running.
+func ProxyDelays(targetsJSON, url, directURL string, timeoutMs int) string {
+	targets, err := parseProxyDelayTargets(targetsJSON)
+	if err != nil {
+		return marshalJSON(map[string]any{"error": err.Error()})
+	}
+
+	session := beginProxyDelayBatch()
+	defer finishProxyDelayBatch(session)
+	if coreStartedAt.IsZero() {
+		return marshalJSON(map[string]any{"error": "内核未运行"})
+	}
+	proxies := tunnel.Proxies()
+	url, directURL, timeoutMs = normalizeProxyDelayOptions(url, directURL, timeoutMs)
+	results := make(map[string]uint16, len(targets))
+	for _, target := range targets {
+		results[target.Key] = 0
+	}
+
+	workerCount := min(proxyDelayWorkerLimit, len(targets))
+	jobs := make(chan proxyDelayTarget)
+	var resultsMu sync.Mutex
+	var workers sync.WaitGroup
+	workers.Add(workerCount)
+	for range workerCount {
+		go func() {
+			defer workers.Done()
+			for {
+				var target proxyDelayTarget
+				var ok bool
+				select {
+				case <-session.ctx.Done():
+					return
+				case target, ok = <-jobs:
+					if !ok {
+						return
+					}
+				}
+				if session.ctx.Err() != nil {
+					return
+				}
+				proxy, exists := resolveDelayProxy(target.Name, target.Group, proxies)
+				if !exists {
+					continue
+				}
+				delay, _ := measureProxyDelay(
+					session.ctx, proxy, target.Name, proxies,
+					url, directURL, timeoutMs, "批量测速")
+				if delay == 0 {
+					continue
+				}
+				if session.ctx.Err() != nil {
+					return
+				}
+				resultsMu.Lock()
+				results[target.Key] = delay
+				resultsMu.Unlock()
+			}
+		}()
+	}
+	producerCanceled := false
+produce:
+	for _, target := range targets {
+		select {
+		case <-session.ctx.Done():
+			producerCanceled = true
+			break produce
+		case jobs <- target:
+		}
+	}
+	close(jobs)
+	workers.Wait()
+	if producerCanceled || session.ctx.Err() != nil {
+		return marshalJSON(map[string]any{"error": "批量测速已取消"})
+	}
+
+	return marshalJSON(map[string]any{"results": results})
+}
+
+func parseProxyDelayTargets(raw string) ([]proxyDelayTarget, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, errors.New("测速目标为空")
+	}
+	var decoded []proxyDelayTarget
+	if err := json.Unmarshal([]byte(raw), &decoded); err != nil {
+		return nil, fmt.Errorf("测速目标格式错误: %w", err)
+	}
+	if len(decoded) == 0 {
+		return nil, errors.New("测速目标为空")
+	}
+	if len(decoded) > maxProxyDelayTargets {
+		return nil, fmt.Errorf("测速目标超过 %d 个上限", maxProxyDelayTargets)
+	}
+
+	targets := make([]proxyDelayTarget, 0, len(decoded))
+	seen := make(map[string]struct{}, len(decoded))
+	for index, target := range decoded {
+		if strings.TrimSpace(target.Key) == "" {
+			return nil, fmt.Errorf("第 %d 个测速目标缺少 key", index+1)
+		}
+		if strings.TrimSpace(target.Name) == "" {
+			return nil, fmt.Errorf("第 %d 个测速目标缺少 name", index+1)
+		}
+		if _, exists := seen[target.Key]; exists {
+			continue
+		}
+		seen[target.Key] = struct{}{}
+		targets = append(targets, target)
+	}
+	return targets, nil
+}
+
+func resolveDelayProxy(name, group string, proxies map[string]C.Proxy) (C.Proxy, bool) {
+	if proxy, exists := proxies[name]; exists {
+		return proxy, true
+	}
+	if strings.TrimSpace(group) == "" {
+		return nil, false
+	}
+	parent, exists := proxies[group]
+	if !exists {
+		return nil, false
+	}
+	proxyGroup, ok := parent.Adapter().(outboundgroup.ProxyGroup)
+	if !ok {
+		return nil, false
+	}
+	for _, member := range proxyGroup.Proxies() {
+		if member.Name() == name {
+			return member, true
+		}
+	}
+	return nil, false
+}
+
+func normalizeProxyDelayOptions(url, directURL string, timeoutMs int) (string, string, int) {
 	if url == "" {
 		url = "https://www.gstatic.com/generate_204"
 	}
@@ -2199,38 +2394,52 @@ func ProxyDelay(name, group, url, directURL string, timeoutMs int) string {
 	if timeoutMs <= 0 {
 		timeoutMs = 5000
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(timeoutMs))
-	defer cancel()
+	return url, directURL, timeoutMs
+}
 
+func measureProxyDelay(parent context.Context,
+	proxy C.Proxy,
+	name string,
+	proxies map[string]C.Proxy,
+	url string,
+	directURL string,
+	timeoutMs int,
+	operation string) (uint16, error) {
+	snellNode := proxy.Type() == C.Snell
+	if snellNode {
+		interfaceName := currentPhysicalInterface()
+		appendRunLog(fmt.Sprintf("Snell 蜂窝 TCP：%s %s，接口=%s，%s",
+			operation, name, displayInterfaceName(interfaceName),
+			snellCellularTCPStatus(name, interfaceName)))
+	}
+
+	ctx, cancel := context.WithTimeout(parent, time.Millisecond*time.Duration(timeoutMs))
+	defer cancel()
 	var expectedStatus utils.IntRanges[uint16]
-	delay, err := p.URLTest(ctx,
-		delayURLForProxy(p, url, directURL, proxies), expectedStatus)
+	delay, err := proxy.URLTest(
+		ctx, delayURLForProxy(proxy, url, directURL, proxies), expectedStatus)
 	if err != nil {
+		timedOut := proxyDelayTimedOut(ctx, err)
 		if snellNode {
-			appendRunLog(fmt.Sprintf("Snell 蜂窝 TCP：单节点测速 %s 失败：%v",
-				name, err))
+			appendRunLog(fmt.Sprintf("Snell 蜂窝 TCP：%s %s 失败：%v",
+				operation, name, err))
 		}
-		if proxyDelayTimedOut(ctx, err) {
-			return `{"delay":0}`
+		if timedOut {
+			return 0, context.DeadlineExceeded
 		}
-		return proxyDelayErrorResponse(err)
+		return 0, err
 	}
 	if delay == 0 {
 		if snellNode {
-			appendRunLog(fmt.Sprintf("Snell 蜂窝 TCP：单节点测速 %s 超时",
-				name))
+			appendRunLog(fmt.Sprintf("Snell 蜂窝 TCP：%s %s 超时", operation, name))
 		}
-		return `{"delay":0}`
+		return 0, nil
 	}
 	if snellNode {
-		appendRunLog(fmt.Sprintf("Snell 蜂窝 TCP：单节点测速 %s 成功，延迟=%dms",
-			name, delay))
+		appendRunLog(fmt.Sprintf("Snell 蜂窝 TCP：%s %s 成功，延迟=%dms",
+			operation, name, delay))
 	}
-	out, err := json.Marshal(map[string]uint16{"delay": delay})
-	if err != nil {
-		return `{"error":"marshal: ` + err.Error() + `"}`
-	}
-	return string(out)
+	return delay, nil
 }
 
 func proxyDelayErrorResponse(err error) string {
@@ -2529,8 +2738,8 @@ func Mode() string {
 // SetMode 设置模式（rule/global/direct，大小写不敏感，未知按 rule）。
 // 对应 Swift 侧 `MihomoSetMode(_:)`。
 func SetMode(mode string) {
-	configApplyMu.Lock()
-	defer configApplyMu.Unlock()
+	lockConfigApplyForWrite()
+	defer unlockConfigApplyForWrite()
 	switch strings.ToLower(strings.TrimSpace(mode)) {
 	case "global":
 		tunnel.SetMode(tunnel.Global)
@@ -2795,8 +3004,8 @@ func SetDefaultInterface(name string) {
 	if name == "" {
 		return
 	}
-	configApplyMu.Lock()
-	defer configApplyMu.Unlock()
+	lockConfigApplyForWrite()
+	defer unlockConfigApplyForWrite()
 	storePhysicalInterface(name)
 	dialer.DefaultInterface.Store(name)
 	appendRunLog("默认出站接口 = " + name)
@@ -2816,8 +3025,8 @@ func NotifyNetworkChange(name string, systemDNSJSON string, reason string,
 		reason = "网络状态变化"
 	}
 	newSystemDNS, dnsErr := parseSystemDNSJSON(systemDNSJSON)
-	configApplyMu.Lock()
-	defer configApplyMu.Unlock()
+	lockConfigApplyForWrite()
+	defer unlockConfigApplyForWrite()
 	storePhysicalInterface(name)
 	previous := dialer.DefaultInterface.Load()
 	dialer.DefaultInterface.Store(name)
@@ -3076,8 +3285,8 @@ func rebuildDNSResolverLocked(c *config.DNS, generalIPv6 bool) {
 
 // Stop 关闭内核与所有监听器。对应 Swift 侧 `MihomoStop()`。
 func Stop() {
-	configApplyMu.Lock()
-	defer configApplyMu.Unlock()
+	lockConfigApplyForWrite()
+	defer unlockConfigApplyForWrite()
 	appendRunLog("Stop: 关闭内核")
 	setSnellCellularTCPNodes(nil)
 	storePhysicalInterface("")

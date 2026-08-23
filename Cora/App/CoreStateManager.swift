@@ -324,6 +324,14 @@ final class CoreStateManager: ObservableObject {
         case "groupDelay", "proxyDelay":
             let milliseconds = (request["timeout"] as? NSNumber)?.doubleValue ?? 5_000
             timeout = max(10, milliseconds / 1_000 + 5)
+        case "proxyDelays":
+            let requestedMilliseconds = (request["timeout"] as? NSNumber)?.doubleValue ?? 5_000
+            let milliseconds = requestedMilliseconds > 0 ? requestedMilliseconds : 5_000
+            let requestedCount = (request["count"] as? NSNumber)?.intValue ?? 0
+            let encodedCount = (request["targets"] as? [Any])?.count ?? 0
+            let targetCount = min(256, max(1, max(requestedCount, encodedCount)))
+            let workerWaves = (targetCount + 5) / 6
+            timeout = max(10, Double(workerWaves) * milliseconds / 1_000 + 10)
         case "scriptFetch":
             let nestedRequest = request["request"] as? [String: Any]
             let milliseconds = (nestedRequest?["timeout"] as? NSNumber)?.doubleValue ?? 5_000
