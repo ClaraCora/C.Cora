@@ -50,9 +50,10 @@ final class ConnectionHistoryRecorder {
             timer?.setEventHandler {}
             timer?.cancel()
             timer = nil
-            // The App clears the shared session history when the VPN reaches
-            // disconnected. Avoid a final write racing that clear operation.
-            store?.finishAllActive()
+            // The extension owns the definitive session boundary. Clear here
+            // as well as in the App so a Control Center disconnect while the
+            // App is terminated cannot leak totals into the next VPN session.
+            store?.clearAll(compact: false)
         }
     }
 

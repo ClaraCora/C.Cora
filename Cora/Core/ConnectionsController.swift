@@ -554,6 +554,46 @@ final class ConnectionsController: ObservableObject {
         historyStore?.summary(for: query) ?? .empty
     }
 
+    func nodeTrafficRanking(metric: ConnectionTrafficRankingMetric,
+                            limit: Int = 5) -> [ConnectionHistoryTrafficVolume] {
+        if let stored = historyStore?.nodeTrafficRanking(metric: metric, limit: limit),
+           !stored.isEmpty {
+            return stored
+        }
+
+        // Unsigned builds may not have App Group access. Keep the page useful
+        // with a bounded foreground-only aggregate from the current IPC snapshot.
+        var totals: [String: ConnectionTrafficVolume] = [:]
+        for connection in snapshot?.connections ?? [] {
+            var value = totals[connection.proxyNodeName, default: ConnectionTrafficVolume()]
+            value.add(upload: connection.upload, download: connection.download)
+            totals[connection.proxyNodeName] = value
+        }
+        return totals.map { name, value in
+            ConnectionHistoryTrafficVolume(name: name,
+                                           upload: value.upload,
+                                           download: value.download)
+        }
+        .sorted { left, right in
+            let leftValue = Self.rankingValue(left, metric: metric)
+            let rightValue = Self.rankingValue(right, metric: metric)
+            if leftValue != rightValue { return leftValue > rightValue }
+            if left.total != right.total { return left.total > right.total }
+            return left.name.localizedStandardCompare(right.name) == .orderedAscending
+        }
+        .prefix(max(1, limit))
+        .map { $0 }
+    }
+
+    private static func rankingValue(_ volume: ConnectionHistoryTrafficVolume,
+                                     metric: ConnectionTrafficRankingMetric) -> Int64 {
+        switch metric {
+        case .total: return volume.total
+        case .download: return volume.download
+        case .upload: return volume.upload
+        }
+    }
+
     func loadMoreHistory() {
         guard !isLoadingMoreHistory, hasMoreHistory, let historyStore else { return }
         isLoadingMoreHistory = true
@@ -740,6 +780,7 @@ private extension ConnectionHistoryQuery {
 
     func matches(_ connection: ActiveConnection) -> Bool {
         if let strategyName, connection.strategyName != strategyName { return false }
+        if let proxyNodeName, connection.proxyNodeName != proxyNodeName { return false }
         if let hostName, connection.trafficHostName != hostName { return false }
         return true
     }

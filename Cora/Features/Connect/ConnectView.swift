@@ -21,7 +21,8 @@ struct ConnectView: View {
                                                down: kernel.down,
                                                totalDownload: kernel.totalDownload,
                                                totalUpload: kernel.totalUpload,
-                                               samples: kernel.samples)
+                                               samples: kernel.samples,
+                                               connections: connections)
                         }
 
                         OverviewConnectionLinks(controller: connections)
@@ -317,6 +318,7 @@ private struct RuntimeMetricsGrid: View {
     let totalDownload: Int64
     let totalUpload: Int64
     let samples: [KernelController.TrafficSample]
+    let connections: ConnectionsController
 
     var body: some View {
         LazyVGrid(columns: [
@@ -329,10 +331,25 @@ private struct RuntimeMetricsGrid: View {
             RateMetricWidget(title: "上行", value: ByteFormat.rate(up),
                              systemImage: "arrow.up", tint: .orange,
                              samples: samples, direction: .up)
-            MetricWidget(title: "累计下行", value: ByteFormat.size(totalDownload),
-                         systemImage: "arrow.down.circle", tint: .blue)
-            MetricWidget(title: "累计上行", value: ByteFormat.size(totalUpload),
-                         systemImage: "arrow.up.circle", tint: .orange)
+            NavigationLink {
+                NodeTrafficRankingView(controller: connections,
+                                       initialMetric: .download)
+            } label: {
+                MetricWidget(title: "累计下行", value: ByteFormat.size(totalDownload),
+                             systemImage: "arrow.down.circle", tint: .blue)
+            }
+            .buttonStyle(.plain)
+            .accessibilityHint("查看节点下行流量排行")
+
+            NavigationLink {
+                NodeTrafficRankingView(controller: connections,
+                                       initialMetric: .upload)
+            } label: {
+                MetricWidget(title: "累计上行", value: ByteFormat.size(totalUpload),
+                             systemImage: "arrow.up.circle", tint: .orange)
+            }
+            .buttonStyle(.plain)
+            .accessibilityHint("查看节点上行流量排行")
         }
     }
 
@@ -437,9 +454,16 @@ private struct MetricWidget: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
-            Label(title, systemImage: systemImage)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(tint)
+            HStack(spacing: 8) {
+                Label(title, systemImage: systemImage)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(tint)
+                Spacer(minLength: 0)
+                Image(systemName: "chevron.right")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+                    .accessibilityHidden(true)
+            }
             Text(value)
                 .font(.title3.monospacedDigit().weight(.semibold))
                 .lineLimit(1)
@@ -452,6 +476,7 @@ private struct MetricWidget: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .fill(.regularMaterial)
         )
+        .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         .accessibilityElement(children: .combine)
     }
 }
