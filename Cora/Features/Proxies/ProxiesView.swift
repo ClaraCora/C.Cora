@@ -3,18 +3,15 @@ import UIKit
 
 /// 策略/节点页：按固定类别展示分组，展开后可搜索、切换并比较节点延迟。
 struct ProxiesView: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @EnvironmentObject private var core: CoreStateManager
     @ObservedObject var controller: ProxyController
     let category: ProxyGroupCategory
     @State private var expanded: Set<String> = []
-    @State private var gridRowFrames: [Int: CGRect] = [:]
-    @State private var gridCardFrames: [String: CGRect] = [:]
-    @State private var gridRestoreAnchors: [String: UnitPoint] = [:]
+    @State private var geometryCache = ProxyGeometryCache()
     @State private var gridScrollRequest: GridScrollRequest?
-    @State private var expandedPanelFrames: [String: CGRect] = [:]
     @State private var gridExpansion: GridExpansionState?
     @State private var pendingGridGroupName: String?
-    @State private var gridExpansionCorrectionKey: String?
     @State private var toolbarControlsVisible = true
     @State private var searchText = ""
     @State private var isSearchPresented = false
@@ -101,7 +98,7 @@ struct ProxiesView: View {
                 loadGroupGradients()
                 assignMissingGradients()
             }
-            .onChange(of: groupStructureSignature) { _, _ in
+            .onChange(of: controller.catalogRevision) { _, _ in
                 assignMissingGradients()
                 synchronizeDisplayedGroups()
             }
@@ -117,11 +114,10 @@ struct ProxiesView: View {
                 guard !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                       gridExpansion != nil else { return }
                 gridExpansion = nil
-                gridExpansionCorrectionKey = nil
                 gridScrollRequest = nil
                 expanded = []
                 activeNodeTestTarget = nil
-                expandedPanelFrames = [:]
+                geometryCache.expandedPanelFrames.removeAll()
             }
             .onChange(of: layoutRawValue) { _, value in
                 // Both layouts share one expansion model. Keep a single valid group
@@ -129,10 +125,9 @@ struct ProxiesView: View {
                 let retained = visibleGroups.first(where: { expanded.contains($0.name) })?.name
                 expanded = retained.map { [$0] } ?? []
                 gridScrollRequest = nil
-                expandedPanelFrames = [:]
+                geometryCache.expandedPanelFrames.removeAll()
                 gridExpansion = nil
                 pendingGridGroupName = ProxyNodeLayout(rawValue: value) == .grid ? retained : nil
-                gridExpansionCorrectionKey = nil
                 toolbarControlsVisible = true
                 activeNodeTestTarget = nil
             }
@@ -164,7 +159,7 @@ struct ProxiesView: View {
     }
 
     private var hasHiddenGroups: Bool {
-        let allGroupNames = Set(controller.resolutionGroups.map(\.name))
+        let allGroupNames = controller.resolutionIndex.groupNames
         return controller.groups.contains { group in
             group.hidden && groupCategory(for: group, groupNames: allGroupNames) == category
         }
@@ -176,6 +171,10 @@ struct ProxiesView: View {
 
     private var nodeLayout: ProxyNodeLayout {
         ProxyNodeLayout(rawValue: layoutRawValue) ?? .list
+    }
+
+    private var expansionAnimation: Animation? {
+        reduceMotion ? nil : .snappy(duration: 0.18, extraBounce: 0)
     }
 
     private var activeExpandedGroupName: String? {
@@ -327,13 +326,12 @@ struct ProxiesView: View {
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 6)
-            .animation(.easeOut(duration: 0.16), value: expanded)
         }
         .coordinateSpace(name: StrategyCoordinateSpace.name)
         .simultaneousGesture(listDismissGesture(activeGroupName))
         .simultaneousGesture(strategyToolbarGesture())
         .onPreferenceChange(ExpandedPanelFramePreferenceKey.self) { frames in
-            expandedPanelFrames = frames
+            geometryCache.expandedPanelFrames = frames
         }
         .scrollContentBackground(.hidden)
         .background(Color.clear)
@@ -345,7 +343,7 @@ struct ProxiesView: View {
         let group = result.group
         return StrategyGroupListPanel(
             group: group,
-            allGroups: controller.resolutionGroups,
+            groupIndex: controller.resolutionIndex,
             visibleNodes: result.nodes,
             isExpanded: result.isExpanded,
             isInteractionLocked: activeGroupName != nil && activeGroupName != group.name,
@@ -423,31 +421,19 @@ struct ProxiesView: View {
                 }
                 .background(Color.clear)
                 .refreshable { await reload() }
-                .onPreferenceChange(GridRowFramePreferenceKey.self) { frames in
-                    if gridRowFrames != frames {
-                        gridRowFrames = frames
-                    }
-                }
                 .onPreferenceChange(GridCardFramePreferenceKey.self) { frames in
-                    if gridCardFrames != frames {
-                        gridCardFrames = frames
-                    }
+                    geometryCache.gridCardFrames = frames
                     openPendingGridGroupIfPossible(frames: frames,
                                                    viewportSize: viewport.size)
                 }
                 .onPreferenceChange(ExpandedPanelFramePreferenceKey.self) { frames in
-                    if expandedPanelFrames != frames {
-                        expandedPanelFrames = frames
-                    }
-                    correctGridExpansionIfNeeded(frames: frames,
-                                                 viewportSize: viewport.size)
+                    geometryCache.expandedPanelFrames = frames
                 }
                 .task(id: gridScrollRequest) {
                     guard let request = gridScrollRequest else { return }
                     await Task.yield()
-                    try? await Task.sleep(nanoseconds: 40_000_000)
                     guard !Task.isCancelled else { return }
-                    withAnimation(.easeOut(duration: 0.18)) {
+                    withAnimation(expansionAnimation) {
                         proxy.scrollTo(request.targetID, anchor: request.anchor)
                     }
                 }
@@ -464,10 +450,7 @@ struct ProxiesView: View {
         guard let expansion = gridExpansion else {
             return 24
         }
-        guard let panelHeight = expandedPanelFrames[expansion.groupName]?.height,
-              panelHeight > 0 else {
-            return 120
-        }
+        let panelHeight = expansion.estimatedPanelHeight
         let safeAreaClearance = viewport.safeAreaInsets.bottom + 72
         let minimumClearance = max(120, safeAreaClearance)
         // Keep enough trailing content for a single expanded GLOBAL row to move
@@ -494,7 +477,7 @@ struct ProxiesView: View {
         return VStack(alignment: .leading, spacing: 12) {
             if let expansion = activeExpansion, let activeResult {
                 expandedPanel(for: activeResult,
-                              transitionAnchor: expansion.transitionAnchor) {
+                              animated: true) {
                     toggleGridGroup(activeResult.group.name,
                                     rowIndex: rowIndex,
                                     viewportSize: viewportSize)
@@ -535,7 +518,7 @@ struct ProxiesView: View {
             ForEach(row) { result in
                 GroupGridCard(
                     group: result.group,
-                    allGroups: controller.resolutionGroups,
+                    groupIndex: controller.resolutionIndex,
                     canTest: controller.isRuntimeAvailable &&
                         controller.testingCurrentSelectionKeys.isEmpty,
                     currentSelectionDelay: currentSelectionDelay(for: result.group),
@@ -556,15 +539,6 @@ struct ProxiesView: View {
                 Color.clear
                     .frame(maxWidth: .infinity, minHeight: 76)
                     .accessibilityHidden(true)
-            }
-        }
-        .background {
-            GeometryReader { rowGeometry in
-                Color.clear.preference(
-                    key: GridRowFramePreferenceKey.self,
-                    value: [
-                        rowIndex: rowGeometry.frame(in: .named(StrategyCoordinateSpace.name))
-                    ])
             }
         }
     }
@@ -588,11 +562,11 @@ struct ProxiesView: View {
 
     @ViewBuilder
     private func expandedPanel(for result: DisplayedProxyGroup,
-                               transitionAnchor: UnitPoint? = nil,
+                               animated: Bool = false,
                                onToggle: @escaping () -> Void) -> some View {
         let panel = GroupExpandedPanel(
             group: result.group,
-            allGroups: controller.resolutionGroups,
+            groupIndex: controller.resolutionIndex,
             isTesting: controller.testing.contains(result.group.name),
             canTest: controller.isRuntimeAvailable &&
                 controller.testingCurrentSelectionKeys.isEmpty,
@@ -617,10 +591,8 @@ struct ProxiesView: View {
             }
         }
 
-        if let transitionAnchor {
-            panel.transition(
-                .scale(scale: 0.96, anchor: transitionAnchor)
-                    .combined(with: .opacity))
+        if animated {
+            panel.transition(reduceMotion ? .identity : .opacity)
         } else {
             panel
         }
@@ -665,21 +637,11 @@ struct ProxiesView: View {
         searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
-    /// Tracks category membership and ordering without coupling local presentation
-    /// state to every delay or selection update published by the shared controller.
-    private var groupStructureSignature: [String] {
-        let resolutionNames = controller.resolutionGroups.map(\.name).sorted()
-            .joined(separator: "\u{1E}")
-        return [resolutionNames] + controller.groups.map { group in
-            "\(group.name)\u{1F}\(group.hidden)\u{1F}\(group.all.joined(separator: "\u{1E}"))"
-        }
-    }
-
     /// A node group contains only concrete proxy nodes; a strategy group points
     /// at one or more other groups. Empty groups stay in the strategy category
     /// until their provider members are available, avoiding category flicker.
     private var visibleGroups: [ProxyGroup] {
-        let allGroupNames = Set(controller.resolutionGroups.map(\.name))
+        let allGroupNames = controller.resolutionIndex.groupNames
         return controller.groups.filter { group in
             (showHiddenGroups || !group.hidden) &&
                 groupCategory(for: group, groupNames: allGroupNames) == selectedGroupCategory
@@ -699,15 +661,15 @@ struct ProxiesView: View {
 
     private func currentSelectionTarget(for group: ProxyGroup) -> ProxyDelayBatchTarget? {
         guard let resolution = ProxySelectionResolver.resolve(
-            group: group, groups: controller.resolutionGroups) else { return nil }
-        let groupNames = Set(controller.resolutionGroups.map(\.name))
+            group: group, index: controller.resolutionIndex) else { return nil }
+        let groupNames = controller.resolutionIndex.groupNames
         guard !groupNames.contains(resolution.finalNode) else { return nil }
 
         let parent = resolution.path.dropLast().last.flatMap { name in
             groupNames.contains(name) ? name : nil
         } ?? group.name
         let key = ProxyDelayResolver.storageKey(
-            for: group.now, groups: controller.resolutionGroups)
+            for: group.now, index: controller.resolutionIndex)
         guard !key.isEmpty else { return nil }
         return ProxyDelayBatchTarget(key: key,
                                      node: resolution.finalNode,
@@ -716,7 +678,7 @@ struct ProxiesView: View {
 
     private func currentSelectionDelay(for group: ProxyGroup) -> Int? {
         ProxyDelayResolver.delay(for: group.now,
-                                 groups: controller.resolutionGroups,
+                                 index: controller.resolutionIndex,
                                  delays: controller.delays)
     }
 
@@ -761,7 +723,7 @@ struct ProxiesView: View {
 
     private func groupMetadata(_ group: ProxyGroup) -> String {
         let finalNode = ProxySelectionResolver.resolve(group: group,
-                                                       groups: controller.resolutionGroups)?.finalNode ?? ""
+                                                       index: controller.resolutionIndex)?.finalNode ?? ""
         return "\(group.name) \(group.now) \(finalNode) \(group.type) \(group.displayType)"
             .lowercased()
     }
@@ -769,24 +731,20 @@ struct ProxiesView: View {
     private func toggleListGroup(_ name: String) {
         guard normalizedSearch.isEmpty else { return }
         activeNodeTestTarget = nil
-        withAnimation(.easeOut(duration: 0.16)) {
+        withAnimation(expansionAnimation) {
             expanded = expanded.contains(name) ? [] : [name]
         }
         gridScrollRequest = nil
-        expandedPanelFrames = [:]
+        geometryCache.expandedPanelFrames.removeAll()
     }
 
     private func resetDisplayedGroupState() {
         activeNodeTestTarget = nil
         expanded = []
         gridScrollRequest = nil
-        gridRestoreAnchors = [:]
         gridExpansion = nil
         pendingGridGroupName = nil
-        gridExpansionCorrectionKey = nil
-        expandedPanelFrames = [:]
-        gridRowFrames = [:]
-        gridCardFrames = [:]
+        geometryCache.reset()
     }
 
     private func dismissExpandedGroup(_ name: String) {
@@ -794,23 +752,22 @@ struct ProxiesView: View {
         activeNodeTestTarget = nil
         let restoreRequest = gridRestoreRequest(for: name)
         let closesGridExpansion = gridExpansion?.groupName == name
-        withAnimation(.easeOut(duration: 0.16)) {
+        withAnimation(expansionAnimation) {
             _ = expanded.remove(name)
             if closesGridExpansion {
                 gridExpansion = nil
             }
+            gridScrollRequest = restoreRequest
         }
-        gridScrollRequest = restoreRequest
-        gridRestoreAnchors.removeValue(forKey: name)
-        gridExpansionCorrectionKey = nil
+        geometryCache.gridRestoreAnchors.removeValue(forKey: name)
         pendingGridGroupName = nil
-        expandedPanelFrames = [:]
+        geometryCache.expandedPanelFrames.removeAll()
     }
 
     private func gridDismissGesture(_ activeGroupName: String?) -> some Gesture {
         SpatialTapGesture().onEnded { value in
             guard let name = activeGroupName,
-                  let frame = expandedPanelFrames[name],
+                  let frame = geometryCache.expandedPanelFrames[name],
                   !frame.contains(value.location) else { return }
             dismissExpandedGroup(name)
         }
@@ -819,7 +776,7 @@ struct ProxiesView: View {
     private func listDismissGesture(_ activeGroupName: String?) -> some Gesture {
         SpatialTapGesture().onEnded { value in
             guard let name = activeGroupName,
-                  let frame = expandedPanelFrames[name],
+                  let frame = geometryCache.expandedPanelFrames[name],
                   !frame.contains(value.location) else { return }
             dismissExpandedGroup(name)
         }
@@ -832,7 +789,6 @@ struct ProxiesView: View {
         guard normalizedSearch.isEmpty else {
             pendingGridGroupName = name
             gridExpansion = nil
-            gridExpansionCorrectionKey = nil
             expanded = []
             searchText = ""
             return
@@ -843,7 +799,7 @@ struct ProxiesView: View {
             return
         }
 
-        guard let cardFrame = gridCardFrames[name] else {
+        guard let cardFrame = geometryCache.gridCardFrames[name] else {
             pendingGridGroupName = name
             return
         }
@@ -858,21 +814,24 @@ struct ProxiesView: View {
                                    rowIndex: Int,
                                    cardFrame: CGRect,
                                    viewportSize: CGSize) {
-        guard controller.groups.contains(where: { $0.name == name }) else { return }
+        guard let group = controller.groups.first(where: { $0.name == name }) else { return }
         activeNodeTestTarget = nil
         saveGridRestoreAnchor(for: name,
-                              rowIndex: rowIndex,
+                              cardFrame: cardFrame,
                               viewportHeight: viewportSize.height)
-        gridExpansionCorrectionKey = nil
-        gridScrollRequest = nil
-        expandedPanelFrames = [:]
+        let expansion = GridExpansionState(groupName: name,
+                                           rowIndex: rowIndex,
+                                           cardFrame: cardFrame,
+                                           viewportSize: viewportSize,
+                                           nodeCount: group.nodes.count)
+        geometryCache.expandedPanelFrames.removeAll()
         pendingGridGroupName = nil
-        withAnimation(.easeOut(duration: 0.18)) {
-            gridExpansion = GridExpansionState(groupName: name,
-                                               rowIndex: rowIndex,
-                                               cardFrame: cardFrame,
-                                               viewportSize: viewportSize)
+        withAnimation(expansionAnimation) {
+            gridExpansion = expansion
             expanded = [name]
+            gridScrollRequest = GridScrollRequest(
+                targetID: expandedPanelID(for: name),
+                anchor: expansion.scrollAnchor(viewportHeight: viewportSize.height))
         }
     }
 
@@ -888,37 +847,22 @@ struct ProxiesView: View {
                           viewportSize: viewportSize)
     }
 
-    private func correctGridExpansionIfNeeded(frames: [String: CGRect],
-                                              viewportSize: CGSize) {
-        guard let expansion = gridExpansion,
-              let panelFrame = frames[expansion.groupName],
-              panelFrame.height > 0 else { return }
-        let correctionKey = expansion.correctionKey(panelHeight: panelFrame.height,
-                                                    viewportSize: viewportSize)
-        guard gridExpansionCorrectionKey != correctionKey else { return }
-        gridExpansionCorrectionKey = correctionKey
-        gridScrollRequest = GridScrollRequest(
-            targetID: expandedPanelID(for: expansion.groupName),
-            anchor: expansion.scrollAnchor(panelHeight: panelFrame.height,
-                                           viewportHeight: viewportSize.height))
-    }
-
     private func saveGridRestoreAnchor(for name: String,
-                                       rowIndex: Int,
+                                       cardFrame: CGRect,
                                        viewportHeight: CGFloat) {
-        guard let frame = gridRowFrames[rowIndex], viewportHeight > frame.height else {
-            gridRestoreAnchors[name] = .center
+        guard viewportHeight > cardFrame.height else {
+            geometryCache.gridRestoreAnchors[name] = .center
             return
         }
-        let availableTravel = viewportHeight - frame.height
-        let relativeY = min(max(frame.minY / availableTravel, 0), 1)
-        gridRestoreAnchors[name] = UnitPoint(x: 0.5, y: relativeY)
+        let availableTravel = viewportHeight - cardFrame.height
+        let relativeY = min(max(cardFrame.minY / availableTravel, 0), 1)
+        geometryCache.gridRestoreAnchors[name] = UnitPoint(x: 0.5, y: relativeY)
     }
 
     private func gridRestoreRequest(for name: String) -> GridScrollRequest? {
         guard nodeLayout == .grid,
               let rowIndex = gridRowIndex(for: name),
-              let anchor = gridRestoreAnchors[name] else { return nil }
+              let anchor = geometryCache.gridRestoreAnchors[name] else { return nil }
         return GridScrollRequest(targetID: gridRowID(rowIndex), anchor: anchor)
     }
 
@@ -965,20 +909,18 @@ struct ProxiesView: View {
                 $0.name == expansion.groupName
             }) else {
                 gridExpansion = nil
-                gridExpansionCorrectionKey = nil
                 expanded = []
                 activeNodeTestTarget = nil
-                expandedPanelFrames = [:]
+                geometryCache.expandedPanelFrames.removeAll()
                 return
             }
             let updatedRowIndex = index / 2
             if updatedRowIndex != expansion.rowIndex {
                 gridExpansion = nil
-                gridExpansionCorrectionKey = nil
                 expanded = []
                 activeNodeTestTarget = nil
                 pendingGridGroupName = expansion.groupName
-                expandedPanelFrames = [:]
+                geometryCache.expandedPanelFrames.removeAll()
             }
         }
     }
@@ -1059,12 +1001,24 @@ private struct GridScrollRequest: Hashable {
     }
 }
 
-private struct GridExpansionState {
-    enum HorizontalSide {
-        case leading
-        case trailing
-    }
+/// Geometry preferences change continuously while a scroll view moves. Keeping
+/// them in a non-observable reference avoids invalidating the whole strategy page
+/// on every frame while preserving fresh coordinates for hit testing and restore.
+private final class ProxyGeometryCache {
+    var gridCardFrames: [String: CGRect] = [:]
+    var gridRestoreAnchors: [String: UnitPoint] = [:]
+    var expandedPanelFrames: [String: CGRect] = [:]
 
+    func reset() {
+        // Card frames stay valid until the next preference delivery. Retaining
+        // them avoids a dead first tap when presentation state resets but the
+        // visible grid geometry itself has not changed.
+        gridRestoreAnchors.removeAll()
+        expandedPanelFrames.removeAll()
+    }
+}
+
+private struct GridExpansionState {
     enum VerticalDirection {
         case down
         case up
@@ -1073,40 +1027,28 @@ private struct GridExpansionState {
     let groupName: String
     let rowIndex: Int
     let cardFrame: CGRect
-    let horizontalSide: HorizontalSide
     let verticalDirection: VerticalDirection
+    let estimatedPanelHeight: CGFloat
 
     init(groupName: String,
          rowIndex: Int,
          cardFrame: CGRect,
-         viewportSize: CGSize) {
+         viewportSize: CGSize,
+         nodeCount: Int) {
         self.groupName = groupName
         self.rowIndex = rowIndex
         self.cardFrame = cardFrame
-        self.horizontalSide = cardFrame.midX <= viewportSize.width / 2
-            ? .leading
-            : .trailing
         self.verticalDirection = cardFrame.midY <= viewportSize.height / 2
             ? .down
             : .up
+        let nodeRowCount = (nodeCount + 1) / 2
+        self.estimatedPanelHeight = nodeRowCount == 0
+            ? 72
+            : 62 + CGFloat(nodeRowCount) * 72
     }
 
-    var transitionAnchor: UnitPoint {
-        switch (horizontalSide, verticalDirection) {
-        case (.leading, .down): return .topLeading
-        case (.trailing, .down): return .topTrailing
-        case (.leading, .up): return .bottomLeading
-        case (.trailing, .up): return .bottomTrailing
-        }
-    }
-
-    func correctionKey(panelHeight: CGFloat, viewportSize: CGSize) -> String {
-        "\(groupName)|\(rowIndex)|\(Int(panelHeight.rounded()))|" +
-            "\(Int(viewportSize.width.rounded()))x\(Int(viewportSize.height.rounded()))"
-    }
-
-    func scrollAnchor(panelHeight: CGFloat, viewportHeight: CGFloat) -> UnitPoint {
-        let availableTravel = viewportHeight - panelHeight
+    func scrollAnchor(viewportHeight: CGFloat) -> UnitPoint {
+        let availableTravel = viewportHeight - estimatedPanelHeight
         guard availableTravel > 1 else {
             return verticalDirection == .down ? .top : .bottom
         }
@@ -1116,7 +1058,7 @@ private struct GridExpansionState {
         case .down:
             relativeY = cardFrame.minY / availableTravel
         case .up:
-            relativeY = (cardFrame.maxY - panelHeight) / availableTravel
+            relativeY = (cardFrame.maxY - estimatedPanelHeight) / availableTravel
         }
         return UnitPoint(x: 0.5, y: min(max(relativeY, 0), 1))
     }
@@ -1124,14 +1066,6 @@ private struct GridExpansionState {
 
 private enum StrategyCoordinateSpace {
     static let name = "proxy-strategy-viewport"
-}
-
-private struct GridRowFramePreferenceKey: PreferenceKey {
-    static var defaultValue: [Int: CGRect] = [:]
-
-    static func reduce(value: inout [Int: CGRect], nextValue: () -> [Int: CGRect]) {
-        value.merge(nextValue(), uniquingKeysWith: { _, latest in latest })
-    }
 }
 
 private struct GridCardFramePreferenceKey: PreferenceKey {
@@ -1216,7 +1150,7 @@ private extension View {
 
 private struct StrategyGroupListPanel: View {
     let group: ProxyGroup
-    let allGroups: [ProxyGroup]
+    let groupIndex: ProxyGroupIndex
     let visibleNodes: [ProxyGroupNode]
     let isExpanded: Bool
     let isInteractionLocked: Bool
@@ -1238,18 +1172,18 @@ private struct StrategyGroupListPanel: View {
     let onSelect: (String) -> Void
 
     var body: some View {
-        VStack(spacing: 0) {
+        LazyVStack(spacing: 0) {
             Group {
                 if isExpanded {
                     GroupExpandedHeader(group: group,
-                                        allGroups: allGroups,
+                                        groupIndex: groupIndex,
                                         isTesting: isTesting,
                                         canTest: canTest,
                                         onToggle: onToggle,
                                         onTest: onTest)
                 } else {
                     GroupCompactHeader(group: group,
-                                       allGroups: allGroups,
+                                       groupIndex: groupIndex,
                                        delay: currentSelectionDelay,
                                        isTestingDelay: isTestingCurrentSelection,
                                        onToggle: onToggle)
@@ -1281,15 +1215,16 @@ private struct StrategyGroupListPanel: View {
                         .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
                         .padding(.horizontal, 14)
                 } else {
-                    ForEach(Array(visibleNodes.enumerated()), id: \.element.id) { index, item in
+                    ForEach(visibleNodes.indices, id: \.self) { index in
+                        let item = visibleNodes[index]
                         let testTarget = ProxyNodeTestTarget(groupName: group.name,
                                                              nodeName: item.name,
                                                              nodeID: item.id)
                         ProxyNodeListRow(
                             node: item.name,
-                            referencedGroup: allGroups.first {
-                                $0.name == item.name && $0.name != group.name
-                            },
+                            referencedGroup: item.name == group.name
+                                ? nil
+                                : groupIndex.group(named: item.name),
                             isCurrent: item.name == group.now,
                             isSelecting: selecting == item.name,
                             isSelectionBlocked: selecting != nil,
@@ -1300,7 +1235,7 @@ private struct StrategyGroupListPanel: View {
                             isTestingDelay: testingNodes.contains(
                                 ProxyNodeTestKey(group: group.name, node: item.name)),
                             delay: ProxyDelayResolver.delay(for: item.name,
-                                                            groups: allGroups,
+                                                            index: groupIndex,
                                                             delays: delays),
                             onTestDelay: onTestActiveNodeDelay,
                             onTestUnlock: onTestActiveNodeUnlock,
@@ -1322,7 +1257,6 @@ private struct StrategyGroupListPanel: View {
         }
         .background(GroupGradient.background(for: gradientIndex))
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .animation(.easeOut(duration: 0.16), value: isExpanded)
         .allowsHitTesting(!isInteractionLocked)
     }
 }
@@ -1520,7 +1454,7 @@ private struct ProxyNodeListRow: View {
 
 private struct GroupGridCard: View {
     let group: ProxyGroup
-    let allGroups: [ProxyGroup]
+    let groupIndex: ProxyGroupIndex
     let canTest: Bool
     let currentSelectionDelay: Int?
     let isTestingCurrentSelection: Bool
@@ -1532,7 +1466,7 @@ private struct GroupGridCard: View {
 
     var body: some View {
         GroupCompactHeader(group: group,
-                           allGroups: allGroups,
+                           groupIndex: groupIndex,
                            delay: currentSelectionDelay,
                            isTestingDelay: isTestingCurrentSelection,
                            onToggle: onToggle)
@@ -1567,7 +1501,7 @@ private struct GroupGridCard: View {
 
 private struct GroupExpandedPanel: View {
     let group: ProxyGroup
-    let allGroups: [ProxyGroup]
+    let groupIndex: ProxyGroupIndex
     let isTesting: Bool
     let canTest: Bool
     let selecting: String?
@@ -1586,7 +1520,7 @@ private struct GroupExpandedPanel: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             GroupExpandedHeader(group: group,
-                                allGroups: allGroups,
+                                groupIndex: groupIndex,
                                 isTesting: isTesting,
                                 canTest: canTest,
                                 onToggle: onToggle,
@@ -1615,9 +1549,9 @@ private struct GroupExpandedPanel: View {
                                                          nodeName: item.name,
                                                          nodeID: item.id)
                     GroupNodeGridCell(node: item,
-                                      referencedGroup: allGroups.first {
-                                          $0.name == item.name && $0.name != group.name
-                                      },
+                                      referencedGroup: item.name == group.name
+                                          ? nil
+                                          : groupIndex.group(named: item.name),
                                       isCurrent: item.name == group.now,
                                       isSelecting: selecting == item.name,
                                       isSelectionBlocked: selecting != nil,
@@ -1627,7 +1561,7 @@ private struct GroupExpandedPanel: View {
                                       isTestingDelay: testingNodes.contains(
                                           ProxyNodeTestKey(group: group.name, node: item.name)),
                                       delay: ProxyDelayResolver.delay(for: item.name,
-                                                                      groups: allGroups,
+                                                                      index: groupIndex,
                                                                       delays: delays),
                                       onTestDelay: onTestActiveNodeDelay,
                                       onTestUnlock: onTestActiveNodeUnlock,
@@ -1639,37 +1573,38 @@ private struct GroupExpandedPanel: View {
         .padding(8)
         .background(GroupGradient.background(for: gradientIndex))
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .animation(.easeOut(duration: 0.16), value: group.id)
     }
 }
 
 private struct GroupCompactHeader: View {
     let group: ProxyGroup
-    let allGroups: [ProxyGroup]
+    let groupIndex: ProxyGroupIndex
     let delay: Int?
     let isTestingDelay: Bool
     let onToggle: () -> Void
     var compact = false
 
-    private var resolution: ProxySelectionResolution? {
-        ProxySelectionResolver.resolve(group: group, groups: allGroups)
-    }
-
-    private var immediateReference: String? {
+    private func immediateReference(
+        for resolution: ProxySelectionResolution?
+    ) -> String? {
         guard let resolution, resolution.hasDistinctFinalNode else { return nil }
         return resolution.immediateSelection
     }
 
-    private var finalSelection: String {
+    private func finalSelection(
+        for resolution: ProxySelectionResolution?
+    ) -> String {
         resolution?.finalNode ?? "未选择"
     }
 
-    private var accessibilityValue: String {
+    private func accessibilityValue(
+        for resolution: ProxySelectionResolution?
+    ) -> String {
         var values: [String] = []
-        if let immediateReference {
+        if let immediateReference = immediateReference(for: resolution) {
             values.append("当前分组 \(immediateReference)")
         }
-        values.append("当前节点 \(finalSelection)")
+        values.append("当前节点 \(finalSelection(for: resolution))")
         if !compact {
             values.append(isTestingDelay
                           ? "正在测试延迟"
@@ -1679,21 +1614,24 @@ private struct GroupCompactHeader: View {
     }
 
     var body: some View {
+        let resolution = ProxySelectionResolver.resolve(group: group, index: groupIndex)
         Button(action: onToggle) {
             if compact {
-                compactContent
+                compactContent(resolution: resolution)
             } else {
-                collapsedContent
+                collapsedContent(resolution: resolution)
             }
         }
         .buttonStyle(.plain)
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(group.name)
-        .accessibilityValue(accessibilityValue)
+        .accessibilityValue(accessibilityValue(for: resolution))
     }
 
-    private var compactContent: some View {
+    private func compactContent(
+        resolution: ProxySelectionResolution?
+    ) -> some View {
         HStack(spacing: 9) {
             GroupIcon(url: group.icon)
             VStack(alignment: .leading, spacing: 1) {
@@ -1712,8 +1650,11 @@ private struct GroupCompactHeader: View {
         .contentShape(Rectangle())
     }
 
-    private var collapsedContent: some View {
-        VStack(alignment: .leading, spacing: 1) {
+    private func collapsedContent(
+        resolution: ProxySelectionResolution?
+    ) -> some View {
+        let immediateReference = immediateReference(for: resolution)
+        return VStack(alignment: .leading, spacing: 1) {
             HStack(alignment: .top, spacing: 9) {
                 GroupIcon(url: group.icon)
                 VStack(alignment: .leading, spacing: 1) {
@@ -1737,7 +1678,7 @@ private struct GroupCompactHeader: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            Text(finalSelection)
+            Text(finalSelection(for: resolution))
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
@@ -1781,7 +1722,7 @@ private struct GroupHeaderDelayBadge: View {
 
 private struct GroupExpandedHeader: View {
     let group: ProxyGroup
-    let allGroups: [ProxyGroup]
+    let groupIndex: ProxyGroupIndex
     let isTesting: Bool
     let canTest: Bool
     let onToggle: () -> Void
@@ -1790,7 +1731,7 @@ private struct GroupExpandedHeader: View {
     var body: some View {
         HStack(spacing: 10) {
             GroupCompactHeader(group: group,
-                               allGroups: allGroups,
+                               groupIndex: groupIndex,
                                delay: nil,
                                isTestingDelay: false,
                                onToggle: onToggle,

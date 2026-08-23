@@ -70,34 +70,63 @@ struct ProxySelectionResolution {
     var hasDistinctFinalNode: Bool { finalNode != immediateSelection }
 }
 
+/// 一份代理分组快照对应的不可变名称索引。
+///
+/// 分组引用解析会在卡片和节点行渲染期间频繁发生。索引由控制器在
+/// `resolutionGroups` 变化时构建一次，避免每次解析都重新创建整张字典。
+struct ProxyGroupIndex {
+    private let groupsByName: [String: ProxyGroup]
+    let groupNames: Set<String>
+
+    init(groups: [ProxyGroup] = []) {
+        var lookup: [String: ProxyGroup] = [:]
+        lookup.reserveCapacity(groups.count)
+        for group in groups {
+            // 保持旧实现语义：若异常数据含同名分组，后出现的分组生效。
+            lookup[group.name] = group
+        }
+        groupsByName = lookup
+        groupNames = Set(lookup.keys)
+    }
+
+    func group(named name: String) -> ProxyGroup? {
+        groupsByName[name]
+    }
+}
+
 /// 沿策略组当前选择递归找到最终出口。精确匹配组名，并对循环、空引用和过深引用安全降级。
 enum ProxySelectionResolver {
     private static let maximumDepth = 64
 
     static func resolve(group: ProxyGroup,
                         groups: [ProxyGroup]) -> ProxySelectionResolution? {
+        resolve(group: group, index: ProxyGroupIndex(groups: groups))
+    }
+
+    static func resolve(group: ProxyGroup,
+                        index: ProxyGroupIndex) -> ProxySelectionResolution? {
         let immediate = group.now
         guard !immediate.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return nil
         }
-        return resolve(name: immediate, groups: groups, initiallyVisited: [group.name])
+        return resolve(name: immediate, index: index, initiallyVisited: [group.name])
     }
 
     static func resolve(name: String,
                         groups: [ProxyGroup]) -> ProxySelectionResolution? {
-        resolve(name: name, groups: groups, initiallyVisited: [])
+        resolve(name: name, index: ProxyGroupIndex(groups: groups))
+    }
+
+    static func resolve(name: String,
+                        index: ProxyGroupIndex) -> ProxySelectionResolution? {
+        resolve(name: name, index: index, initiallyVisited: [])
     }
 
     private static func resolve(name: String,
-                                groups: [ProxyGroup],
+                                index: ProxyGroupIndex,
                                 initiallyVisited: Set<String>) -> ProxySelectionResolution? {
         guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return nil
-        }
-
-        var lookup: [String: ProxyGroup] = [:]
-        for group in groups {
-            lookup[group.name] = group
         }
 
         var current = name
@@ -110,7 +139,7 @@ enum ProxySelectionResolver {
         }
 
         for _ in 0..<maximumDepth {
-            guard let group = lookup[current] else {
+            guard let group = index.group(named: current) else {
                 return ProxySelectionResolution(immediateSelection: name,
                                                 finalNode: current,
                                                 path: path)
@@ -137,7 +166,11 @@ enum ProxySelectionResolver {
 enum ProxyDelayResolver {
     /// 返回延迟查询优先级：实际节点优先，其次是引用链上的分组名（兼容旧会话数据）。
     static func keys(for name: String, groups: [ProxyGroup]) -> [String] {
-        guard let resolution = ProxySelectionResolver.resolve(name: name, groups: groups) else {
+        keys(for: name, index: ProxyGroupIndex(groups: groups))
+    }
+
+    static func keys(for name: String, index: ProxyGroupIndex) -> [String] {
+        guard let resolution = ProxySelectionResolver.resolve(name: name, index: index) else {
             return [name]
         }
 
@@ -149,13 +182,25 @@ enum ProxyDelayResolver {
     }
 
     static func storageKey(for name: String, groups: [ProxyGroup]) -> String {
-        keys(for: name, groups: groups).first ?? name
+        storageKey(for: name, index: ProxyGroupIndex(groups: groups))
+    }
+
+    static func storageKey(for name: String, index: ProxyGroupIndex) -> String {
+        keys(for: name, index: index).first ?? name
     }
 
     static func delay(for name: String,
                       groups: [ProxyGroup],
                       delays: [String: Int]) -> Int? {
-        for key in keys(for: name, groups: groups) {
+        delay(for: name,
+              index: ProxyGroupIndex(groups: groups),
+              delays: delays)
+    }
+
+    static func delay(for name: String,
+                      index: ProxyGroupIndex,
+                      delays: [String: Int]) -> Int? {
+        for key in keys(for: name, index: index) {
             if let value = delays[key] { return value }
         }
         return nil
@@ -172,7 +217,16 @@ final class ProxyController: ObservableObject {
 
     @Published private(set) var groups: [ProxyGroup] = []
     /// 完整分组图用于递归解析引用；`groups` 仍只包含当前模式需要展示的分组。
-    @Published private(set) var resolutionGroups: [ProxyGroup] = []
+    @Published private(set) var resolutionGroups: [ProxyGroup] = [] {
+        didSet {
+            resolutionIndex = ProxyGroupIndex(groups: resolutionGroups)
+            catalogRevision &+= 1
+        }
+    }
+    /// 与 `resolutionGroups` 同步的解析索引，供高频 UI 查询复用。
+    private(set) var resolutionIndex = ProxyGroupIndex()
+    /// 分组目录的轻量变更标记，避免视图每次刷新都排序并拼接完整成员列表。
+    private(set) var catalogRevision: UInt64 = 0
     @Published private(set) var mode: String = "rule"
     @Published var isLoading = false
     @Published private(set) var hasLoaded = false
@@ -466,8 +520,9 @@ final class ProxyController: ObservableObject {
         error = nil
         testing.insert(name)
         let memberNames = groups.first(where: { $0.name == name })?.all ?? []
+        let memberNameSet = Set(memberNames)
         let memberDelayKeys = Set(memberNames.map {
-            ProxyDelayResolver.storageKey(for: $0, groups: resolutionGroups)
+            ProxyDelayResolver.storageKey(for: $0, index: resolutionIndex)
         })
         clearDelayValues(for: memberDelayKeys)
         defer {
@@ -492,12 +547,12 @@ final class ProxyController: ObservableObject {
             }
             var values: [String: Int] = [:]
             for node in memberNames {
-                let key = ProxyDelayResolver.storageKey(for: node, groups: resolutionGroups)
+                let key = ProxyDelayResolver.storageKey(for: node, index: resolutionIndex)
                 values[key] = (dict[node] as? NSNumber)?.intValue ?? 0
             }
             for (node, ms) in dict {
-                if let value = (ms as? NSNumber)?.intValue, !memberNames.contains(node) {
-                    let key = ProxyDelayResolver.storageKey(for: node, groups: resolutionGroups)
+                if let value = (ms as? NSNumber)?.intValue, !memberNameSet.contains(node) {
+                    let key = ProxyDelayResolver.storageKey(for: node, index: resolutionIndex)
                     values[key] = value
                 }
             }
@@ -516,7 +571,7 @@ final class ProxyController: ObservableObject {
         let session = sessionGeneration
         error = nil
         testingNodes.insert(testingKey)
-        let delayKey = ProxyDelayResolver.storageKey(for: name, groups: resolutionGroups)
+        let delayKey = ProxyDelayResolver.storageKey(for: name, index: resolutionIndex)
         clearDelayValues(for: [delayKey])
         defer {
             if session == sessionGeneration {
