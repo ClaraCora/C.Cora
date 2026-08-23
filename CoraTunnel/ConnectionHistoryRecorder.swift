@@ -9,37 +9,29 @@ final class ConnectionHistoryRecorder {
     private static let pollInterval: TimeInterval = 2
     private static let snapshotLimit = 500
     private static let closedBatchLimit = 512
+    private static let storeRetryIntervals: [TimeInterval] = [5, 10, 20, 40, 60]
 
-    private let store: ConnectionHistoryStore?
     private let queue = DispatchQueue(label: "com.cora.tunnel.connection-history",
                                       qos: .utility)
+    private var store: ConnectionHistoryStore?
     private var timer: DispatchSourceTimer?
+    private var storeRetryWorkItem: DispatchWorkItem?
     private var closedCursor: Int64 = 0
-    private var isStopped = false
-
-    init() {
-        store = ConnectionHistoryStore.openShared()
-    }
+    private var isStopped = true
+    private var didLogStoreFailure = false
+    private var storeRetryAttempt = 0
+    private var sessionGeneration: UInt64 = 0
 
     func start() {
         queue.async { [weak self] in
-            guard let self, self.timer == nil, self.store != nil else { return }
+            guard let self, self.isStopped else { return }
             self.isStopped = false
+            self.sessionGeneration &+= 1
+            let generation = self.sessionGeneration
             // Mihomo's close queue cursor belongs to the current core process.
             // A restarted core begins again at zero.
             self.closedCursor = 0
-            // A prior extension instance can be killed without stopTunnel. Mark
-            // any stale active rows as finished before this instance begins.
-            self.store?.finishAllActive()
-            self.sampleLocked()
-
-            let timer = DispatchSource.makeTimerSource(queue: self.queue)
-            timer.schedule(deadline: .now() + Self.pollInterval,
-                           repeating: Self.pollInterval,
-                           leeway: .milliseconds(250))
-            timer.setEventHandler { [weak self] in self?.sampleLocked() }
-            self.timer = timer
-            timer.resume()
+            self.openStoreAndStartTimerLocked(generation: generation)
         }
     }
 
@@ -47,6 +39,9 @@ final class ConnectionHistoryRecorder {
         queue.sync {
             guard !isStopped else { return }
             isStopped = true
+            sessionGeneration &+= 1
+            storeRetryWorkItem?.cancel()
+            storeRetryWorkItem = nil
             timer?.setEventHandler {}
             timer?.cancel()
             timer = nil
@@ -54,7 +49,60 @@ final class ConnectionHistoryRecorder {
             // as well as in the App so a Control Center disconnect while the
             // App is terminated cannot leak totals into the next VPN session.
             store?.clearAll(compact: false)
+            store = nil
+            didLogStoreFailure = false
+            storeRetryAttempt = 0
         }
+    }
+
+    private func openStoreAndStartTimerLocked(generation: UInt64) {
+        guard !isStopped, generation == sessionGeneration, timer == nil else { return }
+        // Never run schema migration inside the memory-constrained NE. The
+        // main App owns upgrades; this recorder retries once the schema is ready.
+        store = store ?? ConnectionHistoryStore.openShared(performMigrations: false)
+        guard let store else {
+            if !didLogStoreFailure {
+                FileLog.write("连接历史数据库暂时不可用，将在后台重试；VPN 转发不受影响")
+                didLogStoreFailure = true
+            }
+            scheduleStoreRetryLocked(generation: generation)
+            return
+        }
+
+        if didLogStoreFailure {
+            FileLog.write("连接历史数据库已恢复")
+            didLogStoreFailure = false
+        }
+        storeRetryAttempt = 0
+        // A prior extension instance can be killed without stopTunnel. Mark
+        // any stale active rows as finished before this instance begins.
+        store.finishAllActive()
+        sampleLocked()
+
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + Self.pollInterval,
+                       repeating: Self.pollInterval,
+                       leeway: .milliseconds(250))
+        timer.setEventHandler { [weak self] in self?.sampleLocked() }
+        self.timer = timer
+        timer.resume()
+    }
+
+    private func scheduleStoreRetryLocked(generation: UInt64) {
+        guard !isStopped, generation == sessionGeneration,
+              storeRetryWorkItem == nil else { return }
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self, !self.isStopped,
+                  generation == self.sessionGeneration else { return }
+            self.storeRetryWorkItem = nil
+            self.openStoreAndStartTimerLocked(generation: generation)
+        }
+        let interval = Self.storeRetryIntervals[
+            min(storeRetryAttempt, Self.storeRetryIntervals.count - 1)]
+        storeRetryAttempt += 1
+        storeRetryWorkItem = workItem
+        queue.asyncAfter(deadline: .now() + interval,
+                         execute: workItem)
     }
 
     private func sampleLocked() {

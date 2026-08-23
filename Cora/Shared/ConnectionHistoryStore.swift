@@ -308,6 +308,7 @@ final class ConnectionHistoryStore: @unchecked Sendable {
     private static let migrationDatabasePages: Int64 = maximumDatabasePages + 16_384
     private static let migrationBusyTimeoutMilliseconds = 5_000
     private static let runtimeBusyTimeoutMilliseconds = 1_200
+    private static let currentSchemaVersion: Int64 = 1
     private static let maximumNodeAggregateCount = 4_096
     private static let migrationBatchSize = 250
     private static let defaultPageSize = 100
@@ -320,13 +321,15 @@ final class ConnectionHistoryStore: @unchecked Sendable {
 
     static var defaultFetchPageSize: Int { Int(defaultPageSize) }
 
-    static func openShared() -> ConnectionHistoryStore? {
+    static func openShared(performMigrations: Bool = true) -> ConnectionHistoryStore? {
         guard let container = AppGroup.containerURL else { return nil }
-        return try? ConnectionHistoryStore(
-            databaseURL: container.appendingPathComponent("connection-history.sqlite"))
+        guard let store = try? ConnectionHistoryStore(
+            databaseURL: container.appendingPathComponent("connection-history.sqlite"),
+            performMigrations: performMigrations) else { return nil }
+        return store
     }
 
-    init(databaseURL: URL) throws {
+    init(databaseURL: URL, performMigrations: Bool) throws {
         self.databaseURL = databaseURL
         try FileManager.default.createDirectory(at: databaseURL.deletingLastPathComponent(),
                                                 withIntermediateDirectories: true)
@@ -339,9 +342,14 @@ final class ConnectionHistoryStore: @unchecked Sendable {
         }
         database = handle
         do {
-            try configure()
+            let migrated = try configure(performMigrations: performMigrations)
             try trimLocked(now: Date())
-            try restoreDatabasePageLimitLocked()
+            if migrated {
+                try restoreDatabasePageLimitLocked()
+            } else {
+                try applySteadyStatePageLimitLocked()
+            }
+            try execute("PRAGMA temp_store = MEMORY")
             try execute("PRAGMA busy_timeout = \(Self.runtimeBusyTimeoutMilliseconds)")
         } catch {
             try? execute("PRAGMA max_page_count = \(Self.maximumDatabasePages)")
@@ -562,48 +570,63 @@ final class ConnectionHistoryStore: @unchecked Sendable {
         }
     }
 
-    private func configure() throws {
-        // Only schema migration may hold the cross-process writer lock for
-        // longer than the normal observability write budget.
-        try execute("PRAGMA busy_timeout = \(Self.migrationBusyTimeoutMilliseconds)")
+    private func configure(performMigrations: Bool) throws -> Bool {
+        try execute("PRAGMA busy_timeout = \(Self.runtimeBusyTimeoutMilliseconds)")
         try execute("PRAGMA page_size = 4096")
         try execute("PRAGMA auto_vacuum = INCREMENTAL")
         try execute("PRAGMA journal_mode = WAL")
         try execute("PRAGMA synchronous = NORMAL")
         try execute("PRAGMA wal_autocheckpoint = 128")
-        try execute("PRAGMA temp_store = MEMORY")
+
+        let version = row(for: "PRAGMA user_version")?.int(0) ?? 0
+        guard version < Self.currentSchemaVersion else { return false }
+        guard performMigrations else { throw StoreError.migrationRequired }
+
+        // Only the one-time schema migration may hold the cross-process writer
+        // lock longer than the normal observability write budget. Keep index
+        // sorting on disk so migration cannot consume the NE memory allowance.
+        try execute("PRAGMA busy_timeout = \(Self.migrationBusyTimeoutMilliseconds)")
+        try execute("PRAGMA temp_store = FILE")
         // Existing databases may already sit at the normal hard limit. Give
         // the one-time column/index migration bounded room, then compact and
         // restore the normal limit before exposing this handle to callers.
         try execute("PRAGMA max_page_count = \(Self.migrationDatabasePages)")
-        try execute("""
-            CREATE TABLE IF NOT EXISTS connection_history (
-                id TEXT PRIMARY KEY NOT NULL,
-                started_at REAL NOT NULL,
-                ended_at REAL,
-                is_active INTEGER NOT NULL,
-                upload INTEGER NOT NULL,
-                download INTEGER NOT NULL,
-                network TEXT NOT NULL,
-                connection_type TEXT NOT NULL,
-                source_ip TEXT NOT NULL,
-                source_port TEXT NOT NULL,
-                destination_ip TEXT NOT NULL,
-                destination_port TEXT NOT NULL,
-                host TEXT NOT NULL,
-                sniff_host TEXT NOT NULL,
-                process TEXT NOT NULL,
-                process_path TEXT NOT NULL,
-                chains TEXT NOT NULL,
-                strategy_name TEXT NOT NULL,
-                proxy_node_name TEXT NOT NULL DEFAULT 'DIRECT',
-                host_name TEXT NOT NULL,
-                rule TEXT NOT NULL,
-                rule_payload TEXT NOT NULL
-            )
-            """)
         try execute("BEGIN IMMEDIATE TRANSACTION")
         do {
+            // Another process may have completed the migration while this
+            // handle waited for BEGIN IMMEDIATE. Recheck under the writer lock.
+            let lockedVersion = row(for: "PRAGMA user_version")?.int(0) ?? 0
+            if lockedVersion >= Self.currentSchemaVersion {
+                try execute("COMMIT")
+                return true
+            }
+
+            try execute("""
+                CREATE TABLE IF NOT EXISTS connection_history (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    started_at REAL NOT NULL,
+                    ended_at REAL,
+                    is_active INTEGER NOT NULL,
+                    upload INTEGER NOT NULL,
+                    download INTEGER NOT NULL,
+                    network TEXT NOT NULL,
+                    connection_type TEXT NOT NULL,
+                    source_ip TEXT NOT NULL,
+                    source_port TEXT NOT NULL,
+                    destination_ip TEXT NOT NULL,
+                    destination_port TEXT NOT NULL,
+                    host TEXT NOT NULL,
+                    sniff_host TEXT NOT NULL,
+                    process TEXT NOT NULL,
+                    process_path TEXT NOT NULL,
+                    chains TEXT NOT NULL,
+                    strategy_name TEXT NOT NULL,
+                    proxy_node_name TEXT NOT NULL DEFAULT 'DIRECT',
+                    host_name TEXT NOT NULL,
+                    rule TEXT NOT NULL,
+                    rule_payload TEXT NOT NULL
+                )
+                """)
             let addedProxyNodeColumn = try ensureProxyNodeColumnLocked()
             if addedProxyNodeColumn {
                 try backfillProxyNodeNamesLocked()
@@ -678,7 +701,9 @@ final class ConnectionHistoryStore: @unchecked Sendable {
                         + "ON connection_history(proxy_node_name, is_active, started_at DESC)")
             try execute("CREATE INDEX IF NOT EXISTS history_host_index "
                         + "ON connection_history(host_name, is_active, started_at DESC)")
+            try execute("PRAGMA user_version = \(Self.currentSchemaVersion)")
             try execute("COMMIT")
+            return true
         } catch {
             try? execute("ROLLBACK")
             throw error
@@ -828,7 +853,7 @@ final class ConnectionHistoryStore: @unchecked Sendable {
 
     private func restoreDatabasePageLimitLocked() throws {
         try? execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        try? execute("PRAGMA incremental_vacuum")
+        try? execute("PRAGMA incremental_vacuum(2048)")
 
         // An index migration can temporarily grow the main database beyond
         // its steady-state page cap. Remove only oldest completed details;
@@ -842,7 +867,11 @@ final class ConnectionHistoryStore: @unchecked Sendable {
             pageCount = row(for: "PRAGMA page_count")?.int(0) ?? pageCount
             attempts += 1
         }
-        let currentPages = row(for: "PRAGMA page_count")?.int(0) ?? pageCount
+        try applySteadyStatePageLimitLocked(fallbackPageCount: pageCount)
+    }
+
+    private func applySteadyStatePageLimitLocked(fallbackPageCount: Int64 = 0) throws {
+        let currentPages = row(for: "PRAGMA page_count")?.int(0) ?? fallbackPageCount
         let finalLimit = max(Self.maximumDatabasePages, currentPages)
         try execute("PRAGMA max_page_count = \(finalLimit)")
         guard row(for: "PRAGMA max_page_count")?.int(0) == finalLimit else {
@@ -1056,6 +1085,7 @@ final class ConnectionHistoryStore: @unchecked Sendable {
 
     private enum StoreError: Error {
         case openFailed
+        case migrationRequired
         case sqlite(Int32)
     }
 

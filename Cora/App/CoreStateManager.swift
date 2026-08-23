@@ -69,6 +69,7 @@ final class CoreStateManager: ObservableObject {
             // 通知在主线程队列回调；用 Task 切到 actor 上下文更新隔离状态
             Task { @MainActor in
                 guard let self, self.tunnel.owns(connection) else { return }
+                self.tunnel.noteStatusChange(connection.status)
                 self.status = connection.status
                 // 同步给控制中心磁贴（App 在前台时覆盖各种来源的状态变化）
                 AppGroupState.vpnConnected = self.isActive
@@ -86,7 +87,9 @@ final class CoreStateManager: ObservableObject {
 
     /// 初始化或前台回来时主动拉一次当前状态。
     func refreshStatus() async {
-        status = await tunnel.currentStatus()
+        let currentStatus = await tunnel.currentStatus()
+        tunnel.noteStatusChange(currentStatus)
+        status = currentStatus
         AppGroupState.vpnConnected = isActive
         if status == .connected || status == .reasserting {
             await fetchNotices()

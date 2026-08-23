@@ -27,6 +27,8 @@ final class TunnelManager {
 
     /// 当前使用的 provider 管理对象。懒加载/复用，避免重复创建系统描述文件。
     private var manager: NETunnelProviderManager?
+    private var persistedNELogAttemptID: String?
+    private var appInitiatedStartupAttemptID: String?
 
     private static let startupPollNanoseconds: UInt64 = 250_000_000
     private static let startupPollCount = 40
@@ -82,23 +84,91 @@ final class TunnelManager {
         return connection === manager.connection
     }
 
+    /// A new `.connecting` transition without an App-owned attempt came from
+    /// Control Center or On-Demand. Do not let that session reuse old log data.
+    func noteStatusChange(_ status: NEVPNStatus) {
+        switch status {
+        case .connecting:
+            if appInitiatedStartupAttemptID == nil {
+                persistedNELogAttemptID = nil
+            }
+        case .connected, .disconnecting, .disconnected, .invalid:
+            appInitiatedStartupAttemptID = nil
+        case .reasserting:
+            break
+        @unknown default:
+            appInitiatedStartupAttemptID = nil
+        }
+    }
+
     /// 启动隧道，并把订阅配置 + 设置经 options 下发给 NE（不依赖 App Group）。
     /// App 启动始终携带 config：非空=订阅，空串=明确 DIRECT；系统无 options 重连才复用缓存。
     func start(configYAML: String?, settingsJSON: String, protocolOptions: ProtocolOptions) async throws {
         let mgr = try await loadOrCreateManager(options: protocolOptions)
         var options: [String: NSObject] = ["config": (configYAML ?? "") as NSString]
         if !settingsJSON.isEmpty { options["settings"] = settingsJSON as NSString }
-        try mgr.connection.startVPNTunnel(options: options)
+        let startupAttemptID = UUID().uuidString
+        options["startupAttemptID"] = startupAttemptID as NSString
+        persistedNELogAttemptID = Self.resetPersistedNELog() ? startupAttemptID : nil
+        appInitiatedStartupAttemptID = startupAttemptID
+        do {
+            try mgr.connection.startVPNTunnel(options: options)
+        } catch {
+            if appInitiatedStartupAttemptID == startupAttemptID {
+                appInitiatedStartupAttemptID = nil
+            }
+            throw error
+        }
 
         switch await observeStartup(mgr.connection) {
-        case .connected, .stillConnecting:
+        case .connected:
+            if appInitiatedStartupAttemptID == startupAttemptID {
+                appInitiatedStartupAttemptID = nil
+            }
+            return
+        case .stillConnecting:
             return
         case .failed:
+            if appInitiatedStartupAttemptID == startupAttemptID {
+                appInitiatedStartupAttemptID = nil
+            }
             if let error = await lastDisconnectError(mgr.connection) {
                 throw error
             }
-            throw Self.startupError("隧道在启动阶段断开，请查看日志中的具体错误")
+            if let attemptID = persistedNELogAttemptID,
+               Self.persistedNELog(for: attemptID) == nil {
+                throw Self.startupError(
+                    "未收到 NE 启动日志，隧道扩展可能在初始化阶段退出；请重新连接，若仍失败请重新安装此版本的 VPN 配置")
+            }
+            let message = persistedNELogAttemptID != nil
+                ? "隧道在启动阶段断开，请查看日志中的具体错误"
+                : "隧道在启动阶段断开，本次启动未建立共享日志回退"
+            throw Self.startupError(message)
         }
+    }
+
+    private static func resetPersistedNELog() -> Bool {
+        guard let url = AppGroup.containerURL?.appendingPathComponent("ne.log") else {
+            return false
+        }
+        do {
+            try Data().write(to: url, options: .atomic)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private static func persistedNELog(for attemptID: String) -> String? {
+        guard let url = AppGroup.containerURL?.appendingPathComponent("ne.log"),
+              let text = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        let marker = "startup-attempt=\(attemptID)"
+        guard let markerRange = text.range(of: marker, options: .backwards) else { return nil }
+        let lineStart = text[..<markerRange.lowerBound].lastIndex(of: "\n")
+            .map { text.index(after: $0) } ?? text.startIndex
+        let value = String(text[lineStart...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
     }
 
     private func observeStartup(_ connection: NEVPNConnection) async -> StartOutcome {
@@ -429,7 +499,14 @@ final class TunnelManager {
         case .ok(let data):
             return String(data: data, encoding: .utf8) ?? "(响应非文本)"
         case .failure(let reason):
-            return "(取日志失败：\(reason))"
+            if let attemptID = persistedNELogAttemptID,
+               let persisted = Self.persistedNELog(for: attemptID) {
+                return "===== ne（共享文件回退）=====\n\(persisted)\n\n(实时 IPC 不可用：\(reason))"
+            }
+            if persistedNELogAttemptID != nil {
+                return "(未收到 NE 启动日志；扩展可能在初始化阶段退出。实时 IPC：\(reason))"
+            }
+            return "(实时 IPC 不可用，且本次启动未建立共享日志回退：\(reason))"
         }
     }
 }
