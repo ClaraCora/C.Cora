@@ -81,6 +81,10 @@ const defaultRunLogChunkBytes = 48 << 10
 
 const maxSnellCellularTCPNodes = 4096
 
+var coraReservedSyntheticIPPrefixes = [...]netip.Prefix{
+	netip.MustParsePrefix("198.18.0.0/16"),
+}
+
 const (
 	maxProxyDelayTargets  = 256
 	proxyDelayWorkerLimit = 6
@@ -146,6 +150,8 @@ var (
 	activeSystemDNS       []string
 	activeUsesSystemDNS   bool
 	pendingUsesSystemDNS  bool
+	pendingSourceDNSMode  string
+	activeDNSGeneration   uint64
 	coreStartedAt         time.Time
 	snellCellularTCPMu    sync.RWMutex
 	snellCellularTCPNodes []string
@@ -726,7 +732,10 @@ func applyRuntimeConfig(fd int, tunnelMTU int, configYAML string, st appSettings
 		return err
 	}
 
-	appendRunLog("启动 ParseRawConfig 成功，开始 ApplyConfig")
+	// Keep Cora's synthetic TUN/Fake-IP range out of every routing mode when
+	// a stale client-side DNS answer no longer has a reverse mapping.
+	tunnel.SetReservedSyntheticIPPrefixes(coraReservedSyntheticIPPrefixes[:])
+	appendRunLog("启动 ParseRawConfig 成功，已注册 198.18.0.0/16 合成地址防线，开始 ApplyConfig")
 	executor.ApplyConfig(cfg, true)
 	for group, name := range st.ProxySelections {
 		proxy, exists := tunnel.Proxies()[group]
@@ -748,6 +757,14 @@ func applyRuntimeConfig(fd int, tunnelMTU int, configYAML string, st appSettings
 	activeGeneralIPv6 = cfg.General.IPv6
 	activeSystemDNS = append(activeSystemDNS[:0], st.SystemDNS...)
 	activeUsesSystemDNS = pendingUsesSystemDNS
+	if cfg.DNS != nil && cfg.DNS.Enable {
+		activeDNSGeneration++
+	} else {
+		activeDNSGeneration = 0
+	}
+	_, mapperReady := resolver.DefaultHostMapper.(*mdns.ResolverEnhancer)
+	appendRunLog(dnsStartupDiagnostic(st, cfg.DNS, mapperReady,
+		activeDNSGeneration))
 	// ApplyConfig 会按 YAML 重写 DefaultInterface；恢复 NWPathMonitor 选出的物理接口。
 	if name := currentPhysicalInterface(); name != "" {
 		dialer.DefaultInterface.Store(name)
@@ -760,6 +777,50 @@ func applyRuntimeConfig(fd int, tunnelMTU int, configYAML string, st appSettings
 	return nil
 }
 
+func dnsStartupDiagnostic(st appSettings, dnsConfig *config.DNS,
+	mapperReady bool, generation uint64) string {
+	overrideEnabled := st.Overrides.DNS.Overwrite
+	overrideApplied := st.ApplyOverrides && overrideEnabled
+	overrideMode := configuredDNSModeLabel(st.Overrides.DNS.EnhancedMode)
+	if overrideApplied && overrideMode == "无效" {
+		overrideMode = "无效（回退 fake-ip）"
+	}
+	finalMode := "disabled"
+	if dnsConfig != nil && dnsConfig.Enable {
+		finalMode = dnsConfig.EnhancedMode.String()
+	}
+	systemDNS := "无"
+	if len(st.SystemDNS) > 0 {
+		systemDNS = strings.Join(st.SystemDNS, ",")
+	}
+	return fmt.Sprintf("DNS 启动诊断：源 enhanced-mode=%s，DNS 覆写启用=%v，DNS 覆写应用=%v，覆写 enhanced-mode=%s，最终 enhanced-mode=%s，引用 system=%v，system DNS=%s，generation=%d，mapper 就绪=%v",
+		pendingSourceDNSMode, overrideEnabled, overrideApplied, overrideMode, finalMode,
+		pendingUsesSystemDNS, systemDNS, generation, mapperReady)
+}
+
+func sourceDNSEnhancedMode(root map[string]any) string {
+	dnsConfig, ok := root["dns"].(map[string]any)
+	if !ok {
+		return "未配置"
+	}
+	mode, ok := dnsConfig["enhanced-mode"].(string)
+	if !ok {
+		return "未配置"
+	}
+	return configuredDNSModeLabel(mode)
+}
+
+func configuredDNSModeLabel(mode string) string {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "" {
+		return "未配置"
+	}
+	if _, exists := C.DNSModeMapping[mode]; exists {
+		return mode
+	}
+	return "无效"
+}
+
 // mergeConfig 把订阅 YAML 与 iOS 必需设置 + 用户设置合并。
 // 强制 iOS TUN 与 DNS 接管所需参数；DNS enhanced-mode 保留配置值，未配置时使用 Mihomo 默认值。
 // fd 不在此写入（运行期值）；MTU 优先使用配置值，缺省时使用 iOS utun 的实际值。
@@ -770,6 +831,7 @@ func mergeConfig(subYAML string, st appSettings, tunnelMTU int) ([]byte, error) 
 			return nil, err
 		}
 	}
+	pendingSourceDNSMode = sourceDNSEnhancedMode(m)
 
 	// 重建 iOS tun 的核心参数；保留订阅显式声明的路由开关，方便配置审计并尊重
 	// auto-route=false。auto-redirect 在非 Linux 平台会由 sing-tun 强制关闭，strict-route
@@ -3037,14 +3099,22 @@ func NotifyNetworkChange(name string, systemDNSJSON string, reason string,
 	logSnellCellularTCPState(name, "网络路径变化")
 
 	resolverUpdated := false
+	var resolverErr error
 	if dnsErr == nil && len(newSystemDNS) > 0 &&
 		!equalStringSlices(newSystemDNS, activeSystemDNS) {
-		updated, replacements := replaceActiveSystemDNSLocked(newSystemDNS)
-		if updated {
-			rebuildDNSResolverLocked(activeDNSConfig, activeGeneralIPv6)
-			resolverUpdated = true
-			appendRunLog(fmt.Sprintf("system DNS 已按接口 %s 更新为 %s（替换 %d 处）",
-				name, strings.Join(newSystemDNS, ","), replacements))
+		updated, replacements := prepareActiveSystemDNSLocked(newSystemDNS)
+		if updated != nil {
+			if err := rebuildDNSResolverLocked(updated, activeGeneralIPv6); err != nil {
+				resolverErr = err
+				appendRunLog(fmt.Sprintf("system DNS 热更新失败：保留 generation=%d 和旧 DNS；%v",
+					activeDNSGeneration, err))
+			} else {
+				activeDNSConfig = updated
+				activeSystemDNS = append(activeSystemDNS[:0], newSystemDNS...)
+				resolverUpdated = true
+				appendRunLog(fmt.Sprintf("system DNS 已按接口 %s 更新为 %s（替换 %d 处）",
+					name, strings.Join(newSystemDNS, ","), replacements))
+			}
 		} else if activeUsesSystemDNS {
 			appendRunLog(fmt.Sprintf("接口 %s 已读取到新的 system DNS %s，但未匹配到运行中的旧 DNS；保留旧 DNS 等待下次刷新",
 				name, strings.Join(newSystemDNS, ",")))
@@ -3053,8 +3123,14 @@ func NotifyNetworkChange(name string, systemDNSJSON string, reason string,
 				name, strings.Join(newSystemDNS, ",")))
 		}
 	}
-	if resolverUpdated || resetConnections {
-		resolver.ResetConnection()
+	if resetConnections {
+		if resolverUpdated {
+			// The new default resolver has no stale transports, but the independent
+			// system resolver can still hold sockets bound to the previous path.
+			go resolver.SystemResolver.ResetConnection()
+		} else {
+			resolver.ResetConnection()
+		}
 	}
 
 	if resetConnections {
@@ -3077,7 +3153,7 @@ func NotifyNetworkChange(name string, systemDNSJSON string, reason string,
 	if dnsErr != nil {
 		appendRunLog("忽略无效的 scoped system DNS: " + dnsErr.Error())
 	}
-	return dnsErr
+	return errors.Join(dnsErr, resolverErr)
 }
 
 func networkChangeRequiresReset(previous, current string, requested bool) bool {
@@ -3113,10 +3189,13 @@ func parseSystemDNSJSON(raw string) ([]string, error) {
 	return result, nil
 }
 
-func replaceActiveSystemDNSLocked(newSystemDNS []string) (bool, int) {
+// prepareActiveSystemDNSLocked builds a replacement config without publishing
+// it when the runtime uses system DNS. For configurations that do not, it only
+// advances the observed system-DNS value to avoid repeated no-op refreshes.
+func prepareActiveSystemDNSLocked(newSystemDNS []string) (*config.DNS, int) {
 	if activeDNSConfig == nil || !activeUsesSystemDNS {
 		activeSystemDNS = append(activeSystemDNS[:0], newSystemDNS...)
-		return false, 0
+		return nil, 0
 	}
 
 	updated := *activeDNSConfig
@@ -3137,11 +3216,9 @@ func replaceActiveSystemDNSLocked(newSystemDNS []string) (bool, int) {
 		activeDNSConfig.ProxyServerPolicy, activeSystemDNS, newSystemDNS, replacements)
 
 	if replacements == 0 {
-		return false, 0
+		return nil, 0
 	}
-	activeSystemDNS = append(activeSystemDNS[:0], newSystemDNS...)
-	activeDNSConfig = &updated
-	return true, replacements
+	return &updated, replacements
 }
 
 func replaceSystemNameServersAdding(servers []mdns.NameServer, oldSystemDNS,
@@ -3229,10 +3306,32 @@ func equalStringSlices(left, right []string) bool {
 	return true
 }
 
-func rebuildDNSResolverLocked(c *config.DNS, generalIPv6 bool) {
+type dnsResolverRuntime struct {
+	resolvers      mdns.Resolvers
+	service        *mdns.Service
+	proxyResolver  resolver.Resolver
+	directResolver resolver.Resolver
+}
+
+func buildDNSResolverRuntime(c *config.DNS, generalIPv6 bool,
+	mapper *mdns.ResolverEnhancer) (runtimeState *dnsResolverRuntime, err error) {
 	if c == nil || !c.Enable {
-		return
+		return nil, errors.New("DNS 未启用")
 	}
+	if mapper == nil {
+		return nil, errors.New("运行中的 DNS mapper 不可用")
+	}
+	if !dnsMapperMatchesMode(mapper, c.EnhancedMode) {
+		return nil, fmt.Errorf("运行中的 DNS mapper 与 enhanced-mode=%s 不匹配",
+			c.EnhancedMode.String())
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			runtimeState = nil
+			err = fmt.Errorf("构建 DNS resolver panic: %v", recovered)
+		}
+	}()
+
 	ipv6 := c.IPv6 && generalIPv6
 	dnsResolver := mdns.NewResolver(mdns.Config{
 		Main:                 c.NameServer,
@@ -3251,36 +3350,74 @@ func rebuildDNSResolverLocked(c *config.DNS, generalIPv6 bool) {
 		CacheAlgorithm:       c.CacheAlgorithm,
 		CacheMaxSize:         c.CacheMaxSize,
 	})
-	enhancer := mdns.NewEnhancer(mdns.EnhancerConfig{
-		IPv6:          ipv6,
-		EnhancedMode:  c.EnhancedMode,
-		FakeIPPool:    c.FakeIPPool,
-		FakeIPPool6:   c.FakeIPPool6,
-		FakeIPSkipper: c.FakeIPSkipper,
-		FakeIPTTL:     c.FakeIPTTL,
-		UseHosts:      c.UseHosts,
-	})
-	if old, ok := resolver.DefaultHostMapper.(*mdns.ResolverEnhancer); ok {
-		enhancer.PatchFrom(old)
-	}
-	service := mdns.NewService(dnsResolver, enhancer)
-	resolver.DefaultResolver = dnsResolver
-	resolver.DefaultHostMapper = enhancer
-	resolver.DefaultService = service
-	resolver.UseSystemHosts = c.UseSystemHosts
+	service := mdns.NewService(dnsResolver, mapper)
+	proxyResolver := resolver.Resolver(dnsResolver.Resolver)
 	if dnsResolver.ProxyResolver.Invalid() {
-		resolver.ProxyServerHostResolver = dnsResolver.ProxyResolver
-	} else {
-		resolver.ProxyServerHostResolver = dnsResolver.Resolver
+		proxyResolver = dnsResolver.ProxyResolver
 	}
+	directResolver := resolver.Resolver(dnsResolver.Resolver)
 	if dnsResolver.DirectResolver.Invalid() {
-		resolver.DirectHostResolver = dnsResolver.DirectResolver
-	} else {
-		resolver.DirectHostResolver = dnsResolver.Resolver
+		directResolver = dnsResolver.DirectResolver
 	}
+	return &dnsResolverRuntime{
+		resolvers:      dnsResolver,
+		service:        service,
+		proxyResolver:  proxyResolver,
+		directResolver: directResolver,
+	}, nil
+}
+
+func dnsMapperMatchesMode(mapper *mdns.ResolverEnhancer, mode C.DNSMode) bool {
+	switch mode {
+	case C.DNSFakeIP:
+		return mapper.FakeIPEnabled()
+	case C.DNSMapping:
+		return mapper.MappingEnabled() && !mapper.FakeIPEnabled()
+	case C.DNSNormal, C.DNSHosts:
+		return !mapper.MappingEnabled() && !mapper.FakeIPEnabled()
+	default:
+		return false
+	}
+}
+
+func rebuildDNSResolverLocked(c *config.DNS, generalIPv6 bool) error {
+	if c == nil || !c.Enable {
+		return errors.New("DNS 未启用")
+	}
+	mapper, ok := resolver.DefaultHostMapper.(*mdns.ResolverEnhancer)
+	if !ok || mapper == nil {
+		return errors.New("运行中的 DNS mapper 类型无效")
+	}
+	nextGeneration := activeDNSGeneration + 1
+	appendRunLog(fmt.Sprintf("system DNS 热更新开始：generation=%d->%d，enhanced-mode=%s，mapper=复用",
+		activeDNSGeneration, nextGeneration, c.EnhancedMode.String()))
+	runtimeState, err := buildDNSResolverRuntime(c, generalIPv6, mapper)
+	if err != nil {
+		return err
+	}
+
+	oldResolver := resolver.CurrentDNSRuntime().DefaultResolver
+	resolver.PublishDNSRuntime(resolver.DNSRuntimeSnapshot{
+		DefaultResolver:         runtimeState.resolvers,
+		ProxyServerHostResolver: runtimeState.proxyResolver,
+		DirectHostResolver:      runtimeState.directResolver,
+		DefaultService:          runtimeState.service,
+		UseSystemHosts:          c.UseSystemHosts,
+	})
 	listenConfig := inbound.NewListenConfig()
 	listenConfig.SetRouteMark(c.ListenRoutingMark)
-	mdns.ReCreateServer(c.Listen, listenConfig, service)
+	mdns.ReCreateServer(c.Listen, listenConfig, resolver.DefaultService)
+	activeDNSGeneration = nextGeneration
+	resetDNSResolverTransport(oldResolver)
+	appendRunLog(fmt.Sprintf("system DNS 热更新完成：generation=%d，enhanced-mode=%s，mapper=复用，旧 resolver 传输已释放",
+		activeDNSGeneration, c.EnhancedMode.String()))
+	return nil
+}
+
+func resetDNSResolverTransport(oldResolver resolver.Resolver) {
+	if resetter, ok := oldResolver.(interface{ ResetConnection() }); ok {
+		resetter.ResetConnection()
+	}
 }
 
 // Stop 关闭内核与所有监听器。对应 Swift 侧 `MihomoStop()`。
@@ -3294,9 +3431,11 @@ func Stop() {
 	activeSystemDNS = nil
 	activeGeneralIPv6 = false
 	activeUsesSystemDNS = false
+	activeDNSGeneration = 0
 	coreStartedAt = time.Time{}
 	CloseAllConnections()
 	executor.Shutdown()
+	tunnel.SetReservedSyntheticIPPrefixes(nil)
 	// 旧运行时必须在下一次 StartWithConfig 前尽量归还 Go 堆页，
 	// 避免完整 stop/start 重载在 NE 中形成短暂的内存峰值。
 	runtime.GC()

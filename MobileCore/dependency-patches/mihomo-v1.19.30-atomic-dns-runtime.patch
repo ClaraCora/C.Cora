@@ -1,0 +1,558 @@
+diff --git a/adapter/outbound/direct.go b/adapter/outbound/direct.go
+index 1e2b2ef..d5c7b6c 100644
+--- a/adapter/outbound/direct.go
++++ b/adapter/outbound/direct.go
+@@ -50,8 +50,9 @@ func (d *Direct) ListenPacketContext(ctx context.Context, metadata *C.Metadata)
+ }
+ 
+ func (d *Direct) ResolveUDP(ctx context.Context, metadata *C.Metadata) error {
+-	if (!metadata.Resolved() || resolver.DirectHostResolver != resolver.DefaultResolver) && metadata.Host != "" {
+-		ip, err := resolveIPWithResolver(ctx, metadata.Host, d.prefer, resolver.DirectHostResolver)
++	runtime := resolver.CurrentDNSRuntime()
++	if (!metadata.Resolved() || runtime.DirectHostResolver != runtime.DefaultResolver) && metadata.Host != "" {
++		ip, err := resolveIPWithResolver(ctx, metadata.Host, d.prefer, runtime.DirectHostResolver)
+ 		if err != nil {
+ 			return fmt.Errorf("can't resolve ip: %w", err)
+ 		}
+diff --git a/component/resolver/host.go b/component/resolver/host.go
+index 51445d2..428e04e 100644
+--- a/component/resolver/host.go
++++ b/component/resolver/host.go
+@@ -13,10 +13,7 @@ import (
+ 	"github.com/metacubex/randv2"
+ )
+ 
+-var (
+-	DisableSystemHosts, _ = strconv.ParseBool(os.Getenv("DISABLE_SYSTEM_HOSTS"))
+-	UseSystemHosts        bool
+-)
++var DisableSystemHosts, _ = strconv.ParseBool(os.Getenv("DISABLE_SYSTEM_HOSTS"))
+ 
+ type Hosts struct {
+ 	*trie.DomainTrie[HostValue]
+@@ -50,7 +47,7 @@ func (h *Hosts) Search(domain string, isDomain bool) (*HostValue, bool) {
+ 		return &hostValue, false
+ 	}
+ 
+-	if !isDomain && !DisableSystemHosts && UseSystemHosts {
++	if !isDomain && !DisableSystemHosts && loadDNSRuntime().UseSystemHosts {
+ 		addr, _ := hosts.LookupStaticHost(domain)
+ 		if hostValue, err := NewHostValue(addr); err == nil {
+ 			return &hostValue, true
+diff --git a/component/resolver/resolver.go b/component/resolver/resolver.go
+index e87a910..9c0f241 100644
+--- a/component/resolver/resolver.go
++++ b/component/resolver/resolver.go
+@@ -15,14 +15,11 @@ import (
+ )
+ 
+ var (
+-	// DefaultResolver aim to resolve ip
+-	DefaultResolver Resolver
+-
+-	// ProxyServerHostResolver resolve ip for proxies server host, only nil when DefaultResolver is nil
+-	ProxyServerHostResolver Resolver
+-
+-	// DirectHostResolver resolve ip for direct outbound host, only nil when DefaultResolver is nil
+-	DirectHostResolver Resolver
++	// These stable proxies preserve the public resolver API while the actual
++	// resolver roles are atomically replaced as one DNSRuntimeSnapshot.
++	DefaultResolver         Resolver = runtimeResolver(defaultResolverRole)
++	ProxyServerHostResolver Resolver = runtimeResolver(proxyServerHostResolverRole)
++	DirectHostResolver      Resolver = runtimeResolver(directHostResolverRole)
+ 
+ 	// SystemResolver always using system dns, and was init in dns module
+ 	SystemResolver Resolver
+@@ -38,6 +35,80 @@ var (
+ 	DefaultDNSTimeout = time.Second * 5
+ )
+ 
++type runtimeResolverRole uint8
++
++const (
++	defaultResolverRole runtimeResolverRole = iota
++	proxyServerHostResolverRole
++	directHostResolverRole
++)
++
++type runtimeResolver runtimeResolverRole
++
++func (r runtimeResolver) current() Resolver {
++	runtime := loadDNSRuntime()
++	switch runtimeResolverRole(r) {
++	case proxyServerHostResolverRole:
++		return runtime.ProxyServerHostResolver
++	case directHostResolverRole:
++		return runtime.DirectHostResolver
++	default:
++		return runtime.DefaultResolver
++	}
++}
++
++func (r runtimeResolver) LookupIP(ctx context.Context, host string) ([]netip.Addr, error) {
++	if current := r.current(); current != nil && current.Invalid() {
++		return current.LookupIP(ctx, host)
++	}
++	return SystemResolver.LookupIP(ctx, host)
++}
++
++func (r runtimeResolver) LookupIPv4(ctx context.Context, host string) ([]netip.Addr, error) {
++	if current := r.current(); current != nil && current.Invalid() {
++		return current.LookupIPv4(ctx, host)
++	}
++	return SystemResolver.LookupIPv4(ctx, host)
++}
++
++func (r runtimeResolver) LookupIPv6(ctx context.Context, host string) ([]netip.Addr, error) {
++	if current := r.current(); current != nil && current.Invalid() {
++		return current.LookupIPv6(ctx, host)
++	}
++	return SystemResolver.LookupIPv6(ctx, host)
++}
++
++func (r runtimeResolver) ResolveECH(ctx context.Context, host string) ([]byte, error) {
++	if current := r.current(); current != nil && current.Invalid() {
++		return current.ResolveECH(ctx, host)
++	}
++	return SystemResolver.ResolveECH(ctx, host)
++}
++
++func (r runtimeResolver) ExchangeContext(ctx context.Context, msg *dns.Msg) (*dns.Msg, error) {
++	if current := r.current(); current != nil && current.Invalid() {
++		return current.ExchangeContext(ctx, msg)
++	}
++	return SystemResolver.ExchangeContext(ctx, msg)
++}
++
++func (r runtimeResolver) Invalid() bool {
++	current := r.current()
++	return current != nil && current.Invalid()
++}
++
++func (r runtimeResolver) ClearCache() {
++	if current := r.current(); current != nil {
++		current.ClearCache()
++	}
++}
++
++func (r runtimeResolver) ResetConnection() {
++	if current := r.current(); current != nil {
++		current.ResetConnection()
++	}
++}
++
+ var (
+ 	ErrIPNotFound   = errors.New("couldn't find ip")
+ 	ErrIPVersion    = errors.New("ip version error")
+@@ -83,7 +154,7 @@ func LookupIPv4WithResolver(ctx context.Context, host string, r Resolver) ([]net
+ 
+ // LookupIPv4 with a host, return ipv4 list
+ func LookupIPv4(ctx context.Context, host string) ([]netip.Addr, error) {
+-	return LookupIPv4WithResolver(ctx, host, DefaultResolver)
++	return LookupIPv4WithResolver(ctx, host, loadDNSRuntime().DefaultResolver)
+ }
+ 
+ // ResolveIPv4WithResolver same as ResolveIPv4, but with a resolver
+@@ -99,7 +170,7 @@ func ResolveIPv4WithResolver(ctx context.Context, host string, r Resolver) (neti
+ 
+ // ResolveIPv4 with a host, return ipv4
+ func ResolveIPv4(ctx context.Context, host string) (netip.Addr, error) {
+-	return ResolveIPv4WithResolver(ctx, host, DefaultResolver)
++	return ResolveIPv4WithResolver(ctx, host, loadDNSRuntime().DefaultResolver)
+ }
+ 
+ // LookupIPv6WithResolver same as LookupIPv6, but with a resolver
+@@ -133,7 +204,7 @@ func LookupIPv6WithResolver(ctx context.Context, host string, r Resolver) ([]net
+ 
+ // LookupIPv6 with a host, return ipv6 list
+ func LookupIPv6(ctx context.Context, host string) ([]netip.Addr, error) {
+-	return LookupIPv6WithResolver(ctx, host, DefaultResolver)
++	return LookupIPv6WithResolver(ctx, host, loadDNSRuntime().DefaultResolver)
+ }
+ 
+ // ResolveIPv6WithResolver same as ResolveIPv6, but with a resolver
+@@ -148,7 +219,7 @@ func ResolveIPv6WithResolver(ctx context.Context, host string, r Resolver) (neti
+ }
+ 
+ func ResolveIPv6(ctx context.Context, host string) (netip.Addr, error) {
+-	return ResolveIPv6WithResolver(ctx, host, DefaultResolver)
++	return ResolveIPv6WithResolver(ctx, host, loadDNSRuntime().DefaultResolver)
+ }
+ 
+ // LookupIPWithResolver same as LookupIP, but with a resolver
+@@ -176,7 +247,7 @@ func LookupIPWithResolver(ctx context.Context, host string, r Resolver) ([]netip
+ 
+ // LookupIP with a host, return ip
+ func LookupIP(ctx context.Context, host string) ([]netip.Addr, error) {
+-	return LookupIPWithResolver(ctx, host, DefaultResolver)
++	return LookupIPWithResolver(ctx, host, loadDNSRuntime().DefaultResolver)
+ }
+ 
+ // ResolveIPWithResolver same as ResolveIP, but with a resolver
+@@ -196,7 +267,7 @@ func ResolveIPWithResolver(ctx context.Context, host string, r Resolver) (netip.
+ 
+ // ResolveIP with a host, return ip and priority return TypeA
+ func ResolveIP(ctx context.Context, host string) (netip.Addr, error) {
+-	return ResolveIPWithResolver(ctx, host, DefaultResolver)
++	return ResolveIPWithResolver(ctx, host, loadDNSRuntime().DefaultResolver)
+ }
+ 
+ // ResolveIPPrefer6WithResolver same as ResolveIP, but with a resolver
+@@ -216,7 +287,7 @@ func ResolveIPPrefer6WithResolver(ctx context.Context, host string, r Resolver)
+ 
+ // ResolveIPPrefer6 with a host, return ip and priority return TypeAAAA
+ func ResolveIPPrefer6(ctx context.Context, host string) (netip.Addr, error) {
+-	return ResolveIPPrefer6WithResolver(ctx, host, DefaultResolver)
++	return ResolveIPPrefer6WithResolver(ctx, host, loadDNSRuntime().DefaultResolver)
+ }
+ 
+ func ResolveECHWithResolver(ctx context.Context, host string, r Resolver) ([]byte, error) {
+@@ -227,19 +298,19 @@ func ResolveECHWithResolver(ctx context.Context, host string, r Resolver) ([]byt
+ }
+ 
+ func ResolveECH(ctx context.Context, host string) ([]byte, error) {
+-	return ResolveECHWithResolver(ctx, host, DefaultResolver)
++	return ResolveECHWithResolver(ctx, host, loadDNSRuntime().DefaultResolver)
+ }
+ 
+ func ClearCache() {
+-	if DefaultResolver != nil {
+-		go DefaultResolver.ClearCache()
++	if current := loadDNSRuntime().DefaultResolver; current != nil {
++		go current.ClearCache()
+ 	}
+ 	go SystemResolver.ClearCache() // SystemResolver unneeded check nil
+ }
+ 
+ func ResetConnection() {
+-	if DefaultResolver != nil {
+-		go DefaultResolver.ResetConnection()
++	if current := loadDNSRuntime().DefaultResolver; current != nil {
++		go current.ResetConnection()
+ 	}
+ 	go SystemResolver.ResetConnection() // SystemResolver unneeded check nil
+ }
+diff --git a/component/resolver/runtime.go b/component/resolver/runtime.go
+new file mode 100644
+index 0000000..49799ca
+--- /dev/null
++++ b/component/resolver/runtime.go
+@@ -0,0 +1,39 @@
++package resolver
++
++import "sync/atomic"
++
++// DNSRuntimeSnapshot is the complete resolver state used by the data plane.
++// Published snapshots are immutable and may be retained by concurrent readers.
++type DNSRuntimeSnapshot struct {
++	DefaultResolver         Resolver
++	ProxyServerHostResolver Resolver
++	DirectHostResolver      Resolver
++	DefaultService          Service
++	UseSystemHosts          bool
++}
++
++var (
++	emptyDNSRuntime DNSRuntimeSnapshot
++	dnsRuntime      atomic.Pointer[DNSRuntimeSnapshot]
++)
++
++func loadDNSRuntime() *DNSRuntimeSnapshot {
++	if runtime := dnsRuntime.Load(); runtime != nil {
++		return runtime
++	}
++	return &emptyDNSRuntime
++}
++
++// CurrentDNSRuntime returns a copy of one coherent DNS runtime generation.
++// Callers that need more than one field should retain the returned value for
++// the whole operation instead of loading the snapshot again.
++func CurrentDNSRuntime() DNSRuntimeSnapshot {
++	return *loadDNSRuntime()
++}
++
++// PublishDNSRuntime atomically replaces every resolver role and its related
++// service/hosts setting. The copy prevents later caller mutations from
++// changing a snapshot already visible to the data plane.
++func PublishDNSRuntime(runtime DNSRuntimeSnapshot) {
++	dnsRuntime.Store(&runtime)
++}
+diff --git a/component/resolver/runtime_test.go b/component/resolver/runtime_test.go
+new file mode 100644
+index 0000000..60a9dd9
+--- /dev/null
++++ b/component/resolver/runtime_test.go
+@@ -0,0 +1,136 @@
++package resolver
++
++import (
++	"context"
++	"net/netip"
++	"sync"
++	"sync/atomic"
++	"testing"
++
++	D "github.com/miekg/dns"
++)
++
++type runtimeTestResolver struct {
++	ip netip.Addr
++}
++
++func (r *runtimeTestResolver) LookupIP(context.Context, string) ([]netip.Addr, error) {
++	return []netip.Addr{r.ip}, nil
++}
++
++func (r *runtimeTestResolver) LookupIPv4(ctx context.Context, host string) ([]netip.Addr, error) {
++	return r.LookupIP(ctx, host)
++}
++
++func (r *runtimeTestResolver) LookupIPv6(ctx context.Context, host string) ([]netip.Addr, error) {
++	return r.LookupIP(ctx, host)
++}
++
++func (r *runtimeTestResolver) ResolveECH(context.Context, string) ([]byte, error) {
++	return nil, nil
++}
++
++func (r *runtimeTestResolver) ExchangeContext(context.Context, *D.Msg) (*D.Msg, error) {
++	return new(D.Msg), nil
++}
++
++func (*runtimeTestResolver) Invalid() bool    { return true }
++func (*runtimeTestResolver) ClearCache()      {}
++func (*runtimeTestResolver) ResetConnection() {}
++
++type runtimeTestService struct{}
++
++func (*runtimeTestService) ServeMsg(context.Context, *D.Msg) (*D.Msg, error) {
++	return new(D.Msg), nil
++}
++
++func preserveDNSRuntime(t *testing.T) {
++	t.Helper()
++	previous := CurrentDNSRuntime()
++	t.Cleanup(func() { PublishDNSRuntime(previous) })
++}
++
++func TestPublishDNSRuntimeCopiesInputAndProxiesLatestResolver(t *testing.T) {
++	preserveDNSRuntime(t)
++	first := &runtimeTestResolver{ip: netip.MustParseAddr("192.0.2.1")}
++	next := DNSRuntimeSnapshot{DefaultResolver: first}
++	PublishDNSRuntime(next)
++	next.DefaultResolver = nil
++
++	if CurrentDNSRuntime().DefaultResolver != first {
++		t.Fatal("published runtime changed when the caller mutated its input")
++	}
++	ips, err := DefaultResolver.LookupIP(context.Background(), "example.com")
++	if err != nil || len(ips) != 1 || ips[0] != first.ip {
++		t.Fatalf("stable proxy result = %v, %v; want %s", ips, err, first.ip)
++	}
++}
++
++func TestDNSRuntimePublicationNeverExposesMixedGeneration(t *testing.T) {
++	preserveDNSRuntime(t)
++	aDefault := &runtimeTestResolver{ip: netip.MustParseAddr("192.0.2.1")}
++	aProxy := &runtimeTestResolver{ip: netip.MustParseAddr("192.0.2.2")}
++	aDirect := &runtimeTestResolver{ip: netip.MustParseAddr("192.0.2.3")}
++	aService := &runtimeTestService{}
++	bDefault := &runtimeTestResolver{ip: netip.MustParseAddr("198.51.100.1")}
++	bProxy := &runtimeTestResolver{ip: netip.MustParseAddr("198.51.100.2")}
++	bDirect := &runtimeTestResolver{ip: netip.MustParseAddr("198.51.100.3")}
++	bService := &runtimeTestService{}
++	a := DNSRuntimeSnapshot{
++		DefaultResolver: aDefault, ProxyServerHostResolver: aProxy,
++		DirectHostResolver: aDirect, DefaultService: aService,
++	}
++	b := DNSRuntimeSnapshot{
++		DefaultResolver: bDefault, ProxyServerHostResolver: bProxy,
++		DirectHostResolver: bDirect, DefaultService: bService,
++		UseSystemHosts: true,
++	}
++	PublishDNSRuntime(a)
++
++	var mixed atomic.Bool
++	var group sync.WaitGroup
++	group.Add(5)
++	go func() {
++		defer group.Done()
++		for i := 0; i < 20000; i++ {
++			PublishDNSRuntime(a)
++			PublishDNSRuntime(b)
++		}
++	}()
++	for reader := 0; reader < 4; reader++ {
++		go func() {
++			defer group.Done()
++			for i := 0; i < 50000; i++ {
++				runtime := CurrentDNSRuntime()
++				isA := runtime.DefaultResolver == aDefault &&
++					runtime.ProxyServerHostResolver == aProxy &&
++					runtime.DirectHostResolver == aDirect &&
++					runtime.DefaultService == aService && !runtime.UseSystemHosts
++				isB := runtime.DefaultResolver == bDefault &&
++					runtime.ProxyServerHostResolver == bProxy &&
++					runtime.DirectHostResolver == bDirect &&
++					runtime.DefaultService == bService && runtime.UseSystemHosts
++				if !isA && !isB {
++					mixed.Store(true)
++					return
++				}
++			}
++		}()
++	}
++	group.Wait()
++	if mixed.Load() {
++		t.Fatal("a reader observed fields from different DNS runtime generations")
++	}
++}
++
++var runtimeSnapshotSink DNSRuntimeSnapshot
++
++func TestCurrentDNSRuntimeDoesNotAllocate(t *testing.T) {
++	preserveDNSRuntime(t)
++	PublishDNSRuntime(DNSRuntimeSnapshot{})
++	if allocs := testing.AllocsPerRun(1000, func() {
++		runtimeSnapshotSink = CurrentDNSRuntime()
++	}); allocs != 0 {
++		t.Fatalf("CurrentDNSRuntime allocations = %v, want 0", allocs)
++	}
++}
+diff --git a/component/resolver/service.go b/component/resolver/service.go
+index 8b8f115..0a20cc4 100644
+--- a/component/resolver/service.go
++++ b/component/resolver/service.go
+@@ -6,7 +6,16 @@ import (
+ 	D "github.com/miekg/dns"
+ )
+ 
+-var DefaultService Service
++var DefaultService Service = runtimeService{}
++
++type runtimeService struct{}
++
++func (runtimeService) ServeMsg(ctx context.Context, msg *D.Msg) (*D.Msg, error) {
++	if server := loadDNSRuntime().DefaultService; server != nil {
++		return server.ServeMsg(ctx, msg)
++	}
++	return nil, ErrIPNotFound
++}
+ 
+ type Service interface {
+ 	ServeMsg(ctx context.Context, msg *D.Msg) (*D.Msg, error)
+@@ -14,7 +23,7 @@ type Service interface {
+ 
+ // ServeMsg with a dns.Msg, return resolve dns.Msg
+ func ServeMsg(ctx context.Context, msg *D.Msg) (*D.Msg, error) {
+-	if server := DefaultService; server != nil {
++	if server := loadDNSRuntime().DefaultService; server != nil {
+ 		return server.ServeMsg(ctx, msg)
+ 	}
+ 
+diff --git a/dns/server.go b/dns/server.go
+index d476c29..8b815d4 100644
+--- a/dns/server.go
++++ b/dns/server.go
+@@ -63,7 +63,6 @@ func (s *Server) SetService(service resolver.Service) {
+ 
+ func ReCreateServer(addr string, lc C.InboundListenConfig, service resolver.Service) {
+ 	if addr == address && service != nil {
+-		server.SetService(service)
+ 		return
+ 	}
+ 
+diff --git a/hub/executor/executor.go b/hub/executor/executor.go
+index 796face..ee6466d 100644
+--- a/hub/executor/executor.go
++++ b/hub/executor/executor.go
+@@ -237,11 +237,8 @@ func updateNTP(c *config.NTP) {
+ 
+ func updateDNS(c *config.DNS, generalIPv6 bool) {
+ 	if !c.Enable {
+-		resolver.DefaultResolver = nil
+ 		resolver.DefaultHostMapper = nil
+-		resolver.DefaultService = nil
+-		resolver.ProxyServerHostResolver = nil
+-		resolver.DirectHostResolver = nil
++		resolver.PublishDNSRuntime(resolver.DNSRuntimeSnapshot{})
+ 		dns.ReCreateServer("", nil, nil)
+ 		return
+ 	}
+@@ -280,27 +277,26 @@ func updateDNS(c *config.DNS, generalIPv6 bool) {
+ 	}
+ 
+ 	s := dns.NewService(r, m)
+-
+-	resolver.DefaultResolver = r
+ 	resolver.DefaultHostMapper = m
+-	resolver.DefaultService = s
+-	resolver.UseSystemHosts = c.UseSystemHosts
+-
++	proxyResolver := resolver.Resolver(r.Resolver)
+ 	if r.ProxyResolver.Invalid() {
+-		resolver.ProxyServerHostResolver = r.ProxyResolver
+-	} else {
+-		resolver.ProxyServerHostResolver = r.Resolver
++		proxyResolver = r.ProxyResolver
+ 	}
+-
++	directResolver := resolver.Resolver(r.Resolver)
+ 	if r.DirectResolver.Invalid() {
+-		resolver.DirectHostResolver = r.DirectResolver
+-	} else {
+-		resolver.DirectHostResolver = r.Resolver
+-	}
++		directResolver = r.DirectResolver
++	}
++	resolver.PublishDNSRuntime(resolver.DNSRuntimeSnapshot{
++		DefaultResolver:         r,
++		ProxyServerHostResolver: proxyResolver,
++		DirectHostResolver:      directResolver,
++		DefaultService:          s,
++		UseSystemHosts:          c.UseSystemHosts,
++	})
+ 
+ 	lc := inbound.NewListenConfig()
+ 	lc.SetRouteMark(c.ListenRoutingMark)
+-	dns.ReCreateServer(c.Listen, lc, s)
++	dns.ReCreateServer(c.Listen, lc, resolver.DefaultService)
+ }
+ 
+ func updateHosts(tree *trie.DomainTrie[resolver.HostValue]) {
+diff --git a/hub/route/dns.go b/hub/route/dns.go
+index 5a805a1..23c586c 100644
+--- a/hub/route/dns.go
++++ b/hub/route/dns.go
+@@ -20,7 +20,8 @@ func dnsRouter() http.Handler {
+ }
+ 
+ func queryDNS(w http.ResponseWriter, r *http.Request) {
+-	if resolver.DefaultResolver == nil {
++	dnsResolver := resolver.CurrentDNSRuntime().DefaultResolver
++	if dnsResolver == nil {
+ 		render.Status(r, http.StatusInternalServerError)
+ 		render.JSON(w, r, newError("DNS section is disabled"))
+ 		return
+@@ -41,7 +42,7 @@ func queryDNS(w http.ResponseWriter, r *http.Request) {
+ 
+ 	msg := dns.Msg{}
+ 	msg.SetQuestion(dns.Fqdn(name), qType)
+-	resp, err := resolver.DefaultResolver.ExchangeContext(ctx, &msg)
++	resp, err := dnsResolver.ExchangeContext(ctx, &msg)
+ 	if err != nil {
+ 		render.Status(r, http.StatusInternalServerError)
+ 		render.JSON(w, r, newError(err.Error()))
+diff --git a/hub/route/doh.go b/hub/route/doh.go
+index 3e0c30c..c6030c6 100644
+--- a/hub/route/doh.go
++++ b/hub/route/doh.go
+@@ -16,7 +16,7 @@ func dohRouter() http.Handler {
+ }
+ 
+ func dohHandler(w http.ResponseWriter, r *http.Request) {
+-	if resolver.DefaultResolver == nil {
++	if resolver.CurrentDNSRuntime().DefaultResolver == nil {
+ 		render.Status(r, http.StatusInternalServerError)
+ 		render.PlainText(w, r, "DNS section is disabled")
+ 		return

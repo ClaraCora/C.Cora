@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,7 +12,10 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/component/dialer"
+	"github.com/metacubex/mihomo/component/fakeip"
+	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/config"
+	C "github.com/metacubex/mihomo/constant"
 	mdns "github.com/metacubex/mihomo/dns"
 	"gopkg.in/yaml.v3"
 )
@@ -520,12 +524,177 @@ func TestReplaceActiveSystemDNSKeepsOldDNSOnMismatch(t *testing.T) {
 	activeSystemDNS = []string{"10.0.0.1"}
 	activeUsesSystemDNS = true
 
-	updated, replacements := replaceActiveSystemDNSLocked([]string{"192.168.1.1"})
-	if updated || replacements != 0 {
+	updated, replacements := prepareActiveSystemDNSLocked([]string{"192.168.1.1"})
+	if updated != nil || replacements != 0 {
 		t.Fatalf("updated = %v, replacements = %d", updated, replacements)
 	}
 	if !equalStringSlices(activeSystemDNS, []string{"10.0.0.1"}) {
 		t.Fatalf("activeSystemDNS advanced after mismatch: %v", activeSystemDNS)
+	}
+}
+
+func TestPrepareActiveSystemDNSDoesNotPublishCandidate(t *testing.T) {
+	previousConfig := activeDNSConfig
+	previousSystemDNS := append([]string(nil), activeSystemDNS...)
+	previousUsesSystemDNS := activeUsesSystemDNS
+	defer func() {
+		activeDNSConfig = previousConfig
+		activeSystemDNS = previousSystemDNS
+		activeUsesSystemDNS = previousUsesSystemDNS
+	}()
+
+	original := &config.DNS{NameServer: []mdns.NameServer{{Addr: "10.0.0.1:53"}}}
+	activeDNSConfig = original
+	activeSystemDNS = []string{"10.0.0.1"}
+	activeUsesSystemDNS = true
+
+	candidate, replacements := prepareActiveSystemDNSLocked([]string{"192.168.1.1"})
+	if candidate == nil || replacements != 1 {
+		t.Fatalf("candidate = %v, replacements = %d", candidate, replacements)
+	}
+	if activeDNSConfig != original || !equalStringSlices(activeSystemDNS, []string{"10.0.0.1"}) {
+		t.Fatalf("candidate was published before resolver install: config=%p DNS=%v",
+			activeDNSConfig, activeSystemDNS)
+	}
+	if got := candidate.NameServer[0].Addr; got != "192.168.1.1:53" {
+		t.Fatalf("candidate nameserver = %q, want 192.168.1.1:53", got)
+	}
+}
+
+type dnsResolverGlobalsSnapshot struct {
+	runtime    resolver.DNSRuntimeSnapshot
+	mapper     resolver.Enhancer
+	generation uint64
+}
+
+func preserveDNSResolverGlobals(t *testing.T) {
+	t.Helper()
+	snapshot := dnsResolverGlobalsSnapshot{
+		runtime:    resolver.CurrentDNSRuntime(),
+		mapper:     resolver.DefaultHostMapper,
+		generation: activeDNSGeneration,
+	}
+	t.Cleanup(func() {
+		resetDNSResolverTransport(resolver.CurrentDNSRuntime().DefaultResolver)
+		resolver.PublishDNSRuntime(snapshot.runtime)
+		resolver.DefaultHostMapper = snapshot.mapper
+		activeDNSGeneration = snapshot.generation
+		mdns.ReCreateServer("", nil, snapshot.runtime.DefaultService)
+	})
+}
+
+func TestRebuildDNSResolverReusesMapperAcrossGenerations(t *testing.T) {
+	preserveDNSResolverGlobals(t)
+	pool, err := fakeip.New(fakeip.Options{
+		IPNet: netip.MustParsePrefix("198.18.0.0/16"),
+		Size:  128,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mapper := mdns.NewEnhancer(mdns.EnhancerConfig{
+		EnhancedMode: C.DNSFakeIP,
+		FakeIPPool:   pool,
+		FakeIPTTL:    1,
+	})
+	resolver.DefaultHostMapper = mapper
+	runtime := resolver.CurrentDNSRuntime()
+	runtime.DefaultResolver = mdns.NewResolver(mdns.Config{})
+	resolver.PublishDNSRuntime(runtime)
+	activeDNSGeneration = 20
+	config := &config.DNS{
+		Enable:       true,
+		EnhancedMode: C.DNSFakeIP,
+		FakeIPPool:   pool,
+	}
+
+	for refresh := 1; refresh <= 2; refresh++ {
+		done := make(chan error, 1)
+		go func() { done <- rebuildDNSResolverLocked(config, false) }()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("refresh %d failed: %v", refresh, err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("refresh %d deadlocked with a shared Fake-IP pool", refresh)
+		}
+		if resolver.DefaultHostMapper != mapper {
+			t.Fatalf("refresh %d replaced mapper %p with %p", refresh, mapper,
+				resolver.DefaultHostMapper)
+		}
+		if got, want := activeDNSGeneration, uint64(20+refresh); got != want {
+			t.Fatalf("refresh %d generation = %d, want %d", refresh, got, want)
+		}
+
+		lateIP := pool.Lookup(fmt.Sprintf("late-%d.example", refresh))
+		if host, ok := resolver.FindHostByIP(lateIP); !ok ||
+			host != fmt.Sprintf("late-%d.example", refresh) {
+			t.Fatalf("late mapping after refresh %d = %q, %v", refresh, host, ok)
+		}
+	}
+}
+
+func TestRebuildDNSResolverFailureKeepsGeneration(t *testing.T) {
+	preserveDNSResolverGlobals(t)
+	oldResolver := mdns.NewResolver(mdns.Config{})
+	runtime := resolver.CurrentDNSRuntime()
+	runtime.DefaultResolver = oldResolver
+	resolver.PublishDNSRuntime(runtime)
+	resolver.DefaultHostMapper = nil
+	activeDNSGeneration = 73
+
+	err := rebuildDNSResolverLocked(&config.DNS{
+		Enable:       true,
+		EnhancedMode: C.DNSMapping,
+	}, false)
+	if err == nil {
+		t.Fatal("rebuild succeeded without a running mapper")
+	}
+	if activeDNSGeneration != 73 {
+		t.Fatalf("failed rebuild advanced generation to %d", activeDNSGeneration)
+	}
+	got, ok := resolver.CurrentDNSRuntime().DefaultResolver.(mdns.Resolvers)
+	if !ok || got.Resolver != oldResolver.Resolver {
+		t.Fatal("failed rebuild replaced the active resolver")
+	}
+}
+
+func TestDNSStartupDiagnosticReportsModesWithoutConfigContent(t *testing.T) {
+	previousUsesSystemDNS := pendingUsesSystemDNS
+	previousSourceMode := pendingSourceDNSMode
+	defer func() {
+		pendingUsesSystemDNS = previousUsesSystemDNS
+		pendingSourceDNSMode = previousSourceMode
+	}()
+	pendingUsesSystemDNS = true
+	pendingSourceDNSMode = sourceDNSEnhancedMode(map[string]any{
+		"dns": map[string]any{
+			"enhanced-mode": "redir-host",
+			"nameserver":    []any{"https://private.example/dns-query"},
+		},
+	})
+	settings := appSettings{
+		ApplyOverrides: true,
+		SystemDNS:      []string{"192.168.1.1"},
+		Overrides: configOverrideSettings{DNS: dnsOverrideSettings{
+			Overwrite:    true,
+			EnhancedMode: "fake-ip",
+		}},
+	}
+	diagnostic := dnsStartupDiagnostic(settings,
+		&config.DNS{Enable: true, EnhancedMode: C.DNSFakeIP}, true, 4)
+	for _, field := range []string{
+		"源 enhanced-mode=redir-host", "DNS 覆写启用=true", "DNS 覆写应用=true",
+		"覆写 enhanced-mode=fake-ip", "最终 enhanced-mode=fake-ip",
+		"引用 system=true", "system DNS=192.168.1.1", "generation=4", "mapper 就绪=true",
+	} {
+		if !strings.Contains(diagnostic, field) {
+			t.Errorf("diagnostic %q is missing %q", diagnostic, field)
+		}
+	}
+	if strings.Contains(diagnostic, "private.example") {
+		t.Fatalf("diagnostic exposed configuration content: %q", diagnostic)
 	}
 }
 

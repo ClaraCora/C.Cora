@@ -1,5 +1,136 @@
 # Third-party patches
 
+## mihomo-v1.19.30-atomic-dns-runtime
+
+- Added: 2026-08-23
+- Upstream module: `github.com/metacubex/mihomo v1.19.30`
+- Patched files: `component/resolver`, `dns/server.go`,
+  `hub/executor/executor.go`, `adapter/outbound/direct.go`, and the DNS
+  controller routes
+- Build tags: default and `with_low_memory`
+
+### Reason
+
+Mihomo v1.19.30 publishes `DefaultResolver`, the proxy/direct host resolvers,
+`DefaultService`, and `UseSystemHosts` as separate package globals. Cora can
+rebuild DNS while the packet tunnel is carrying traffic, so assigning those
+globals one after another creates both data races and a window in which a
+request sees fields from different DNS generations. Cora's configuration lock
+serializes writers but cannot protect Mihomo's concurrent data-plane readers.
+
+### Local behavior
+
+The five runtime values now live in one immutable `DNSRuntimeSnapshot`,
+published with a single `atomic.Pointer` store. Readers either retain one
+snapshot for a multi-field operation or use stable compatibility proxies that
+load the current snapshot before dispatching. `use-system-hosts`, controller
+DNS queries, and the direct resolver identity check also read the snapshot.
+Mihomo's normal configuration executor builds all values before publishing
+them, and Cora's scoped system-DNS refresh follows the same path.
+The UDP/TCP DNS listener is installed once with the stable Service proxy. A
+same-address refresh no longer rewrites `Server.service` while `ServeDNS` may
+be reading it; each query reaches the newly published Service through the
+snapshot instead.
+
+Each publication allocates one small snapshot. DNS requests perform one atomic
+load and do not allocate a snapshot, acquire a mutex, retain request history,
+or start a goroutine. Cora publishes the new generation before releasing the
+old resolver transport, while a failed candidate build leaves the old snapshot
+untouched. The existing `ResolverEnhancer` remains shared across Cora's
+system-DNS-only refresh, preserving redir-host/Fake-IP reverse mappings.
+
+### Verification
+
+The preparation script verifies every touched upstream and resulting file
+hash, refuses pre-existing added runtime files, and applies the patch with
+strict whitespace checks. CI tests and vets `component/resolver`, `dns`, and
+the patched hub packages in default and low-memory builds. Regression tests
+exercise caller-copy isolation,
+concurrent alternating publications without mixed fields, stable proxy
+dispatch, and zero-allocation snapshot reads.
+
+### Rollback
+
+Revert the commit that added this section and remove:
+
+- `dependency-patches/mihomo-v1.19.30-atomic-dns-runtime.patch`;
+- its preparation-script paths, hashes, and apply wiring;
+- `./component/resolver`, `./dns`, `./hub/executor`, and `./hub/route` from the
+  Mihomo CI test and vet package lists; and
+- the MobileCore `CurrentDNSRuntime` / `PublishDNSRuntime` calls.
+
+Restore the original direct assignments only as one rollback unit. Removing
+just the patch while leaving MobileCore's snapshot API calls will intentionally
+fail compilation. No stored configuration or user-data migration is involved.
+
+## mihomo-v1.19.30-reserved-synthetic-ip-guard
+
+- Added: 2026-08-23
+- Upstream module: `github.com/metacubex/mihomo v1.19.30`
+- Patched file: `tunnel/tunnel.go`; added
+  `tunnel/reserved_synthetic_ip.go` and its regression tests
+- Build tags: default and `with_low_memory`
+
+### Reason
+
+Cora's TUN and optional Fake-IP pool use `198.18.0.0/16`. During a live DNS
+transition, or when another DNS server returns an address from that synthetic
+range, Mihomo can receive a connection whose reverse domain mapping is absent.
+Without a guard, the address is treated as an ordinary private IP, can match a
+`private_ip` rule, and can be sent to DIRECT. Dialing the synthetic address
+then times out and repeated failures can make the device appear offline.
+
+This protection is independent of the configured DNS enhanced mode. It is
+needed even with `redir-host`, because stale DNS answers can survive a mode or
+network transition and an upstream Wi-Fi DNS server can return its own
+synthetic address.
+
+### Local behavior
+
+MobileCore registers Cora's exact synthetic range through
+`tunnel.SetReservedSyntheticIPPrefixes`. The tunnel first performs Mihomo's
+normal reverse lookup. A mapped address therefore keeps the upstream behavior.
+Only an address inside a registered range that still has neither a host nor a
+reverse mapping is rejected before rule matching.
+
+TCP retains Mihomo's existing pre-handle failure path and gets one opportunity
+to recover the domain through the configured TLS/HTTP sniffer. If the sniffer
+reports a domain without replacing the destination, the guard promotes that
+domain and removes the synthetic IP before routing. If recovery fails, the
+connection is closed. UDP checks the metadata both before creating its NAT
+sender and again after asynchronous sniffing. The second check is authoritative,
+so a reverse mapping evicted between those stages aborts the dial instead of
+letting a stale synthetic address reach routing.
+
+The prefix snapshot is immutable, atomically replaced, and limited to 16
+entries. The hot path performs a bounded prefix scan and allocates no address
+history, cache, timer, or goroutine. A single atomic counter records blocked
+events. Diagnostics are emitted only at totals 1, 2, 4, 8, and subsequent
+powers of two, so a failure remains visible without flooding Network Extension
+logs.
+
+### Verification
+
+The preparation script verifies the exact upstream `tunnel.go` hash, refuses
+unexpected pre-existing added files, applies the patch with strict whitespace
+checks, and verifies all three resulting file hashes. CI runs the full tunnel
+tests and `vet` in default and low-memory builds. Regression tests cover
+prefix normalization, duplicate removal, the 16-prefix bound, caller-slice
+isolation, mapped-address preservation, protection with mapping disabled,
+unregistered addresses, TCP sniff recovery, UDP mapping-eviction handling,
+and power-of-two diagnostics.
+
+### Rollback
+
+Revert the commit that added this section and remove:
+
+- `dependency-patches/mihomo-v1.19.30-reserved-synthetic-ip-guard.patch`;
+- its preparation-script SHA and apply wiring;
+- `./tunnel` from the Mihomo CI test and vet package lists; and
+- the MobileCore calls to `tunnel.SetReservedSyntheticIPPrefixes`.
+
+No stored configuration or user-data migration is involved.
+
 ## mihomo-v1.19.30-snell-cellular-tcp
 
 - Added: 2026-08-23
