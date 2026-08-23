@@ -1,4 +1,5 @@
 import Foundation
+import Network
 
 /// 读取 iOS 物理网络的 system DNS（C 桥接，内部走 libresolv 的 res_getservers）。
 ///
@@ -69,8 +70,15 @@ enum SystemDNS {
         return servers
     }
 
-    /// 剔除本隧道自己的 DNS（198.18.0.0/16 fake-ip 网段），避免隧道 DNS 被回喂成 system DNS。
+    /// 剔除 RFC 2544 的完整保留网段（含本隧道使用的 198.18.0.0/16），
+    /// 避免隧道 DNS 或其它合成地址被回喂成 system DNS。
     static func excludingTunnel(_ servers: [String]) -> [String] {
-        servers.filter { !$0.hasPrefix("198.18.") }
+        servers.filter { !isReservedSyntheticIPv4($0) }
+    }
+
+    private static func isReservedSyntheticIPv4(_ value: String) -> Bool {
+        guard let address = IPv4Address(value) else { return false }
+        let octets = [UInt8](address.rawValue)
+        return octets.count == 4 && octets[0] == 198 && (octets[1] & 0xfe) == 18
     }
 }

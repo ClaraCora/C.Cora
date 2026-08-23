@@ -75,15 +75,12 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         systemDNSLock.unlock()
     }
 
-    @discardableResult
-    private func updateSystemDNSServers(_ servers: [String]) -> Bool {
+    private func systemDNSServersDiffer(from servers: [String]) -> Bool {
         guard !servers.isEmpty else { return false }
         systemDNSLock.lock()
         defer { systemDNSLock.unlock() }
         // dns_configuration_copy 的 resolver 顺序偶尔会抖动；相同地址集合不算 DNS 变化。
-        guard Set(servers) != Set(systemDNSServers) else { return false }
-        systemDNSServers = servers
-        return true
+        return Set(servers) != Set(systemDNSServers)
     }
 
     // 物理接口监控：把真实出站接口（en0/pdp_ip0）显式喂给内核，取代 mihomo 自带的不可靠监控。
@@ -97,9 +94,16 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private var pathMonitor: NWPathMonitor?
     private let pathMonitorQueue = DispatchQueue(label: "com.cora.tunnel.pathmonitor", qos: .utility)
     private var pendingPathUpdate: DispatchWorkItem?
+    // All path state is serialized on pathMonitorQueue. Keeping the latest
+    // observation prevents a DNS retry from reusing an interface snapshot
+    // that became stale while the backoff timer was pending.
+    private var latestObservedPath: Network.NWPath?
     private var lastPhysicalPath: PhysicalPathSnapshot?
     private var hasAppliedPhysicalPath = false
     private var lastPathWasSatisfied: Bool?
+    private var systemDNSRetrySignature: String?
+    private var systemDNSRetryAttempt = 0
+    private static let systemDNSRetryDelays: [TimeInterval] = [2, 5, 10]
 
     override func startTunnel(options: [String: NSObject]?,
                               completionHandler: @escaping (Error?) -> Void) {
@@ -364,13 +368,16 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         pendingPathUpdate = nil
         pathMonitor?.cancel()
         pathMonitor = nil
+        latestObservedPath = nil
         lastPhysicalPath = nil
         hasAppliedPhysicalPath = false
         lastPathWasSatisfied = nil
+        resetSystemDNSRetryLocked()
     }
 
     /// 首次立即应用（缩短启动时「出站未绑接口」的窗口）；之后变化用防抖。
     private func schedulePathUpdate(_ path: Network.NWPath) {
+        latestObservedPath = path
         pendingPathUpdate?.cancel()
         if !hasAppliedPhysicalPath {
             applyInterface(from: path)
@@ -414,11 +421,14 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
         let scopedDNS = SystemDNS.excludingTunnel(
             SystemDNS.scopedServers(for: iface.name))
-        let dnsChanged = updateSystemDNSServers(scopedDNS)
+        let candidateDNS = scopedDNS.isEmpty ? currentSystemDNSServers() : scopedDNS
+        let dnsChanged = systemDNSServersDiffer(from: candidateDNS)
         if dnsChanged {
-            FileLog.write("物理接口 \(iface.name) scoped DNS = \(scopedDNS)")
+            FileLog.write("物理接口 \(iface.name) 候选 scoped DNS = \(candidateDNS)")
         } else if scopedDNS.isEmpty && (isInitialPath || wasUnavailable) {
             FileLog.write("物理接口 \(iface.name) 未读取到 scoped DNS，沿用现有 system DNS")
+        } else {
+            resetSystemDNSRetryLocked()
         }
 
         lastPhysicalPath = snapshot
@@ -429,10 +439,15 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             FileLog.write("初始出站接口 = \(iface.name)")
             // 内核启动与首个 NWPath 回调之间可能已经建立了 DNS/健康检查连接；
             // 首次也执行完整刷新，避免这些连接留在未绑定或错误接口上。
-            notifyNetworkChange(
+            let applied = notifyNetworkChange(
                 interfaceName: iface.name,
+                systemDNSServers: candidateDNS,
                 reason: "初始物理路径",
                 resetConnections: true)
+            finishSystemDNSUpdate(applied: applied,
+                                  changed: dnsChanged,
+                                  candidate: candidateDNS,
+                                  path: path)
             return
         }
 
@@ -468,10 +483,15 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         FileLog.write(resetConnections
             ? "物理网络需要刷新：\(reason)"
             : "物理网络 DNS 刷新：\(reason)，保留活动连接")
-        notifyNetworkChange(
+        let applied = notifyNetworkChange(
             interfaceName: iface.name,
+            systemDNSServers: candidateDNS,
             reason: reason,
             resetConnections: resetConnections)
+        finishSystemDNSUpdate(applied: applied,
+                              changed: dnsChanged,
+                              candidate: candidateDNS,
+                              path: path)
     }
 
     private func stabilizedAddresses(
@@ -509,10 +529,10 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private func notifyNetworkChange(
         interfaceName: String,
+        systemDNSServers servers: [String],
         reason: String,
         resetConnections: Bool
-    ) {
-        let servers = currentSystemDNSServers()
+    ) -> Bool {
         let data = try? JSONSerialization.data(withJSONObject: servers)
         let json = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
         var updateError: NSError?
@@ -522,6 +542,63 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             FileLog.write("刷新物理接口/DNS 失败："
                 + (updateError?.localizedDescription ?? "未知错误"))
         }
+        return ok
+    }
+
+    /// DNS 候选值只在内核完成原子发布后才提交为已生效值。
+    /// 失败时保留旧基线并做有限退避重试，避免临时内存或输入错误在 NE 内形成无限循环。
+    private func finishSystemDNSUpdate(
+        applied: Bool,
+        changed: Bool,
+        candidate: [String],
+        path: Network.NWPath
+    ) {
+        guard changed else {
+            if applied { resetSystemDNSRetryLocked() }
+            return
+        }
+        if applied {
+            replaceSystemDNSServers(candidate)
+            resetSystemDNSRetryLocked()
+            FileLog.write("system DNS 已提交为 \(candidate)")
+        } else {
+            scheduleSystemDNSRetryLocked(path: path, candidate: candidate)
+        }
+    }
+
+    private func scheduleSystemDNSRetryLocked(path: Network.NWPath, candidate: [String]) {
+        let signature = candidate.sorted().joined(separator: ",")
+        if systemDNSRetrySignature != signature {
+            systemDNSRetrySignature = signature
+            systemDNSRetryAttempt = 0
+        }
+        guard systemDNSRetryAttempt < Self.systemDNSRetryDelays.count else {
+            FileLog.write("system DNS 热更新已达重试上限，保留旧 DNS 等待下次网络变化")
+            return
+        }
+
+        let delay = Self.systemDNSRetryDelays[systemDNSRetryAttempt]
+        systemDNSRetryAttempt += 1
+        let expectedSignature = signature
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.pendingPathUpdate = nil
+            guard self.systemDNSRetrySignature == expectedSignature,
+                  self.systemDNSServersDiffer(from: candidate) else {
+                self.resetSystemDNSRetryLocked()
+                return
+            }
+            FileLog.write("system DNS 热更新第 \(self.systemDNSRetryAttempt) 次重试")
+            self.applyInterface(from: self.latestObservedPath ?? path)
+        }
+        pendingPathUpdate?.cancel()
+        pendingPathUpdate = work
+        pathMonitorQueue.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    private func resetSystemDNSRetryLocked() {
+        systemDNSRetrySignature = nil
+        systemDNSRetryAttempt = 0
     }
 
     /// `availableInterfaces` 可能同时包含 Wi-Fi、蜂窝和 utun；只选择当前 path 实际使用的

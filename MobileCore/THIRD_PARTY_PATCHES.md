@@ -73,12 +73,13 @@ fail compilation. No stored configuration or user-data migration is involved.
 
 ### Reason
 
-Cora's TUN and optional Fake-IP pool use `198.18.0.0/16`. During a live DNS
-transition, or when another DNS server returns an address from that synthetic
-range, Mihomo can receive a connection whose reverse domain mapping is absent.
-Without a guard, the address is treated as an ordinary private IP, can match a
-`private_ip` rule, and can be sent to DIRECT. Dialing the synthetic address
-then times out and repeated failures can make the device appear offline.
+Cora's TUN and Fake-IP pool use `198.18.0.0/16`, which belongs to RFC 2544's
+full `198.18.0.0/15` benchmarking range. During a live DNS transition, or when
+another DNS server returns an address from that reserved range, Mihomo can
+receive a connection whose destination remains synthetic after DNS
+preprocessing. Without a guard, the address can match a `private_ip` rule and
+be sent to DIRECT. Dialing it then times out and repeated failures can make the
+device appear offline.
 
 This protection is independent of the configured DNS enhanced mode. It is
 needed even with `redir-host`, because stale DNS answers can survive a mode or
@@ -87,11 +88,14 @@ synthetic address.
 
 ### Local behavior
 
-MobileCore registers Cora's exact synthetic range through
+MobileCore registers the complete RFC 2544 range through
 `tunnel.SetReservedSyntheticIPPrefixes`. The tunnel first performs Mihomo's
-normal reverse lookup. A mapped address therefore keeps the upstream behavior.
-Only an address inside a registered range that still has neither a host nor a
-reverse mapping is rejected before rule matching.
+normal reverse lookup. A current Fake-IP mapping is consumed by Mihomo and
+clears the destination IP, so it continues normally. A `redir-host` mapping
+does not clear the destination IP; if that IP remains in the protected range,
+the tunnel rejects it before rule matching rather than allowing `private_ip` to
+send it to DIRECT. This also rejects stale or otherwise unrecognised addresses
+from the other half of the RFC 2544 range.
 
 TCP retains Mihomo's existing pre-handle failure path and gets one opportunity
 to recover the domain through the configured TLS/HTTP sniffer. If the sniffer
@@ -116,7 +120,7 @@ unexpected pre-existing added files, applies the patch with strict whitespace
 checks, and verifies all three resulting file hashes. CI runs the full tunnel
 tests and `vet` in default and low-memory builds. Regression tests cover
 prefix normalization, duplicate removal, the 16-prefix bound, caller-slice
-isolation, mapped-address preservation, protection with mapping disabled,
+isolation, current Fake-IP mapping preservation, `redir-host` protection,
 unregistered addresses, TCP sniff recovery, UDP mapping-eviction handling,
 and power-of-two diagnostics.
 

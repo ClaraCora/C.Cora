@@ -464,30 +464,30 @@ func TestParseSystemDNSJSON(t *testing.T) {
 	}
 }
 
-func TestReplaceSystemNameServers(t *testing.T) {
+func TestMaterializeSystemNameServersUsesParsedSourceIdentity(t *testing.T) {
 	servers, err := mdns.ParseNameServer([]string{
-		"10.0.0.1",
+		"system",
 		"https://dns.example/dns-query",
-		"fe80::1%25en0",
+		"10.0.0.1",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if servers[0].Net != "" || servers[2].Net != "" {
-		t.Fatalf("mihomo parsed UDP Net values as %q and %q, want empty strings",
+	if servers[0].Net != "system" || servers[2].Net != "" {
+		t.Fatalf("mihomo parsed source identities as %q and %q",
 			servers[0].Net, servers[2].Net)
 	}
-	updated, replacements := replaceSystemNameServers(
+	updated, replacements := materializeSystemNameServers(
 		servers,
-		[]string{"10.0.0.1", "fe80::1%en0"},
 		[]string{"192.168.1.1", "fe80::2%en0"})
-	if replacements != 2 {
-		t.Fatalf("replacements = %d, want 2", replacements)
+	if replacements != 1 {
+		t.Fatalf("replacements = %d, want 1", replacements)
 	}
 	want := []mdns.NameServer{
 		{Addr: "192.168.1.1:53"},
 		{Addr: "[fe80::2%en0]:53"},
 		servers[1],
+		servers[2],
 	}
 	if len(updated) != len(want) {
 		t.Fatalf("updated = %+v, want %+v", updated, want)
@@ -499,9 +499,26 @@ func TestReplaceSystemNameServers(t *testing.T) {
 	}
 }
 
-func TestReplaceUnresolvedSystemNameServer(t *testing.T) {
-	updated, replacements := replaceSystemNameServers(
-		[]mdns.NameServer{{Net: "system"}}, nil, []string{"223.5.5.5"})
+func TestMaterializeSystemNameServersPreservesExplicitAddressCollision(t *testing.T) {
+	servers, err := mdns.ParseNameServer([]string{"10.0.0.1", "system"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial, replacements := materializeSystemNameServers(servers, []string{"10.0.0.1"})
+	if replacements != 1 || len(initial) != 1 || initial[0].Addr != "10.0.0.1:53" {
+		t.Fatalf("initial = %+v, replacements = %d", initial, replacements)
+	}
+
+	updated, replacements := materializeSystemNameServers(servers, []string{"192.168.1.1"})
+	if replacements != 1 || len(updated) != 2 ||
+		updated[0].Addr != "10.0.0.1:53" || updated[1].Addr != "192.168.1.1:53" {
+		t.Fatalf("updated = %+v, replacements = %d", updated, replacements)
+	}
+}
+
+func TestMaterializeUnresolvedSystemNameServer(t *testing.T) {
+	updated, replacements := materializeSystemNameServers(
+		[]mdns.NameServer{{Net: "system"}}, []string{"223.5.5.5"})
 	if replacements != 1 || len(updated) != 1 ||
 		updated[0].Net != "" || updated[0].Addr != "223.5.5.5:53" {
 		t.Fatalf("updated = %+v, replacements = %d", updated, replacements)
@@ -510,10 +527,12 @@ func TestReplaceUnresolvedSystemNameServer(t *testing.T) {
 
 func TestReplaceActiveSystemDNSKeepsOldDNSOnMismatch(t *testing.T) {
 	previousConfig := activeDNSConfig
+	previousSource := activeDNSSystemSource
 	previousSystemDNS := append([]string(nil), activeSystemDNS...)
 	previousUsesSystemDNS := activeUsesSystemDNS
 	defer func() {
 		activeDNSConfig = previousConfig
+		activeDNSSystemSource = previousSource
 		activeSystemDNS = previousSystemDNS
 		activeUsesSystemDNS = previousUsesSystemDNS
 	}()
@@ -521,6 +540,7 @@ func TestReplaceActiveSystemDNSKeepsOldDNSOnMismatch(t *testing.T) {
 	activeDNSConfig = &config.DNS{
 		NameServer: []mdns.NameServer{{Net: "https", Addr: "https://dns.example/dns-query"}},
 	}
+	activeDNSSystemSource = cloneDNSConfig(activeDNSConfig)
 	activeSystemDNS = []string{"10.0.0.1"}
 	activeUsesSystemDNS = true
 
@@ -535,16 +555,21 @@ func TestReplaceActiveSystemDNSKeepsOldDNSOnMismatch(t *testing.T) {
 
 func TestPrepareActiveSystemDNSDoesNotPublishCandidate(t *testing.T) {
 	previousConfig := activeDNSConfig
+	previousSource := activeDNSSystemSource
 	previousSystemDNS := append([]string(nil), activeSystemDNS...)
 	previousUsesSystemDNS := activeUsesSystemDNS
 	defer func() {
 		activeDNSConfig = previousConfig
+		activeDNSSystemSource = previousSource
 		activeSystemDNS = previousSystemDNS
 		activeUsesSystemDNS = previousUsesSystemDNS
 	}()
 
 	original := &config.DNS{NameServer: []mdns.NameServer{{Addr: "10.0.0.1:53"}}}
 	activeDNSConfig = original
+	activeDNSSystemSource = &config.DNS{
+		NameServer: []mdns.NameServer{{Net: "system"}},
+	}
 	activeSystemDNS = []string{"10.0.0.1"}
 	activeUsesSystemDNS = true
 
@@ -713,13 +738,6 @@ func TestDNSConfigUsesSystem(t *testing.T) {
 		"fake-ip-filter": []any{"system"},
 	}) {
 		t.Fatal("unrelated DNS field was treated as a system nameserver")
-	}
-}
-
-func TestSystemDNSToAnyListEscapesIPv6Zone(t *testing.T) {
-	values := systemDNSToAnyList([]string{"192.168.1.1", "fe80::1%en0"})
-	if len(values) != 2 || values[0] != "192.168.1.1" || values[1] != "fe80::1%25en0" {
-		t.Fatalf("systemDNSToAnyList = %v", values)
 	}
 }
 

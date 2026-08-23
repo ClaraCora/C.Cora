@@ -1,6 +1,6 @@
 diff --git a/tunnel/reserved_synthetic_ip.go b/tunnel/reserved_synthetic_ip.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..29c731f4c99c4d08b6f3528733964907e96c7de2
+index 0000000..b175fe8
 --- /dev/null
 +++ b/tunnel/reserved_synthetic_ip.go
 @@ -0,0 +1,115 @@
@@ -28,8 +28,8 @@ index 0000000000000000000000000000000000000000..29c731f4c99c4d08b6f3528733964907
 +)
 +
 +// SetReservedSyntheticIPPrefixes replaces the address ranges that must never
-+// reach routing or dialing without a DNS reverse mapping. The immutable
-+// snapshot is bounded so reads on the packet path require no allocation.
++// remain as a destination IP after DNS preprocessing. The immutable snapshot
++// is bounded so reads on the packet path require no allocation.
 +func SetReservedSyntheticIPPrefixes(prefixes []netip.Prefix) {
 +	snapshot := new(reservedSyntheticIPPrefixSnapshot)
 +	for _, prefix := range prefixes {
@@ -93,9 +93,9 @@ index 0000000000000000000000000000000000000000..29c731f4c99c4d08b6f3528733964907
 +func blockedReservedSyntheticIPError(ip netip.Addr) error {
 +	total, shouldLog := recordBlockedReservedSyntheticIP()
 +	if shouldLog {
-+		log.Warnln("[DNS] blocked unmapped reserved address %s before rule matching; total=%d", ip, total)
++		log.Warnln("[DNS] blocked reserved synthetic address %s retained after DNS preprocessing; total=%d", ip, total)
 +	}
-+	return fmt.Errorf("unmapped reserved DNS address %s", ip)
++	return fmt.Errorf("reserved synthetic DNS address %s remained after preprocessing", ip)
 +}
 +
 +func recoverReservedSyntheticIPFromSniff(metadata *C.Metadata) {
@@ -121,10 +121,10 @@ index 0000000000000000000000000000000000000000..29c731f4c99c4d08b6f3528733964907
 +}
 diff --git a/tunnel/reserved_synthetic_ip_test.go b/tunnel/reserved_synthetic_ip_test.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..38bc9b6dbd83a4aaac4531816cb3774a511c972e
+index 0000000..0f9def3
 --- /dev/null
 +++ b/tunnel/reserved_synthetic_ip_test.go
-@@ -0,0 +1,167 @@
+@@ -0,0 +1,202 @@
 +package tunnel
 +
 +import (
@@ -137,12 +137,14 @@ index 0000000000000000000000000000000000000000..38bc9b6dbd83a4aaac4531816cb3774a
 +)
 +
 +type reservedSyntheticIPTestEnhancer struct {
-+	hosts map[netip.Addr]string
++	hosts           map[netip.Addr]string
++	fakeIPs         map[netip.Addr]bool
++	fakeIPEnabled   bool
 +}
 +
-+func (*reservedSyntheticIPTestEnhancer) FakeIPEnabled() bool               { return false }
++func (e *reservedSyntheticIPTestEnhancer) FakeIPEnabled() bool             { return e.fakeIPEnabled }
 +func (*reservedSyntheticIPTestEnhancer) MappingEnabled() bool              { return true }
-+func (*reservedSyntheticIPTestEnhancer) IsFakeIP(netip.Addr) bool          { return false }
++func (e *reservedSyntheticIPTestEnhancer) IsFakeIP(ip netip.Addr) bool     { return e.fakeIPs[ip] }
 +func (*reservedSyntheticIPTestEnhancer) IsFakeBroadcastIP(netip.Addr) bool { return false }
 +func (*reservedSyntheticIPTestEnhancer) IsExistFakeIP(netip.Addr) bool     { return false }
 +func (*reservedSyntheticIPTestEnhancer) FlushFakeIP() error                { return nil }
@@ -192,26 +194,56 @@ index 0000000000000000000000000000000000000000..38bc9b6dbd83a4aaac4531816cb3774a
 +	}
 +}
 +
-+func TestPreHandleMetadataBlocksOnlyUnmappedReservedAddresses(t *testing.T) {
++func TestReservedSyntheticIPPrefixBoundaries(t *testing.T) {
 +	preserveReservedSyntheticIPTestState(t)
-+	SetReservedSyntheticIPPrefixes([]netip.Prefix{netip.MustParsePrefix("198.18.0.0/16")})
++	SetReservedSyntheticIPPrefixes([]netip.Prefix{netip.MustParsePrefix("198.18.0.0/15")})
 +
-+	mappedIP := netip.MustParseAddr("198.18.0.10")
++	for _, raw := range []string{"198.18.0.0", "198.19.255.255"} {
++		if !isReservedSyntheticIP(netip.MustParseAddr(raw)) {
++			t.Errorf("registered /15 did not include %s", raw)
++		}
++	}
++	if isReservedSyntheticIP(netip.MustParseAddr("198.20.0.0")) {
++		t.Fatal("registered /15 included 198.20.0.0")
++	}
++}
++
++func TestPreHandleMetadataRejectsReservedUnlessCurrentFakeIPMapping(t *testing.T) {
++	preserveReservedSyntheticIPTestState(t)
++	SetReservedSyntheticIPPrefixes([]netip.Prefix{netip.MustParsePrefix("198.18.0.0/15")})
++
++	redirHostIP := netip.MustParseAddr("198.18.0.10")
++	fakeIP := netip.MustParseAddr("198.19.0.10")
 +	resolver.DefaultHostMapper = &reservedSyntheticIPTestEnhancer{
-+		hosts: map[netip.Addr]string{mappedIP: "mapped.example"},
++		hosts: map[netip.Addr]string{
++			redirHostIP: "redir-host.example",
++			fakeIP:      "fake-ip.example",
++		},
++		fakeIPs:       map[netip.Addr]bool{fakeIP: true},
++		fakeIPEnabled: true,
 +	}
 +
-+	mapped := &C.Metadata{DstIP: mappedIP}
-+	if err := preHandleMetadata(mapped); err != nil {
-+		t.Fatalf("mapped address was blocked: %v", err)
++	redirHost := &C.Metadata{DstIP: redirHostIP}
++	if err := preHandleMetadata(redirHost); err == nil ||
++		!strings.Contains(err.Error(), "reserved synthetic DNS address") {
++		t.Fatalf("redir-host reserved address reached routing: %v", err)
 +	}
-+	if mapped.Host != "mapped.example" {
-+		t.Fatalf("mapped host = %q, want mapped.example", mapped.Host)
++	if redirHost.Host != "redir-host.example" || redirHost.DstIP != redirHostIP {
++		t.Fatalf("redir-host preprocessing result = %#v", redirHost)
++	}
++
++	currentFakeIP := &C.Metadata{DstIP: fakeIP}
++	if err := preHandleMetadata(currentFakeIP); err != nil {
++		t.Fatalf("current Fake-IP mapping was blocked: %v", err)
++	}
++	if currentFakeIP.Host != "fake-ip.example" || currentFakeIP.DstIP.IsValid() ||
++		currentFakeIP.DNSMode != C.DNSFakeIP {
++		t.Fatalf("current Fake-IP mapping was not consumed safely: %#v", currentFakeIP)
 +	}
 +
 +	unmapped := &C.Metadata{DstIP: netip.MustParseAddr("198.18.0.105")}
 +	err := preHandleMetadata(unmapped)
-+	if err == nil || !strings.Contains(err.Error(), "unmapped reserved DNS address") {
++	if err == nil || !strings.Contains(err.Error(), "reserved synthetic DNS address") {
 +		t.Fatalf("unmapped reserved address error = %v", err)
 +	}
 +
@@ -223,7 +255,7 @@ index 0000000000000000000000000000000000000000..38bc9b6dbd83a4aaac4531816cb3774a
 +
 +func TestPreHandleMetadataBlocksWhenMappingModeIsDisabled(t *testing.T) {
 +	preserveReservedSyntheticIPTestState(t)
-+	SetReservedSyntheticIPPrefixes([]netip.Prefix{netip.MustParsePrefix("198.18.0.0/16")})
++	SetReservedSyntheticIPPrefixes([]netip.Prefix{netip.MustParsePrefix("198.18.0.0/15")})
 +	resolver.DefaultHostMapper = nil
 +
 +	err := preHandleMetadata(&C.Metadata{DstIP: netip.MustParseAddr("198.18.0.105")})
@@ -247,7 +279,7 @@ index 0000000000000000000000000000000000000000..38bc9b6dbd83a4aaac4531816cb3774a
 +
 +func TestRecoverReservedSyntheticIPFromSniff(t *testing.T) {
 +	preserveReservedSyntheticIPTestState(t)
-+	SetReservedSyntheticIPPrefixes([]netip.Prefix{netip.MustParsePrefix("198.18.0.0/16")})
++	SetReservedSyntheticIPPrefixes([]netip.Prefix{netip.MustParsePrefix("198.18.0.0/15")})
 +
 +	metadata := &C.Metadata{
 +		DstIP:     netip.MustParseAddr("198.18.0.105"),
@@ -273,11 +305,13 @@ index 0000000000000000000000000000000000000000..38bc9b6dbd83a4aaac4531816cb3774a
 +
 +func TestResolveUDPMetadataAfterSniffRejectsMappingLostAfterPrecheck(t *testing.T) {
 +	preserveReservedSyntheticIPTestState(t)
-+	SetReservedSyntheticIPPrefixes([]netip.Prefix{netip.MustParsePrefix("198.18.0.0/16")})
++	SetReservedSyntheticIPPrefixes([]netip.Prefix{netip.MustParsePrefix("198.18.0.0/15")})
 +
 +	ip := netip.MustParseAddr("198.18.0.105")
 +	enhancer := &reservedSyntheticIPTestEnhancer{
-+		hosts: map[netip.Addr]string{ip: "mapped.example"},
++		hosts:         map[netip.Addr]string{ip: "mapped.example"},
++		fakeIPs:       map[netip.Addr]bool{ip: true},
++		fakeIPEnabled: true,
 +	}
 +	resolver.DefaultHostMapper = enhancer
 +	metadata := &C.Metadata{DstIP: ip}
@@ -286,21 +320,22 @@ index 0000000000000000000000000000000000000000..38bc9b6dbd83a4aaac4531816cb3774a
 +		t.Fatalf("initial UDP precheck failed: %v", err)
 +	}
 +	delete(enhancer.hosts, ip)
++	delete(enhancer.fakeIPs, ip)
 +
 +	_, _, err := resolveUDPMetadataAfterSniff(metadata)
-+	if err == nil || !strings.Contains(err.Error(), "unmapped reserved DNS address") {
++	if err == nil || !strings.Contains(err.Error(), "reserved synthetic DNS address") {
 +		t.Fatalf("lost mapping reached UDP routing: %v", err)
 +	}
 +}
 diff --git a/tunnel/tunnel.go b/tunnel/tunnel.go
-index 86dbc14ae428ba7927dd2dc3ab52d78f0ddb1e87..9175716019e62f4ec45b2532cb5fac66081e8d59 100644
+index 86dbc14..f617b43 100644
 --- a/tunnel/tunnel.go
 +++ b/tunnel/tunnel.go
 @@ -311,6 +311,10 @@ func preHandleMetadata(metadata *C.Metadata) error {
  		metadata.Host = node.Domain
  	}
  
-+	if metadata.Host == "" && isReservedSyntheticIP(metadata.DstIP) {
++	if isReservedSyntheticIP(metadata.DstIP) {
 +		return blockedReservedSyntheticIPError(metadata.DstIP)
 +	}
 +

@@ -82,7 +82,7 @@ const defaultRunLogChunkBytes = 48 << 10
 const maxSnellCellularTCPNodes = 4096
 
 var coraReservedSyntheticIPPrefixes = [...]netip.Prefix{
-	netip.MustParsePrefix("198.18.0.0/16"),
+	netip.MustParsePrefix("198.18.0.0/15"),
 }
 
 const (
@@ -146,6 +146,7 @@ var (
 	configNotices         []string
 	proxyDetailsMap       = map[string]string{}
 	activeDNSConfig       *config.DNS
+	activeDNSSystemSource *config.DNS
 	activeGeneralIPv6     bool
 	activeSystemDNS       []string
 	activeUsesSystemDNS   bool
@@ -731,11 +732,17 @@ func applyRuntimeConfig(fd int, tunnelMTU int, configYAML string, st appSettings
 		appendRunLog("启动 ParseRawConfig 失败: " + err.Error())
 		return err
 	}
+	dnsSystemSource := cloneDNSConfig(cfg.DNS)
+	if resolvedDNS, replacements := materializeSystemDNSConfig(
+		dnsSystemSource, st.SystemDNS); replacements > 0 {
+		cfg.DNS = resolvedDNS
+		appendRunLog(fmt.Sprintf("DNS 启动已从 system 来源模板注入 %d 处物理 DNS", replacements))
+	}
 
 	// Keep Cora's synthetic TUN/Fake-IP range out of every routing mode when
 	// a stale client-side DNS answer no longer has a reverse mapping.
 	tunnel.SetReservedSyntheticIPPrefixes(coraReservedSyntheticIPPrefixes[:])
-	appendRunLog("启动 ParseRawConfig 成功，已注册 198.18.0.0/16 合成地址防线，开始 ApplyConfig")
+	appendRunLog("启动 ParseRawConfig 成功，已注册 198.18.0.0/15 保留地址防线，开始 ApplyConfig")
 	executor.ApplyConfig(cfg, true)
 	for group, name := range st.ProxySelections {
 		proxy, exists := tunnel.Proxies()[group]
@@ -754,6 +761,7 @@ func applyRuntimeConfig(fd int, tunnelMTU int, configYAML string, st appSettings
 		cachefile.Cache().SetSelected(group, name)
 	}
 	activeDNSConfig = cfg.DNS
+	activeDNSSystemSource = dnsSystemSource
 	activeGeneralIPv6 = cfg.General.IPv6
 	activeSystemDNS = append(activeSystemDNS[:0], st.SystemDNS...)
 	activeUsesSystemDNS = pendingUsesSystemDNS
@@ -894,21 +902,9 @@ func mergeConfig(subYAML string, st appSettings, tunnelMTU int) ([]byte, error) 
 			"https://1.1.1.1/dns-query",
 		}
 	}
-	// 订阅可能写 `nameserver: [system]`。iOS 没有可供 Go 读取的 /etc/resolv.conf，
-	// 内核无法解析 "system"；NE 启动时会抓取物理网络 DNS 注入（st.SystemDNS），
-	// 这里据此替换。未注入（如抓取失败）时原样保留，行为与旧版一致。
-	for _, key := range []string{"nameserver", "fallback", "default-nameserver", "proxy-server-nameserver", "direct-nameserver"} {
-		if v, exists := dnsCfg[key]; exists {
-			dnsCfg[key] = replaceSystemNameserver(v, st.SystemDNS, key)
-		}
-	}
-	for _, key := range []string{"nameserver-policy", "proxy-server-nameserver-policy"} {
-		if policy, ok := dnsCfg[key].(map[string]any); ok {
-			for k, v := range policy {
-				policy[k] = replaceSystemNameserver(v, st.SystemDNS, key)
-			}
-		}
-	}
+	// 保留 `system` 条目的原始身份直到 ParseRawConfig 完成。启动时再在
+	// config.DNS 上注入物理 DNS，并保留一份来源模板供热更新使用。
+	// 这样不需要按旧 IP 反推来源，也不会误改用户显式填写的同值 DNS。
 	m["dns"] = dnsCfg
 	if st.ApplyOverrides && st.Overrides.Sniffer.Overwrite {
 		m["sniffer"] = buildSnifferOverride(st.Overrides.Sniffer)
@@ -1136,35 +1132,6 @@ func stringsToAny(values []string) []any {
 	return out
 }
 
-// replaceSystemNameserver 把 DNS 服务器列表（或单字符串值）中的 "system" 展开为
-// NE 侧注入的物理网络 DNS（system 参数）。未注入时原样返回，行为与旧版一致。
-func replaceSystemNameserver(value any, system []string, field string) any {
-	if len(system) == 0 {
-		return value
-	}
-	if s, ok := value.(string); ok {
-		if isSystemDNSValue(s) {
-			appendRunLog("dns." + field + " 的 system 已替换为 " + strings.Join(system, ","))
-			return systemDNSToAnyList(system)
-		}
-		return value
-	}
-	list, ok := value.([]any)
-	if !ok {
-		return value
-	}
-	out := make([]any, 0, len(list))
-	for _, item := range list {
-		if s, ok := item.(string); ok && isSystemDNSValue(s) {
-			appendRunLog("dns." + field + " 的 system 已替换为 " + strings.Join(system, ","))
-			out = append(out, systemDNSToAnyList(system)...)
-			continue
-		}
-		out = append(out, item)
-	}
-	return out
-}
-
 func dnsConfigUsesSystem(dnsConfig map[string]any) bool {
 	for _, key := range []string{
 		"nameserver", "fallback", "default-nameserver",
@@ -1207,16 +1174,6 @@ func isSystemDNSValue(value string) bool {
 	default:
 		return false
 	}
-}
-
-func systemDNSToAnyList(ss []string) []any {
-	out := make([]any, 0, len(ss))
-	for _, s := range ss {
-		// mihomo parses nameservers as URLs. Encode the '%' introducing an
-		// IPv6 zone so url.Parse turns %25en0 back into the runtime form %en0.
-		out = append(out, strings.ReplaceAll(s, "%", "%25"))
-	}
-	return out
 }
 
 // filterUnsupportedRules 剔除 iOS 上无效的规则类型（按进程匹配），并登记提示。
@@ -3189,69 +3146,98 @@ func parseSystemDNSJSON(raw string) ([]string, error) {
 	return result, nil
 }
 
-// prepareActiveSystemDNSLocked builds a replacement config without publishing
-// it when the runtime uses system DNS. For configurations that do not, it only
-// advances the observed system-DNS value to avoid repeated no-op refreshes.
+// prepareActiveSystemDNSLocked builds a candidate from the parsed source
+// template without publishing it. Only entries whose source was `system` are
+// materialized, so an explicit DNS address equal to the previous system DNS is
+// never mistaken for an injected entry.
 func prepareActiveSystemDNSLocked(newSystemDNS []string) (*config.DNS, int) {
-	if activeDNSConfig == nil || !activeUsesSystemDNS {
+	if activeDNSConfig == nil || activeDNSSystemSource == nil || !activeUsesSystemDNS {
 		activeSystemDNS = append(activeSystemDNS[:0], newSystemDNS...)
 		return nil, 0
 	}
 
-	updated := *activeDNSConfig
-	replacements := 0
-	updated.NameServer, replacements = replaceSystemNameServers(
-		activeDNSConfig.NameServer, activeSystemDNS, newSystemDNS)
-	updated.Fallback, replacements = replaceSystemNameServersAdding(
-		activeDNSConfig.Fallback, activeSystemDNS, newSystemDNS, replacements)
-	updated.DefaultNameserver, replacements = replaceSystemNameServersAdding(
-		activeDNSConfig.DefaultNameserver, activeSystemDNS, newSystemDNS, replacements)
-	updated.ProxyServerNameserver, replacements = replaceSystemNameServersAdding(
-		activeDNSConfig.ProxyServerNameserver, activeSystemDNS, newSystemDNS, replacements)
-	updated.DirectNameServer, replacements = replaceSystemNameServersAdding(
-		activeDNSConfig.DirectNameServer, activeSystemDNS, newSystemDNS, replacements)
-	updated.NameServerPolicy, replacements = replaceSystemPolicies(
-		activeDNSConfig.NameServerPolicy, activeSystemDNS, newSystemDNS, replacements)
-	updated.ProxyServerPolicy, replacements = replaceSystemPolicies(
-		activeDNSConfig.ProxyServerPolicy, activeSystemDNS, newSystemDNS, replacements)
-
+	updated, replacements := materializeSystemDNSConfig(
+		activeDNSSystemSource, newSystemDNS)
 	if replacements == 0 {
 		return nil, 0
 	}
-	return &updated, replacements
+	return updated, replacements
 }
 
-func replaceSystemNameServersAdding(servers []mdns.NameServer, oldSystemDNS,
+func cloneDNSConfig(source *config.DNS) *config.DNS {
+	if source == nil {
+		return nil
+	}
+	cloned := *source
+	cloned.NameServer = append([]mdns.NameServer(nil), source.NameServer...)
+	cloned.Fallback = append([]mdns.NameServer(nil), source.Fallback...)
+	cloned.DefaultNameserver = append([]mdns.NameServer(nil), source.DefaultNameserver...)
+	cloned.ProxyServerNameserver = append([]mdns.NameServer(nil), source.ProxyServerNameserver...)
+	cloned.DirectNameServer = append([]mdns.NameServer(nil), source.DirectNameServer...)
+	cloned.NameServerPolicy = cloneDNSPolicies(source.NameServerPolicy)
+	cloned.ProxyServerPolicy = cloneDNSPolicies(source.ProxyServerPolicy)
+	return &cloned
+}
+
+func cloneDNSPolicies(policies []mdns.Policy) []mdns.Policy {
+	cloned := append([]mdns.Policy(nil), policies...)
+	for index := range cloned {
+		cloned[index].NameServers = append(
+			[]mdns.NameServer(nil), policies[index].NameServers...)
+	}
+	return cloned
+}
+
+func materializeSystemDNSConfig(source *config.DNS,
+	newSystemDNS []string) (*config.DNS, int) {
+	if source == nil {
+		return nil, 0
+	}
+	updated := cloneDNSConfig(source)
+	replacements := 0
+	updated.NameServer, replacements = materializeSystemNameServersAdding(
+		source.NameServer, newSystemDNS, replacements)
+	updated.Fallback, replacements = materializeSystemNameServersAdding(
+		source.Fallback, newSystemDNS, replacements)
+	updated.DefaultNameserver, replacements = materializeSystemNameServersAdding(
+		source.DefaultNameserver, newSystemDNS, replacements)
+	updated.ProxyServerNameserver, replacements = materializeSystemNameServersAdding(
+		source.ProxyServerNameserver, newSystemDNS, replacements)
+	updated.DirectNameServer, replacements = materializeSystemNameServersAdding(
+		source.DirectNameServer, newSystemDNS, replacements)
+	updated.NameServerPolicy, replacements = materializeSystemPolicies(
+		source.NameServerPolicy, newSystemDNS, replacements)
+	updated.ProxyServerPolicy, replacements = materializeSystemPolicies(
+		source.ProxyServerPolicy, newSystemDNS, replacements)
+	return updated, replacements
+}
+
+func materializeSystemNameServersAdding(servers []mdns.NameServer,
 	newSystemDNS []string, count int) ([]mdns.NameServer, int) {
-	updated, added := replaceSystemNameServers(servers, oldSystemDNS, newSystemDNS)
+	updated, added := materializeSystemNameServers(servers, newSystemDNS)
 	return updated, count + added
 }
 
-func replaceSystemPolicies(policies []mdns.Policy, oldSystemDNS, newSystemDNS []string,
+func materializeSystemPolicies(policies []mdns.Policy, newSystemDNS []string,
 	count int) ([]mdns.Policy, int) {
-	updated := append([]mdns.Policy(nil), policies...)
+	updated := cloneDNSPolicies(policies)
 	for index := range updated {
-		updated[index].NameServers, count = replaceSystemNameServersAdding(
-			policies[index].NameServers, oldSystemDNS, newSystemDNS, count)
+		updated[index].NameServers, count = materializeSystemNameServersAdding(
+			policies[index].NameServers, newSystemDNS, count)
 	}
 	return updated, count
 }
 
-func replaceSystemNameServers(servers []mdns.NameServer, oldSystemDNS,
+func materializeSystemNameServers(servers []mdns.NameServer,
 	newSystemDNS []string) ([]mdns.NameServer, int) {
 	updated := make([]mdns.NameServer, 0, len(servers)+len(newSystemDNS))
 	replacements := 0
-	inserted := false
 	for _, server := range servers {
-		if !isInjectedSystemNameServer(server, oldSystemDNS) {
+		if server.Net != "system" || len(newSystemDNS) == 0 {
 			updated = appendUniqueNameServer(updated, server)
 			continue
 		}
 		replacements++
-		if inserted {
-			continue
-		}
-		inserted = true
 		for _, address := range newSystemDNS {
 			replacement := server
 			// mihomo uses an empty Net value for its canonical UDP nameserver.
@@ -3261,23 +3247,6 @@ func replaceSystemNameServers(servers []mdns.NameServer, oldSystemDNS,
 		}
 	}
 	return updated, replacements
-}
-
-func isInjectedSystemNameServer(server mdns.NameServer, oldSystemDNS []string) bool {
-	if server.Net == "system" {
-		return true
-	}
-	// Parsed udp:// nameservers use an empty Net value. Accept "udp" too for
-	// callers that construct NameServer values directly.
-	if server.Net != "" && server.Net != "udp" {
-		return false
-	}
-	for _, address := range oldSystemDNS {
-		if server.Addr == systemNameServerAddress(address) {
-			return true
-		}
-	}
-	return false
 }
 
 func systemNameServerAddress(address string) string {
@@ -3428,6 +3397,7 @@ func Stop() {
 	setSnellCellularTCPNodes(nil)
 	storePhysicalInterface("")
 	activeDNSConfig = nil
+	activeDNSSystemSource = nil
 	activeSystemDNS = nil
 	activeGeneralIPv6 = false
 	activeUsesSystemDNS = false
