@@ -521,27 +521,27 @@ final class SubscriptionStore: ObservableObject {
                 let key = Self.resourceUpdateKey(kind: .proxyProvider, name: $0.name)
                 let exactUpdatedAt = subscription.resourceUpdatedAt[key]
                 let fallbackUpdatedAt = proxyCache[$0.name] == nil ? nil : cacheUpdatedAt
-                RemoteResource(subscriptionID: subscription.id,
-                               subscriptionName: subscription.name,
-                               name: $0.name,
-                               url: $0.url,
-                               kind: .proxyProvider,
-                               behavior: nil,
-                               format: nil,
-                               updatedAt: exactUpdatedAt ?? fallbackUpdatedAt,
-                               updateTimeIsApproximate: exactUpdatedAt == nil && fallbackUpdatedAt != nil)
+                return RemoteResource(subscriptionID: subscription.id,
+                                      subscriptionName: subscription.name,
+                                      name: $0.name,
+                                      url: $0.url,
+                                      kind: .proxyProvider,
+                                      behavior: nil,
+                                      format: nil,
+                                      updatedAt: exactUpdatedAt ?? fallbackUpdatedAt,
+                                      updateTimeIsApproximate: exactUpdatedAt == nil && fallbackUpdatedAt != nil)
             }
             let ruleResources = manifest.ruleProviders.map {
                 let key = Self.resourceUpdateKey(kind: .ruleProvider, name: $0.name)
-                RemoteResource(subscriptionID: subscription.id,
-                               subscriptionName: subscription.name,
-                               name: $0.name,
-                               url: $0.url,
-                               kind: .ruleProvider,
-                               behavior: $0.behavior,
-                               format: $0.format,
-                               updatedAt: subscription.resourceUpdatedAt[key],
-                               updateTimeIsApproximate: false)
+                return RemoteResource(subscriptionID: subscription.id,
+                                      subscriptionName: subscription.name,
+                                      name: $0.name,
+                                      url: $0.url,
+                                      kind: .ruleProvider,
+                                      behavior: $0.behavior,
+                                      format: $0.format,
+                                      updatedAt: subscription.resourceUpdatedAt[key],
+                                      updateTimeIsApproximate: false)
             }
             return proxyResources + ruleResources
         }
