@@ -163,6 +163,11 @@ jobs:
           # iOS 可能继续使用旧的 Network Extension 注册，表现为连接后立即断开。
           BUILD_NUMBER="${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
           echo "CFBundleVersion: ${BUILD_NUMBER}"
+          # GitHub's public Checks API otherwise exposes only xcodebuild's exit
+          # code. Preserve the normal log while surfacing compiler errors as
+          # check annotations, so a failed unsigned build is actionable.
+          BUILD_LOG="$RUNNER_TEMP/cora-xcodebuild.log"
+          set +e
           xcodebuild \
             -project Cora.xcodeproj \
             -scheme Cora \
@@ -173,7 +178,15 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
-            clean build
+            clean build 2>&1 | tee "$BUILD_LOG"
+          BUILD_STATUS="${PIPESTATUS[0]}"
+          set -e
+          if [[ "$BUILD_STATUS" -ne 0 ]]; then
+            while IFS= read -r diagnostic; do
+              echo "::error title=Xcode build::$diagnostic"
+            done < <({ grep -E '\.swift:[0-9]+:[0-9]+: error:|error:' "$BUILD_LOG" || true; } | tail -n 50)
+            exit "$BUILD_STATUS"
+          fi
 
       - name: Package into .ipa (unsigned)
         run: |
