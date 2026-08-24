@@ -547,6 +547,50 @@ final class SubscriptionStore: ObservableObject {
         }
     }
 
+    /// 同步当前运行配置内 HTTP Provider 的实际缓存时间。该请求仅读取 NE 侧文件元数据，
+    /// 不下载内容、不触发 Provider 更新，也不查询非当前配置。
+    func synchronizeRuntimeRemoteResourceUpdateTimes() async {
+        guard let subscriptionID = selectedID,
+              let subscription = subscriptions.first(where: { $0.id == subscriptionID }),
+              !subscription.yaml.isEmpty else { return }
+        let status = CoreStateManager.shared.status
+        guard status == .connected || status == .reasserting,
+              let manifest = try? Self.remoteResourceManifest(subscription.yaml) else { return }
+
+        var expectedKeys = Set<String>()
+        for provider in manifest.proxyProviders {
+            expectedKeys.insert(Self.resourceUpdateKey(kind: .proxyProvider, name: provider.name))
+        }
+        for provider in manifest.ruleProviders {
+            expectedKeys.insert(Self.resourceUpdateKey(kind: .ruleProvider, name: provider.name))
+        }
+        guard !expectedKeys.isEmpty else { return }
+
+        let result = await CoreStateManager.shared.sendMessage(["cmd": "remoteResourceStatus"])
+        guard case .ok(let data) = result,
+              let response = try? JSONDecoder().decode(RuntimeRemoteResourceStatusResponse.self, from: data),
+              response.ok,
+              selectedID == subscriptionID,
+              let index = subscriptions.firstIndex(where: { $0.id == subscriptionID }) else { return }
+
+        let formatter = ISO8601DateFormatter()
+        var didChange = false
+        for resource in response.resources {
+            guard let kind = RemoteResource.Kind(rawValue: resource.kind),
+                  let updatedAt = formatter.date(from: resource.updatedAt) else { continue }
+            let key = Self.resourceUpdateKey(kind: kind, name: resource.name)
+            guard expectedKeys.contains(key) else { continue }
+            if let existing = subscriptions[index].resourceUpdatedAt[key], existing >= updatedAt {
+                continue
+            }
+            subscriptions[index].resourceUpdatedAt[key] = updatedAt
+            didChange = true
+        }
+        guard didChange else { return }
+        resourceUpdateRevision &+= 1
+        save()
+    }
+
     func refreshProxyProvider(_ resource: RemoteResource) async {
         guard resource.kind == .proxyProvider,
               !refreshingResourceIDs.contains(resource.id),
@@ -1109,6 +1153,17 @@ private struct RemoteResourceManifestResponse: Decodable, Sendable {
     let proxyProviders: [RemoteProxyProvider]
     let ruleProviders: [RemoteRuleProvider]
     let error: String?
+}
+
+private struct RuntimeRemoteResourceStatusResponse: Decodable, Sendable {
+    let ok: Bool
+    let resources: [RuntimeRemoteResourceStatus]
+}
+
+private struct RuntimeRemoteResourceStatus: Decodable, Sendable {
+    let name: String
+    let kind: String
+    let updatedAt: String
 }
 
 private enum ProxyProviderRefreshError: LocalizedError {

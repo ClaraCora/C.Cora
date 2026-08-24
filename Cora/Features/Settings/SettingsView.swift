@@ -94,9 +94,12 @@ struct SettingsView: View {
 struct RemoteResourcesView: View {
     @EnvironmentObject private var subscriptions: SubscriptionStore
     @EnvironmentObject private var core: CoreStateManager
+    @EnvironmentObject private var settings: SettingsStore
+    @Environment(\.scenePhase) private var scenePhase
     @State private var resultMessage: String?
     @State private var selectedContent: RemoteResourceContent?
     @State private var contentError: String?
+    @State private var showUpdateSettings = false
 
     var body: some View {
         Form {
@@ -123,7 +126,22 @@ struct RemoteResourcesView: View {
         .listRowSeparatorTint(Color.primary.opacity(0.08))
         .navigationTitle("远程资源")
         .navigationBarTitleDisplayMode(.inline)
-        .task { await core.refreshStatus() }
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    showUpdateSettings = true
+                } label: {
+                    Image(systemName: "gearshape")
+                        .frame(width: 44, height: 44)
+                }
+                .accessibilityLabel("远程资源自动更新设置")
+            }
+        }
+        .task { await refreshRuntimeResourceUpdateTimes() }
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .active else { return }
+            Task { await refreshRuntimeResourceUpdateTimes() }
+        }
         .alert("远程资源", isPresented: Binding(
             get: { resultMessage != nil },
             set: { if !$0 { resultMessage = nil } }
@@ -134,6 +152,12 @@ struct RemoteResourcesView: View {
         }
         .sheet(item: $selectedContent) { content in
             RemoteResourceContentView(content: content)
+        }
+        .sheet(isPresented: $showUpdateSettings) {
+            RemoteResourceUpdateSettingsView()
+                .environmentObject(settings)
+                .presentationDetents([.medium])
+                .presentationDragIndicator(.visible)
         }
         .alert("查看资源内容", isPresented: Binding(
             get: { contentError != nil },
@@ -259,6 +283,11 @@ struct RemoteResourcesView: View {
         await subscriptions.refreshAllRuleProviders()
         resultMessage = subscriptions.lastError ?? "当前配置的规则来源已全部更新"
     }
+
+    private func refreshRuntimeResourceUpdateTimes() async {
+        await core.refreshStatus()
+        await subscriptions.synchronizeRuntimeRemoteResourceUpdateTimes()
+    }
 }
 
 private struct RemoteResourceRow: View {
@@ -305,11 +334,13 @@ private struct RemoteResourceRow: View {
                         .accessibilityLabel("连接对应配置后可更新")
                 }
 
-                updateText
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .monospacedDigit()
-                    .lineLimit(1)
+                TimelineView(.periodic(from: .now, by: 60)) { _ in
+                    updateText
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                        .lineLimit(1)
+                }
             }
             .frame(minWidth: 86, alignment: .trailing)
         }
@@ -322,7 +353,81 @@ private struct RemoteResourceRow: View {
             return Text("未更新")
         }
         return Text(resource.updateTimeIsApproximate ? "缓存 · " : "更新 · ")
-            + Text(updatedAt, style: .relative)
+            + Text(Self.relativeUpdateText(updatedAt))
+    }
+
+    private static func relativeUpdateText(_ date: Date) -> String {
+        let elapsed = max(0, Date().timeIntervalSince(date))
+        if elapsed < 60 {
+            return "刚刚"
+        }
+        if elapsed < 3_600 {
+            return "\(Int(elapsed / 60)) 分钟前"
+        }
+        return "\(Int(elapsed / 3_600)) 小时前"
+    }
+}
+
+private struct RemoteResourceUpdateSettingsView: View {
+    @EnvironmentObject private var settings: SettingsStore
+    @Environment(\.dismiss) private var dismiss
+
+    private static let fixedIntervals = [6, 12, 24, 72, 168]
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("自动更新") {
+                    Picker("更新方式", selection: $settings.remoteResourceUpdatePolicy) {
+                        Text("遵从配置").tag("inherit")
+                        Text("关闭自动更新").tag("disabled")
+                        Text("固定间隔").tag("fixed")
+                    }
+
+                    if settings.remoteResourceUpdatePolicy == "fixed" {
+                        Picker("更新间隔", selection: $settings.remoteResourceUpdateInterval) {
+                            ForEach(Self.fixedIntervals, id: \.self) { hours in
+                                Text(intervalText(hours)).tag(hours)
+                            }
+                        }
+                    }
+                } footer: {
+                    Text(updateDescription)
+                }
+                .listRowBackground(AppListRowBackground())
+            }
+            .scrollContentBackground(.hidden)
+            .background(AppAmbientBackground())
+            .listStyle(.insetGrouped)
+            .listSectionSpacing(18)
+            .listRowSeparatorTint(Color.primary.opacity(0.08))
+            .navigationTitle("自动更新")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("完成") { dismiss() }
+                }
+            }
+        }
+    }
+
+    private var updateDescription: String {
+        switch settings.remoteResourceUpdatePolicy {
+        case "disabled":
+            return "关闭后不再定时检查。首次没有本地缓存时仍会下载，后续只能手动刷新。"
+        case "fixed":
+            return "下次连接 VPN 后，HTTP 节点来源和规则来源会由 mihomo 在扩展内每 \(intervalText(settings.remoteResourceUpdateInterval)) 原地更新，不会重载 VPN。"
+        default:
+            return "保留配置文件中每个 HTTP Provider 自带的 interval。配置未设置 interval 时不会自动更新。"
+        }
+    }
+
+    private func intervalText(_ hours: Int) -> String {
+        switch hours {
+        case 72: return "3 天"
+        case 168: return "7 天"
+        default: return "\(hours) 小时"
+        }
     }
 }
 
@@ -1016,35 +1121,6 @@ private struct GeoSettingsContent: View {
             }
             .listRowBackground(AppListRowBackground())
 
-            Section("下载来源") {
-                if settings.geodataMode {
-                    GeoURLField(title: "GeoIP 下载地址", text: $settings.geoIPDatURL)
-                } else {
-                    GeoURLField(title: "MMDB 下载地址", text: $settings.geoMMDBURL)
-                }
-                GeoURLField(title: "GeoSite 下载地址", text: $settings.geoSiteURL)
-            }
-            .listRowBackground(AppListRowBackground())
-
-            Section("更新策略") {
-                InfoToggleRow(
-                    title: "自动更新",
-                    message: "按照设定间隔检查并下载规则数据。",
-                    isOn: $settings.geoAutoUpdate)
-                if settings.geoAutoUpdate {
-                    Stepper(value: $settings.geoUpdateInterval, in: 1...168) {
-                        HStack {
-                            InfoLabel(title: "更新间隔", message: "可设置为 1 到 168 小时。")
-                            Spacer()
-                            Text("\(settings.geoUpdateInterval) 小时")
-                                .foregroundStyle(.secondary)
-                                .monospacedDigit()
-                        }
-                    }
-                }
-            }
-            .listRowBackground(AppListRowBackground())
-
             Section("本地数据") {
                 if let installedInfo {
                     HStack(spacing: 10) {
@@ -1081,6 +1157,35 @@ private struct GeoSettingsContent: View {
                         .font(.caption)
                         .foregroundStyle(geoDatabase.statusIsError ? Color.red : Color.secondary)
                 }
+            }
+            .listRowBackground(AppListRowBackground())
+
+            Section("更新策略") {
+                InfoToggleRow(
+                    title: "自动更新",
+                    message: "按照设定间隔检查并下载规则数据。",
+                    isOn: $settings.geoAutoUpdate)
+                if settings.geoAutoUpdate {
+                    Stepper(value: $settings.geoUpdateInterval, in: 1...168) {
+                        HStack {
+                            InfoLabel(title: "更新间隔", message: "可设置为 1 到 168 小时。")
+                            Spacer()
+                            Text("\(settings.geoUpdateInterval) 小时")
+                                .foregroundStyle(.secondary)
+                                .monospacedDigit()
+                        }
+                    }
+                }
+            }
+            .listRowBackground(AppListRowBackground())
+
+            Section("下载来源") {
+                if settings.geodataMode {
+                    GeoURLField(title: "GeoIP 下载地址", text: $settings.geoIPDatURL)
+                } else {
+                    GeoURLField(title: "MMDB 下载地址", text: $settings.geoMMDBURL)
+                }
+                GeoURLField(title: "GeoSite 下载地址", text: $settings.geoSiteURL)
             }
             .listRowBackground(AppListRowBackground())
         }

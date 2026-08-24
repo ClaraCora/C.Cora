@@ -61,16 +61,7 @@ struct SubscriptionsView: View {
                         tint: .orange,
                         message: core.configNotices.joined(separator: "\n\n"))
                 }
-                HStack(spacing: 12) {
-                    SettingsSymbol(systemImage: "network.badge.shield.half.filled")
-                    InfoLabel(title: "订阅请求 UA", message: "拉取订阅时发送的 User-Agent。不同服务可能根据 UA 返回不同配置格式，修改后重新拉取订阅生效。")
-                    Spacer()
-                    TextField("clash-meta", text: $settings.subscriptionUA)
-                        .multilineTextAlignment(.trailing)
-                        .autocorrectionDisabled()
-                        .textInputAutocapitalization(.never)
-                        .frame(maxWidth: 180)
-                }
+                SubscriptionUserAgentSetting(userAgent: $settings.subscriptionUA)
                 SettingsNavigationRow(
                     title: "配置覆写",
                     systemImage: "slider.horizontal.3",
@@ -129,6 +120,75 @@ struct SubscriptionsView: View {
             Text(store.lastError ?? "")
         }
     }
+}
+
+private struct SubscriptionUserAgentSetting: View {
+    @Binding var userAgent: String
+    @State private var selectedPreset = "clash-meta"
+
+    private static let customPreset = "__custom__"
+    private static let presets = [
+        UserAgentPreset(title: "Clash Meta", value: "clash-meta"),
+        UserAgentPreset(title: "Mihomo", value: "mihomo"),
+        UserAgentPreset(title: "Clash Verge", value: "Clash Verge"),
+        UserAgentPreset(title: "Clash for Windows", value: "ClashForWindows"),
+        UserAgentPreset(title: "Surge", value: "Surge iOS"),
+        UserAgentPreset(title: "Quantumult X", value: "Quantumult X"),
+        UserAgentPreset(title: "Shadowrocket", value: "Shadowrocket"),
+        UserAgentPreset(title: "Stash", value: "Stash"),
+    ]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 12) {
+                SettingsSymbol(systemImage: "network.badge.shield.half.filled")
+                InfoLabel(
+                    title: "订阅请求 UA",
+                    message: "拉取订阅时发送的 User-Agent。不同服务可能根据 UA 返回不同配置格式，修改后重新拉取订阅生效。")
+                Spacer(minLength: 8)
+                Picker("订阅请求 UA 预设", selection: $selectedPreset) {
+                    ForEach(Self.presets) { preset in
+                        Text(preset.title).tag(preset.value)
+                    }
+                    Text("自定义").tag(Self.customPreset)
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .accessibilityLabel("订阅请求 UA 预设")
+            }
+
+            if selectedPreset == Self.customPreset {
+                TextField("自定义 UA", text: $userAgent)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+                    .accessibilityLabel("自定义订阅请求 UA")
+                    .padding(.leading, 42)
+            }
+        }
+        .padding(.vertical, 2)
+        .onAppear { synchronizePresetSelection() }
+        .onChange(of: userAgent) { _, _ in
+            guard selectedPreset != Self.customPreset else { return }
+            synchronizePresetSelection()
+        }
+        .onChange(of: selectedPreset) { _, preset in
+            guard preset != Self.customPreset else { return }
+            userAgent = preset
+        }
+    }
+
+    private func synchronizePresetSelection() {
+        selectedPreset = Self.presets.contains(where: { $0.value == userAgent })
+            ? userAgent
+            : Self.customPreset
+    }
+}
+
+private struct UserAgentPreset: Identifiable {
+    let title: String
+    let value: String
+
+    var id: String { value }
 }
 
 struct SubscriptionRow: View {

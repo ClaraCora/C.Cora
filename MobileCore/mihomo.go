@@ -412,26 +412,28 @@ func startLogCapture() {
 
 // appSettings 是主 App 下发的设置（JSON）。零值即各项默认。
 type appSettings struct {
-	Stack                 string                 `json:"stack"`
-	IPv6                  bool                   `json:"ipv6"`
-	GeoEnabled            bool                   `json:"geoEnabled"`
-	GeoLoader             string                 `json:"geoLoader"`
-	GeodataMode           bool                   `json:"geodataMode"`
-	GeoIPDatURL           string                 `json:"geoIPDatURL"`
-	GeoMMDBURL            string                 `json:"geoMMDBURL"`
-	GeoSiteURL            string                 `json:"geoSiteURL"`
-	IgnoreGeoNegation     bool                   `json:"ignoreGeoNegation"`
-	GeoAutoUpdate         bool                   `json:"geoAutoUpdate"`
-	GeoUpdateInterval     int                    `json:"geoUpdateInterval"`
-	LogLevel              string                 `json:"logLevel"`
-	SnellCellularTCPNodes []string               `json:"snellCellularTCPNodes"`
-	UnifiedDelay          bool                   `json:"unifiedDelay"`
-	MixedPort             int                    `json:"mixedPort"`
-	BlockDirectSTUN       bool                   `json:"blockDirectSTUN"`
-	SystemDNS             []string               `json:"systemDNS"`
-	ApplyOverrides        bool                   `json:"applyOverrides"`
-	Overrides             configOverrideSettings `json:"overrides"`
-	ProxySelections       map[string]string      `json:"proxySelections"`
+	Stack                        string                 `json:"stack"`
+	IPv6                         bool                   `json:"ipv6"`
+	GeoEnabled                   bool                   `json:"geoEnabled"`
+	GeoLoader                    string                 `json:"geoLoader"`
+	GeodataMode                  bool                   `json:"geodataMode"`
+	GeoIPDatURL                  string                 `json:"geoIPDatURL"`
+	GeoMMDBURL                   string                 `json:"geoMMDBURL"`
+	GeoSiteURL                   string                 `json:"geoSiteURL"`
+	IgnoreGeoNegation            bool                   `json:"ignoreGeoNegation"`
+	GeoAutoUpdate                bool                   `json:"geoAutoUpdate"`
+	GeoUpdateInterval            int                    `json:"geoUpdateInterval"`
+	RemoteResourceUpdatePolicy   string                 `json:"remoteResourceUpdatePolicy"`
+	RemoteResourceUpdateInterval int                    `json:"remoteResourceUpdateInterval"`
+	LogLevel                     string                 `json:"logLevel"`
+	SnellCellularTCPNodes        []string               `json:"snellCellularTCPNodes"`
+	UnifiedDelay                 bool                   `json:"unifiedDelay"`
+	MixedPort                    int                    `json:"mixedPort"`
+	BlockDirectSTUN              bool                   `json:"blockDirectSTUN"`
+	SystemDNS                    []string               `json:"systemDNS"`
+	ApplyOverrides               bool                   `json:"applyOverrides"`
+	Overrides                    configOverrideSettings `json:"overrides"`
+	ProxySelections              map[string]string      `json:"proxySelections"`
 }
 
 type configOverrideSettings struct {
@@ -485,6 +487,7 @@ func parseSettings(settingsJSON string) appSettings {
 		ApplyOverrides: true,
 		GeoEnabled:     true, GeoLoader: "memconservative", GeodataMode: true,
 		IgnoreGeoNegation: false, GeoUpdateInterval: 24,
+		RemoteResourceUpdatePolicy: "inherit", RemoteResourceUpdateInterval: 24,
 		GeoIPDatURL: "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat",
 		GeoMMDBURL:  "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb",
 		GeoSiteURL:  "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat"}
@@ -506,6 +509,10 @@ func parseSettings(settingsJSON string) appSettings {
 	if s.GeoUpdateInterval <= 0 {
 		s.GeoUpdateInterval = 24
 	}
+	s.RemoteResourceUpdatePolicy = normalizedRemoteResourceUpdatePolicy(s.RemoteResourceUpdatePolicy)
+	if s.RemoteResourceUpdateInterval < 1 || s.RemoteResourceUpdateInterval > 168 {
+		s.RemoteResourceUpdateInterval = 24
+	}
 	s.SnellCellularTCPNodes = normalizeSnellCellularTCPNodes(s.SnellCellularTCPNodes)
 	if s.GeoIPDatURL == "" {
 		s.GeoIPDatURL = "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat"
@@ -517,6 +524,15 @@ func parseSettings(settingsJSON string) appSettings {
 		s.GeoSiteURL = "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat"
 	}
 	return s
+}
+
+func normalizedRemoteResourceUpdatePolicy(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "inherit", "disabled", "fixed":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return "inherit"
+	}
 }
 
 type geoDownloadURLs struct {
@@ -912,6 +928,7 @@ func mergeConfig(subYAML string, st appSettings, tunnelMTU int) ([]byte, error) 
 	m["ipv6"] = st.IPv6
 	m["log-level"] = st.LogLevel
 	m["unified-delay"] = st.UnifiedDelay
+	applyRemoteResourceUpdatePolicy(m, st)
 
 	// WebUI/external-controller is intentionally unavailable in the extension.
 	// Strip subscription-owned endpoints so no HTTP control listener is exposed.
@@ -1006,6 +1023,42 @@ func mergeConfig(subYAML string, st appSettings, tunnelMTU int) ([]byte, error) 
 	buildProxyDetails(m)
 
 	return yaml.Marshal(m)
+}
+
+// applyRemoteResourceUpdatePolicy delegates periodic refreshes to mihomo's
+// native HTTP Provider Fetcher. This keeps refreshes in the NE runtime and
+// avoids rebuilding the tunnel or running a competing Swift-side timer.
+func applyRemoteResourceUpdatePolicy(root map[string]any, st appSettings) {
+	policy := normalizedRemoteResourceUpdatePolicy(st.RemoteResourceUpdatePolicy)
+	if policy == "inherit" {
+		return
+	}
+
+	interval := 0
+	if policy == "fixed" {
+		interval = st.RemoteResourceUpdateInterval * 60 * 60
+	}
+
+	for _, key := range []string{"proxy-providers", "rule-providers"} {
+		providers, ok := root[key].(map[string]any)
+		if !ok {
+			continue
+		}
+		for name, rawDefinition := range providers {
+			definition, ok := rawDefinition.(map[string]any)
+			if !ok {
+				continue
+			}
+			providerType, _ := definition["type"].(string)
+			providerURL, _ := definition["url"].(string)
+			if !strings.EqualFold(strings.TrimSpace(providerType), "http") ||
+				strings.TrimSpace(providerURL) == "" {
+				continue
+			}
+			definition["interval"] = interval
+			providers[name] = definition
+		}
+	}
 }
 
 var publicSTUNLeakEndpoints = []string{
@@ -1790,6 +1843,62 @@ func updateRuntimeProviders(names []string, update func(string) error) string {
 		"updated":  updated,
 		"failures": failures,
 	})
+}
+
+type runtimeRemoteResourceStatus struct {
+	Name      string `json:"name"`
+	Kind      string `json:"kind"`
+	UpdatedAt string `json:"updatedAt"`
+}
+
+// RemoteResourceStatus returns only metadata for HTTP providers in the
+// running configuration. Reading the cache file's modification time avoids
+// loading provider content or initiating a refresh from the App process.
+func RemoteResourceStatus() string {
+	configApplyMu.RLock()
+	defer configApplyMu.RUnlock()
+
+	resources := make([]runtimeRemoteResourceStatus, 0)
+	for name, provider := range tunnel.Providers() {
+		if status, ok := runtimeRemoteResourceStatusForProvider(name, "proxyProvider", provider); ok {
+			resources = append(resources, status)
+		}
+	}
+	for name, provider := range tunnel.RuleProviders() {
+		if status, ok := runtimeRemoteResourceStatusForProvider(name, "ruleProvider", provider); ok {
+			resources = append(resources, status)
+		}
+	}
+	sort.Slice(resources, func(left, right int) bool {
+		if resources[left].Kind == resources[right].Kind {
+			return resources[left].Name < resources[right].Name
+		}
+		return resources[left].Kind < resources[right].Kind
+	})
+	return marshalJSON(map[string]any{"ok": true, "resources": resources})
+}
+
+func runtimeRemoteResourceStatusForProvider(name, kind string, provider P.Provider) (runtimeRemoteResourceStatus, bool) {
+	if provider.VehicleType() != P.HTTP {
+		return runtimeRemoteResourceStatus{}, false
+	}
+	vehicleProvider, ok := provider.(interface{ Vehicle() P.Vehicle })
+	if !ok {
+		return runtimeRemoteResourceStatus{}, false
+	}
+	path := strings.TrimSpace(vehicleProvider.Vehicle().Path())
+	if path == "" {
+		return runtimeRemoteResourceStatus{}, false
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.ModTime().IsZero() {
+		return runtimeRemoteResourceStatus{}, false
+	}
+	return runtimeRemoteResourceStatus{
+		Name:      name,
+		Kind:      kind,
+		UpdatedAt: info.ModTime().UTC().Format(time.RFC3339),
+	}, true
 }
 
 func providerNotFoundResponse(name string) string {

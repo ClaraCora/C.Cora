@@ -30,6 +30,30 @@ final class SettingsStore: ObservableObject {
     @Published var geoAutoUpdate: Bool { didSet { d.set(geoAutoUpdate, forKey: K.geoAuto) } }
     /// 自动更新间隔（小时）。
     @Published var geoUpdateInterval: Int { didSet { d.set(geoUpdateInterval, forKey: K.geoInterval) } }
+    /// 远程 Provider 更新策略：inherit=遵从配置，disabled=关闭，fixed=统一间隔。
+    @Published var remoteResourceUpdatePolicy: String {
+        didSet {
+            let normalized = Self.remoteResourceUpdatePolicyOptions.contains(remoteResourceUpdatePolicy)
+                ? remoteResourceUpdatePolicy
+                : "inherit"
+            if remoteResourceUpdatePolicy != normalized {
+                remoteResourceUpdatePolicy = normalized
+                return
+            }
+            d.set(normalized, forKey: K.remoteResourcePolicy)
+        }
+    }
+    /// 远程 Provider 固定更新间隔（小时），仅策略为 fixed 时使用。
+    @Published var remoteResourceUpdateInterval: Int {
+        didSet {
+            let normalized = min(max(remoteResourceUpdateInterval, 1), 168)
+            if remoteResourceUpdateInterval != normalized {
+                remoteResourceUpdateInterval = normalized
+                return
+            }
+            d.set(normalized, forKey: K.remoteResourceInterval)
+        }
+    }
     /// 日志等级：silent / error / warning / info / debug。
     @Published var logLevel: String { didSet { d.set(logLevel, forKey: K.logLevel) } }
     /// 指定在蜂窝网络使用普通 TCP 的 Snell 节点。Wi-Fi 下仍保留节点原有 TFO 行为。
@@ -103,6 +127,7 @@ final class SettingsStore: ObservableObject {
     static let stackOptions = ["gvisor", "system", "mixed"]
     static let logLevelOptions = ["silent", "error", "warning", "info", "debug"]
     static let geoLoaderOptions = ["memconservative", "standard"]
+    static let remoteResourceUpdatePolicyOptions = ["inherit", "disabled", "fixed"]
     static let defaultGeoIPDatURL =
         "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat"
     static let defaultGeoMMDBURL =
@@ -124,6 +149,8 @@ final class SettingsStore: ObservableObject {
         static let geoSiteURL = "set.geoSiteURL"
         static let ignoreGeoNegation = "set.ignoreGeoNegation"
         static let geoAuto = "set.geoAuto", geoInterval = "set.geoInterval"
+        static let remoteResourcePolicy = "set.remoteResourceUpdatePolicy"
+        static let remoteResourceInterval = "set.remoteResourceUpdateInterval"
         static let logLevel = "set.logLevel"
         static let snellCellularTCPNodes = "set.snellCellularTCPNodes"
         static let delayTestURL = "set.delayTestURL"
@@ -151,6 +178,14 @@ final class SettingsStore: ObservableObject {
         geoAutoUpdate = d.object(forKey: K.geoAuto) as? Bool ?? false
         let gi = d.integer(forKey: K.geoInterval)
         geoUpdateInterval = gi == 0 ? 24 : gi
+        let remotePolicy = d.string(forKey: K.remoteResourcePolicy) ?? "inherit"
+        remoteResourceUpdatePolicy = Self.remoteResourceUpdatePolicyOptions.contains(remotePolicy)
+            ? remotePolicy
+            : "inherit"
+        let remoteInterval = d.integer(forKey: K.remoteResourceInterval)
+        remoteResourceUpdateInterval = remoteInterval == 0
+            ? 24
+            : min(max(remoteInterval, 1), 168)
         logLevel = d.string(forKey: K.logLevel) ?? "info"
         snellCellularTCPNodes = Set(d.stringArray(forKey: K.snellCellularTCPNodes) ?? [])
         delayTestURL = d.string(forKey: K.delayTestURL) ?? Self.defaultDelayTestURL
@@ -187,6 +222,8 @@ final class SettingsStore: ObservableObject {
             "ignoreGeoNegation": ignoreGeoNegation,
             "geoAutoUpdate": geoAutoUpdate,
             "geoUpdateInterval": geoUpdateInterval,
+            "remoteResourceUpdatePolicy": remoteResourceUpdatePolicy,
+            "remoteResourceUpdateInterval": remoteResourceUpdateInterval,
             "logLevel": logLevel,
             "snellCellularTCPNodes": snellCellularTCPNodes.sorted(),
             "unifiedDelay": unifiedDelay,

@@ -649,6 +649,10 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             ipcQueue.async {
                 reply(Data(MihomoQueryProxies().utf8))
             }
+        case "remoteResourceStatus":
+            ipcQueue.async {
+                reply(Data(MihomoRemoteResourceStatus().utf8))
+            }
         case "updateProxyProviders":
             ipcQueue.async {
                 reply(Data(MihomoUpdateProxyProviders().utf8))

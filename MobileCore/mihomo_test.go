@@ -990,6 +990,10 @@ func TestParseSettingsGeoDefaultsAndOverride(t *testing.T) {
 	if defaults.IgnoreGeoNegation {
 		t.Error("IgnoreGeoNegation default = true, want false")
 	}
+	if defaults.RemoteResourceUpdatePolicy != "inherit" || defaults.RemoteResourceUpdateInterval != 24 {
+		t.Errorf("remote resource update defaults = %q/%d, want inherit/24",
+			defaults.RemoteResourceUpdatePolicy, defaults.RemoteResourceUpdateInterval)
+	}
 	if len(defaults.SnellCellularTCPNodes) != 0 {
 		t.Errorf("SnellCellularTCPNodes default = %v, want empty", defaults.SnellCellularTCPNodes)
 	}
@@ -1010,7 +1014,9 @@ func TestParseSettingsGeoDefaultsAndOverride(t *testing.T) {
 		"geodataMode": false,
 		"geoIPDatURL": "https://example.com/GeoIP.dat",
 		"geoMMDBURL": "https://example.com/geoip.metadb",
-		"geoSiteURL": "https://example.com/GeoSite.dat"
+		"geoSiteURL": "https://example.com/GeoSite.dat",
+		"remoteResourceUpdatePolicy": "fixed",
+		"remoteResourceUpdateInterval": 12
 	}`)
 	if custom.GeoEnabled {
 		t.Error("GeoEnabled override = true, want false")
@@ -1028,6 +1034,10 @@ func TestParseSettingsGeoDefaultsAndOverride(t *testing.T) {
 		custom.GeoMMDBURL != "https://example.com/geoip.metadb" ||
 		custom.GeoSiteURL != "https://example.com/GeoSite.dat" {
 		t.Error("GEO download URL overrides were not parsed")
+	}
+	if custom.RemoteResourceUpdatePolicy != "fixed" || custom.RemoteResourceUpdateInterval != 12 {
+		t.Errorf("remote resource update override = %q/%d, want fixed/12",
+			custom.RemoteResourceUpdatePolicy, custom.RemoteResourceUpdateInterval)
 	}
 }
 
@@ -1064,6 +1074,71 @@ func TestMergeConfigGeoModeAndMainAppUpdateSettings(t *testing.T) {
 	for key, want := range wantURLs {
 		if got := urls[key]; got != want {
 			t.Errorf("geox-url.%s = %v, want %v", key, got, want)
+		}
+	}
+}
+
+func TestMergeConfigAppliesRemoteResourceUpdatePolicy(t *testing.T) {
+	const input = `
+proxy-providers:
+  remote-proxy:
+    type: http
+    url: https://example.com/proxy.yaml
+    interval: 600
+  local-proxy:
+    type: file
+    path: ./proxy.yaml
+rule-providers:
+  remote-rule:
+    type: http
+    behavior: domain
+    format: yaml
+    url: https://example.com/rules.yaml
+    interval: 1200
+  local-rule:
+    type: file
+    behavior: domain
+    path: ./rules.yaml
+`
+
+	inherit := mergedMapWithSettings(t, input, appSettings{
+		Stack: "gvisor", LogLevel: "info", RemoteResourceUpdatePolicy: "inherit",
+	})
+	if got := nestedMap(t, nestedMap(t, inherit, "proxy-providers"), "remote-proxy")["interval"]; got != 600 {
+		t.Errorf("inherit proxy interval = %v, want 600", got)
+	}
+	if got := nestedMap(t, nestedMap(t, inherit, "rule-providers"), "remote-rule")["interval"]; got != 1200 {
+		t.Errorf("inherit rule interval = %v, want 1200", got)
+	}
+
+	disabled := mergedMapWithSettings(t, input, appSettings{
+		Stack: "gvisor", LogLevel: "info", RemoteResourceUpdatePolicy: "disabled",
+	})
+	for _, provider := range []map[string]any{
+		nestedMap(t, nestedMap(t, disabled, "proxy-providers"), "remote-proxy"),
+		nestedMap(t, nestedMap(t, disabled, "rule-providers"), "remote-rule"),
+	} {
+		if got := provider["interval"]; got != 0 {
+			t.Errorf("disabled interval = %v, want 0", got)
+		}
+	}
+	if _, exists := nestedMap(t, nestedMap(t, disabled, "proxy-providers"), "local-proxy")["interval"]; exists {
+		t.Error("non-HTTP proxy provider should not gain an interval")
+	}
+	if _, exists := nestedMap(t, nestedMap(t, disabled, "rule-providers"), "local-rule")["interval"]; exists {
+		t.Error("non-HTTP rule provider should not gain an interval")
+	}
+
+	fixed := mergedMapWithSettings(t, input, appSettings{
+		Stack: "gvisor", LogLevel: "info", RemoteResourceUpdatePolicy: "fixed",
+		RemoteResourceUpdateInterval: 12,
+	})
+	for _, provider := range []map[string]any{
+		nestedMap(t, nestedMap(t, fixed, "proxy-providers"), "remote-proxy"),
+		nestedMap(t, nestedMap(t, fixed, "rule-providers"), "remote-rule"),
+	} {
+		if got := provider["interval"]; got != 43_200 {
+			t.Errorf("fixed interval = %v, want 43200", got)
 		}
 	}
 }
