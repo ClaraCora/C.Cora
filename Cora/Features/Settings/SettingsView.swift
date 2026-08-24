@@ -377,7 +377,7 @@ private struct RemoteResourceUpdateSettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("自动更新") {
+                Section {
                     Picker("更新方式", selection: $settings.remoteResourceUpdatePolicy) {
                         Text("遵从配置").tag("inherit")
                         Text("关闭自动更新").tag("disabled")
@@ -391,6 +391,8 @@ private struct RemoteResourceUpdateSettingsView: View {
                             }
                         }
                     }
+                } header: {
+                    Text("自动更新")
                 } footer: {
                     Text(updateDescription)
                 }
