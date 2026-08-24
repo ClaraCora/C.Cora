@@ -85,7 +85,7 @@ struct SettingsView: View {
 
     private var appVersion: String {
         let bundle = Bundle.main
-        let version = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0.3"
+        let version = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0.5"
         let build = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1"
         return "\(version) (\(build))"
     }
@@ -118,6 +118,9 @@ struct RemoteResourcesView: View {
         }
         .scrollContentBackground(.hidden)
         .background(AppAmbientBackground())
+        .listStyle(.insetGrouped)
+        .listSectionSpacing(18)
+        .listRowSeparatorTint(Color.primary.opacity(0.08))
         .navigationTitle("远程资源")
         .navigationBarTitleDisplayMode(.inline)
         .task { await core.refreshStatus() }
@@ -164,7 +167,9 @@ struct RemoteResourcesView: View {
         Section {
             if sectionResources.isEmpty {
                 Label(emptyMessage, systemImage: "tray")
+                    .font(.subheadline)
                     .foregroundStyle(.secondary)
+                    .padding(.vertical, 4)
             } else {
                 ForEach(sectionResources) { resource in
                     RemoteResourceRow(
@@ -190,8 +195,9 @@ struct RemoteResourcesView: View {
                 }
             }
         } header: {
-            HStack {
+            HStack(spacing: 8) {
                 Text(title)
+                    .font(.subheadline.weight(.semibold))
                 Spacer()
                 if isBatchRefreshing {
                     ProgressView()
@@ -205,6 +211,7 @@ struct RemoteResourcesView: View {
                             .frame(width: 44, height: 44)
                     }
                     .accessibilityLabel("批量刷新\(title)")
+                    .buttonStyle(.borderless)
                     .disabled(sectionResources.isEmpty ||
                               (kind == .ruleProvider && !canBatchUpdateRules))
                 }
@@ -282,18 +289,40 @@ private struct RemoteResourceRow: View {
                 .lineLimit(1)
             }
             Spacer(minLength: 8)
-            if isRefreshing {
-                ProgressView()
-                    .controlSize(.small)
-            } else if !canRefresh {
-                Image(systemName: "lock")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-                    .accessibilityLabel("连接对应配置后可更新")
+            VStack(alignment: .trailing, spacing: 5) {
+                if isRefreshing {
+                    HStack(spacing: 5) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("正在刷新")
+                    }
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                } else if !canRefresh {
+                    Label("待连接", systemImage: "lock")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .accessibilityLabel("连接对应配置后可更新")
+                }
+
+                updateText
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+                    .lineLimit(1)
             }
+            .frame(minWidth: 86, alignment: .trailing)
         }
-        .padding(.vertical, 3)
+        .padding(.vertical, 4)
         .contentShape(Rectangle())
+    }
+
+    private var updateText: Text {
+        guard let updatedAt = resource.updatedAt else {
+            return Text("未更新")
+        }
+        return Text(resource.updateTimeIsApproximate ? "缓存 · " : "更新 · ")
+            + Text(updatedAt, style: .relative)
     }
 }
 
@@ -419,12 +448,15 @@ private struct DelayTestSettingsView: View {
 
     var body: some View {
         Form {
-            Section {
+            Section("测试方式") {
                 InfoToggleRow(
                     title: "统一测速地址",
                     message: "让 mihomo 的策略组使用统一的测速地址。关闭时保留配置内各策略组自带的测速地址；主 App 手动测速仍使用下方地址。",
                     isOn: $settings.unifiedDelay)
+            }
+            .listRowBackground(AppListRowBackground())
 
+            Section("测试时限") {
                 HStack {
                     InfoLabel(title: "测速超时", message: "单个节点最长等待时间。范围为 1 到 60 秒，默认 5 秒。")
                     Spacer()
@@ -439,42 +471,48 @@ private struct DelayTestSettingsView: View {
             }
             .listRowBackground(AppListRowBackground())
 
-            Section {
-                VStack(alignment: .leading, spacing: 6) {
-                    InfoLabel(title: "代理测速地址", message: "普通代理节点的策略组与单节点测速使用此 HTTP 或 HTTPS 地址。留空时使用默认地址；修改后立即用于下一次测速。")
-                    TextField(SettingsStore.defaultDelayTestURL,
-                              text: $settings.delayTestURL,
-                              axis: .vertical)
-                        .font(.footnote.monospaced())
-                        .keyboardType(.URL)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .lineLimit(1...3)
-                }
-                .padding(.vertical, 2)
-            }
-            .listRowBackground(AppListRowBackground())
-
-            Section {
-                VStack(alignment: .leading, spacing: 6) {
-                    InfoLabel(title: "直连测速地址", message: "DIRECT 或最终落到 DIRECT 的国内直连策略使用此地址。留空时使用默认地址；不会改变普通代理节点的测速地址。")
-                    TextField(SettingsStore.defaultDirectDelayTestURL,
-                              text: $settings.directDelayTestURL,
-                              axis: .vertical)
-                        .font(.footnote.monospaced())
-                        .keyboardType(.URL)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .lineLimit(1...3)
-                }
-                .padding(.vertical, 2)
+            Section("测试地址") {
+                DelayTestURLField(
+                    title: "代理测速地址",
+                    message: "普通代理节点的策略组与单节点测速使用此 HTTP 或 HTTPS 地址。留空时使用默认地址；修改后立即用于下一次测速。",
+                    placeholder: SettingsStore.defaultDelayTestURL,
+                    text: $settings.delayTestURL)
+                DelayTestURLField(
+                    title: "直连测速地址",
+                    message: "DIRECT 或最终落到 DIRECT 的国内直连策略使用此地址。留空时使用默认地址；不会改变普通代理节点的测速地址。",
+                    placeholder: SettingsStore.defaultDirectDelayTestURL,
+                    text: $settings.directDelayTestURL)
             }
             .listRowBackground(AppListRowBackground())
         }
         .scrollContentBackground(.hidden)
         .background(AppAmbientBackground())
+        .listStyle(.insetGrouped)
+        .listSectionSpacing(18)
+        .listRowSeparatorTint(Color.primary.opacity(0.08))
         .navigationTitle("测速")
         .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+private struct DelayTestURLField: View {
+    let title: String
+    let message: String
+    let placeholder: String
+    @Binding var text: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            InfoLabel(title: title, message: message)
+                .font(.body.weight(.medium))
+            TextField(placeholder, text: $text, axis: .vertical)
+                .font(.footnote.monospaced())
+                .keyboardType(.URL)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .lineLimit(1...3)
+        }
+        .padding(.vertical, 4)
     }
 }
 
@@ -815,10 +853,12 @@ private struct GeoSettingsView: View {
     var body: some View {
         Form {
             GeoSettingsContent(installedInfo: installedInfo)
-                .listRowBackground(AppListRowBackground())
         }
         .scrollContentBackground(.hidden)
         .background(AppAmbientBackground())
+        .listStyle(.insetGrouped)
+        .listSectionSpacing(18)
+        .listRowSeparatorTint(Color.primary.opacity(0.08))
         .navigationTitle("规则数据")
         .navigationBarTitleDisplayMode(.inline)
         .task(id: refreshID) { await refreshInstalledInfo() }
@@ -931,8 +971,12 @@ private struct GeoSettingsContent: View {
     let installedInfo: GeoInstalledInfo?
 
     var body: some View {
-        Group {
-            Toggle("使用 GEO 规则", isOn: $settings.geoEnabled)
+        Section("启用与状态") {
+            InfoToggleRow(
+                title: "使用 GEO 规则",
+                message: "使用 GeoIP、GeoSite 和 ASN 数据解析配置中的 GEO 规则。关闭后不会删除已下载的数据。",
+                isOn: $settings.geoEnabled)
+
             if settings.geoEnabled {
                 if AppGroup.containerURL == nil {
                     Label("签名未授予 \(AppGroup.identifier)，连接时会自动忽略 GEO/ASN 规则。",
@@ -945,22 +989,83 @@ private struct GeoSettingsContent: View {
                         .font(.caption)
                         .foregroundStyle(.green)
                 }
-                Picker("加载方式", selection: $settings.geoLoader) {
+            } else {
+                Label("关闭后将忽略配置中的 GEO/ASN 规则。",
+                      systemImage: "pause.circle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .listRowBackground(AppListRowBackground())
+
+        if settings.geoEnabled {
+            Section("加载格式") {
+                Picker(selection: $settings.geoLoader) {
                     ForEach(SettingsStore.geoLoaderOptions, id: \.self) { Text($0).tag($0) }
+                } label: {
+                    InfoLabel(title: "加载方式", message: "控制规则数据被内核读取的方式。更改后在下一次连接时生效。")
                 }
-                Toggle("GeoIP 数据格式", isOn: $settings.geodataMode)
-                Toggle("忽略 GEO 取反规则", isOn: $settings.ignoreGeoNegation)
+                InfoToggleRow(
+                    title: "GeoIP 数据格式",
+                    message: "开启时使用 GeoIP.dat；关闭时使用 MMDB。下载地址会随格式切换。",
+                    isOn: $settings.geodataMode)
+                InfoToggleRow(
+                    title: "忽略 GEO 取反规则",
+                    message: "忽略配置中以 GEO 规则取反的匹配条件。",
+                    isOn: $settings.ignoreGeoNegation)
+            }
+            .listRowBackground(AppListRowBackground())
+
+            Section("下载来源") {
                 if settings.geodataMode {
                     GeoURLField(title: "GeoIP 下载地址", text: $settings.geoIPDatURL)
                 } else {
                     GeoURLField(title: "MMDB 下载地址", text: $settings.geoMMDBURL)
                 }
                 GeoURLField(title: "GeoSite 下载地址", text: $settings.geoSiteURL)
-                Toggle("自动更新", isOn: $settings.geoAutoUpdate)
+            }
+            .listRowBackground(AppListRowBackground())
+
+            Section("更新策略") {
+                InfoToggleRow(
+                    title: "自动更新",
+                    message: "按照设定间隔检查并下载规则数据。",
+                    isOn: $settings.geoAutoUpdate)
                 if settings.geoAutoUpdate {
-                    Stepper("更新间隔 \(settings.geoUpdateInterval) 小时",
-                            value: $settings.geoUpdateInterval, in: 1...168)
+                    Stepper(value: $settings.geoUpdateInterval, in: 1...168) {
+                        HStack {
+                            InfoLabel(title: "更新间隔", message: "可设置为 1 到 168 小时。")
+                            Spacer()
+                            Text("\(settings.geoUpdateInterval) 小时")
+                                .foregroundStyle(.secondary)
+                                .monospacedDigit()
+                        }
+                    }
                 }
+            }
+            .listRowBackground(AppListRowBackground())
+
+            Section("本地数据") {
+                if let installedInfo {
+                    HStack(spacing: 10) {
+                        Image(systemName: "internaldrive")
+                            .foregroundStyle(.secondary)
+                            .frame(width: 20)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(ByteFormat.size(installedInfo.size))
+                                .font(.body.weight(.medium))
+                            Text("更新于 \(installedInfo.updatedAt.formatted(date: .abbreviated, time: .shortened))")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(.vertical, 2)
+                } else {
+                    Label("尚未下载规则数据", systemImage: "internaldrive")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+
                 Button {
                     Task { await updateGeo() }
                 } label: {
@@ -971,23 +1076,13 @@ private struct GeoSettingsContent: View {
                     }
                 }
                 .disabled(geoDatabase.isUpdating)
-                if let installedInfo {
-                    HStack {
-                        Text("本地数据")
-                        Spacer()
-                        Text("\(ByteFormat.size(installedInfo.size)) · "
-                           + installedInfo.updatedAt.formatted(date: .abbreviated,
-                                                               time: .shortened))
-                    }
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                }
                 if let result = geoDatabase.statusText {
                     Text(result)
                         .font(.caption)
                         .foregroundStyle(geoDatabase.statusIsError ? Color.red : Color.secondary)
                 }
             }
+            .listRowBackground(AppListRowBackground())
         }
     }
 
@@ -1007,8 +1102,7 @@ private struct GeoURLField: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(title)
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                .font(.body.weight(.medium))
             TextField(title, text: $text, axis: .vertical)
                 .font(.footnote.monospaced())
                 .keyboardType(.URL)

@@ -20,10 +20,16 @@ struct SubscriptionDetailView: View {
         Group {
             if let sub {
                 List {
-                    infoSection(sub).listRowBackground(AppListRowBackground())
-                    actionSection(sub).listRowBackground(AppListRowBackground())
+                    summarySection(sub).listRowBackground(AppListRowBackground())
+                    primaryActionSection(sub).listRowBackground(AppListRowBackground())
+                    if !sub.isLocal {
+                        synchronizationSection(sub).listRowBackground(AppListRowBackground())
+                    }
+                    configurationSection(sub).listRowBackground(AppListRowBackground())
+                    detailsSection(sub).listRowBackground(AppListRowBackground())
                     yamlSection(sub).listRowBackground(AppListRowBackground())
                 }
+                .listStyle(.insetGrouped)
                 .scrollContentBackground(.hidden)
                 .background(AppAmbientBackground())
             } else {
@@ -40,15 +46,117 @@ struct SubscriptionDetailView: View {
         }
     }
 
-    @ViewBuilder private func infoSection(_ sub: Subscription) -> some View {
-        Section("信息") {
+    @ViewBuilder private func summarySection(_ sub: Subscription) -> some View {
+        Section {
+            SubscriptionSummary(sub: sub, isSelected: sub.id == store.selectedID)
+        }
+    }
+
+    @ViewBuilder private func primaryActionSection(_ sub: Subscription) -> some View {
+        Section("主要操作") {
+            if sub.id == store.selectedID {
+                HStack(spacing: 10) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                    Text("当前正在使用")
+                    Spacer()
+                    Text("已启用")
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(.green)
+                }
+            } else {
+                Button {
+                    store.select(sub.id)
+                } label: {
+                    Label("设为当前配置", systemImage: "checkmark.circle")
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private func synchronizationSection(_ sub: Subscription) -> some View {
+        Section("同步") {
+            Button {
+                Task {
+                    refreshing = true
+                    refreshOK = false
+                    await store.refresh(sub.id)
+                    refreshing = false
+                    refreshOK = (store.lastError == nil)
+                }
+            } label: {
+                HStack {
+                    Label("刷新订阅", systemImage: "arrow.clockwise")
+                    Spacer()
+                    if refreshing {
+                        ProgressView()
+                    } else if refreshOK {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                    }
+                }
+            }
+            .disabled(refreshing)
+
+            Button {
+                Task {
+                    providerRefreshOK = false
+                    await store.refreshProxyProviders(sub.id)
+                    providerRefreshOK = (store.lastError == nil)
+                }
+            } label: {
+                HStack {
+                    Label("刷新远程 Provider", systemImage: "arrow.triangle.2.circlepath")
+                    Spacer()
+                    if store.refreshingProviderIDs.contains(sub.id) {
+                        ProgressView()
+                    } else if providerRefreshOK {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                    }
+                }
+            }
+            .disabled(refreshing || store.refreshingProviderIDs.contains(sub.id))
+        }
+    }
+
+    @ViewBuilder private func configurationSection(_ sub: Subscription) -> some View {
+        Section("配置行为") {
+            Button {
+                if sub.isLocal {
+                    showEditor = true
+                } else {
+                    showRemoteEditor = true
+                }
+            } label: {
+                Label(sub.isLocal ? "编辑配置" : "编辑名称 / 链接",
+                      systemImage: "pencil")
+            }
+
+            Toggle(isOn: Binding(
+                get: { sub.overrideEnabled },
+                set: { store.setOverrideEnabled(sub.id, enabled: $0) }
+            )) {
+                Label("启用配置覆写", systemImage: "slider.horizontal.3")
+            }
+        }
+    }
+
+    @ViewBuilder private func detailsSection(_ sub: Subscription) -> some View {
+        Section("详细信息") {
             LabeledContent("类型", value: sub.isLocal ? "本地配置" : "远程订阅")
             LabeledContent("节点数", value: "\(sub.nodeCount)")
             LabeledContent("配置覆写", value: sub.overrideEnabled ? "已启用" : "未启用")
             if !sub.isLocal {
-                LabeledContent("链接") {
-                    Text(sub.url).foregroundStyle(.secondary)
-                        .lineLimit(2).truncationMode(.middle)
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("订阅链接")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                    Text(sub.url)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(3)
+                        .truncationMode(.middle)
                         .textSelection(.enabled)
                 }
             }
@@ -65,86 +173,11 @@ struct SubscriptionDetailView: View {
         }
     }
 
-    @ViewBuilder private func actionSection(_ sub: Subscription) -> some View {
-        Section {
-            if sub.id == store.selectedID {
-                Label("已是当前配置", systemImage: "checkmark.circle.fill")
-                    .foregroundStyle(.green)
-            } else {
-                Button {
-                    store.select(sub.id)
-                } label: {
-                    Label("设为当前配置", systemImage: "checkmark.circle")
-                }
-            }
-
-            if sub.isLocal {
-                Button {
-                    showEditor = true
-                } label: {
-                    Label("编辑配置", systemImage: "pencil")
-                }
-            } else {
-                Button {
-                    showRemoteEditor = true
-                } label: {
-                    Label("编辑名称 / 链接", systemImage: "pencil")
-                }
-
-                Button {
-                    Task {
-                        refreshing = true
-                        refreshOK = false
-                        await store.refresh(sub.id)
-                        refreshing = false
-                        refreshOK = (store.lastError == nil)
-                    }
-                } label: {
-                    HStack {
-                        Label("刷新订阅", systemImage: "arrow.clockwise")
-                        Spacer()
-                        if refreshing {
-                            ProgressView()
-                        } else if refreshOK {
-                            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-                        }
-                    }
-                }
-                .disabled(refreshing)
-
-                Button {
-                    Task {
-                        providerRefreshOK = false
-                        await store.refreshProxyProviders(sub.id)
-                        providerRefreshOK = (store.lastError == nil)
-                    }
-                } label: {
-                    HStack {
-                        Label("刷新远程 Provider", systemImage: "arrow.triangle.2.circlepath")
-                        Spacer()
-                        if store.refreshingProviderIDs.contains(sub.id) {
-                            ProgressView()
-                        } else if providerRefreshOK {
-                            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-                        }
-                    }
-                }
-                .disabled(refreshing || store.refreshingProviderIDs.contains(sub.id))
-            }
-
-            Toggle(isOn: Binding(
-                get: { sub.overrideEnabled },
-                set: { store.setOverrideEnabled(sub.id, enabled: $0) }
-            )) {
-                Label("启用配置覆写", systemImage: "slider.horizontal.3")
-            }
-        }
-    }
-
     @ViewBuilder private func yamlSection(_ sub: Subscription) -> some View {
         Section("配置内容") {
             if sub.yaml.isEmpty {
-                Text(sub.isLocal ? "（空，点上方编辑添加内容）" : "（未拉取，下拉刷新）")
+                Label(sub.isLocal ? "配置为空，可在上方编辑后保存" : "尚未拉取配置，可在上方同步",
+                      systemImage: sub.isLocal ? "doc.badge.plus" : "arrow.clockwise")
                     .foregroundStyle(.secondary)
             } else {
                 // 整份 YAML 放进 List 的单个 Text 会让滑动很卡（SwiftUI 要测量整段超长文本）。
@@ -157,6 +190,109 @@ struct SubscriptionDetailView: View {
                 }
             }
         }
+    }
+}
+
+/// 顶部配置摘要：只显示当前使用状态和最需要快速确认的信息。
+private struct SubscriptionSummary: View {
+    let sub: Subscription
+    let isSelected: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top, spacing: 12) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        .fill(LinearGradient(
+                            colors: [iconTint.opacity(0.20), iconTint.opacity(0.08)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing))
+                    Image(systemName: sub.isLocal ? "doc.text.fill" : "link")
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(iconTint)
+                }
+                .frame(width: 44, height: 44)
+
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(sub.name)
+                        .font(.headline)
+                        .lineLimit(2)
+
+                    HStack(spacing: 6) {
+                        Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                            .foregroundStyle(isSelected ? .green : .secondary)
+                        Text(isSelected ? "当前使用" : "备用配置")
+                        Text(sub.isLocal ? "本地" : "远程")
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Capsule().fill(iconTint.opacity(0.12)))
+                    }
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                }
+
+                Spacer(minLength: 0)
+            }
+
+            Divider()
+
+            HStack(spacing: 0) {
+                SubscriptionSummaryMetric(
+                    title: "节点",
+                    value: "\(sub.nodeCount)",
+                    systemImage: "circle.hexagongrid",
+                    tint: .accentColor
+                )
+
+                Divider()
+                    .frame(height: 30)
+                    .padding(.horizontal, 12)
+
+                SubscriptionSummaryMetric(
+                    title: sub.hasUsage ? "已用流量" : "上次更新",
+                    value: sub.hasUsage ? ByteFormat.size(sub.used) : (sub.updatedText ?? "未更新"),
+                    systemImage: sub.hasUsage ? "chart.bar.fill" : "clock",
+                    tint: sub.hasUsage ? usageTint : .secondary
+                )
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    private var iconTint: Color {
+        sub.isLocal ? .orange : .accentColor
+    }
+
+    private var usageTint: Color {
+        let ratio = sub.total > 0 ? Double(sub.used) / Double(sub.total) : 0
+        return ratio > 0.9 ? .red : (ratio > 0.7 ? .orange : .green)
+    }
+}
+
+private struct SubscriptionSummaryMetric: View {
+    let title: String
+    let value: String
+    let systemImage: String
+    let tint: Color
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Image(systemName: systemImage)
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(tint)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Text(value)
+                    .font(.caption.weight(.semibold).monospacedDigit())
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.76)
+                    .truncationMode(.tail)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 

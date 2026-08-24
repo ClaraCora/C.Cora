@@ -16,6 +16,10 @@ struct RemoteResource: Identifiable, Hashable, Sendable {
     let kind: Kind
     let behavior: String?
     let format: String?
+    /// 最近一次确认刷新到本地/运行内核的时间。旧版 Proxy Provider 缓存只有订阅级文件时间时，
+    /// 会使用该文件时间作为回退，并由 updateTimeIsApproximate 标记。
+    let updatedAt: Date?
+    let updateTimeIsApproximate: Bool
 
     var id: String {
         "\(subscriptionID.uuidString)|\(kind.rawValue)|\(name)"
@@ -39,13 +43,16 @@ struct Subscription: Identifiable, Codable, Equatable, Sendable {
     var autoNamed: Bool       // 名称是否自动获取（用户没手填时才自动覆盖）
     var overrideEnabled: Bool // 是否应用全局固定覆写设置
     var proxySelections: [String: String] // 离线选择，下次连接时恢复
+    /// 远程资源按「类型 + 名称」保存的准确刷新时间。旧订阅没有该字段时自动兼容。
+    var resourceUpdatedAt: [String: Date]
 
     init(id: UUID = UUID(), name: String, url: String, yaml: String = "",
          updatedAt: Date? = nil, nodeCount: Int = 0,
          upload: Int64 = 0, download: Int64 = 0, total: Int64 = 0,
          expire: Date? = nil, autoNamed: Bool = false,
          overrideEnabled: Bool = false,
-         proxySelections: [String: String] = [:]) {
+         proxySelections: [String: String] = [:],
+         resourceUpdatedAt: [String: Date] = [:]) {
         self.id = id
         self.name = name
         self.url = url
@@ -59,6 +66,7 @@ struct Subscription: Identifiable, Codable, Equatable, Sendable {
         self.autoNamed = autoNamed
         self.overrideEnabled = overrideEnabled
         self.proxySelections = proxySelections
+        self.resourceUpdatedAt = resourceUpdatedAt
     }
 
     var used: Int64 { upload + download }
@@ -86,7 +94,7 @@ struct Subscription: Identifiable, Codable, Equatable, Sendable {
     // 容错解码：旧版 subscriptions.json 没有新字段，缺失时给默认值，避免整体解码失败丢订阅。
     enum CodingKeys: String, CodingKey {
         case id, name, url, yaml, updatedAt, nodeCount, upload, download, total, expire, autoNamed
-        case overrideEnabled, proxySelections
+        case overrideEnabled, proxySelections, resourceUpdatedAt
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -104,6 +112,8 @@ struct Subscription: Identifiable, Codable, Equatable, Sendable {
         overrideEnabled = try c.decodeIfPresent(Bool.self, forKey: .overrideEnabled) ?? false
         proxySelections = try c.decodeIfPresent([String: String].self,
                                                 forKey: .proxySelections) ?? [:]
+        resourceUpdatedAt = try c.decodeIfPresent([String: Date].self,
+                                                   forKey: .resourceUpdatedAt) ?? [:]
     }
 }
 
@@ -123,6 +133,7 @@ final class SubscriptionStore: ObservableObject {
     @Published private(set) var refreshingProviderIDs: Set<UUID> = []
     @Published private(set) var refreshingResourceIDs: Set<String> = []
     @Published private(set) var providerCacheRevision = 0
+    @Published private(set) var resourceUpdateRevision = 0
 
     private static let fileURL: URL = {
         let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -255,6 +266,7 @@ final class SubscriptionStore: ObservableObject {
             apply(payload, to: &subscriptions[index], resetMissingUsage: true)
             subscriptions[index].url = u
             removeProviderCache(id)
+            clearResourceUpdateTimes(for: id)
             if !n.isEmpty {
                 subscriptions[index].name = n
                 subscriptions[index].autoNamed = false
@@ -454,6 +466,7 @@ final class SubscriptionStore: ObservableObject {
             }
             var cached = Self.loadProviderCache(id)
             var downloaded = 0
+            var refreshedProviderNames: [String] = []
             for provider in providers {
                 do {
                     guard let url = Self.remoteURL(provider.url) else {
@@ -478,6 +491,7 @@ final class SubscriptionStore: ObservableObject {
                     }
                     cached[provider.name] = payload
                     downloaded += 1
+                    refreshedProviderNames.append(provider.name)
                 } catch {
                     failures.append("\(provider.name)：\(error.localizedDescription)")
                 }
@@ -485,6 +499,9 @@ final class SubscriptionStore: ObservableObject {
             if downloaded > 0 {
                 try Self.saveProviderCache(cached, id: id)
                 updateNodeCount(id, providerPayloads: cached)
+                recordResourceUpdates(subscriptionID: id,
+                                      kind: .proxyProvider,
+                                      names: refreshedProviderNames)
                 providerCacheRevision &+= 1
             }
         } catch {
@@ -497,23 +514,34 @@ final class SubscriptionStore: ObservableObject {
         subscriptions.flatMap { subscription -> [RemoteResource] in
             guard !subscription.yaml.isEmpty,
                   let manifest = try? Self.remoteResourceManifest(subscription.yaml) else { return [] }
+            // 只读取一次订阅级缓存。资源列表渲染不触发网络或 NE IPC。
+            let proxyCache = Self.loadProviderCache(subscription.id)
+            let cacheUpdatedAt = Self.providerCacheModificationDate(subscription.id)
             let proxyResources = manifest.proxyProviders.map {
+                let key = Self.resourceUpdateKey(kind: .proxyProvider, name: $0.name)
+                let exactUpdatedAt = subscription.resourceUpdatedAt[key]
+                let fallbackUpdatedAt = proxyCache[$0.name] == nil ? nil : cacheUpdatedAt
                 RemoteResource(subscriptionID: subscription.id,
                                subscriptionName: subscription.name,
                                name: $0.name,
                                url: $0.url,
                                kind: .proxyProvider,
                                behavior: nil,
-                               format: nil)
+                               format: nil,
+                               updatedAt: exactUpdatedAt ?? fallbackUpdatedAt,
+                               updateTimeIsApproximate: exactUpdatedAt == nil && fallbackUpdatedAt != nil)
             }
             let ruleResources = manifest.ruleProviders.map {
+                let key = Self.resourceUpdateKey(kind: .ruleProvider, name: $0.name)
                 RemoteResource(subscriptionID: subscription.id,
                                subscriptionName: subscription.name,
                                name: $0.name,
                                url: $0.url,
                                kind: .ruleProvider,
                                behavior: $0.behavior,
-                               format: $0.format)
+                               format: $0.format,
+                               updatedAt: subscription.resourceUpdatedAt[key],
+                               updateTimeIsApproximate: false)
             }
             return proxyResources + ruleResources
         }
@@ -528,6 +556,7 @@ final class SubscriptionStore: ObservableObject {
         defer { refreshingResourceIDs.remove(resource.id) }
 
         var failures: [String] = []
+        var didRefreshPayload = false
         let runtimeStatus = CoreStateManager.shared.status
         if selectedID == resource.subscriptionID &&
             (runtimeStatus == .connected || runtimeStatus == .reasserting) {
@@ -545,9 +574,15 @@ final class SubscriptionStore: ObservableObject {
             cached[provider.name] = payload
             try Self.saveProviderCache(cached, id: resource.subscriptionID)
             updateNodeCount(resource.subscriptionID, providerPayloads: cached)
+            didRefreshPayload = true
             providerCacheRevision &+= 1
         } catch {
             failures.append(error.localizedDescription)
+        }
+        if didRefreshPayload {
+            recordResourceUpdates(subscriptionID: resource.subscriptionID,
+                                  kind: .proxyProvider,
+                                  names: [resource.name])
         }
         lastError = failures.isEmpty ? nil : failures.joined(separator: "\n")
     }
@@ -577,6 +612,11 @@ final class SubscriptionStore: ObservableObject {
         defer { refreshingResourceIDs.remove(resource.id) }
         let failures = await Self.runtimeProviderFailures(
             command: ["cmd": "updateRuleProvider", "name": resource.name])
+        if failures.isEmpty {
+            recordResourceUpdates(subscriptionID: resource.subscriptionID,
+                                  kind: .ruleProvider,
+                                  names: [resource.name])
+        }
         lastError = failures.isEmpty ? nil : failures.joined(separator: "\n")
     }
 
@@ -593,6 +633,11 @@ final class SubscriptionStore: ObservableObject {
         lastError = nil
         defer { refreshingResourceIDs.subtract(resources.map(\.id)) }
         let failures = await Self.runtimeProviderFailures(command: ["cmd": "updateRuleProviders"])
+        if failures.isEmpty {
+            recordResourceUpdates(subscriptionID: selectedID,
+                                  kind: .ruleProvider,
+                                  names: resources.map(\.name))
+        }
         lastError = failures.isEmpty ? nil : "部分 Rule Provider 更新失败：\n" + failures.joined(separator: "\n")
     }
 
@@ -617,9 +662,6 @@ final class SubscriptionStore: ObservableObject {
         guard let payload = cache[resource.name] else {
             return .unavailable("该节点来源还没有本地缓存，请先刷新资源")
         }
-        let attributes = try? FileManager.default.attributesOfItem(
-            atPath: Self.providerCacheURL(resource.subscriptionID).path)
-        let updatedAt = attributes?[.modificationDate] as? Date
         return .content(RemoteResourceContent(
             id: resource.id,
             resourceName: resource.name,
@@ -628,7 +670,7 @@ final class SubscriptionStore: ObservableObject {
             sourceURL: resource.url,
             content: payload,
             size: Int64(payload.utf8.count),
-            updatedAt: updatedAt,
+            updatedAt: resource.updatedAt ?? Self.providerCacheModificationDate(resource.subscriptionID),
             isTruncated: false))
     }
 
@@ -757,6 +799,37 @@ final class SubscriptionStore: ObservableObject {
 
     private static func providerCacheURL(_ id: UUID) -> URL {
         providerCacheDirectory.appendingPathComponent("\(id.uuidString).json")
+    }
+
+    private static func providerCacheModificationDate(_ id: UUID) -> Date? {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: providerCacheURL(id).path)
+        return attributes?[.modificationDate] as? Date
+    }
+
+    private static func resourceUpdateKey(kind: RemoteResource.Kind, name: String) -> String {
+        "\(kind.rawValue)|\(name)"
+    }
+
+    /// 只在资源内容或运行内核确认更新成功后记录。时间随订阅 JSON 原子持久化，
+    /// 不会在列表渲染时访问网络或发 IPC。
+    private func recordResourceUpdates(subscriptionID: UUID,
+                                       kind: RemoteResource.Kind,
+                                       names: [String]) {
+        guard let index = subscriptions.firstIndex(where: { $0.id == subscriptionID }),
+              !names.isEmpty else { return }
+        let now = Date()
+        for name in Set(names) {
+            subscriptions[index].resourceUpdatedAt[Self.resourceUpdateKey(kind: kind, name: name)] = now
+        }
+        resourceUpdateRevision &+= 1
+        save()
+    }
+
+    private func clearResourceUpdateTimes(for subscriptionID: UUID) {
+        guard let index = subscriptions.firstIndex(where: { $0.id == subscriptionID }),
+              !subscriptions[index].resourceUpdatedAt.isEmpty else { return }
+        subscriptions[index].resourceUpdatedAt.removeAll()
+        resourceUpdateRevision &+= 1
     }
 
     private static func loadProviderCache(_ id: UUID) -> [String: String] {
