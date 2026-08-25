@@ -158,13 +158,15 @@ private struct NodeTrafficRankingRow: View {
                 .frame(height: 7)
                 .padding(.leading, 36)
 
-            HStack(spacing: 12) {
+            HStack(spacing: 8) {
                 Label(ByteFormat.size(volume.download), systemImage: "arrow.down")
                 Label(ByteFormat.size(volume.upload), systemImage: "arrow.up")
                 Spacer(minLength: 0)
                 Text("合计 \(ByteFormat.size(volume.total))")
             }
-            .font(.caption.monospacedDigit())
+            .font(.caption2.monospacedDigit())
+            .lineLimit(1)
+            .minimumScaleFactor(0.85)
             .foregroundStyle(.secondary)
             .padding(.leading, 36)
         }
