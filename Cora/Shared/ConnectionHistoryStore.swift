@@ -31,21 +31,12 @@ struct ConnectionHistoryRecord: Identifiable, Sendable {
         Self.normalizedStrategyName(chains)
     }
 
-    var proxyNodeName: String {
-        Self.normalizedProxyNodeName(chains)
-    }
-
     var hostName: String {
         Self.normalizedHostName(host: host, sniffHost: sniffHost, destinationIP: destinationIP)
     }
 
     static func normalizedStrategyName(_ chains: [String]) -> String {
         let value = chains.last?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return value.isEmpty ? "DIRECT" : value
-    }
-
-    static func normalizedProxyNodeName(_ chains: [String]) -> String {
-        let value = chains.first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return value.isEmpty ? "DIRECT" : value
     }
 
@@ -187,25 +178,21 @@ struct ConnectionHistoryRecord: Identifiable, Sendable {
 /// the same column names without transferring the complete history into RAM.
 struct ConnectionHistoryQuery: Equatable, Hashable, Sendable {
     let strategyName: String?
-    let proxyNodeName: String?
     let hostName: String?
     let network: String?
     let isActive: Bool?
     let searchText: String?
 
     init(strategyName: String? = nil,
-         proxyNodeName: String? = nil,
          hostName: String? = nil,
          network: String? = nil,
          isActive: Bool? = nil,
          searchText: String? = nil) {
         let strategy = strategyName?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let proxyNode = proxyNodeName?.trimmingCharacters(in: .whitespacesAndNewlines)
         let host = hostName?.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalizedNetwork = network?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let normalizedSearch = searchText?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         self.strategyName = strategy?.isEmpty == true ? nil : strategy
-        self.proxyNodeName = proxyNode?.isEmpty == true ? nil : proxyNode
         self.hostName = host?.isEmpty == true ? nil : host
         self.network = normalizedNetwork?.isEmpty == true ? nil : normalizedNetwork
         self.isActive = isActive
@@ -214,21 +201,12 @@ struct ConnectionHistoryQuery: Equatable, Hashable, Sendable {
 
     static let all = ConnectionHistoryQuery()
 
-    var isUnfiltered: Bool {
-        strategyName == nil && proxyNodeName == nil && hostName == nil && network == nil
-            && isActive == nil && searchText == nil
-    }
-
     fileprivate var sqlPredicate: (clause: String, values: [String]) {
         var clauses: [String] = []
         var values: [String] = []
         if let strategyName {
             clauses.append("strategy_name = ?")
             values.append(strategyName)
-        }
-        if let proxyNodeName {
-            clauses.append("proxy_node_name = ?")
-            values.append(proxyNodeName)
         }
         if let hostName {
             clauses.append("host_name = ?")
@@ -245,11 +223,10 @@ struct ConnectionHistoryQuery: Equatable, Hashable, Sendable {
             clauses.append("(LOWER(host) LIKE ? OR LOWER(sniff_host) LIKE ? "
                            + "OR LOWER(destination_ip) LIKE ? OR LOWER(source_ip) LIKE ? "
                            + "OR LOWER(process) LIKE ? OR LOWER(process_path) LIKE ? "
-                           + "OR LOWER(strategy_name) LIKE ? OR LOWER(proxy_node_name) LIKE ? "
-                           + "OR LOWER(host_name) LIKE ? "
+                           + "OR LOWER(strategy_name) LIKE ? OR LOWER(host_name) LIKE ? "
                            + "OR LOWER(rule) LIKE ? OR LOWER(rule_payload) LIKE ?)")
             let pattern = "%\(searchText)%"
-            values.append(contentsOf: Array(repeating: pattern, count: 11))
+            values.append(contentsOf: Array(repeating: pattern, count: 10))
         }
         return (clauses.isEmpty ? "" : "WHERE " + clauses.joined(separator: " AND "), values)
     }
@@ -263,21 +240,12 @@ struct ConnectionHistoryTrafficVolume: Sendable {
     var total: Int64 { upload + download }
 }
 
-enum ConnectionTrafficRankingMetric: String, CaseIterable, Hashable, Identifiable, Sendable {
-    case total
-    case download
-    case upload
-
-    var id: Self { self }
-}
-
 struct ConnectionHistorySummary: Sendable {
     let recordCount: Int
     let activeCount: Int
     let uploadTotal: Int64
     let downloadTotal: Int64
     let strategyVolumes: [ConnectionHistoryTrafficVolume]
-    let nodeVolumes: [ConnectionHistoryTrafficVolume]
     let hostVolumes: [ConnectionHistoryTrafficVolume]
 
     static let empty = ConnectionHistorySummary(recordCount: 0,
@@ -285,7 +253,6 @@ struct ConnectionHistorySummary: Sendable {
                                                 uploadTotal: 0,
                                                 downloadTotal: 0,
                                                 strategyVolumes: [],
-                                                nodeVolumes: [],
                                                 hostVolumes: [])
 }
 
@@ -303,14 +270,10 @@ final class ConnectionHistoryStore: @unchecked Sendable {
     private static let maximumDatabasePages: Int64 = 10_752
     // Schema upgrades can need temporary pages for a rebuilt table or index.
     // Remove that temporary growth allowance after migration and compaction.
-    // A 256-character node name can occupy up to 1 KiB in UTF-8 and is copied
-    // into both the new column and its index. Cover the full 20,000-row bound.
     private static let migrationDatabasePages: Int64 = maximumDatabasePages + 16_384
     private static let migrationBusyTimeoutMilliseconds = 5_000
     private static let runtimeBusyTimeoutMilliseconds = 1_200
-    private static let currentSchemaVersion: Int64 = 1
-    private static let maximumNodeAggregateCount = 4_096
-    private static let migrationBatchSize = 250
+    private static let currentSchemaVersion: Int64 = 2
     private static let defaultPageSize = 100
     private static let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
@@ -394,7 +357,6 @@ final class ConnectionHistoryStore: @unchecked Sendable {
                         recordCount += 1
                     }
                 }
-                try trimNodeTrafficLocked()
                 try trimLocked(now: Date())
                 try execute("COMMIT")
             } catch StoreError.sqlite(let code) where code == SQLITE_FULL {
@@ -485,7 +447,6 @@ final class ConnectionHistoryStore: @unchecked Sendable {
             do {
                 try execute("BEGIN IMMEDIATE TRANSACTION")
                 try execute("DELETE FROM connection_history")
-                try execute("DELETE FROM connection_node_traffic")
                 try execute("COMMIT")
                 if compact {
                     try execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -548,25 +509,13 @@ final class ConnectionHistoryStore: @unchecked Sendable {
                 + "FROM connection_history \(predicate.clause)"
             guard let totals = row(for: totalsSQL, bindings: predicate.values) else { return .empty }
             let strategies = aggregateLocked(column: "strategy_name", limit: 64, query: query)
-            let nodes = query.isUnfiltered
-                ? nodeTrafficLocked(metric: .total, limit: 5)
-                : aggregateLocked(column: "proxy_node_name", limit: 5, query: query)
             let hosts = aggregateLocked(column: "host_name", limit: 5, query: query)
             return ConnectionHistorySummary(recordCount: Int(totals.int(0)),
                                             activeCount: Int(totals.int(1)),
                                             uploadTotal: totals.int(2),
                                             downloadTotal: totals.int(3),
                                             strategyVolumes: strategies,
-                                            nodeVolumes: nodes,
                                             hostVolumes: hosts)
-        }
-    }
-
-    func nodeTrafficRanking(metric: ConnectionTrafficRankingMetric,
-                            limit: Int = 5) -> [ConnectionHistoryTrafficVolume] {
-        queue.sync {
-            guard database != nil else { return [] }
-            return nodeTrafficLocked(metric: metric, limit: min(max(1, limit), 20))
         }
     }
 
@@ -621,75 +570,31 @@ final class ConnectionHistoryStore: @unchecked Sendable {
                     process_path TEXT NOT NULL,
                     chains TEXT NOT NULL,
                     strategy_name TEXT NOT NULL,
-                    proxy_node_name TEXT NOT NULL DEFAULT 'DIRECT',
                     host_name TEXT NOT NULL,
                     rule TEXT NOT NULL,
                     rule_payload TEXT NOT NULL
                 )
                 """)
-            let addedProxyNodeColumn = try ensureProxyNodeColumnLocked()
-            if addedProxyNodeColumn {
-                try backfillProxyNodeNamesLocked()
-            }
 
-            // Older builds used different fallback labels. Normalize those labels
-            // before seeding aggregates so every byte lands in the canonical bucket.
+            // Older builds used different fallback labels. Normalize them before
+            // the shared App and Network Extension handles resume normal writes.
             try execute("UPDATE connection_history SET strategy_name = 'DIRECT' "
                         + "WHERE strategy_name IS NULL OR strategy_name = ''")
-            try execute("UPDATE connection_history SET proxy_node_name = 'DIRECT' "
-                        + "WHERE proxy_node_name IS NULL OR proxy_node_name = ''")
             try execute("UPDATE connection_history SET host_name = '未知' "
                         + "WHERE host_name IS NULL OR host_name = '' "
                         + "OR host_name IN ('Unknown', '未知目标')")
 
-            try execute("""
-                CREATE TABLE IF NOT EXISTS connection_node_traffic (
-                    node_name TEXT PRIMARY KEY NOT NULL,
-                    upload INTEGER NOT NULL,
-                    download INTEGER NOT NULL,
-                    updated_at REAL NOT NULL
-                )
-                """)
-            try seedNodeTrafficIfNeededLocked()
-
-            // Detail rows may be trimmed during a long VPN session. These
-            // triggers retain only compact per-node deltas until disconnect.
-            try execute("""
-                CREATE TRIGGER IF NOT EXISTS history_node_traffic_insert
-                AFTER INSERT ON connection_history
-                WHEN NEW.upload > 0 OR NEW.download > 0
-                BEGIN
-                    INSERT INTO connection_node_traffic (
-                        node_name, upload, download, updated_at
-                    ) VALUES (
-                        NEW.proxy_node_name, MAX(NEW.upload, 0), MAX(NEW.download, 0),
-                        CAST(strftime('%s', 'now') AS REAL)
-                    )
-                    ON CONFLICT(node_name) DO UPDATE SET
-                        upload = upload + excluded.upload,
-                        download = download + excluded.download,
-                        updated_at = excluded.updated_at;
-                END
-                """)
-            try execute("""
-                CREATE TRIGGER IF NOT EXISTS history_node_traffic_update
-                AFTER UPDATE OF upload, download, proxy_node_name ON connection_history
-                WHEN NEW.upload > OLD.upload OR NEW.download > OLD.download
-                BEGIN
-                    INSERT INTO connection_node_traffic (
-                        node_name, upload, download, updated_at
-                    ) VALUES (
-                        NEW.proxy_node_name,
-                        MAX(NEW.upload - OLD.upload, 0),
-                        MAX(NEW.download - OLD.download, 0),
-                        CAST(strftime('%s', 'now') AS REAL)
-                    )
-                    ON CONFLICT(node_name) DO UPDATE SET
-                        upload = upload + excluded.upload,
-                        download = download + excluded.download,
-                        updated_at = excluded.updated_at;
-                END
-                """)
+            // Schema v1 persisted a second per-node aggregate and maintained it
+            // through triggers for every sampled connection update. That work is
+            // intentionally retired to keep the Network Extension lean. Keep the
+            // old column in place on existing databases: rebuilding the history
+            // table merely to remove it would create a larger migration spike.
+            if lockedVersion < 2 {
+                try execute("DROP TRIGGER IF EXISTS history_node_traffic_insert")
+                try execute("DROP TRIGGER IF EXISTS history_node_traffic_update")
+                try execute("DROP TABLE IF EXISTS connection_node_traffic")
+                try execute("DROP INDEX IF EXISTS history_proxy_node_index")
+            }
 
             try execute("CREATE INDEX IF NOT EXISTS history_started_index "
                         + "ON connection_history(is_active, started_at DESC)")
@@ -697,8 +602,6 @@ final class ConnectionHistoryStore: @unchecked Sendable {
                         + "ON connection_history(ended_at ASC)")
             try execute("CREATE INDEX IF NOT EXISTS history_strategy_index "
                         + "ON connection_history(strategy_name, is_active, started_at DESC)")
-            try execute("CREATE INDEX IF NOT EXISTS history_proxy_node_index "
-                        + "ON connection_history(proxy_node_name, is_active, started_at DESC)")
             try execute("CREATE INDEX IF NOT EXISTS history_host_index "
                         + "ON connection_history(host_name, is_active, started_at DESC)")
             try execute("PRAGMA user_version = \(Self.currentSchemaVersion)")
@@ -710,90 +613,14 @@ final class ConnectionHistoryStore: @unchecked Sendable {
         }
     }
 
-    private func ensureProxyNodeColumnLocked() throws -> Bool {
-        if try columnExistsLocked("proxy_node_name", in: "connection_history") {
-            return false
-        }
-        try execute("ALTER TABLE connection_history ADD COLUMN "
-                    + "proxy_node_name TEXT NOT NULL DEFAULT 'DIRECT'")
-        return true
-    }
-
-    private func columnExistsLocked(_ column: String, in table: String) throws -> Bool {
-        var statement: OpaquePointer?
-        try prepare("PRAGMA table_info(\(table))", into: &statement)
-        defer { sqlite3_finalize(statement) }
-        while sqlite3_step(statement) == SQLITE_ROW {
-            if text(statement, index: 1) == column { return true }
-        }
-        return false
-    }
-
-    private func backfillProxyNodeNamesLocked() throws {
-        var lastRowID: Int64 = 0
-        let decoder = JSONDecoder()
-        while true {
-            var statement: OpaquePointer?
-            try prepare("SELECT rowid, chains FROM connection_history "
-                        + "WHERE rowid > ? ORDER BY rowid LIMIT \(Self.migrationBatchSize)",
-                        into: &statement)
-            sqlite3_bind_int64(statement, 1, lastRowID)
-
-            var batch: [(rowID: Int64, nodeName: String)] = []
-            while sqlite3_step(statement) == SQLITE_ROW {
-                let rowID = sqlite3_column_int64(statement, 0)
-                let chainsText = text(statement, index: 1)
-                let chains = (try? decoder.decode(
-                    [String].self, from: Data(chainsText.utf8))) ?? []
-                batch.append((rowID, ConnectionHistoryRecord.normalizedProxyNodeName(chains)))
-                lastRowID = rowID
-            }
-            sqlite3_finalize(statement)
-            guard !batch.isEmpty else { return }
-
-            var update: OpaquePointer?
-            try prepare("UPDATE connection_history SET proxy_node_name = ? WHERE rowid = ?",
-                        into: &update)
-            do {
-                for item in batch {
-                    sqlite3_reset(update)
-                    sqlite3_clear_bindings(update)
-                    bindText(item.nodeName, to: update, index: 1)
-                    sqlite3_bind_int64(update, 2, item.rowID)
-                    try stepDone(update)
-                }
-                sqlite3_finalize(update)
-            } catch {
-                sqlite3_finalize(update)
-                throw error
-            }
-        }
-    }
-
-    private func seedNodeTrafficIfNeededLocked() throws {
-        let count = row(for: "SELECT COUNT(*) FROM connection_node_traffic")?.int(0) ?? 0
-        guard count == 0 else { return }
-        try execute("""
-            INSERT INTO connection_node_traffic (node_name, upload, download, updated_at)
-            SELECT proxy_node_name,
-                   COALESCE(SUM(upload), 0),
-                   COALESCE(SUM(download), 0),
-                   COALESCE(MAX(COALESCE(ended_at, started_at)), 0)
-            FROM connection_history
-            GROUP BY proxy_node_name
-            HAVING SUM(upload) > 0 OR SUM(download) > 0
-            """)
-        try trimNodeTrafficLocked()
-    }
-
     private func upsertLocked(_ record: ConnectionHistoryRecord) throws {
         let sql = """
             INSERT INTO connection_history (
                 id, started_at, ended_at, is_active, upload, download, network,
                 connection_type, source_ip, source_port, destination_ip,
                 destination_port, host, sniff_host, process, process_path, chains,
-                strategy_name, proxy_node_name, host_name, rule, rule_payload
-            ) VALUES (?, ?, NULL, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                strategy_name, host_name, rule, rule_payload
+            ) VALUES (?, ?, NULL, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 upload = excluded.upload,
                 download = excluded.download,
@@ -811,7 +638,6 @@ final class ConnectionHistoryStore: @unchecked Sendable {
                 process_path = excluded.process_path,
                 chains = excluded.chains,
                 strategy_name = excluded.strategy_name,
-                proxy_node_name = excluded.proxy_node_name,
                 host_name = excluded.host_name,
                 rule = excluded.rule,
                 rule_payload = excluded.rule_payload
@@ -824,7 +650,7 @@ final class ConnectionHistoryStore: @unchecked Sendable {
             record.sourcePort, record.destinationIP, record.destinationPort, record.host,
             record.sniffHost, record.process, record.processPath,
             (try? String(data: JSONEncoder().encode(record.chains), encoding: .utf8)) ?? "[]",
-            record.strategyName, record.proxyNodeName, record.hostName, record.rule, record.rulePayload,
+            record.strategyName, record.hostName, record.rule, record.rulePayload,
         ]
         bindText(record.id, to: statement, index: 1)
         sqlite3_bind_double(statement, 2, record.startedAt.timeIntervalSince1970)
@@ -855,9 +681,9 @@ final class ConnectionHistoryStore: @unchecked Sendable {
         try? execute("PRAGMA wal_checkpoint(TRUNCATE)")
         try? execute("PRAGMA incremental_vacuum(2048)")
 
-        // An index migration can temporarily grow the main database beyond
+        // A schema migration can temporarily grow the main database beyond
         // its steady-state page cap. Remove only oldest completed details;
-        // active connections and compact node totals are never sacrificed.
+        // active connections are never sacrificed.
         var attempts = 0
         var pageCount = row(for: "PRAGMA page_count")?.int(0) ?? 0
         while pageCount > Self.maximumDatabasePages, attempts < 20 {
@@ -939,8 +765,7 @@ final class ConnectionHistoryStore: @unchecked Sendable {
                                  limit: Int,
                                  query: ConnectionHistoryQuery = .all)
         -> [ConnectionHistoryTrafficVolume] {
-        guard column == "strategy_name" || column == "proxy_node_name"
-                || column == "host_name" else { return [] }
+        guard column == "strategy_name" || column == "host_name" else { return [] }
         let predicate = query.sqlPredicate
         let sql = "SELECT \(column), COALESCE(SUM(upload), 0), COALESCE(SUM(download), 0) "
             + "FROM connection_history \(predicate.clause) GROUP BY \(column) "
@@ -963,51 +788,6 @@ final class ConnectionHistoryStore: @unchecked Sendable {
         } catch {
             return []
         }
-    }
-
-    private func nodeTrafficLocked(metric: ConnectionTrafficRankingMetric,
-                                   limit: Int) -> [ConnectionHistoryTrafficVolume] {
-        let order: String
-        switch metric {
-        case .total:
-            order = "(upload + download) DESC, download DESC"
-        case .download:
-            order = "download DESC, upload DESC"
-        case .upload:
-            order = "upload DESC, download DESC"
-        }
-        let sql = "SELECT node_name, upload, download FROM connection_node_traffic "
-            + "WHERE upload > 0 OR download > 0 "
-            + "ORDER BY \(order), node_name COLLATE NOCASE ASC LIMIT \(limit)"
-        do {
-            var statement: OpaquePointer?
-            try prepare(sql, into: &statement)
-            defer { sqlite3_finalize(statement) }
-            var values: [ConnectionHistoryTrafficVolume] = []
-            while sqlite3_step(statement) == SQLITE_ROW {
-                values.append(ConnectionHistoryTrafficVolume(
-                    name: text(statement, index: 0),
-                    upload: sqlite3_column_int64(statement, 1),
-                    download: sqlite3_column_int64(statement, 2)))
-            }
-            return values
-        } catch {
-            return []
-        }
-    }
-
-    private func trimNodeTrafficLocked() throws {
-        let count = row(for: "SELECT COUNT(*) FROM connection_node_traffic")?.int(0) ?? 0
-        let excess = max(0, Int(count) - Self.maximumNodeAggregateCount)
-        guard excess > 0 else { return }
-        try execute("""
-            DELETE FROM connection_node_traffic
-            WHERE node_name IN (
-                SELECT node_name FROM connection_node_traffic
-                ORDER BY (upload + download) ASC, updated_at ASC, node_name ASC
-                LIMIT \(excess)
-            )
-            """)
     }
 
     private func record(from statement: OpaquePointer?) -> ConnectionHistoryRecord? {

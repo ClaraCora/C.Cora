@@ -21,8 +21,7 @@ struct ConnectView: View {
                                                down: kernel.down,
                                                totalDownload: kernel.totalDownload,
                                                totalUpload: kernel.totalUpload,
-                                               samples: kernel.samples,
-                                               connections: connections)
+                                               samples: kernel.samples)
                         }
 
                         OverviewConnectionLinks(controller: connections)
@@ -318,7 +317,6 @@ private struct RuntimeMetricsGrid: View {
     let totalDownload: Int64
     let totalUpload: Int64
     let samples: [KernelController.TrafficSample]
-    let connections: ConnectionsController
 
     var body: some View {
         LazyVGrid(columns: [
@@ -331,25 +329,10 @@ private struct RuntimeMetricsGrid: View {
             RateMetricWidget(title: "上行", value: ByteFormat.rate(up),
                              systemImage: "arrow.up", tint: .orange,
                              samples: samples, direction: .up)
-            NavigationLink {
-                NodeTrafficRankingView(controller: connections,
-                                       initialMetric: .download)
-            } label: {
-                MetricWidget(title: "累计下行", value: ByteFormat.size(totalDownload),
-                             systemImage: "arrow.down.circle", tint: .blue)
-            }
-            .buttonStyle(.plain)
-            .accessibilityHint("查看节点下行流量排行")
-
-            NavigationLink {
-                NodeTrafficRankingView(controller: connections,
-                                       initialMetric: .upload)
-            } label: {
-                MetricWidget(title: "累计上行", value: ByteFormat.size(totalUpload),
-                             systemImage: "arrow.up.circle", tint: .orange)
-            }
-            .buttonStyle(.plain)
-            .accessibilityHint("查看节点上行流量排行")
+            MetricWidget(title: "累计下行", value: ByteFormat.size(totalDownload),
+                         systemImage: "arrow.down.circle", tint: .blue)
+            MetricWidget(title: "累计上行", value: ByteFormat.size(totalUpload),
+                         systemImage: "arrow.up.circle", tint: .orange)
         }
     }
 

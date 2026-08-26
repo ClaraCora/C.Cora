@@ -45,9 +45,6 @@ private struct ConnectionOverview: View {
     private var hostTotals: [TrafficAggregate] {
         Array(trafficTotals(from: controller.historySummary.hostVolumes, role: .host).prefix(5))
     }
-    private var nodeTotals: [ConnectionHistoryTrafficVolume] {
-        controller.historySummary.nodeVolumes
-    }
     private var totalTraffic: Int64 {
         controller.historySummary.uploadTotal + controller.historySummary.downloadTotal
     }
@@ -103,26 +100,6 @@ private struct ConnectionOverview: View {
                     }
                 }
                 .buttonStyle(.plain)
-
-                VStack(alignment: .leading, spacing: 10) {
-                    NavigationLink {
-                        NodeTrafficRankingView(controller: controller,
-                                               initialMetric: .total)
-                    } label: {
-                        HStack(spacing: 8) {
-                            sectionHeading("节点流量 TOP 5", symbol: "server.rack")
-                            Spacer(minLength: 8)
-                            Image(systemName: "chevron.right")
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(.tertiary)
-                        }
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-
-                    NodeTrafficTopCard(volumes: nodeTotals,
-                                       controller: controller)
-                }
 
                 VStack(alignment: .leading, spacing: 10) {
                     sectionHeading("主机名", symbol: "network")
@@ -531,7 +508,6 @@ struct ConnectionListView: View {
         guard let historyQuery else { return nil }
         return ConnectionHistoryQuery(
             strategyName: strategy.isEmpty ? historyQuery.strategyName : strategy,
-            proxyNodeName: historyQuery.proxyNodeName,
             hostName: historyQuery.hostName,
             network: network == .all ? nil : network.rawValue,
             isActive: status == .all ? nil : status == .active,
