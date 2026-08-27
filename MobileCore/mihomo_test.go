@@ -527,12 +527,12 @@ func TestMaterializeUnresolvedSystemNameServer(t *testing.T) {
 
 func TestReplaceActiveSystemDNSKeepsOldDNSOnMismatch(t *testing.T) {
 	previousConfig := activeDNSConfig
-	previousSource := activeDNSSystemSource
+	previousTemplate := activeDNSSystemTemplate
 	previousSystemDNS := append([]string(nil), activeSystemDNS...)
 	previousUsesSystemDNS := activeUsesSystemDNS
 	defer func() {
 		activeDNSConfig = previousConfig
-		activeDNSSystemSource = previousSource
+		activeDNSSystemTemplate = previousTemplate
 		activeSystemDNS = previousSystemDNS
 		activeUsesSystemDNS = previousUsesSystemDNS
 	}()
@@ -540,7 +540,7 @@ func TestReplaceActiveSystemDNSKeepsOldDNSOnMismatch(t *testing.T) {
 	activeDNSConfig = &config.DNS{
 		NameServer: []mdns.NameServer{{Net: "https", Addr: "https://dns.example/dns-query"}},
 	}
-	activeDNSSystemSource = cloneDNSConfig(activeDNSConfig)
+	activeDNSSystemTemplate = captureDNSSystemTemplate(activeDNSConfig)
 	activeSystemDNS = []string{"10.0.0.1"}
 	activeUsesSystemDNS = true
 
@@ -555,21 +555,21 @@ func TestReplaceActiveSystemDNSKeepsOldDNSOnMismatch(t *testing.T) {
 
 func TestPrepareActiveSystemDNSDoesNotPublishCandidate(t *testing.T) {
 	previousConfig := activeDNSConfig
-	previousSource := activeDNSSystemSource
+	previousTemplate := activeDNSSystemTemplate
 	previousSystemDNS := append([]string(nil), activeSystemDNS...)
 	previousUsesSystemDNS := activeUsesSystemDNS
 	defer func() {
 		activeDNSConfig = previousConfig
-		activeDNSSystemSource = previousSource
+		activeDNSSystemTemplate = previousTemplate
 		activeSystemDNS = previousSystemDNS
 		activeUsesSystemDNS = previousUsesSystemDNS
 	}()
 
 	original := &config.DNS{NameServer: []mdns.NameServer{{Addr: "10.0.0.1:53"}}}
 	activeDNSConfig = original
-	activeDNSSystemSource = &config.DNS{
+	activeDNSSystemTemplate = captureDNSSystemTemplate(&config.DNS{
 		NameServer: []mdns.NameServer{{Net: "system"}},
-	}
+	})
 	activeSystemDNS = []string{"10.0.0.1"}
 	activeUsesSystemDNS = true
 
@@ -583,6 +583,54 @@ func TestPrepareActiveSystemDNSDoesNotPublishCandidate(t *testing.T) {
 	}
 	if got := candidate.NameServer[0].Addr; got != "192.168.1.1:53" {
 		t.Fatalf("candidate nameserver = %q, want 192.168.1.1:53", got)
+	}
+}
+
+func TestDNSSystemTemplateRetainsOnlySystemPolicyLists(t *testing.T) {
+	policies := make([]mdns.Policy, 64)
+	policies[7].NameServers = []mdns.NameServer{{Net: "system"}, {Addr: "9.9.9.9:53"}}
+	policies[29].NameServers = []mdns.NameServer{{Addr: "1.1.1.1:53"}}
+	proxyPolicies := make([]mdns.Policy, 48)
+	proxyPolicies[31].NameServers = []mdns.NameServer{{Net: "system"}}
+
+	source := &config.DNS{
+		NameServer:        []mdns.NameServer{{Addr: "223.5.5.5:53"}},
+		NameServerPolicy:  policies,
+		ProxyServerPolicy: proxyPolicies,
+	}
+	template := captureDNSSystemTemplate(source)
+	if template == nil {
+		t.Fatal("captureDNSSystemTemplate returned nil")
+	}
+	if template.nameServer != nil || len(template.nameServerPolicy) != 1 ||
+		len(template.proxyServerPolicy) != 1 {
+		t.Fatalf("unexpected compact template: %+v", template)
+	}
+	if _, ok := template.nameServerPolicy[7]; !ok {
+		t.Fatalf("system policy source was not retained: %+v", template.nameServerPolicy)
+	}
+	if _, ok := template.nameServerPolicy[29]; ok {
+		t.Fatalf("non-system policy source should not be retained: %+v", template.nameServerPolicy)
+	}
+
+	updated, replacements := materializeSystemDNSConfig(source, template, []string{"192.168.1.1"})
+	if replacements != 2 {
+		t.Fatalf("replacements = %d, want 2", replacements)
+	}
+	if updated == nil || updated == source {
+		t.Fatalf("updated = %p, want independent DNS config", updated)
+	}
+	if got := updated.NameServerPolicy[7].NameServers[0].Addr; got != "192.168.1.1:53" {
+		t.Fatalf("system policy address = %q, want 192.168.1.1:53", got)
+	}
+	if got := updated.NameServerPolicy[29].NameServers[0].Addr; got != "1.1.1.1:53" {
+		t.Fatalf("explicit policy address = %q, want 1.1.1.1:53", got)
+	}
+	if got := updated.ProxyServerPolicy[31].NameServers[0].Addr; got != "192.168.1.1:53" {
+		t.Fatalf("proxy system policy address = %q, want 192.168.1.1:53", got)
+	}
+	if source.NameServerPolicy[7].NameServers[0].Net != "system" {
+		t.Fatalf("source policy was mutated: %+v", source.NameServerPolicy[7].NameServers)
 	}
 }
 

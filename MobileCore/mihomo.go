@@ -101,6 +101,28 @@ type proxyDelayBatchSession struct {
 	cancel context.CancelFunc
 }
 
+// dnsSystemNameServerTemplate only retains a DNS list that actually declared
+// `system`. Keeping the parsed source identity lets a future path update
+// replace just those entries without mistaking an explicit equal address for
+// an injected one.
+type dnsSystemNameServerTemplate struct {
+	source []mdns.NameServer
+}
+
+// dnsSystemTemplate intentionally does not mirror config.DNS. Large
+// nameserver-policy tables are common in subscription configs, and retaining
+// a second complete DNS config kept those tables alive for an entire tunnel
+// session. Only the small lists that contain a `system` source are retained.
+type dnsSystemTemplate struct {
+	nameServer              *dnsSystemNameServerTemplate
+	fallback                *dnsSystemNameServerTemplate
+	defaultNameserver       *dnsSystemNameServerTemplate
+	proxyServerNameserver   *dnsSystemNameServerTemplate
+	directNameserver        *dnsSystemNameServerTemplate
+	nameServerPolicy        map[int]*dnsSystemNameServerTemplate
+	proxyServerPolicy       map[int]*dnsSystemNameServerTemplate
+}
+
 // connectionSnapshotHeap keeps only the oldest item at its root, allowing the
 // IPC snapshot to select the newest live connections without allocating a
 // slice proportional to the total number of active trackers.
@@ -146,7 +168,7 @@ var (
 	configNotices         []string
 	proxyDetailsMap       = map[string]string{}
 	activeDNSConfig       *config.DNS
-	activeDNSSystemSource *config.DNS
+	activeDNSSystemTemplate *dnsSystemTemplate
 	activeGeneralIPv6     bool
 	activeSystemDNS       []string
 	activeUsesSystemDNS   bool
@@ -748,11 +770,11 @@ func applyRuntimeConfig(fd int, tunnelMTU int, configYAML string, st appSettings
 		appendRunLog("启动 ParseRawConfig 失败: " + err.Error())
 		return err
 	}
-	dnsSystemSource := cloneDNSConfig(cfg.DNS)
+	dnsSystemTemplate := captureDNSSystemTemplate(cfg.DNS)
 	if resolvedDNS, replacements := materializeSystemDNSConfig(
-		dnsSystemSource, st.SystemDNS); replacements > 0 {
+		cfg.DNS, dnsSystemTemplate, st.SystemDNS); replacements > 0 {
 		cfg.DNS = resolvedDNS
-		appendRunLog(fmt.Sprintf("DNS 启动已从 system 来源模板注入 %d 处物理 DNS", replacements))
+		appendRunLog(fmt.Sprintf("DNS 启动已从 system 轻量模板注入 %d 处物理 DNS", replacements))
 	}
 
 	// Keep Cora's synthetic TUN/Fake-IP range out of every routing mode when
@@ -777,7 +799,7 @@ func applyRuntimeConfig(fd int, tunnelMTU int, configYAML string, st appSettings
 		cachefile.Cache().SetSelected(group, name)
 	}
 	activeDNSConfig = cfg.DNS
-	activeDNSSystemSource = dnsSystemSource
+	activeDNSSystemTemplate = dnsSystemTemplate
 	activeGeneralIPv6 = cfg.General.IPv6
 	activeSystemDNS = append(activeSystemDNS[:0], st.SystemDNS...)
 	activeUsesSystemDNS = pendingUsesSystemDNS
@@ -3255,70 +3277,120 @@ func parseSystemDNSJSON(raw string) ([]string, error) {
 	return result, nil
 }
 
-// prepareActiveSystemDNSLocked builds a candidate from the parsed source
+// prepareActiveSystemDNSLocked builds a candidate from the compact source
 // template without publishing it. Only entries whose source was `system` are
 // materialized, so an explicit DNS address equal to the previous system DNS is
 // never mistaken for an injected entry.
 func prepareActiveSystemDNSLocked(newSystemDNS []string) (*config.DNS, int) {
-	if activeDNSConfig == nil || activeDNSSystemSource == nil || !activeUsesSystemDNS {
+	if activeDNSConfig == nil || activeDNSSystemTemplate == nil || !activeUsesSystemDNS {
 		activeSystemDNS = append(activeSystemDNS[:0], newSystemDNS...)
 		return nil, 0
 	}
 
 	updated, replacements := materializeSystemDNSConfig(
-		activeDNSSystemSource, newSystemDNS)
+		activeDNSConfig, activeDNSSystemTemplate, newSystemDNS)
 	if replacements == 0 {
 		return nil, 0
 	}
 	return updated, replacements
 }
 
-func cloneDNSConfig(source *config.DNS) *config.DNS {
+func captureDNSSystemTemplate(source *config.DNS) *dnsSystemTemplate {
 	if source == nil {
 		return nil
 	}
-	cloned := *source
-	cloned.NameServer = append([]mdns.NameServer(nil), source.NameServer...)
-	cloned.Fallback = append([]mdns.NameServer(nil), source.Fallback...)
-	cloned.DefaultNameserver = append([]mdns.NameServer(nil), source.DefaultNameserver...)
-	cloned.ProxyServerNameserver = append([]mdns.NameServer(nil), source.ProxyServerNameserver...)
-	cloned.DirectNameServer = append([]mdns.NameServer(nil), source.DirectNameServer...)
-	cloned.NameServerPolicy = cloneDNSPolicies(source.NameServerPolicy)
-	cloned.ProxyServerPolicy = cloneDNSPolicies(source.ProxyServerPolicy)
-	return &cloned
-}
-
-func cloneDNSPolicies(policies []mdns.Policy) []mdns.Policy {
-	cloned := append([]mdns.Policy(nil), policies...)
-	for index := range cloned {
-		cloned[index].NameServers = append(
-			[]mdns.NameServer(nil), policies[index].NameServers...)
+	template := &dnsSystemTemplate{
+		nameServer:            captureDNSSystemNameServerTemplate(source.NameServer),
+		fallback:              captureDNSSystemNameServerTemplate(source.Fallback),
+		defaultNameserver:     captureDNSSystemNameServerTemplate(source.DefaultNameserver),
+		proxyServerNameserver: captureDNSSystemNameServerTemplate(source.ProxyServerNameserver),
+		directNameserver:      captureDNSSystemNameServerTemplate(source.DirectNameServer),
+		nameServerPolicy:      captureDNSSystemPolicyTemplates(source.NameServerPolicy),
+		proxyServerPolicy:     captureDNSSystemPolicyTemplates(source.ProxyServerPolicy),
 	}
-	return cloned
+	if template.isEmpty() {
+		return nil
+	}
+	return template
 }
 
-func materializeSystemDNSConfig(source *config.DNS,
+func captureDNSSystemNameServerTemplate(
+	servers []mdns.NameServer,
+) *dnsSystemNameServerTemplate {
+	for _, server := range servers {
+		if server.Net == "system" {
+			// The list itself is required to preserve ordering and deduplication,
+			// but only lists containing a system source are kept across the session.
+			return &dnsSystemNameServerTemplate{
+				source: append([]mdns.NameServer(nil), servers...),
+			}
+		}
+	}
+	return nil
+}
+
+func captureDNSSystemPolicyTemplates(
+	policies []mdns.Policy,
+) map[int]*dnsSystemNameServerTemplate {
+	var templates map[int]*dnsSystemNameServerTemplate
+	for index := range policies {
+		template := captureDNSSystemNameServerTemplate(policies[index].NameServers)
+		if template == nil {
+			continue
+		}
+		if templates == nil {
+			templates = make(map[int]*dnsSystemNameServerTemplate)
+		}
+		templates[index] = template
+	}
+	return templates
+}
+
+func (template *dnsSystemTemplate) isEmpty() bool {
+	return template == nil ||
+		(template.nameServer == nil &&
+			template.fallback == nil &&
+			template.defaultNameserver == nil &&
+			template.proxyServerNameserver == nil &&
+			template.directNameserver == nil &&
+			len(template.nameServerPolicy) == 0 &&
+			len(template.proxyServerPolicy) == 0)
+}
+
+// materializeSystemDNSConfig shallow-copies config.DNS and only copies fields
+// with an actual system source. All other DNS and policy data stays shared with
+// the active configuration, avoiding a second long-lived policy table in NE.
+func materializeSystemDNSConfig(active *config.DNS, template *dnsSystemTemplate,
 	newSystemDNS []string) (*config.DNS, int) {
-	if source == nil {
+	if active == nil || template == nil || template.isEmpty() {
 		return nil, 0
 	}
-	updated := cloneDNSConfig(source)
+	updated := *active
 	replacements := 0
-	updated.NameServer, replacements = materializeSystemNameServersAdding(
-		source.NameServer, newSystemDNS, replacements)
-	updated.Fallback, replacements = materializeSystemNameServersAdding(
-		source.Fallback, newSystemDNS, replacements)
-	updated.DefaultNameserver, replacements = materializeSystemNameServersAdding(
-		source.DefaultNameserver, newSystemDNS, replacements)
-	updated.ProxyServerNameserver, replacements = materializeSystemNameServersAdding(
-		source.ProxyServerNameserver, newSystemDNS, replacements)
-	updated.DirectNameServer, replacements = materializeSystemNameServersAdding(
-		source.DirectNameServer, newSystemDNS, replacements)
-	updated.NameServerPolicy, replacements = materializeSystemPolicies(
-		source.NameServerPolicy, newSystemDNS, replacements)
-	updated.ProxyServerPolicy, replacements = materializeSystemPolicies(
-		source.ProxyServerPolicy, newSystemDNS, replacements)
-	return updated, replacements
+	updated.NameServer, replacements = materializeSystemNameServerTemplate(
+		active.NameServer, template.nameServer, newSystemDNS, replacements)
+	updated.Fallback, replacements = materializeSystemNameServerTemplate(
+		active.Fallback, template.fallback, newSystemDNS, replacements)
+	updated.DefaultNameserver, replacements = materializeSystemNameServerTemplate(
+		active.DefaultNameserver, template.defaultNameserver, newSystemDNS, replacements)
+	updated.ProxyServerNameserver, replacements = materializeSystemNameServerTemplate(
+		active.ProxyServerNameserver, template.proxyServerNameserver, newSystemDNS, replacements)
+	updated.DirectNameServer, replacements = materializeSystemNameServerTemplate(
+		active.DirectNameServer, template.directNameserver, newSystemDNS, replacements)
+	updated.NameServerPolicy, replacements = materializeSystemPolicyTemplates(
+		active.NameServerPolicy, template.nameServerPolicy, newSystemDNS, replacements)
+	updated.ProxyServerPolicy, replacements = materializeSystemPolicyTemplates(
+		active.ProxyServerPolicy, template.proxyServerPolicy, newSystemDNS, replacements)
+	return &updated, replacements
+}
+
+func materializeSystemNameServerTemplate(active []mdns.NameServer,
+	template *dnsSystemNameServerTemplate, newSystemDNS []string,
+	count int) ([]mdns.NameServer, int) {
+	if template == nil {
+		return active, count
+	}
+	return materializeSystemNameServersAdding(template.source, newSystemDNS, count)
 }
 
 func materializeSystemNameServersAdding(servers []mdns.NameServer,
@@ -3327,12 +3399,19 @@ func materializeSystemNameServersAdding(servers []mdns.NameServer,
 	return updated, count + added
 }
 
-func materializeSystemPolicies(policies []mdns.Policy, newSystemDNS []string,
+func materializeSystemPolicyTemplates(policies []mdns.Policy,
+	templates map[int]*dnsSystemNameServerTemplate, newSystemDNS []string,
 	count int) ([]mdns.Policy, int) {
-	updated := cloneDNSPolicies(policies)
-	for index := range updated {
-		updated[index].NameServers, count = materializeSystemNameServersAdding(
-			policies[index].NameServers, newSystemDNS, count)
+	if len(templates) == 0 {
+		return policies, count
+	}
+	updated := append([]mdns.Policy(nil), policies...)
+	for index, template := range templates {
+		if index < 0 || index >= len(updated) {
+			continue
+		}
+		updated[index].NameServers, count = materializeSystemNameServerTemplate(
+			policies[index].NameServers, template, newSystemDNS, count)
 	}
 	return updated, count
 }
@@ -3506,7 +3585,7 @@ func Stop() {
 	setSnellCellularTCPNodes(nil)
 	storePhysicalInterface("")
 	activeDNSConfig = nil
-	activeDNSSystemSource = nil
+	activeDNSSystemTemplate = nil
 	activeSystemDNS = nil
 	activeGeneralIPv6 = false
 	activeUsesSystemDNS = false
