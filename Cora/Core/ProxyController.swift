@@ -533,6 +533,7 @@ final class ProxyController: ObservableObject {
         let result = await CoreStateManager.shared.sendMessage(
             ["cmd": "groupDelay", "group": name, "url": delayTestURL,
              "directURL": directDelayTestURL,
+             "count": memberNames.count,
              "timeout": delayTestTimeoutMilliseconds])
         guard session == sessionGeneration else { return }
         switch result {
@@ -557,6 +558,9 @@ final class ProxyController: ObservableObject {
                 }
             }
             mergeDelayValues(values)
+            if (dict["_partial"] as? Bool) == true {
+                self.error = "分组较大，已达到测速安全时间上限，未完成节点显示为超时"
+            }
         case .failure(let reason):
             self.error = "测速失败：\(reason)"
         }

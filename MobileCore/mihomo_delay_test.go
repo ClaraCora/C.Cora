@@ -156,3 +156,96 @@ func TestConfigWriteCancelsActiveProxyDelayBatch(t *testing.T) {
 		t.Fatal("configuration writer stayed blocked after batch cancellation cleanup")
 	}
 }
+
+func TestProxyDelayWorkerCounts(t *testing.T) {
+	previous := currentPhysicalInterface()
+	defer storePhysicalInterface(previous)
+
+	tests := []struct {
+		name      string
+		iface     string
+		batchWant int
+		groupWant int
+	}{
+		{name: "wifi", iface: "en0", batchWant: proxyDelayBatchWorkerLimit, groupWant: proxyDelayGroupWorkerLimit},
+		{name: "cellular", iface: "pdp_ip0", batchWant: proxyDelayCellularBatchWorkerLimit, groupWant: proxyDelayCellularGroupWorkerLimit},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			storePhysicalInterface(test.iface)
+			if got := proxyDelayWorkerCount(); got != test.batchWant {
+				t.Fatalf("proxyDelayWorkerCount() = %d, want %d", got, test.batchWant)
+			}
+			if got := proxyGroupDelayWorkerCount(); got != test.groupWant {
+				t.Fatalf("proxyGroupDelayWorkerCount() = %d, want %d", got, test.groupWant)
+			}
+		})
+	}
+}
+
+func TestProxyDelayRunContextCapsDuration(t *testing.T) {
+	tests := []struct {
+		name      string
+		targets   int
+		timeoutMs int
+		workers   int
+		want      time.Duration
+	}{
+		{name: "small run", targets: 4, timeoutMs: 1000, workers: 2, want: 7 * time.Second},
+		{name: "large run cap", targets: 256, timeoutMs: 5000, workers: 2, want: proxyDelayMaxRunDuration},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := proxyDelayRunContext(context.Background(), test.targets, test.timeoutMs, test.workers)
+			defer cancel()
+			deadline, ok := ctx.Deadline()
+			if !ok {
+				t.Fatal("proxyDelayRunContext() did not set a deadline")
+			}
+			remaining := time.Until(deadline)
+			if remaining < test.want-150*time.Millisecond || remaining > test.want+150*time.Millisecond {
+				t.Fatalf("deadline remaining = %s, want about %s", remaining, test.want)
+			}
+		})
+	}
+}
+
+func TestMarshalProxyDelayMapPartialPreservesResults(t *testing.T) {
+	response := marshalProxyDelayMap(map[string]uint16{"node-a": 123, "node-b": 0}, true)
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(response), &decoded); err != nil {
+		t.Fatalf("marshalProxyDelayMap() returned invalid JSON: %v", err)
+	}
+	if partial, ok := decoded["_partial"].(bool); !ok || !partial {
+		t.Fatalf("_partial = %#v, want true", decoded["_partial"])
+	}
+	if delay, ok := decoded["node-a"].(float64); !ok || delay != 123 {
+		t.Fatalf("node-a delay = %#v, want 123", decoded["node-a"])
+	}
+	if delay, ok := decoded["node-b"].(float64); !ok || delay != 0 {
+		t.Fatalf("node-b delay = %#v, want 0", decoded["node-b"])
+	}
+}
+
+func TestBeginProxyDelayBatchWaitsForPreviousSession(t *testing.T) {
+	first := beginProxyDelayBatch()
+	secondReady := make(chan *proxyDelayBatchSession, 1)
+	go func() {
+		secondReady <- beginProxyDelayBatch()
+	}()
+
+	select {
+	case second := <-secondReady:
+		finishProxyDelayBatch(second)
+		t.Fatal("new delay session started before previous session finished")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	finishProxyDelayBatch(first)
+	select {
+	case second := <-secondReady:
+		finishProxyDelayBatch(second)
+	case <-time.After(time.Second):
+		t.Fatal("new delay session did not start after previous session finished")
+	}
+}

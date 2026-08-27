@@ -345,7 +345,16 @@ final class CoreStateManager: ObservableObject {
         let command = request["cmd"] as? String ?? ""
         let timeout: TimeInterval
         switch command {
-        case "groupDelay", "proxyDelay":
+        case "groupDelay":
+            let milliseconds = (request["timeout"] as? NSNumber)?.doubleValue ?? 5_000
+            let requestedCount = (request["count"] as? NSNumber)?.intValue ?? 0
+            // The NE may be on cellular, where group tests use two workers.
+            // Use that conservative estimate for the IPC deadline so a
+            // bounded test is not mistaken for an unresponsive extension.
+            let targetCount = max(1, requestedCount)
+            let workerWaves = (targetCount + 1) / 2
+            timeout = min(190, max(10, Double(workerWaves) * milliseconds / 1_000 + 10))
+        case "proxyDelay":
             let milliseconds = (request["timeout"] as? NSNumber)?.doubleValue ?? 5_000
             timeout = max(10, milliseconds / 1_000 + 5)
         case "proxyDelays":
@@ -354,8 +363,10 @@ final class CoreStateManager: ObservableObject {
             let requestedCount = (request["count"] as? NSNumber)?.intValue ?? 0
             let encodedCount = (request["targets"] as? [Any])?.count ?? 0
             let targetCount = min(256, max(1, max(requestedCount, encodedCount)))
-            let workerWaves = (targetCount + 5) / 6
-            timeout = max(10, Double(workerWaves) * milliseconds / 1_000 + 10)
+            // Batch tests use two workers on cellular; use this lower bound
+            // for the IPC deadline even when the current interface is Wi-Fi.
+            let workerWaves = (targetCount + 1) / 2
+            timeout = min(190, max(10, Double(workerWaves) * milliseconds / 1_000 + 10))
         case "scriptFetch":
             let nestedRequest = request["request"] as? [String: Any]
             let milliseconds = (nestedRequest?["timeout"] as? NSNumber)?.doubleValue ?? 5_000

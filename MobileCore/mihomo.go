@@ -86,8 +86,16 @@ var coraReservedSyntheticIPPrefixes = [...]netip.Prefix{
 }
 
 const (
-	maxProxyDelayTargets  = 256
-	proxyDelayWorkerLimit = 6
+	maxProxyDelayTargets = 256
+	// Delay tests are deliberately kept below the number of nodes in a group.
+	// A single shared semaphore below also prevents GroupDelay, ProxyDelays and
+	// ProxyDelay from multiplying their network and transport allocations.
+	proxyDelayBatchWorkerLimit         = 4
+	proxyDelayGroupWorkerLimit         = 8
+	proxyDelayCellularBatchWorkerLimit = 2
+	proxyDelayCellularGroupWorkerLimit = 4
+	proxyDelaySlotLimit                = 8
+	proxyDelayMaxRunDuration           = 3 * time.Minute
 )
 
 type proxyDelayTarget struct {
@@ -99,6 +107,7 @@ type proxyDelayTarget struct {
 type proxyDelayBatchSession struct {
 	ctx    context.Context
 	cancel context.CancelFunc
+	done   chan struct{}
 }
 
 // dnsSystemNameServerTemplate only retains a DNS list that actually declared
@@ -114,13 +123,13 @@ type dnsSystemNameServerTemplate struct {
 // a second complete DNS config kept those tables alive for an entire tunnel
 // session. Only the small lists that contain a `system` source are retained.
 type dnsSystemTemplate struct {
-	nameServer              *dnsSystemNameServerTemplate
-	fallback                *dnsSystemNameServerTemplate
-	defaultNameserver       *dnsSystemNameServerTemplate
-	proxyServerNameserver   *dnsSystemNameServerTemplate
-	directNameserver        *dnsSystemNameServerTemplate
-	nameServerPolicy        map[int]*dnsSystemNameServerTemplate
-	proxyServerPolicy       map[int]*dnsSystemNameServerTemplate
+	nameServer            *dnsSystemNameServerTemplate
+	fallback              *dnsSystemNameServerTemplate
+	defaultNameserver     *dnsSystemNameServerTemplate
+	proxyServerNameserver *dnsSystemNameServerTemplate
+	directNameserver      *dnsSystemNameServerTemplate
+	nameServerPolicy      map[int]*dnsSystemNameServerTemplate
+	proxyServerPolicy     map[int]*dnsSystemNameServerTemplate
 }
 
 // connectionSnapshotHeap keeps only the oldest item at its root, allowing the
@@ -152,32 +161,34 @@ func (items *connectionSnapshotHeap) Pop() any {
 
 // homeDir 是 mihomo 工作目录（= App Group 容器），run.log 也写在这里。
 var (
-	homeDir               string
-	logCaptureMu          sync.Once
-	logFileMu             sync.Mutex
-	runLogFile            *os.File
-	runLogBytes           int64 = -1
-	runLogGeneration      int64
-	configApplyMu         sync.RWMutex
-	proxyDelayBatchMu     sync.Mutex
-	activeProxyDelayBatch *proxyDelayBatchSession
-	interfaceMu           sync.RWMutex
-	physicalIface         string
+	homeDir                string
+	logCaptureMu           sync.Once
+	logFileMu              sync.Mutex
+	runLogFile             *os.File
+	runLogBytes            int64 = -1
+	runLogGeneration       int64
+	configApplyMu          sync.RWMutex
+	proxyDelayBatchMu      sync.Mutex
+	proxyDelayBatchStartMu sync.Mutex
+	activeProxyDelayBatch  *proxyDelayBatchSession
+	proxyDelaySlots        = make(chan struct{}, proxyDelaySlotLimit)
+	interfaceMu            sync.RWMutex
+	physicalIface          string
 
 	// 最近一次合并配置时收集的：不适用内容提示 + 各节点协议摘要（供主 App 经 IPC 取用）。
-	configNotices         []string
-	proxyDetailsMap       = map[string]string{}
-	activeDNSConfig       *config.DNS
+	configNotices           []string
+	proxyDetailsMap         = map[string]string{}
+	activeDNSConfig         *config.DNS
 	activeDNSSystemTemplate *dnsSystemTemplate
-	activeGeneralIPv6     bool
-	activeSystemDNS       []string
-	activeUsesSystemDNS   bool
-	pendingUsesSystemDNS  bool
-	pendingSourceDNSMode  string
-	activeDNSGeneration   uint64
-	coreStartedAt         time.Time
-	snellCellularTCPMu    sync.RWMutex
-	snellCellularTCPNodes []string
+	activeGeneralIPv6       bool
+	activeSystemDNS         []string
+	activeUsesSystemDNS     bool
+	pendingUsesSystemDNS    bool
+	pendingSourceDNSMode    string
+	activeDNSGeneration     uint64
+	coreStartedAt           time.Time
+	snellCellularTCPMu      sync.RWMutex
+	snellCellularTCPNodes   []string
 )
 
 // lockConfigApplyForWrite cancels the active multi-node delay run before it
@@ -198,12 +209,26 @@ func unlockConfigApplyForWrite() {
 }
 
 func beginProxyDelayBatch() *proxyDelayBatchSession {
+	// Cancellation is cooperative. Serialize starts so a new batch cannot
+	// acquire the read lock while the previous batch is still unwinding.
+	proxyDelayBatchStartMu.Lock()
+	defer proxyDelayBatchStartMu.Unlock()
+
 	proxyDelayBatchMu.Lock()
-	if activeProxyDelayBatch != nil {
-		activeProxyDelayBatch.cancel()
+	previous := activeProxyDelayBatch
+	if previous != nil {
+		previous.cancel()
 	}
+	proxyDelayBatchMu.Unlock()
+	if previous != nil {
+		<-previous.done
+	}
+
+	proxyDelayBatchMu.Lock()
 	ctx, cancel := context.WithCancel(context.Background())
-	session := &proxyDelayBatchSession{ctx: ctx, cancel: cancel}
+	session := &proxyDelayBatchSession{
+		ctx: ctx, cancel: cancel, done: make(chan struct{}),
+	}
 	activeProxyDelayBatch = session
 	configApplyMu.RLock()
 	proxyDelayBatchMu.Unlock()
@@ -217,7 +242,61 @@ func finishProxyDelayBatch(session *proxyDelayBatchSession) {
 	if activeProxyDelayBatch == session {
 		activeProxyDelayBatch = nil
 	}
+	close(session.done)
 	proxyDelayBatchMu.Unlock()
+}
+
+// proxyDelayWorkerCount keeps high fan-out tests bounded while retaining more
+// throughput on Wi-Fi. Cellular links use fewer concurrent probes because the
+// same TUN and transport buffers are more likely to accumulate under bursts.
+func proxyDelayWorkerCount() int {
+	if isCellularInterface(currentPhysicalInterface()) {
+		return proxyDelayCellularBatchWorkerLimit
+	}
+	return proxyDelayBatchWorkerLimit
+}
+
+func proxyGroupDelayWorkerCount() int {
+	if isCellularInterface(currentPhysicalInterface()) {
+		return proxyDelayCellularGroupWorkerLimit
+	}
+	return proxyDelayGroupWorkerLimit
+}
+
+// proxyDelayRunContext gives a bounded worker pool enough time to process all
+// targets while preventing a large or broken group from holding the config
+// read lock indefinitely. A deadline returns partial results with zeroes.
+func proxyDelayRunContext(parent context.Context,
+	targetCount, timeoutMs, workerCount int) (context.Context, context.CancelFunc) {
+	if timeoutMs <= 0 {
+		timeoutMs = 5_000
+	}
+	if workerCount <= 0 {
+		workerCount = 1
+	}
+	if targetCount <= 0 {
+		targetCount = 1
+	}
+	waves := (targetCount + workerCount - 1) / workerCount
+	duration := time.Duration(int64(waves)*int64(timeoutMs))*time.Millisecond + 5*time.Second
+	if duration > proxyDelayMaxRunDuration {
+		duration = proxyDelayMaxRunDuration
+	}
+	return context.WithTimeout(parent, duration)
+}
+
+// withProxyDelaySlot is shared by every URLTest path. Waiting is cancellable,
+// so a configuration reload or a newer batch cannot leave blocked goroutines
+// behind after its context is cancelled.
+func withProxyDelaySlot(ctx context.Context,
+	test func() (uint16, error)) (uint16, error) {
+	select {
+	case proxyDelaySlots <- struct{}{}:
+		defer func() { <-proxyDelaySlots }()
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+	return test()
 }
 
 // Version 返回「mihomo 内核版本 / Go 运行时版本」。
@@ -2281,11 +2360,12 @@ func SelectProxy(group, name string) error {
 
 // GroupDelay 对策略组里所有节点做延迟测试（等价 REST GET /group/{name}/delay），
 // DIRECT 链路使用 directURL，其余节点使用 url。返回 {<节点名>: 毫秒} 的 JSON；
-// 每个成员都会出现在结果中，失败或超时使用 0。
+// 每个成员都会出现在结果中，失败或超时使用 0。节点测试由有界 worker 池执行，
+// 超过安全总时长时返回已完成结果，未开始的节点保持 0。
 // 对应 Swift 侧 `MihomoGroupDelay(_:_:_:_:)`。
 func GroupDelay(group, url, directURL string, timeoutMs int) string {
-	configApplyMu.RLock()
-	defer configApplyMu.RUnlock()
+	session := beginProxyDelayBatch()
+	defer finishProxyDelayBatch(session)
 	proxies := tunnel.Proxies()
 	p, exist := proxies[group]
 	if !exist {
@@ -2313,42 +2393,61 @@ func GroupDelay(group, url, directURL string, timeoutMs int) string {
 		appendRunLog(fmt.Sprintf("Snell 蜂窝 TCP：分组测速 %s，Snell 节点=%d，普通 TCP=%d，接口=%s",
 			group, len(snellNames), manualTCP, displayInterfaceName(interfaceName)))
 	}
-	if url == "" {
-		url = "https://www.gstatic.com/generate_204"
-	}
-	if directURL == "" {
-		directURL = url
-	}
-	if timeoutMs <= 0 {
-		timeoutMs = 5000
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(timeoutMs))
+	url, directURL, timeoutMs = normalizeProxyDelayOptions(url, directURL, timeoutMs)
+	workerCount := min(proxyGroupDelayWorkerCount(), len(members))
+	ctx, cancel := proxyDelayRunContext(session.ctx, len(members), timeoutMs, workerCount)
 	defer cancel()
+	appendRunLog(fmt.Sprintf("分组测速：%s，节点=%d，并发=%d，单节点超时=%dms",
+		group, len(members), workerCount, timeoutMs))
 
-	var expectedStatus utils.IntRanges[uint16] // 零值=不限定状态码，与不带 expected 的 REST 行为一致
-	// Some automatic groups ignore the URL supplied to ProxyGroup.URLTest and
-	// use their configured health-check URL. Test their resolved members here so
-	// the app's configured URL applies uniformly to every group type.
 	dm := make(map[string]uint16, len(members))
 	for _, proxy := range members {
 		dm[proxy.Name()] = 0
 	}
+	if workerCount == 0 {
+		return marshalJSON(map[string]any{"error": "策略组没有可测速节点"})
+	}
+
+	jobs := make(chan C.Proxy)
 	var delayMu sync.Mutex
 	var wait sync.WaitGroup
-	for _, proxy := range members {
-		proxy := proxy
-		wait.Add(1)
+	wait.Add(workerCount)
+	for range workerCount {
 		go func() {
 			defer wait.Done()
-			testURL := delayURLForProxy(proxy, url, directURL, proxies)
-			delay, testErr := proxy.URLTest(ctx, testURL, expectedStatus)
-			if testErr == nil && delay > 0 {
-				delayMu.Lock()
-				dm[proxy.Name()] = delay
-				delayMu.Unlock()
+			for {
+				var proxy C.Proxy
+				var ok bool
+				select {
+				case <-ctx.Done():
+					return
+				case proxy, ok = <-jobs:
+					if !ok {
+						return
+					}
+				}
+				delay, testErr := measureProxyDelay(
+					ctx, proxy, proxy.Name(), proxies,
+					url, directURL, timeoutMs, "分组测速")
+				if testErr == nil && delay > 0 {
+					delayMu.Lock()
+					dm[proxy.Name()] = delay
+					delayMu.Unlock()
+				}
 			}
 		}()
 	}
+	producerCanceled := false
+produce:
+	for _, proxy := range members {
+		select {
+		case <-ctx.Done():
+			producerCanceled = true
+			break produce
+		case jobs <- proxy:
+		}
+	}
+	close(jobs)
 	wait.Wait()
 	if len(snellNames) > 0 {
 		timedOut := 0
@@ -2360,19 +2459,38 @@ func GroupDelay(group, url, directURL string, timeoutMs int) string {
 		appendRunLog(fmt.Sprintf("Snell 蜂窝 TCP：分组测速 %s 完成，Snell 节点超时 %d/%d",
 			group, timedOut, len(snellNames)))
 	}
-	out, err := json.Marshal(dm)
-	if err != nil {
-		return `{"error":"marshal: ` + err.Error() + `"}`
+	if producerCanceled && session.ctx.Err() != nil {
+		return marshalProxyDelayMap(dm, true)
 	}
-	return string(out)
+	if ctx.Err() != nil {
+		appendRunLog(fmt.Sprintf("分组测速 %s 达到安全时间上限，未完成节点按超时返回", group))
+		return marshalProxyDelayMap(dm, true)
+	}
+	return marshalProxyDelayMap(dm, false)
+}
+
+func marshalProxyDelayMap(values map[string]uint16, partial bool) string {
+	if !partial {
+		out, err := json.Marshal(values)
+		if err != nil {
+			return `{"error":"marshal: ` + err.Error() + `"}`
+		}
+		return string(out)
+	}
+	result := make(map[string]any, len(values)+1)
+	result["_partial"] = true
+	for name, delay := range values {
+		result[name] = delay
+	}
+	return marshalJSON(result)
 }
 
 // ProxyDelay 对单个代理做延迟测试，供策略页节点卡片的长按菜单使用。
 // DIRECT 链路使用 directURL，其余节点使用 url。返回 {"delay": 毫秒}，超时为 0；
 // 其他失败返回 {"error": ...}。
 func ProxyDelay(name, group, url, directURL string, timeoutMs int) string {
-	configApplyMu.RLock()
-	defer configApplyMu.RUnlock()
+	session := beginProxyDelayBatch()
+	defer finishProxyDelayBatch(session)
 	proxies := tunnel.Proxies()
 	p, exist := resolveDelayProxy(name, group, proxies)
 	if !exist {
@@ -2380,7 +2498,7 @@ func ProxyDelay(name, group, url, directURL string, timeoutMs int) string {
 	}
 	url, directURL, timeoutMs = normalizeProxyDelayOptions(url, directURL, timeoutMs)
 	delay, err := measureProxyDelay(
-		context.Background(), p, name, proxies, url, directURL, timeoutMs, "单节点测速")
+		session.ctx, p, name, proxies, url, directURL, timeoutMs, "单节点测速")
 	if err != nil {
 		if proxyDelayTimedOut(context.Background(), err) {
 			return `{"delay":0}`
@@ -2399,7 +2517,8 @@ func ProxyDelay(name, group, url, directURL string, timeoutMs int) string {
 
 // ProxyDelays tests a bounded list of concrete proxy selections. Every target
 // receives its own timeout after leaving the worker queue, so later waves do
-// not lose their request budget while earlier nodes are running.
+// not lose their request budget while earlier nodes are running. The worker
+// count is reduced on cellular and the complete run has a bounded deadline.
 func ProxyDelays(targetsJSON, url, directURL string, timeoutMs int) string {
 	targets, err := parseProxyDelayTargets(targetsJSON)
 	if err != nil {
@@ -2413,12 +2532,17 @@ func ProxyDelays(targetsJSON, url, directURL string, timeoutMs int) string {
 	}
 	proxies := tunnel.Proxies()
 	url, directURL, timeoutMs = normalizeProxyDelayOptions(url, directURL, timeoutMs)
+	workerCount := proxyDelayWorkerCount()
+	ctx, cancel := proxyDelayRunContext(session.ctx, len(targets), timeoutMs, workerCount)
+	defer cancel()
+	appendRunLog(fmt.Sprintf("批量测速：目标=%d，并发=%d，单节点超时=%dms",
+		len(targets), min(workerCount, len(targets)), timeoutMs))
 	results := make(map[string]uint16, len(targets))
 	for _, target := range targets {
 		results[target.Key] = 0
 	}
 
-	workerCount := min(proxyDelayWorkerLimit, len(targets))
+	workerCount = min(workerCount, len(targets))
 	jobs := make(chan proxyDelayTarget)
 	var resultsMu sync.Mutex
 	var workers sync.WaitGroup
@@ -2430,14 +2554,14 @@ func ProxyDelays(targetsJSON, url, directURL string, timeoutMs int) string {
 				var target proxyDelayTarget
 				var ok bool
 				select {
-				case <-session.ctx.Done():
+				case <-ctx.Done():
 					return
 				case target, ok = <-jobs:
 					if !ok {
 						return
 					}
 				}
-				if session.ctx.Err() != nil {
+				if ctx.Err() != nil {
 					return
 				}
 				proxy, exists := resolveDelayProxy(target.Name, target.Group, proxies)
@@ -2445,12 +2569,12 @@ func ProxyDelays(targetsJSON, url, directURL string, timeoutMs int) string {
 					continue
 				}
 				delay, _ := measureProxyDelay(
-					session.ctx, proxy, target.Name, proxies,
+					ctx, proxy, target.Name, proxies,
 					url, directURL, timeoutMs, "批量测速")
 				if delay == 0 {
 					continue
 				}
-				if session.ctx.Err() != nil {
+				if ctx.Err() != nil {
 					return
 				}
 				resultsMu.Lock()
@@ -2463,7 +2587,7 @@ func ProxyDelays(targetsJSON, url, directURL string, timeoutMs int) string {
 produce:
 	for _, target := range targets {
 		select {
-		case <-session.ctx.Done():
+		case <-ctx.Done():
 			producerCanceled = true
 			break produce
 		case jobs <- target:
@@ -2471,8 +2595,11 @@ produce:
 	}
 	close(jobs)
 	workers.Wait()
-	if producerCanceled || session.ctx.Err() != nil {
+	if session.ctx.Err() != nil {
 		return marshalJSON(map[string]any{"error": "批量测速已取消"})
+	}
+	if producerCanceled || ctx.Err() != nil {
+		return marshalJSON(map[string]any{"results": results, "partial": true})
 	}
 
 	return marshalJSON(map[string]any{"results": results})
@@ -2566,8 +2693,10 @@ func measureProxyDelay(parent context.Context,
 	ctx, cancel := context.WithTimeout(parent, time.Millisecond*time.Duration(timeoutMs))
 	defer cancel()
 	var expectedStatus utils.IntRanges[uint16]
-	delay, err := proxy.URLTest(
-		ctx, delayURLForProxy(proxy, url, directURL, proxies), expectedStatus)
+	delay, err := withProxyDelaySlot(ctx, func() (uint16, error) {
+		return proxy.URLTest(
+			ctx, delayURLForProxy(proxy, url, directURL, proxies), expectedStatus)
+	})
 	if err != nil {
 		timedOut := proxyDelayTimedOut(ctx, err)
 		if snellNode {
