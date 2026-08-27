@@ -3282,8 +3282,14 @@ func parseSystemDNSJSON(raw string) ([]string, error) {
 // materialized, so an explicit DNS address equal to the previous system DNS is
 // never mistaken for an injected entry.
 func prepareActiveSystemDNSLocked(newSystemDNS []string) (*config.DNS, int) {
-	if activeDNSConfig == nil || activeDNSSystemTemplate == nil || !activeUsesSystemDNS {
+	if activeDNSConfig == nil || !activeUsesSystemDNS {
 		activeSystemDNS = append(activeSystemDNS[:0], newSystemDNS...)
+		return nil, 0
+	}
+	// A config that declared system DNS but produced no captured template must
+	// keep its existing resolver. Treating it as a no-system configuration here
+	// would advance the observed address and suppress the later safe retry.
+	if activeDNSSystemTemplate == nil {
 		return nil, 0
 	}
 
