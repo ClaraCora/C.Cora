@@ -7,7 +7,9 @@ import os
 /// Samples bypass the UI log buffers and are persisted as bounded NDJSON files.
 final class MemoryDiagnostics: @unchecked Sendable {
     private static let maxFileBytes: UInt64 = 256 * 1024
-    private static let sampleInterval = DispatchTimeInterval.seconds(1)
+    // 诊断只在用户主动开启开发者模式时运行；5 秒间隔足以看出趋势，
+    // 同时避免采样和磁盘同步本身给 NE 增加持续负担。
+    private static let sampleInterval = DispatchTimeInterval.seconds(5)
     private static let goStatsInterval: TimeInterval = 5
 
     private let queue = DispatchQueue(label: "com.cora.tunnel.memory-diagnostics",

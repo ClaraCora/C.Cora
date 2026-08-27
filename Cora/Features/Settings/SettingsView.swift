@@ -34,6 +34,11 @@ struct SettingsView: View {
                             message: "设置内核运行参数，并查看连接诊断。",
                             destination: KernelSettingsView())
                         SettingsNavigationRow(
+                            title: "开发者模式",
+                            systemImage: "wrench.and.screwdriver",
+                            message: "按需采集和分析 Network Extension 内存快照，普通模式不会持续采样。",
+                            destination: DeveloperDiagnosticsView())
+                        SettingsNavigationRow(
                             title: "规则数据",
                             systemImage: "globe.americas",
                             message: "管理 GEO、GeoSite 和 ASN 规则数据。",

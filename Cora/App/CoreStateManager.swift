@@ -103,6 +103,27 @@ final class CoreStateManager: ObservableObject {
         await tunnel.fetchLogs()
     }
 
+    /// 读取受限的开发者内存诊断，不进入普通日志缓冲。
+    func fetchMemoryDiagnostics() async -> String {
+        await tunnel.fetchMemoryDiagnostics()
+    }
+
+    /// 开发者模式切换后立即同步到正在运行的 NE；下次启动仍会从设置 JSON 恢复。
+    @discardableResult
+    func setMemoryDiagnostics(_ enabled: Bool) async -> Bool {
+        let result = await sendMessage(["cmd": "setMemoryDiagnostics", "enabled": enabled])
+        if case .ok(let data) = result,
+           let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+           (object["ok"] as? Bool) == true {
+            return true
+        }
+        return false
+    }
+
+    func clearMemoryDiagnostics() async -> Result<Void, Error> {
+        await tunnel.clearMemoryDiagnostics()
+    }
+
     /// 取配置「不适用内容」提示（连接后调用）。
     func fetchNotices() async {
         let r = await sendMessage(["cmd": "configNotices"])

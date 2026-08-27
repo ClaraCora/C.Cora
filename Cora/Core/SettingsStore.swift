@@ -56,6 +56,19 @@ final class SettingsStore: ObservableObject {
     }
     /// 日志等级：silent / error / warning / info / debug。
     @Published var logLevel: String { didSet { d.set(logLevel, forKey: K.logLevel) } }
+    /// 开发者内存诊断。默认关闭；开启后才会在 Network Extension 中按 5 秒间隔
+    /// 采集有限的物理内存、Go 堆、连接和 goroutine 快照。
+    @Published var developerMode: Bool {
+        didSet {
+            d.set(developerMode, forKey: K.developerMode)
+            // 系统重连可能没有携带 options；把开关同步到 App Group 的单字节标记，
+            // 让 NE 在没有主 App 参与时也能保持关闭状态。
+            if let stateURL = AppGroup.containerURL?.appendingPathComponent("developer-mode.state") {
+                let value = developerMode ? "1" : "0"
+                try? value.write(to: stateURL, atomically: true, encoding: .utf8)
+            }
+        }
+    }
     /// 指定在蜂窝网络使用普通 TCP 的 Snell 节点。Wi-Fi 下仍保留节点原有 TFO 行为。
     /// 节点名按配置原文精确保存；默认空集合，不迁移旧版自适应开关。
     @Published var snellCellularTCPNodes: Set<String> {
@@ -152,6 +165,7 @@ final class SettingsStore: ObservableObject {
         static let remoteResourcePolicy = "set.remoteResourceUpdatePolicy"
         static let remoteResourceInterval = "set.remoteResourceUpdateInterval"
         static let logLevel = "set.logLevel"
+        static let developerMode = "set.developerMode"
         static let snellCellularTCPNodes = "set.snellCellularTCPNodes"
         static let delayTestURL = "set.delayTestURL"
         static let directDelayTestURL = "set.directDelayTestURL"
@@ -187,6 +201,7 @@ final class SettingsStore: ObservableObject {
             ? 24
             : min(max(remoteInterval, 1), 168)
         logLevel = d.string(forKey: K.logLevel) ?? "info"
+        developerMode = d.object(forKey: K.developerMode) as? Bool ?? false
         snellCellularTCPNodes = Set(d.stringArray(forKey: K.snellCellularTCPNodes) ?? [])
         delayTestURL = d.string(forKey: K.delayTestURL) ?? Self.defaultDelayTestURL
         directDelayTestURL = d.string(forKey: K.directDelayTestURL)
@@ -225,6 +240,7 @@ final class SettingsStore: ObservableObject {
             "remoteResourceUpdatePolicy": remoteResourceUpdatePolicy,
             "remoteResourceUpdateInterval": remoteResourceUpdateInterval,
             "logLevel": logLevel,
+            "developerMode": developerMode,
             "snellCellularTCPNodes": snellCellularTCPNodes.sorted(),
             "unifiedDelay": unifiedDelay,
             "mixedPort": mixedPort,

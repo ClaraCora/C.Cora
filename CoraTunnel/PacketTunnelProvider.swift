@@ -41,7 +41,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private static let ipcMaximumResponseSize = 8 * 1_024 * 1_024
     private static let ipcResponseLifetime: TimeInterval = 30
     private var trollStoreIPCServer: TrollStoreFileIPCServer?
-    private let memoryDiagnostics = MemoryDiagnostics()
+    /// 仅在开发者模式开启时创建，普通 VPN 会话不持有诊断定时器、压力监听或文件句柄。
+    private var memoryDiagnostics: MemoryDiagnostics?
+    private var developerModeEnabled = false
     // Observability is kept outside the packet data path. The recorder writes
     // bounded rows to the App Group SQLite file.
     private let connectionHistoryRecorder = ConnectionHistoryRecorder()
@@ -208,7 +210,15 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             // gomobile 把带 error 返回的 Go 函数生成为「返回 BOOL + NSError** 出参」的 C 函数，
             // 不会自动桥接成 Swift throws，所以用经典 NSError 指针写法：成功返回 true。
             FileLog.write("调用 MihomoStartWithConfig…")
-            self.memoryDiagnostics.start(directoryPath: home)
+            let developerMode = Self.developerModeEnabled(
+                settingsJSON: resolvedSettings,
+                home: home,
+                preferSettings: !settingsJSON.isEmpty)
+            self.runtimeQueue.sync {
+                self.configureMemoryDiagnostics(enabled: developerMode,
+                                                 home: home,
+                                                 persistState: !settingsJSON.isEmpty)
+            }
             var startError: NSError?
             let startResult: Bool? = self.runtimeQueue.sync {
                 guard !self.isStopping else { return nil }
@@ -224,11 +234,16 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                     }
                     self.connectionHistoryRecorder.start()
                     self.startPathMonitor() // 开始把真实出站接口喂给内核
+                    self.memoryDiagnostics?.record(event: "tunnelStarted")
                 }
                 return ok
             }
             guard let startResult else {
-                self.memoryDiagnostics.stop(event: "startCancelled")
+                self.runtimeQueue.sync {
+                    self.memoryDiagnostics?.stop(event: "startCancelled")
+                    self.memoryDiagnostics = nil
+                    self.developerModeEnabled = false
+                }
                 completionHandler(NSError(
                     domain: "CoraTunnel",
                     code: -5,
@@ -236,7 +251,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 return
             }
             guard startResult else {
-                self.memoryDiagnostics.stop(event: "startFailed")
+                self.runtimeQueue.sync {
+                    self.memoryDiagnostics?.stop(event: "startFailed")
+                    self.memoryDiagnostics = nil
+                    self.developerModeEnabled = false
+                }
                 let error = startError ?? NSError(domain: "CoraTunnel", code: -3,
                     userInfo: [NSLocalizedDescriptionKey: "mihomo 启动失败（未知错误）"])
                 FileLog.write("MihomoStartWithConfig 失败：\(error.localizedDescription)")
@@ -312,7 +331,10 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             }
             stopPathMonitor()
             connectionHistoryRecorder.stop()
-            memoryDiagnostics.stop(event: "stop")
+            memoryDiagnostics?.record(event: "tunnelStopping")
+            memoryDiagnostics?.stop(event: "stop")
+            memoryDiagnostics = nil
+            developerModeEnabled = false
             MihomoStop()
             // 断开才清空延迟快照；App 进程退出或进入后台不会触发这里。
             ProxyDelayStore.clear()
@@ -654,22 +676,34 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 reply(Data(MihomoRemoteResourceStatus().utf8))
             }
         case "updateProxyProviders":
+            recordMemoryDiagnostic("providerUpdateStart")
             ipcQueue.async {
-                reply(Data(MihomoUpdateProxyProviders().utf8))
+                let response = MihomoUpdateProxyProviders()
+                self.recordMemoryDiagnostic("providerUpdateEnd")
+                reply(Data(response.utf8))
             }
         case "updateProxyProvider":
             let name = (obj?["name"] as? String) ?? ""
+            recordMemoryDiagnostic("providerUpdateStart")
             ipcQueue.async {
-                reply(Data(MihomoUpdateProxyProvider(name).utf8))
+                let response = MihomoUpdateProxyProvider(name)
+                self.recordMemoryDiagnostic("providerUpdateEnd")
+                reply(Data(response.utf8))
             }
         case "updateRuleProviders":
+            recordMemoryDiagnostic("ruleProviderUpdateStart")
             ipcQueue.async {
-                reply(Data(MihomoUpdateRuleProviders().utf8))
+                let response = MihomoUpdateRuleProviders()
+                self.recordMemoryDiagnostic("ruleProviderUpdateEnd")
+                reply(Data(response.utf8))
             }
         case "updateRuleProvider":
             let name = (obj?["name"] as? String) ?? ""
+            recordMemoryDiagnostic("ruleProviderUpdateStart")
             ipcQueue.async {
-                reply(Data(MihomoUpdateRuleProvider(name).utf8))
+                let response = MihomoUpdateRuleProvider(name)
+                self.recordMemoryDiagnostic("ruleProviderUpdateEnd")
+                reply(Data(response.utf8))
             }
         case "selectProxy":
             let group = (obj?["group"] as? String) ?? ""
@@ -684,8 +718,10 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             let url = (obj?["url"] as? String) ?? ""
             let directURL = (obj?["directURL"] as? String) ?? ""
             let timeout = (obj?["timeout"] as? NSNumber)?.intValue ?? 5000
+            recordMemoryDiagnostic("groupDelayStart")
             ipcQueue.async {
                 let response = MihomoGroupDelay(group, url, directURL, timeout)
+                self.recordMemoryDiagnostic("groupDelayEnd")
                 reply(Self.validatedCoreJSONData(response, command: "groupDelay"))
             }
         case "proxyDelay":
@@ -694,8 +730,10 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             let url = (obj?["url"] as? String) ?? ""
             let directURL = (obj?["directURL"] as? String) ?? ""
             let timeout = (obj?["timeout"] as? NSNumber)?.intValue ?? 5000
+            recordMemoryDiagnostic("proxyDelayStart")
             ipcQueue.async {
                 let response = MihomoProxyDelay(name, group, url, directURL, timeout)
+                self.recordMemoryDiagnostic("proxyDelayEnd")
                 reply(Self.validatedCoreJSONData(response, command: "proxyDelay"))
             }
         case "proxyDelays":
@@ -709,8 +747,10 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             let url = (obj?["url"] as? String) ?? ""
             let directURL = (obj?["directURL"] as? String) ?? ""
             let timeout = (obj?["timeout"] as? NSNumber)?.intValue ?? 5000
+            recordMemoryDiagnostic("proxyDelaysStart")
             ipcQueue.async {
                 let response = MihomoProxyDelays(targetsJSON, url, directURL, timeout)
+                self.recordMemoryDiagnostic("proxyDelaysEnd")
                 reply(Self.validatedCoreJSONData(response, command: "proxyDelays"))
             }
         case "readRuleProvider":
@@ -750,6 +790,29 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             reply(Data(MihomoTrafficNow().utf8))
         case "memory":
             reply(Self.memoryFootprintData())
+        case "setMemoryDiagnostics":
+            let enabled = (obj?["enabled"] as? NSNumber)?.boolValue ?? false
+            let result = setMemoryDiagnosticsEnabled(enabled)
+            reply(Self.jsonData(result.ok
+                ? ["ok": true, "enabled": result.enabled]
+                : ["ok": false, "error": result.error ?? "开发者诊断不可用"]))
+        case "memoryDiagnostics":
+            ipcQueue.async {
+                let enabled = self.runtimeQueue.sync { self.developerModeEnabled }
+                guard enabled else {
+                    reply(Data("开发者模式未开启".utf8))
+                    return
+                }
+                let diagnostics = self.runtimeQueue.sync {
+                    self.collectMemoryDiagnostics()
+                }
+                reply(Self.tailData(diagnostics, maxBytes: 128 * 1024))
+            }
+        case "clearMemoryDiagnostics":
+            let result = clearMemoryDiagnostics()
+            reply(Self.jsonData(result.ok
+                ? ["ok": true]
+                : ["ok": false, "error": result.error ?? "清理诊断失败"]))
         case "proxyDetails":
             reply(Data(MihomoProxyDetails().utf8))
         case "configNotices":
@@ -862,6 +925,118 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             ?? Data(#"{"physFootprint":0}"#.utf8)
     }
 
+    /// 只在设置 JSON 明确开启时启动 NE 诊断。旧缓存或系统重连同样经过这里，
+    /// 因此开发者模式不会因为一次重连意外恢复成常驻采样。
+    private func configureMemoryDiagnostics(enabled: Bool,
+                                            home: String,
+                                            persistState: Bool = false) {
+        if persistState {
+            Self.persistDeveloperMode(enabled, home: home)
+        }
+        memoryDiagnostics?.stop(event: "reconfigure")
+        memoryDiagnostics = nil
+        developerModeEnabled = enabled
+        guard enabled else { return }
+        let diagnostics = MemoryDiagnostics()
+        diagnostics.start(directoryPath: home)
+        memoryDiagnostics = diagnostics
+        FileLog.write("开发者模式：已开启 NE 内存诊断（5 秒采样，文件上限 256KB）")
+    }
+
+    /// 事件标记只进入开发者模式的有界 NDJSON 文件，不进入普通日志/连接历史。
+    private func recordMemoryDiagnostic(_ event: String) {
+        runtimeQueue.async { [weak self] in
+            self?.memoryDiagnostics?.record(event: event)
+        }
+    }
+
+    private func setMemoryDiagnosticsEnabled(_ enabled: Bool)
+        -> (ok: Bool, enabled: Bool, error: String?) {
+        runtimeQueue.sync {
+            guard let home = homeDir else {
+                return (false, developerModeEnabled, "隧道尚未启动")
+            }
+            if enabled == developerModeEnabled,
+               (enabled == false || memoryDiagnostics != nil) {
+                return (true, developerModeEnabled, nil)
+            }
+            configureMemoryDiagnostics(enabled: enabled, home: home, persistState: true)
+            return (true, developerModeEnabled, nil)
+        }
+    }
+
+    private func clearMemoryDiagnostics()
+        -> (ok: Bool, error: String?) {
+        runtimeQueue.sync {
+            guard let home = homeDir else {
+                return (false, "隧道尚未启动")
+            }
+            let shouldRestart = developerModeEnabled
+            memoryDiagnostics?.stop(event: "clear")
+            memoryDiagnostics = nil
+            let directory = URL(fileURLWithPath: home, isDirectory: true)
+            let manager = FileManager.default
+            for name in ["memory-diagnostic.ndjson", "memory-diagnostic.previous.ndjson"] {
+                try? manager.removeItem(at: directory.appendingPathComponent(name))
+            }
+            if shouldRestart {
+                let diagnostics = MemoryDiagnostics()
+                diagnostics.start(directoryPath: home)
+                memoryDiagnostics = diagnostics
+            }
+            FileLog.write("开发者模式：已清理内存诊断文件")
+            return (true, nil)
+        }
+    }
+
+    private func collectMemoryDiagnostics() -> String {
+        guard let home = homeDir else {
+            return "(隧道尚未启动)"
+        }
+        let directory = URL(fileURLWithPath: home, isDirectory: true)
+        let previous = Self.tailTextFile(
+            directory.appendingPathComponent("memory-diagnostic.previous.ndjson").path,
+            maxBytes: 96 * 1024) ?? "(不存在)"
+        let current = Self.tailTextFile(
+            directory.appendingPathComponent("memory-diagnostic.ndjson").path,
+            maxBytes: 96 * 1024) ?? "(不存在)"
+        return "===== memory diagnostic（上一段）=====\n\(previous)\n\n"
+            + "===== memory diagnostic（当前段）=====\n\(current)"
+    }
+
+    private static func developerModeEnabled(settingsJSON: String,
+                                             home: String,
+                                             preferSettings: Bool) -> Bool {
+        if !preferSettings,
+           let persisted = persistedDeveloperMode(home: home) {
+            return persisted
+        }
+        guard let data = settingsJSON.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data),
+              let dict = object as? [String: Any] else { return false }
+        return (dict["developerMode"] as? Bool) ?? false
+    }
+
+    /// 系统重连没有携带 options，使用最近一次 App/IPC 明确设置的轻量标记，
+    /// 避免关闭开发者模式后仍因旧 settings.json 恢复采样。
+    private static func persistedDeveloperMode(home: String) -> Bool? {
+        let path = URL(fileURLWithPath: home, isDirectory: true)
+            .appendingPathComponent("developer-mode.state")
+        guard let value = try? String(contentsOf: path, encoding: .utf8) else { return nil }
+        switch value.trimmingCharacters(in: .whitespacesAndNewlines) {
+        case "1": return true
+        case "0": return false
+        default: return nil
+        }
+    }
+
+    private static func persistDeveloperMode(_ enabled: Bool, home: String) {
+        let path = URL(fileURLWithPath: home, isDirectory: true)
+            .appendingPathComponent("developer-mode.state")
+        let value = enabled ? "1" : "0"
+        try? value.write(to: path, atomically: true, encoding: .utf8)
+    }
+
     /// 取字符串末尾不超过 maxBytes 的 UTF-8 数据（避免 IPC 响应超限被丢成空响应）。
     private static func tailData(_ s: String, maxBytes: Int) -> Data {
         let data = Data(s.utf8)
@@ -871,20 +1046,25 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
     /// 汇总 NE 步骤日志、mihomo 日志和持久化内存诊断。
     private func collectLogs() -> String {
-        var out = "===== ne（NE 启动步骤，内存）=====\n" + FileLog.dump()
+        var out = "===== ne（NE 启动步骤）=====\n" + FileLog.dump()
         if let home = homeDir {
             let runPath = (home as NSString).appendingPathComponent("run.log")
             let run = Self.tailTextFile(runPath, maxBytes: 10 * 1024) ?? "(run.log 不存在)"
             out += "\n\n===== run.log（mihomo 内核）=====\n" + (run.isEmpty ? "(空)" : run)
 
-            let previousPath = (home as NSString)
-                .appendingPathComponent("memory-diagnostic.previous.ndjson")
-            let currentPath = (home as NSString)
-                .appendingPathComponent("memory-diagnostic.ndjson")
-            let previous = Self.tailTextFile(previousPath, maxBytes: 4 * 1024) ?? "(不存在)"
-            let current = Self.tailTextFile(currentPath, maxBytes: 6 * 1024) ?? "(不存在)"
-            out += "\n\n===== memory diagnostic（上一段）=====\n" + previous
-            out += "\n\n===== memory diagnostic（当前段）=====\n" + current
+            // 普通日志请求不读取开发者诊断文件；这样关闭开发者模式后，
+            // 旧诊断数据不会被意外带入日志响应或制造额外内存峰值。
+            let diagnosticsEnabled = runtimeQueue.sync { developerModeEnabled }
+            if diagnosticsEnabled {
+                let previousPath = (home as NSString)
+                    .appendingPathComponent("memory-diagnostic.previous.ndjson")
+                let currentPath = (home as NSString)
+                    .appendingPathComponent("memory-diagnostic.ndjson")
+                let previous = Self.tailTextFile(previousPath, maxBytes: 4 * 1024) ?? "(不存在)"
+                let current = Self.tailTextFile(currentPath, maxBytes: 6 * 1024) ?? "(不存在)"
+                out += "\n\n===== memory diagnostic（上一段）=====\n" + previous
+                out += "\n\n===== memory diagnostic（当前段）=====\n" + current
+            }
         } else {
             out += "\n\n(home 未设置，mihomo 尚未启动)"
         }

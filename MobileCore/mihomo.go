@@ -236,7 +236,7 @@ func ControlInfo() string {
 		"protocolVersion": controlProtocolVersion,
 		"coreVersion":     Version(),
 		"capabilities": []string{
-			"connections", "logs", "proxies", "runtime",
+			"connections", "logs", "proxies", "runtime", "memory-diagnostics",
 		},
 	})
 	if err != nil {
@@ -3044,6 +3044,8 @@ func CloseAllConnections() int {
 // persistent OOM diagnostics. It reads runtime/statistic counters without
 // forcing a garbage collection.
 func RuntimeStats() string {
+	configApplyMu.RLock()
+	defer configApplyMu.RUnlock()
 	var mem runtime.MemStats
 	runtime.ReadMemStats(&mem)
 
@@ -3067,6 +3069,12 @@ func RuntimeStats() string {
 
 	up, down := statistic.DefaultManager.Now()
 	upTotal, downTotal := statistic.DefaultManager.Total()
+	// These counts are deliberately snapshots, not retained diagnostic state.
+	// They help distinguish a Go heap increase caused by loaded providers/groups
+	// from native transport buffers without walking provider contents.
+	proxyProviderCount := len(tunnel.Providers())
+	ruleProviderCount := len(tunnel.RuleProviders())
+	proxyGroupCount := len(tunnel.Proxies())
 	var lastPause uint64
 	if mem.NumGC != 0 {
 		lastPause = mem.PauseNs[(mem.NumGC-1)%uint32(len(mem.PauseNs))]
@@ -3101,6 +3109,9 @@ func RuntimeStats() string {
 		Connections    int     `json:"connections"`
 		TCPConnections int     `json:"tcpConnections"`
 		UDPConnections int     `json:"udpConnections"`
+		ProxyProviders int     `json:"proxyProviders"`
+		RuleProviders  int     `json:"ruleProviders"`
+		ProxyGroups    int     `json:"proxyGroups"`
 		Upload         int64   `json:"up"`
 		Download       int64   `json:"down"`
 		UploadTotal    int64   `json:"upTotal"`
@@ -3134,6 +3145,9 @@ func RuntimeStats() string {
 		Connections:    connections,
 		TCPConnections: tcpConnections,
 		UDPConnections: udpConnections,
+		ProxyProviders: proxyProviderCount,
+		RuleProviders:  ruleProviderCount,
+		ProxyGroups:    proxyGroupCount,
 		Upload:         up,
 		Download:       down,
 		UploadTotal:    upTotal,

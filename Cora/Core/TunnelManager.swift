@@ -509,4 +509,38 @@ final class TunnelManager {
             return "(实时 IPC 不可用，且本次启动未建立共享日志回退：\(reason))"
         }
     }
+
+    /// 取受限的 NE 内存诊断 NDJSON。与完整日志分开，避免日志尾部内容干扰 App 侧解析。
+    func fetchMemoryDiagnostics() async -> String {
+        let payload = (try? JSONSerialization.data(withJSONObject: [
+            "v": 1, "cmd": "memoryDiagnostics"
+        ])) ?? Data(#"{"cmd":"memoryDiagnostics"}"#.utf8)
+        switch await sendMessage(payload, timeout: 15) {
+        case .ok(let data):
+            return String(data: data, encoding: .utf8) ?? "(响应非文本)"
+        case .failure(let reason):
+            return "(内存诊断不可用：\(reason))"
+        }
+    }
+
+    /// 清理 NE 侧诊断文件；普通模式下不会创建这些文件。
+    func clearMemoryDiagnostics() async -> Result<Void, Error> {
+        let payload = (try? JSONSerialization.data(withJSONObject: [
+            "v": 1, "cmd": "clearMemoryDiagnostics"
+        ])) ?? Data(#"{"cmd":"clearMemoryDiagnostics"}"#.utf8)
+        switch await sendMessage(payload, timeout: 15) {
+        case .ok(let data):
+            if let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+               (object["ok"] as? Bool) == true {
+                return .success(())
+            }
+            let message = ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any])?["error"] as? String
+                ?? "清理诊断失败"
+            return .failure(NSError(domain: "Cora.MemoryDiagnostics", code: 1,
+                                    userInfo: [NSLocalizedDescriptionKey: message]))
+        case .failure(let reason):
+            return .failure(NSError(domain: "Cora.MemoryDiagnostics", code: 2,
+                                    userInfo: [NSLocalizedDescriptionKey: reason]))
+        }
+    }
 }
