@@ -442,10 +442,6 @@ private struct MetricWidget: View {
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(tint)
                 Spacer(minLength: 0)
-                Image(systemName: "chevron.right")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.tertiary)
-                    .accessibilityHidden(true)
             }
             Text(value)
                 .font(.title3.monospacedDigit().weight(.semibold))
