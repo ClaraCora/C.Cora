@@ -396,10 +396,10 @@ struct ProxiesView: View {
 
     private var gridGroupList: some View {
         let results = displayedGroups
+        let activeGroupName = gridExpansion?.groupName
         return GeometryReader { viewport in
             let rows = gridRows(results, columnCount: gridColumnCount)
             let upwardExpansionStart = max(0, rows.count - 3)
-            let activeGroupName = gridExpansion?.groupName
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 14) {
