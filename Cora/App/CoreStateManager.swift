@@ -103,6 +103,11 @@ final class CoreStateManager: ObservableObject {
         await tunnel.fetchLogs()
     }
 
+    /// 导出 NE 持久化日志（当前会话 + 上一会话）。
+    func exportNELog() async -> String {
+        await tunnel.exportNELog()
+    }
+
     /// 读取受限的开发者内存诊断，不进入普通日志缓冲。
     func fetchMemoryDiagnostics() async -> String {
         await tunnel.fetchMemoryDiagnostics()

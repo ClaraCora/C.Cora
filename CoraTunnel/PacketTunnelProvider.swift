@@ -114,7 +114,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             tunnelFileDescriptor = nil
         }
         stopTrollStoreIPC()
-        // 每次启动清空 ne.log，避免历史残留干扰排查
+        // 每次启动只清空进程内缓冲；FileLog 会把上一会话的持久化日志轮换为
+        // ne.previous.log，避免 NE 被系统停止后事故现场被新会话覆盖。
         // 隧道建立前先抓物理网络 DNS；隧道起来后系统主解析器会变成隧道自己的 DNS。
         FileLog.reset()
         let startupAttemptID = (options?["startupAttemptID"] as? String) ?? UUID().uuidString
@@ -413,6 +414,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     private func applyInterface(from path: Network.NWPath) {
+        FileLog.write(pathSummary(path))
         guard path.status == .satisfied else {
             if lastPathWasSatisfied != false {
                 FileLog.write("物理网络路径暂时不可用，等待恢复")
@@ -428,6 +430,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             lastPathWasSatisfied = false
             return
         }
+        FileLog.write("物理接口选择 = \(iface.name)（\(Self.interfaceTypeName(iface.type))）")
 
         let previous = lastPhysicalPath
         let isInitialPath = !hasAppliedPhysicalPath
@@ -479,10 +482,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             reasons.append("出站接口变化")
             resetConnections = true
         }
-        if wasUnavailable {
-            reasons.append("网络路径恢复")
-            resetConnections = true
-        }
+        // 路径短暂 unavailable 后恢复并不代表物理出口发生变化。CarPlay 切换
+        // 期间 NWPath 可能短暂抖动；只有接口/地址族真正变化时才清理活动连接，
+        // 避免无谓地关闭所有连接并制造新的 goroutine、socket 和内存峰值。
         if let previous,
            addressFamilyWasReplaced(previous.addresses, snapshot.addresses) {
             reasons.append("接口地址变化")
@@ -623,18 +625,63 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         systemDNSRetryAttempt = 0
     }
 
-    /// `availableInterfaces` 可能同时包含 Wi-Fi、蜂窝和 utun；只选择当前 path 实际使用的
-    /// 物理类型，避免蜂窝切换后仍把新拨号绑定到已不在路径上的 en0。
+    /// `availableInterfaces` 可能同时包含 Wi-Fi、蜂窝和 utun。无线 CarPlay 会
+    /// 建立 Wi-Fi/P2P 链路，但互联网出口仍是蜂窝；当 NWPath 同时报告两者时，
+    /// 蜂窝优先可以避免把 mihomo 出站错误绑定到 CarPlay 的 en0。普通家庭 Wi-Fi
+    /// 路径通常不会把 cellular 标记为 usesInterfaceType，因此仍会选择 en0。
     private func activePhysicalInterface(from path: Network.NWPath) -> NWInterface? {
-        let preferredTypes: [NWInterface.InterfaceType] = [
-            .wifi, .cellular, .wiredEthernet
-        ]
+        let usesWiFi = path.usesInterfaceType(.wifi)
+        let usesCellular = path.usesInterfaceType(.cellular)
+        let preferredTypes: [NWInterface.InterfaceType]
+        if usesWiFi && usesCellular {
+            // 同时存在两条路径时，isExpensive 表示当前出口实际使用蜂窝。
+            // 无线 CarPlay 常见于这一分支；普通家庭 Wi-Fi 通常不会同时 uses
+            // cellular，因此不会误切到蜂窝流量。
+            preferredTypes = path.isExpensive
+                ? [.cellular, .wifi, .wiredEthernet]
+                : [.wifi, .cellular, .wiredEthernet]
+        } else {
+            preferredTypes = [.cellular, .wifi, .wiredEthernet]
+        }
         for type in preferredTypes where path.usesInterfaceType(type) {
             if let interface = path.availableInterfaces.first(where: { $0.type == type }) {
                 return interface
             }
         }
         return nil
+    }
+
+    private func pathSummary(_ path: Network.NWPath) -> String {
+        let used = [
+            path.usesInterfaceType(.wifi) ? "wifi" : nil,
+            path.usesInterfaceType(.cellular) ? "cellular" : nil,
+            path.usesInterfaceType(.wiredEthernet) ? "wired" : nil,
+        ].compactMap { $0 }.joined(separator: ",")
+        let available = path.availableInterfaces.map { interface in
+            "\(interface.name):\(Self.interfaceTypeName(interface.type))"
+        }.joined(separator: ",")
+        let status: String
+        switch path.status {
+        case .satisfied: status = "satisfied"
+        case .unsatisfied: status = "unsatisfied"
+        case .requiresConnection: status = "requiresConnection"
+        @unknown default: status = "unknown"
+        }
+        return "NWPath status=\(status) used=[\(used.isEmpty ? "none" : used)] "
+            + "available=[\(available.isEmpty ? "none" : available)] "
+            + "ipv4=\(path.supportsIPv4) ipv6=\(path.supportsIPv6) "
+            + "expensive=\(path.isExpensive) constrained=\(path.isConstrained)"
+    }
+
+    private static func interfaceTypeName(_ type: NWInterface.InterfaceType) -> String {
+        switch type {
+        case .wifi: return "wifi"
+        case .cellular: return "cellular"
+        case .wiredEthernet: return "wired"
+        case .loopback: return "loopback"
+        case .other: return "other"
+        @unknown default: return "unknown"
+        }
     }
 
     /// 主 App 经系统 IPC 或 TrollStore 文件 IPC 发来的统一控制请求。
@@ -835,6 +882,10 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             // 日志可能很大，IPC 响应有体积上限 → 只回传末尾约 24KB，取最新内容。
             let body = "[cmd=\(cmd)]\n" + collectLogs()
             reply(Self.tailData(body, maxBytes: 24 * 1024))
+        case "exportNELog":
+            // 只导出有界的 NE 专用日志；不包含完整 run.log，避免事故备份本身
+            // 在 NE 内制造不必要的内存峰值。
+            reply(Data(FileLog.export().utf8))
         default:
             reply(Self.jsonData([
                 "ok": false,

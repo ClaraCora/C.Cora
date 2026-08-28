@@ -148,15 +148,10 @@ final class TunnelManager {
     }
 
     private static func resetPersistedNELog() -> Bool {
-        guard let url = AppGroup.containerURL?.appendingPathComponent("ne.log") else {
-            return false
-        }
-        do {
-            try Data().write(to: url, options: .atomic)
-            return true
-        } catch {
-            return false
-        }
+        // 不要在 NE 启动前清空 ne.log。FileLog.reset() 会在扩展进程内
+        // 把旧会话轮换为 ne.previous.log；这里仅报告共享目录是否可用。
+        guard let url = AppGroup.containerURL else { return false }
+        return FileManager.default.isWritableFile(atPath: url.path)
     }
 
     private static func persistedNELog(for attemptID: String) -> String? {
@@ -503,11 +498,52 @@ final class TunnelManager {
                let persisted = Self.persistedNELog(for: attemptID) {
                 return "===== ne（共享文件回退）=====\n\(persisted)\n\n(实时 IPC 不可用：\(reason))"
             }
+            if let persisted = Self.persistedNELogs() {
+                return "===== ne（共享文件回退）=====\n\(persisted)\n\n(实时 IPC 不可用：\(reason))"
+            }
             if persistedNELogAttemptID != nil {
                 return "(未收到 NE 启动日志；扩展可能在初始化阶段退出。实时 IPC：\(reason))"
             }
             return "(实时 IPC 不可用，且本次启动未建立共享日志回退：\(reason))"
         }
+    }
+
+    /// 导出有界的 NE 日志文件（当前会话 + 上一会话），供 App 分享或存档。
+    func exportNELog() async -> String {
+        let payload = (try? JSONSerialization.data(withJSONObject: [
+            "v": 1, "cmd": "exportNELog"
+        ])) ?? Data(#"{"cmd":"exportNELog"}"#.utf8)
+        switch await sendMessage(payload, timeout: 20) {
+        case .ok(let data):
+            return String(data: data, encoding: .utf8) ?? "(NE 日志不是有效文本)"
+        case .failure(let reason):
+            if let persisted = Self.persistedNELogs() {
+                return persisted + "\n\n(实时 IPC 不可用：\(reason))"
+            }
+            return "NE 日志导出失败：\(reason)"
+        }
+    }
+
+    private static func persistedNELogs() -> String? {
+        guard let directory = AppGroup.containerURL else { return nil }
+        let names = ["ne.previous.log", "ne.log"]
+        var sections: [String] = []
+        for name in names {
+            let url = directory.appendingPathComponent(name)
+            guard let handle = try? FileHandle(forReadingFrom: url) else { continue }
+            defer { try? handle.close() }
+            do {
+                let size = try handle.seekToEnd()
+                let offset = size > 512 * 1024 ? size - 512 * 1024 : 0
+                try handle.seek(toOffset: offset)
+                let data = try handle.readToEnd() ?? Data()
+                guard let text = String(data: data, encoding: .utf8), !text.isEmpty else { continue }
+                sections.append("===== \(name) =====\n\(text)")
+            } catch {
+                continue
+            }
+        }
+        return sections.isEmpty ? nil : sections.joined(separator: "\n\n")
     }
 
     /// 取受限的 NE 内存诊断 NDJSON。与完整日志分开，避免日志尾部内容干扰 App 侧解析。

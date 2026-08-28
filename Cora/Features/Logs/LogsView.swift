@@ -10,6 +10,9 @@ struct LogsView: View {
     @State private var pausedAtLineCount = 0
     @State private var isCopyingDiagnostic = false
     @State private var didCopyDiagnostic = false
+    @State private var isExportingLog = false
+    @State private var exportedLogURL: URL?
+    @State private var exportError: String?
 
     var body: some View {
         content
@@ -29,12 +32,35 @@ struct LogsView: View {
                     .disabled(isCopyingDiagnostic)
                     .accessibilityLabel(didCopyDiagnostic ? "诊断已复制" : "复制内存诊断")
 
+                    Button { exportNELog() } label: {
+                        Image(systemName: isExportingLog ? "hourglass" : "square.and.arrow.up")
+                    }
+                    .disabled(isExportingLog)
+                    .accessibilityLabel("导出 NE 日志")
+
                     Button { controller.clear() } label: {
                         Image(systemName: "trash")
                     }
                     .disabled(!controller.hasBufferedLines)
                     .accessibilityLabel("清空日志")
                 }
+            }
+            .sheet(isPresented: Binding(
+                get: { exportedLogURL != nil },
+                set: { if !$0 { exportedLogURL = nil } }
+            )) {
+                if let url = exportedLogURL {
+                    LogShareSheet(url: url)
+                        .presentationDetents([.medium, .large])
+                }
+            }
+            .alert("导出失败", isPresented: Binding(
+                get: { exportError != nil },
+                set: { if !$0 { exportError = nil } }
+            )) {
+                Button("好", role: .cancel) { exportError = nil }
+            } message: {
+                Text(exportError ?? "未知错误")
             }
     }
 
@@ -47,6 +73,29 @@ struct LogsView: View {
             didCopyDiagnostic = true
             try? await Task.sleep(nanoseconds: 2_000_000_000)
             didCopyDiagnostic = false
+        }
+    }
+
+    private func exportNELog() {
+        guard !isExportingLog else { return }
+        isExportingLog = true
+        Task { @MainActor in
+            let text = await core.exportNELog()
+            isExportingLog = false
+            guard !text.hasPrefix("NE 日志导出失败：") else {
+                exportError = text
+                return
+            }
+            let stamp = ISO8601DateFormatter().string(from: Date())
+                .replacingOccurrences(of: ":", with: "-")
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("Cora-ne-log-\(stamp).log")
+            do {
+                try Data(text.utf8).write(to: url, options: .atomic)
+                exportedLogURL = url
+            } catch {
+                exportError = "无法创建日志备份：\(error.localizedDescription)"
+            }
         }
     }
 
@@ -200,6 +249,16 @@ struct LogsView: View {
         pausedAtLineCount = controller.bufferedLineCount
         autoScroll = false
     }
+}
+
+private struct LogShareSheet: UIViewControllerRepresentable {
+    let url: URL
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: [url], applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
 }
 
 /// 紧凑的两层记录行：保持列表滚动成本低，全文在详情页按需显示。

@@ -7,13 +7,16 @@ import Foundation
 /// TrollStore 包经共享目录文件 IPC 调用同一个 handleAppMessage 命令处理器。
 /// 这条通道不需要任何共享容器，只要 NE 在运行即可读取。
 ///
-/// 若 App Group 恰好可用，也会顺带写一份 ne.log 文件（best-effort），但不作为主路径。
+/// 若 App Group 可用，会写入有界的 ne.log，并在新会话开始时轮换为
+/// ne.previous.log。这样 NE 被系统停止后，主 App 仍有机会导出上一会话的现场。
 enum FileLog {
 
     private static let queue = DispatchQueue(label: "com.cora.tunnel.filelog")
     private static let maxBufferedLines = 512
     private static let trimBufferedLinesAt = 640
     private static let maxFileBytes: UInt64 = 512 * 1024
+    private static let currentFileName = "ne.log"
+    private static let previousFileName = "ne.previous.log"
     private static var buffer: [String] = []
     private static var persistedBytes: UInt64 = 0
 
@@ -25,14 +28,12 @@ enum FileLog {
         return f
     }()
 
-    /// 清空（每次 startTunnel 调用）。
+    /// 开始新会话：清空内存缓冲，但保留上一会话的持久化日志。
     static func reset() {
         queue.sync {
             buffer.removeAll()
             persistedBytes = 0
-            if let url = AppGroup.containerURL?.appendingPathComponent("ne.log") {
-                try? Data().write(to: url, options: .atomic)
-            }
+            rotatePersistedLogLocked()
         }
     }
 
@@ -44,11 +45,12 @@ enum FileLog {
             if buffer.count >= trimBufferedLinesAt {
                 buffer.removeFirst(buffer.count - maxBufferedLines)
             }
+
             // best-effort：App Group 可用时也落一份有界文件，便于将来排查。
-            if let url = AppGroup.containerURL?.appendingPathComponent("ne.log") {
+            if let url = AppGroup.containerURL?.appendingPathComponent(currentFileName) {
                 let data = Data((line + "\n").utf8.prefix(64 * 1024))
                 if persistedBytes + UInt64(data.count) > maxFileBytes {
-                    try? Data().write(to: url, options: .atomic)
+                    rotatePersistedLogLocked()
                     persistedBytes = 0
                 }
                 if let handle = try? FileHandle(forWritingTo: url) {
@@ -60,6 +62,80 @@ enum FileLog {
                     persistedBytes = UInt64(data.count)
                 }
             }
+        }
+    }
+
+    /// 导出 NE 专用日志。最多返回当前与上一会话各一份有界文件，
+    /// 不把完整日志长期留在进程内；无 App Group 时退回当前内存缓冲。
+    static func export() -> String {
+        queue.sync {
+            guard let directory = AppGroup.containerURL else {
+                let current = buffer.joined(separator: "\n")
+                return current.isEmpty ? "(App Group 不可用，暂无 NE 持久化日志)" : current
+            }
+
+            let currentURL = directory.appendingPathComponent(currentFileName)
+            let previousURL = directory.appendingPathComponent(previousFileName)
+            let previous = readFileLocked(previousURL, maxBytes: maxFileBytes)
+            let current = readFileLocked(currentURL, maxBytes: maxFileBytes)
+            var sections: [String] = []
+            if let previous, !previous.isEmpty {
+                sections.append("===== ne.previous.log（上一会话）=====\n" + previous)
+            }
+            if let current, !current.isEmpty {
+                sections.append("===== ne.log（当前会话）=====\n" + current)
+            }
+            if sections.isEmpty {
+                let fallback = buffer.joined(separator: "\n")
+                return fallback.isEmpty ? "(暂无 NE 日志)" : fallback
+            }
+            return sections.joined(separator: "\n\n")
+        }
+    }
+
+    /// 在轮换前移动当前文件，不使用 Data(contentsOf:) 将整份文件加载到堆中。
+    private static func rotatePersistedLogLocked() {
+        guard let directory = AppGroup.containerURL else { return }
+        let currentURL = directory.appendingPathComponent(currentFileName)
+        let previousURL = directory.appendingPathComponent(previousFileName)
+        let manager = FileManager.default
+
+        guard manager.fileExists(atPath: currentURL.path) else { return }
+        let size: UInt64
+        if let attributes = try? manager.attributesOfItem(atPath: currentURL.path),
+           let number = attributes[.size] as? NSNumber {
+            size = number.uint64Value
+        } else {
+            size = 0
+        }
+        guard size > 0 else {
+            try? Data().write(to: currentURL, options: .atomic)
+            return
+        }
+
+        do {
+            if manager.fileExists(atPath: previousURL.path) {
+                try manager.removeItem(at: previousURL)
+            }
+            try manager.moveItem(at: currentURL, to: previousURL)
+            try Data().write(to: currentURL, options: .atomic)
+        } catch {
+            // 轮换失败时仍截断当前文件，避免日志持续增长；内存缓冲仍可经 IPC 导出。
+            try? Data().write(to: currentURL, options: .atomic)
+        }
+    }
+
+    private static func readFileLocked(_ url: URL, maxBytes: UInt64) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        do {
+            let size = try handle.seekToEnd()
+            let offset = size > maxBytes ? size - maxBytes : 0
+            try handle.seek(toOffset: offset)
+            let data = try handle.readToEnd() ?? Data()
+            return String(data: data, encoding: .utf8)
+        } catch {
+            return nil
         }
     }
 
