@@ -22,10 +22,10 @@ struct RootView: View {
                 tabs
             }
         }
-        .onChange(of: core.status) { _, _ in
+        .onChange(of: core.status) { _ in
             syncStreams()
         }
-        .onChange(of: scenePhase) { _, phase in
+        .onChange(of: scenePhase) { phase in
             handleScenePhase(phase)
         }
         .onAppear { syncStreams() }

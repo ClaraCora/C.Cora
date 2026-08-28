@@ -1,5 +1,6 @@
 # XcodeGen 工程定义。由 CI 执行 `xcodegen generate` 生成 Cora.xcodeproj（不入库）。
-# 主 App + Network Extension 支持 iOS 17；控制中心扩展单独要求 iOS 18。
+# 标准 App + Network Extension 支持 iOS 17；控制中心扩展单独要求 iOS 18。
+# CoraLegacy / CoraTunnelLegacy 为 iOS 16.4+ 的独立构建，不嵌入 Control Widget。
 name: Cora
 
 configs:
@@ -80,6 +81,54 @@ targets:
       - framework: Vendor/Mihomo.xcframework
         embed: false
 
+  # ──────────────── iOS 16.4+ Legacy App ─────────────────
+  # 与标准版共用业务代码和 Bundle ID，因此二者是替换安装关系，不能并存。
+  # 该 target 不嵌入 iOS 18 Control Widget，供 TrollStore / iOS 16.4 设备使用。
+  CoraLegacy:
+    type: application
+    platform: iOS
+    sources:
+      - path: Cora
+      - path: Shared
+    settings:
+      base:
+        IPHONEOS_DEPLOYMENT_TARGET: "16.4"
+        PRODUCT_NAME: Cora
+        PRODUCT_BUNDLE_IDENTIFIER: com.miclash.app
+        GENERATE_INFOPLIST_FILE: YES
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        INFOPLIST_KEY_CFBundleDisplayName: Cora
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait"
+        CODE_SIGN_ENTITLEMENTS: Cora/Cora.entitlements
+    dependencies:
+      - target: CoraTunnelLegacy
+        embed: true
+      - framework: VendorLegacy/Mihomo.xcframework
+        embed: false
+
+  # Legacy Tunnel 单独编译，以保留标准 CoraTunnel 的 iOS 17 部署目标。
+  CoraTunnelLegacy:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: CoraTunnel
+      - path: Shared
+      - path: Cora/Shared
+    settings:
+      base:
+        IPHONEOS_DEPLOYMENT_TARGET: "16.4"
+        PRODUCT_NAME: CoraTunnel
+        PRODUCT_BUNDLE_IDENTIFIER: com.miclash.app.tunnel
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: CoraTunnel/Info.plist
+        CODE_SIGN_ENTITLEMENTS: CoraTunnel/CoraTunnel.entitlements
+        SWIFT_OBJC_BRIDGING_HEADER: CoraTunnel/CoraTunnel-Bridging-Header.h
+    dependencies:
+      - framework: VendorLegacy/Mihomo.xcframework
+        embed: false
+
   # ──────────────────── 控制中心小组件 ───────────────────
   # iOS 18+ ControlWidget：控制中心里一个「代理开关」磁贴，点击启停 NE 隧道。
   # 只用系统框架（WidgetKit/AppIntents/NetworkExtension，Swift 自动链接），不碰 mihomo。
@@ -97,7 +146,7 @@ targets:
         INFOPLIST_FILE: CoraControl/Info.plist
         CODE_SIGN_ENTITLEMENTS: CoraControl/CoraControl.entitlements
 
-# 显式 scheme，确保 CI 里 `xcodebuild -scheme Cora` 能找到（含嵌入的 NE 扩展）
+# 显式 scheme，标准版保留 Control Widget；Legacy 仅包含主 App 与 Packet Tunnel。
 schemes:
   Cora:
     build:
@@ -107,3 +156,11 @@ schemes:
       config: Debug
     archive:
       config: InternalTestFlight
+  CoraLegacy:
+    build:
+      targets:
+        CoraLegacy: all
+    run:
+      config: Debug
+    archive:
+      config: Release

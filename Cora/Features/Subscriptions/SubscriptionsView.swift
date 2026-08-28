@@ -13,9 +13,9 @@ struct SubscriptionsView: View {
         List {
             Section("配置") {
                 if store.subscriptions.isEmpty {
-                    ContentUnavailableView("还没有配置",
-                        systemImage: "tray",
-                        description: Text("点右上角 + 添加订阅链接，或新建一个本地配置"))
+                    CoraUnavailableState("还没有配置",
+                                         systemImage: "tray",
+                                         description: "点右上角 + 添加订阅链接，或新建一个本地配置")
                         .listRowBackground(Color.clear)
                 }
 
@@ -75,7 +75,7 @@ struct SubscriptionsView: View {
         .navigationTitle("配置与订阅")
         .task { await core.refreshStatus() }
         .toolbar {
-            ToolbarItem(placement: .topBarLeading) {
+            ToolbarItem(placement: .navigationBarLeading) {
                 Button {
                     Task { await store.refreshRemoteSubscriptions() }
                 } label: {
@@ -89,7 +89,7 @@ struct SubscriptionsView: View {
                 .accessibilityLabel("刷新全部远程订阅")
                 .help("刷新全部远程订阅")
             }
-            ToolbarItem(placement: .topBarTrailing) {
+            ToolbarItem(placement: .navigationBarTrailing) {
                 Menu {
                     Button { showAddRemote = true } label: {
                         Label("添加订阅链接", systemImage: "link")
@@ -167,11 +167,11 @@ private struct SubscriptionUserAgentSetting: View {
         }
         .padding(.vertical, 2)
         .onAppear { synchronizePresetSelection() }
-        .onChange(of: userAgent) { _, _ in
+        .onChange(of: userAgent) { _ in
             guard selectedPreset != Self.customPreset else { return }
             synchronizePresetSelection()
         }
-        .onChange(of: selectedPreset) { _, preset in
+        .onChange(of: selectedPreset) { preset in
             guard preset != Self.customPreset else { return }
             userAgent = preset
         }
@@ -326,10 +326,10 @@ private struct AddSubscriptionView: View {
             .navigationTitle("添加订阅")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
+                ToolbarItem(placement: .navigationBarLeading) {
                     Button("取消") { dismiss() }
                 }
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItem(placement: .navigationBarTrailing) {
                     Button("添加") {
                         let n = name, u = url
                         dismiss()

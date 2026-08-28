@@ -46,7 +46,7 @@ struct ProxiesView: View {
             .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItemGroup(placement: .topBarTrailing) {
+                ToolbarItemGroup(placement: .navigationBarTrailing) {
                     HStack(spacing: 4) {
                         if hasHiddenGroups {
                             hiddenGroupsToggle
@@ -88,7 +88,7 @@ struct ProxiesView: View {
             .onAppear {
                 toolbarControlsVisible = true
             }
-            .onChange(of: core.status) { _, status in
+            .onChange(of: core.status) { status in
                 switch status {
                 case .connecting, .disconnected, .invalid:
                     resetDisplayedGroupState()
@@ -103,19 +103,19 @@ struct ProxiesView: View {
                     try? await detectionScripts.refreshManifest()
                 }
             }
-            .onChange(of: controller.catalogRevision) { _, _ in
+            .onChange(of: controller.catalogRevision) { _ in
                 assignMissingGradients()
                 synchronizeDisplayedGroups()
             }
-            .onChange(of: gradientStorage) { _, _ in
+            .onChange(of: gradientStorage) { _ in
                 loadGroupGradients()
             }
-            .onChange(of: isSearchPresented) { _, presented in
+            .onChange(of: isSearchPresented) { presented in
                 if !presented { searchText = "" }
                 toolbarControlsVisible = true
                 activeNodeTestTarget = nil
             }
-            .onChange(of: searchText) { _, value in
+            .onChange(of: searchText) { value in
                 guard !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                       gridExpansion != nil else { return }
                 gridExpansion = nil
@@ -124,7 +124,7 @@ struct ProxiesView: View {
                 activeNodeTestTarget = nil
                 geometryCache.expandedPanelFrames.removeAll()
             }
-            .onChange(of: layoutRawValue) { _, value in
+            .onChange(of: layoutRawValue) { value in
                 // Both layouts share one expansion model. Keep a single valid group
                 // when switching layouts so neither view inherits stale open rows.
                 let retained = visibleGroups.first(where: { expanded.contains($0.name) })?.name
@@ -136,7 +136,7 @@ struct ProxiesView: View {
                 toolbarControlsVisible = true
                 activeNodeTestTarget = nil
             }
-            .onChange(of: showHiddenGroups) { _, _ in
+            .onChange(of: showHiddenGroups) { _ in
                 resetDisplayedGroupState()
             }
             .onDisappear { activeNodeTestTarget = nil }
@@ -179,7 +179,11 @@ struct ProxiesView: View {
     }
 
     private var expansionAnimation: Animation? {
-        reduceMotion ? nil : .snappy(duration: 0.18, extraBounce: 0)
+        guard !reduceMotion else { return nil }
+        if #available(iOS 17.0, *) {
+            return .snappy(duration: 0.18, extraBounce: 0)
+        }
+        return .easeInOut(duration: 0.18)
     }
 
     private var activeExpandedGroupName: String? {
@@ -212,12 +216,12 @@ struct ProxiesView: View {
 
     @ViewBuilder private var emptyGroupView: some View {
         if normalizedSearch.isEmpty {
-            ContentUnavailableView(
+            CoraUnavailableState(
                 "没有\(selectedGroupCategory.title)",
                 systemImage: selectedGroupCategory.systemImage,
-                description: Text(emptyGroupDescription))
+                description: emptyGroupDescription)
         } else {
-            ContentUnavailableView.search(text: searchText)
+            CoraSearchUnavailableState(query: searchText)
         }
     }
 
@@ -233,23 +237,22 @@ struct ProxiesView: View {
 
     @ViewBuilder private var content: some View {
         if let err = controller.error, controller.groups.isEmpty {
-            ContentUnavailableView {
-                Label("拿不到节点", systemImage: "exclamationmark.triangle")
-            } description: {
-                Text(err)
-            } actions: {
-                Button("重试") { Task { await reload() } }
+            CoraUnavailableState("拿不到节点",
+                                 systemImage: "exclamationmark.triangle",
+                                 description: err,
+                                 actionTitle: "重试") {
+                Task { await reload() }
             }
         } else if controller.mode == "direct" && controller.isRuntimeAvailable {
-            ContentUnavailableView("直连模式",
-                systemImage: "arrow.up.forward",
-                description: Text("当前为直连模式，不经过代理节点"))
+            CoraUnavailableState("直连模式",
+                                 systemImage: "arrow.up.forward",
+                                 description: "当前为直连模式，不经过代理节点")
         } else if controller.groups.isEmpty && (!controller.hasLoaded || controller.isLoading) {
             ProgressView("加载\(selectedGroupCategory.title)…")
         } else if controller.groups.isEmpty {
-            ContentUnavailableView("没有\(selectedGroupCategory.title)",
-                systemImage: selectedGroupCategory.systemImage,
-                description: Text("当前配置没有可显示的\(selectedGroupCategory.title)"))
+            CoraUnavailableState("没有\(selectedGroupCategory.title)",
+                                 systemImage: selectedGroupCategory.systemImage,
+                                 description: "当前配置没有可显示的\(selectedGroupCategory.title)")
         } else {
             groupList
         }

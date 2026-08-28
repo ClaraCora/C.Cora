@@ -271,7 +271,7 @@ private struct StringListEditorView: View {
         .navigationTitle(title)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
+            ToolbarItem(placement: .navigationBarTrailing) {
                 Button {
                     values.append("")
                 } label: {
@@ -307,7 +307,7 @@ private struct HostOverridesView: View {
         .navigationTitle("Hosts")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
+            ToolbarItem(placement: .navigationBarTrailing) {
                 Button {
                     overrides.hosts.append(HostOverride())
                 } label: {

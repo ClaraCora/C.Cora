@@ -43,10 +43,10 @@ struct LocalConfigEditorView: View {
             .navigationTitle(editing == nil ? "新建本地配置" : "编辑配置")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
+                ToolbarItem(placement: .navigationBarLeading) {
                     Button("取消") { dismiss() }
                 }
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItem(placement: .navigationBarTrailing) {
                     Button("保存") {
                         let n = name, y = yaml
                         if let editing {

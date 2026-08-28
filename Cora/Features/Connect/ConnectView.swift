@@ -129,7 +129,7 @@ private struct ConnectionHero: View {
                 Text(RuntimeMetricsGrid.duration(kernel.uptime))
                     .font(.system(size: 34, weight: .light, design: .rounded).monospacedDigit())
                     .foregroundStyle(.primary)
-                    .contentTransition(.numericText())
+                    .coraNumericTextTransition()
                     .accessibilityLabel("运行时间 \(RuntimeMetricsGrid.duration(kernel.uptime))")
             }
 
@@ -198,8 +198,8 @@ private struct ConnectionHero: View {
         .frame(maxWidth: .infinity)
         .padding(.vertical, 10)
         .onAppear { updateRipple() }
-        .onChange(of: core.status) { _, _ in updateRipple() }
-        .onChange(of: reduceMotion) { _, _ in updateRipple() }
+        .onChange(of: core.status) { _ in updateRipple() }
+        .onChange(of: reduceMotion) { _ in updateRipple() }
     }
 
     private var rippleRings: some View {

@@ -12,7 +12,8 @@ The patch enables only the AES and PMULL flags for `ios && arm64`. The original
 
 ## Safety checks
 
-- The workflow is pinned to Go 1.25.4 and iOS 17.0.
+- The workflow is pinned to Go 1.25.4. It builds the standard framework with
+  an iOS 17.0 floor and `CoraLegacy` with an iOS 16.4 floor.
 - The unmodified and patched Go source files are verified by SHA-256.
 - CI verifies that the iOS-specific initializer is selected and compiles the
   standard-library AES packages before running `gomobile bind`.
@@ -20,9 +21,12 @@ The patch enables only the AES and PMULL flags for `ios && arm64`. The original
   XCFramework.
 
 ARM crypto extensions cannot be probed by this Go version on iOS. The patch
-therefore relies on the project's iOS 17 iPhone hardware floor (A12 or newer). Before a
-release, test the oldest supported device for `EXC_BAD_INSTRUCTION` and compare
-SS2022 throughput and memory with 1, 4, and 8 concurrent streams.
+therefore relies on an A12-or-newer device floor. `CoraLegacy` lowers the OS
+floor, not the CPU floor: do not distribute its accelerated build to A11 or
+older devices without first adding runtime CPU feature detection or a generic
+crypto variant. Before a release, test the oldest supported device for
+`EXC_BAD_INSTRUCTION` and compare SS2022 throughput and memory with 1, 4, and
+8 concurrent streams.
 
 ## A/B test and rollback
 

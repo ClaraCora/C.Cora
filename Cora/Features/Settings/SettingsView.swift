@@ -132,7 +132,7 @@ struct RemoteResourcesView: View {
         .navigationTitle("远程资源")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
+            ToolbarItem(placement: .navigationBarTrailing) {
                 Button {
                     showUpdateSettings = true
                 } label: {
@@ -143,7 +143,7 @@ struct RemoteResourcesView: View {
             }
         }
         .task { await refreshRuntimeResourceUpdateTimes() }
-        .onChange(of: scenePhase) { _, phase in
+        .onChange(of: scenePhase) { phase in
             guard phase == .active else { return }
             Task { await refreshRuntimeResourceUpdateTimes() }
         }
@@ -458,7 +458,7 @@ private struct RemoteResourceContentView: View {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("完成") { dismiss() }
                 }
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItem(placement: .navigationBarTrailing) {
                     Button {
                         UIPasteboard.general.string = content.content
                     } label: {

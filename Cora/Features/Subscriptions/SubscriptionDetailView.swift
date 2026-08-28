@@ -33,7 +33,7 @@ struct SubscriptionDetailView: View {
                 .scrollContentBackground(.hidden)
                 .background(AppAmbientBackground())
             } else {
-                ContentUnavailableView("配置不存在", systemImage: "doc.questionmark")
+                CoraUnavailableState("配置不存在", systemImage: "doc.questionmark")
             }
         }
         .navigationTitle(sub?.name ?? "详情")
@@ -370,10 +370,10 @@ struct EditSubscriptionView: View {
             .navigationTitle("编辑订阅")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
+                ToolbarItem(placement: .navigationBarLeading) {
                     Button("取消") { dismiss() }
                 }
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItem(placement: .navigationBarTrailing) {
                     Button("保存") {
                         let n = name, u = url
                         dismiss()

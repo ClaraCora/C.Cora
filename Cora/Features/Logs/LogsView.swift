@@ -22,10 +22,10 @@ struct LogsView: View {
                         placement: .navigationBarDrawer(displayMode: .always),
                         prompt: "搜索日志")
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
+                ToolbarItem(placement: .navigationBarLeading) {
                     levelMenu
                 }
-                ToolbarItemGroup(placement: .topBarTrailing) {
+                ToolbarItemGroup(placement: .navigationBarTrailing) {
                     Button { copyDiagnostic() } label: {
                         Image(systemName: didCopyDiagnostic ? "checkmark" : "doc.on.doc")
                     }
@@ -113,19 +113,18 @@ struct LogsView: View {
                     previousSessionHeader
                 }
                 if controller.searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    ContentUnavailableView("当前级别无日志",
-                                           systemImage: "line.3.horizontal.decrease.circle")
+                    CoraUnavailableState("当前级别无日志",
+                                         systemImage: "line.3.horizontal.decrease.circle")
                 } else {
-                    ContentUnavailableView.search(text: controller.searchText)
+                    CoraSearchUnavailableState(query: controller.searchText)
                 }
             }
         } else if core.isActive && controller.error == nil {
             ProgressView("等待内核日志…")
         } else if let error = controller.error {
-            ContentUnavailableView("暂无日志", systemImage: "doc.text",
-                                   description: Text(error))
+            CoraUnavailableState("暂无日志", systemImage: "doc.text", description: error)
         } else {
-            ContentUnavailableView("暂无日志", systemImage: "doc.text.magnifyingglass")
+            CoraUnavailableState("暂无日志", systemImage: "doc.text.magnifyingglass")
         }
     }
 
@@ -179,7 +178,7 @@ struct LogsView: View {
                     scrollControl(proxy)
                 }
             )
-            .onChange(of: controller.lines.last?.id) { _, id in
+            .onChange(of: controller.lines.last?.id) { id in
                 guard autoScroll, let id else { return }
                 proxy.scrollTo(id, anchor: .bottom)
             }
@@ -340,7 +339,7 @@ private struct LogDetailView: View {
         .navigationTitle("日志详情")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
+            ToolbarItem(placement: .navigationBarTrailing) {
                 Button {
                     UIPasteboard.general.string = line.payload
                 } label: {

@@ -6,7 +6,9 @@
 - 开发机为 Windows，无本地 Mac；全程靠 GitHub Actions（macos-26 / Xcode 26）构建。
 - CI 只产出**未签名 ipa**；签名由用户用自有开发者证书自理，工程内不放证书/描述文件/Secrets。
 - 工程用 XcodeGen（`project.yml` 生成 `.xcodeproj`，不入库）。
-- 主 App 与 Packet Tunnel 部署目标 **iOS 17.0**；Control Widget 扩展保持 iOS 18.0。
+- 标准主 App 与 Packet Tunnel 部署目标 **iOS 17.0**；Control Widget 扩展保持 iOS 18.0。
+- `CoraLegacy` / `CoraTunnelLegacy` 独立部署目标为 **iOS 16.4**，不嵌入 Control Widget；
+  两个构建共享 Bundle ID 和业务代码，为替换安装关系。
 
 ## 标识
 | 项 | 值 |
@@ -16,10 +18,14 @@
 | App Group | `group.com.miclash.app` |
 
 ## 当前架构
-三个产物：
+标准版的三个产物：
 - **Cora**：主 App，SwiftUI + MVVM，UI 与控制面。
 - **CoraTunnel**：`NEPacketTunnelProvider` 扩展，接管系统流量，宿主 mihomo 核心。
 - **MihomoCore.xcframework**：mihomo 经 `gomobile bind` 薄封装编出，被 NE 链接。
+
+Legacy 使用独立的 `VendorLegacy/Mihomo.xcframework`，以 iOS 16.4 SDK 下限构建，避免
+改变标准版框架的 iOS 17 下限。两套框架都采用 A12+ 的 ARM64 AES-GCM 加速；Legacy 的
+支持设备应为 A12 或更新机型。
 
 进程间数据流：
 - 隧道启停走 `NETunnelProviderManager`；配置、状态、节点/分组、测延迟、流量、日志和连接管理统一使用带协议版本与超时的命令协议，普通签名走 `sendProviderMessage`，TrollStore 包走共享目录文件 IPC。

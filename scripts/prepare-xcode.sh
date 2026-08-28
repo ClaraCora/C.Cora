@@ -4,7 +4,8 @@ set -euo pipefail
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 readonly MOBILE_ROOT="$REPO_ROOT/MobileCore"
-readonly FRAMEWORK="$REPO_ROOT/Vendor/Mihomo.xcframework"
+readonly STANDARD_FRAMEWORK="$REPO_ROOT/Vendor/Mihomo.xcframework"
+readonly LEGACY_FRAMEWORK="$REPO_ROOT/VendorLegacy/Mihomo.xcframework"
 readonly MOBILE_VERSION="v0.0.0-20260611195102-4dd8f1dbf5d2"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
@@ -30,7 +31,7 @@ for command_name in xcodebuild xcodegen; do
 done
 
 build_core=false
-if [[ ! -d "$FRAMEWORK" || "$rebuild_core" == "true" ]]; then
+if [[ ! -d "$STANDARD_FRAMEWORK" || ! -d "$LEGACY_FRAMEWORK" || "$rebuild_core" == "true" ]]; then
   build_core=true
 fi
 
@@ -82,8 +83,9 @@ if [[ "$build_core" == "true" ]]; then
   export PATCHED_SING PATCHED_MIHOMO PATCHED_GVISOR PATCHED_SING_TUN PATCHED_SS2
 
   bash scripts/build-ios-xcframework.sh
+  bash scripts/build-ios-xcframework.sh --legacy
 else
-  echo "Reusing $FRAMEWORK"
+  echo "Reusing $STANDARD_FRAMEWORK and $LEGACY_FRAMEWORK"
   echo "Use --rebuild-core after MobileCore or dependency changes."
 fi
 
@@ -92,4 +94,4 @@ xcodegen generate
 
 echo
 echo "Xcode project is ready: $REPO_ROOT/Cora.xcodeproj"
-echo "Open it and select the same development team for Cora, CoraTunnel, and CoraControl."
+echo "Open it and select the same development team for Cora, CoraTunnel, CoraControl, CoraLegacy, and CoraTunnelLegacy."

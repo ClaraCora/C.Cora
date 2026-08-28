@@ -7,16 +7,15 @@ struct ConnectionsView: View {
     var body: some View {
         Group {
             if !core.isActive {
-                ContentUnavailableView("VPN 未连接", systemImage: "bolt.horizontal.circle")
+                CoraUnavailableState("VPN 未连接", systemImage: "bolt.horizontal.circle")
             } else if controller.isLoading && controller.snapshot == nil {
                 ProgressView("读取连接记录...")
             } else if let error = controller.error, controller.snapshot == nil {
-                ContentUnavailableView {
-                    Label("无法读取连接", systemImage: "exclamationmark.triangle")
-                } description: {
-                    Text(error)
-                } actions: {
-                    Button("重试") { Task { await controller.refresh() } }
+                CoraUnavailableState("无法读取连接",
+                                     systemImage: "exclamationmark.triangle",
+                                     description: error,
+                                     actionTitle: "重试") {
+                    Task { await controller.refresh() }
                 }
             } else {
                 ConnectionOverview(controller: controller,
@@ -198,7 +197,7 @@ private struct HostTrafficCard: View {
     var body: some View {
         VStack(spacing: 0) {
             if totals.isEmpty {
-                ContentUnavailableView("暂无连接记录", systemImage: "network.slash")
+                CoraUnavailableState("暂无连接记录", systemImage: "network.slash")
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 18)
             } else {
@@ -335,7 +334,7 @@ private struct HostTrafficDetailView: View {
                 if entries.isEmpty && isLoadingHistory {
                     ProgressView("读取连接记录...")
                 } else if entries.isEmpty {
-                    ContentUnavailableView("暂无连接记录", systemImage: "network.slash")
+                    CoraUnavailableState("暂无连接记录", systemImage: "network.slash")
                 } else {
                     ForEach(entries) { entry in
                         ConnectionRecordRow(entry: entry, controller: controller)
@@ -444,8 +443,8 @@ struct ConnectionListView: View {
                 ProgressView("读取连接记录...")
                     .listRowBackground(Color.clear)
             } else if filteredEntries.isEmpty {
-                ContentUnavailableView(query.isEmpty ? "没有匹配的连接" : "没有搜索结果",
-                                       systemImage: "line.3.horizontal.decrease.circle")
+                CoraUnavailableState(query.isEmpty ? "没有匹配的连接" : "没有搜索结果",
+                                     systemImage: "line.3.horizontal.decrease.circle")
                     .listRowBackground(Color.clear)
             } else {
                 ForEach(filteredEntries) { entry in
@@ -474,7 +473,7 @@ struct ConnectionListView: View {
         .navigationBarTitleDisplayMode(.inline)
         .searchable(text: $query, prompt: "搜索主机、策略、节点或地址")
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
+            ToolbarItem(placement: .navigationBarTrailing) {
                 Menu {
                     Picker("排序", selection: $sortOrder) {
                         ForEach(ConnectionSortOrder.allCases) { order in

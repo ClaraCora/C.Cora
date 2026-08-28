@@ -11,7 +11,7 @@
 工程用 [XcodeGen](https://github.com/yonsm/XcodeGen) 管理，`.xcodeproj` 不入库。开发机为 Windows，靠 GitHub Actions（macos-26 / Xcode 26）构建未签名 ipa。
 
 - 推送到 `main` 或手动触发 `Build unsigned IPA` 工作流。
-- 产物 `Cora-unsigned-ipa` 在 Actions artifact 中下载。
+- Actions 同时产出标准版与 `CoraLegacy`（iOS 16.4+）的普通 IPA、TrollStore IPA。
 - 用自有 Apple 开发者证书自行签名后安装（工程内不含任何证书/描述文件/Secrets）。
 
 本地有 Mac 时，先准备 mihomo 框架并生成工程：
@@ -23,12 +23,14 @@ open Cora.xcodeproj
 ```
 
 首次构建前，在 Xcode 的 `Signing & Capabilities` 中为 `Cora`、
-`CoraTunnel`、`CoraControl` 三个 target 选择同一个开发者团队。
+`CoraTunnel`、`CoraControl` 三个标准 target 选择同一个开发者团队。若构建
+Legacy，则为 `CoraLegacy`、`CoraTunnelLegacy` 选择同一团队。
 工程使用自动签名，不需要手动创建或下载 provisioning profile；App Group
 `group.com.miclash.app` 和三个 Bundle ID 仍需属于该团队。
 
 `prepare-xcode.sh` 要求 macOS、Xcode 和 XcodeGen。首次构建内核时还需要 Go 1.25.4，
-脚本会下载 Go 依赖并生成 `Vendor/Mihomo.xcframework`；后续直接复用。MobileCore 或依赖变化后运行：
+脚本会下载 Go 依赖，并生成标准版 `Vendor/Mihomo.xcframework` 与 Legacy
+`VendorLegacy/Mihomo.xcframework`；后续直接复用。MobileCore 或依赖变化后运行：
 
 ```bash
 bash scripts/prepare-xcode.sh --rebuild-core
@@ -45,6 +47,23 @@ bash scripts/prepare-xcode.sh --rebuild-core
 
 内部 TestFlight 构建只能分配给 App Store Connect 团队内的测试人员，不能转为外部测试
 或正式发布。若之后需要外部 TestFlight，应重新上传未标记为 Internal Only 的构建。
+
+## iOS 16.4 Legacy
+
+`CoraLegacy` 是面向 iOS 16.4+ 的独立 Scheme，和标准版共用配置、VPN 描述文件、
+Bundle ID 与核心代码，二者为替换安装关系，不能同时安装。Legacy 不包含 iOS 18 的
+控制中心磁贴；VPN 启停、订阅、策略、测速、记录、日志、外部检测脚本和 Connect On
+Demand 自动连接均保留。
+
+GitHub Actions 产物名称如下：
+
+- `Cora-unsigned-ipa`：标准普通 IPA，主 App / Tunnel 最低 iOS 17。
+- `Cora-trollstore-ipa`：标准 TrollStore IPA，不含 iOS 18 控制中心磁贴。
+- `CoraLegacy-unsigned-ipa`：iOS 16.4+ 普通 IPA。
+- `CoraLegacy-trollstore-ipa`：iOS 16.4+ TrollStore IPA。
+
+Legacy 的 mihomo 框架仍使用 ARM64 AES-GCM 加速，要求 A12 或更新芯片；iPhone SE
+第三代的 A15 满足此前提。A11 及更早设备不在该加速构建的支持范围内。
 
 ## 标识
 
