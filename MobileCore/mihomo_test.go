@@ -858,6 +858,39 @@ func TestControlInfoAdvertisesVersionedIPC(t *testing.T) {
 	}
 }
 
+func TestScriptTargetAddressAndDirectNetworkInfoParsing(t *testing.T) {
+	for _, test := range []struct {
+		address  string
+		wantHost string
+		wantPort string
+	}{
+		{address: "203.0.113.7:443", wantHost: "203.0.113.7", wantPort: "443"},
+		{address: "node.example.com:8443", wantHost: "node.example.com", wantPort: "8443"},
+		{address: "[2001:db8::1]:443", wantHost: "2001:db8::1", wantPort: "443"},
+		{address: "node.example.com", wantHost: "node.example.com", wantPort: ""},
+	} {
+		host, port := splitScriptTargetAddress(test.address)
+		if host != test.wantHost || port != test.wantPort {
+			t.Errorf("splitScriptTargetAddress(%q) = (%q, %q), want (%q, %q)",
+				test.address, host, port, test.wantHost, test.wantPort)
+		}
+	}
+
+	fromIPIP, ok := parseDirectNetworkInfo([]byte("当前 IP：203.0.113.7  来自于：测试网络"))
+	if !ok || fromIPIP["ip"] != "203.0.113.7" || fromIPIP["location"] != "测试网络" {
+		t.Fatalf("ipip response parse = %#v, ok=%v", fromIPIP, ok)
+	}
+	fromJSON, ok := parseDirectNetworkInfo([]byte(`{
+		"ip":"203.0.113.8", "country":"Testland", "region":"Example", "city":"Metro",
+		"asn":"AS64500", "organization":"Example Network"
+	}`))
+	if !ok || fromJSON["ip"] != "203.0.113.8" ||
+		fromJSON["location"] != "Testland / Example / Metro" ||
+		fromJSON["asn"] != "AS64500" {
+		t.Fatalf("JSON response parse = %#v, ok=%v", fromJSON, ok)
+	}
+}
+
 func TestConnectionsIPCEmptySnapshotAndMissingClose(t *testing.T) {
 	var snapshot struct {
 		Connections []json.RawMessage `json:"connections"`

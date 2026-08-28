@@ -29,6 +29,43 @@ enum ExternalScriptLimits {
     static let maxExecutionSeconds: TimeInterval = 45
 }
 
+/// Values supplied by the NE for the one network-info script. They are
+/// ephemeral test data, never written to the script cache or app storage.
+private struct ScriptRuntimeContext: Sendable {
+    let nodeInfo: [String: String]
+    let directNetworkInfo: [String: String]
+
+    static let empty = Self(nodeInfo: [:], directNetworkInfo: [:])
+
+    @MainActor
+    static func load(nodeName: String, groupName: String) async -> Self {
+        let targetResult = await CoreStateManager.shared.sendMessage([
+            "cmd": "scriptTargetInfo", "name": nodeName, "group": groupName,
+        ])
+        let directResult = await CoreStateManager.shared.sendMessage(["cmd": "directNetworkInfo"])
+        return Self(nodeInfo: decodedInfo(from: targetResult),
+                    directNetworkInfo: decodedInfo(from: directResult))
+    }
+
+    @MainActor
+    private static func decodedInfo(from result: TunnelManager.IPCResult) -> [String: String] {
+        guard case .ok(let data) = result,
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              (object["ok"] as? Bool) == true else {
+            return [:]
+        }
+        var values: [String: String] = [:]
+        for (key, value) in object {
+            if let text = value as? String, !text.isEmpty {
+                values[key] = text
+            } else if let number = value as? NSNumber {
+                values[key] = number.stringValue
+            }
+        }
+        return values
+    }
+}
+
 /// Downloads and caches only the signed script selected by the Cora manifest.
 /// The app never bundles the detection logic itself.
 @MainActor
@@ -394,11 +431,18 @@ final class UnlockTestController: ObservableObject {
             guard let source = store.scriptSource(for: script.id) else {
                 throw ExternalScriptStore.ScriptLoadError.invalidManifest
             }
+            let runtimeContext: ScriptRuntimeContext
+            if script.id == "network-entry-exit" {
+                runtimeContext = await ScriptRuntimeContext.load(nodeName: nodeName, groupName: groupName)
+            } else {
+                runtimeContext = .empty
+            }
             let output = try await ScriptExecution(
                 source: source.script,
                 metadata: source.metadata,
                 nodeName: nodeName,
-                groupName: groupName).start()
+                groupName: groupName,
+                runtimeContext: runtimeContext).start()
             result = output
         } catch {
             self.error = error.localizedDescription
@@ -412,15 +456,21 @@ private final class ScriptExecution: @unchecked Sendable {
     private let metadata: ExternalDetectionScript
     private let nodeName: String
     private let groupName: String
+    private let runtimeContext: ScriptRuntimeContext
     private var context: JSContext?
     private var completed = false
     private var requestCount = 0
 
-    init(source: String, metadata: ExternalDetectionScript, nodeName: String, groupName: String) {
+    init(source: String,
+         metadata: ExternalDetectionScript,
+         nodeName: String,
+         groupName: String,
+         runtimeContext: ScriptRuntimeContext) {
         self.source = source
         self.metadata = metadata
         self.nodeName = nodeName
         self.groupName = groupName
+        self.runtimeContext = runtimeContext
     }
 
     func start() async throws -> UnlockTestResult {
@@ -449,7 +499,14 @@ private final class ScriptExecution: @unchecked Sendable {
             }
             fail(exception?.toString() ?? "脚本运行异常")
         }
-        js.setObject(["params": ["node": nodeName]], forKeyedSubscript: "$environment" as NSString)
+        var params: [String: Any] = ["node": nodeName]
+        if !runtimeContext.nodeInfo.isEmpty {
+            params["nodeInfo"] = runtimeContext.nodeInfo
+        }
+        if !runtimeContext.directNetworkInfo.isEmpty {
+            params["directNetworkInfo"] = runtimeContext.directNetworkInfo
+        }
+        js.setObject(["params": params], forKeyedSubscript: "$environment" as NSString)
         let console = JSValue(newObjectIn: js)
         let log: @convention(block) (JSValue) -> Void = { _ in }
         console?.setObject(log, forKeyedSubscript: "log" as NSString)

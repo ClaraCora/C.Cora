@@ -378,6 +378,12 @@ final class CoreStateManager: ObservableObject {
             // Leave a small IPC margin around the mihomo request itself. The
             // script runner caps the nested request at 15 seconds.
             timeout = min(20, max(10, milliseconds / 1_000 + 3))
+        case "scriptTargetInfo":
+            // Endpoint DNS is bounded to five seconds in the NE.
+            timeout = 10
+        case "directNetworkInfo":
+            // The NE tries a small fixed fallback list within ten seconds.
+            timeout = 14
         case "updateProxyProviders", "updateProxyProvider",
              "updateRuleProviders", "updateRuleProvider":
             timeout = 120

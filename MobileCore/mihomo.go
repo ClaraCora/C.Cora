@@ -316,6 +316,7 @@ func ControlInfo() string {
 		"coreVersion":     Version(),
 		"capabilities": []string{
 			"connections", "logs", "proxies", "runtime", "memory-diagnostics",
+			"script-network-info",
 		},
 	})
 	if err != nil {
@@ -2903,6 +2904,232 @@ func ScriptFetch(requestJSON string) string {
 		"body":      string(data),
 		"truncated": truncated,
 	})
+}
+
+// ScriptTargetInfo returns the actual final proxy endpoint selected for a
+// script run. It deliberately exposes only the configured server address and
+// one short-lived IP resolution; scripts never receive credentials or full
+// proxy configuration.
+func ScriptTargetInfo(name, group string) string {
+	configApplyMu.RLock()
+	proxy, err := resolveScriptProxy(name, group, tunnel.Proxies())
+	configApplyMu.RUnlock()
+	if err != nil {
+		return marshalJSON(map[string]any{"ok": false, "error": err.Error()})
+	}
+	if proxy.Type() == C.Direct || proxy.Type() == C.Reject || proxy.Type() == C.RejectDrop {
+		return marshalJSON(map[string]any{"ok": false, "error": "目标不是可查询入口的代理节点"})
+	}
+
+	address := strings.TrimSpace(proxy.Addr())
+	host, port := splitScriptTargetAddress(address)
+	result := map[string]any{
+		"ok":      true,
+		"node":    proxy.Name(),
+		"address": address,
+		"host":    host,
+		"port":    port,
+	}
+	if host == "" {
+		return marshalJSON(result)
+	}
+
+	if ip, err := netip.ParseAddr(host); err == nil {
+		result["ip"] = ip.Unmap().String()
+		return marshalJSON(result)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if ip, err := resolver.ResolveIP(ctx, host); err == nil {
+		result["ip"] = ip.String()
+	} else {
+		// A hostname is still useful to show when its temporary DNS lookup fails.
+		result["resolutionError"] = "节点入口域名暂时无法解析"
+	}
+	return marshalJSON(result)
+}
+
+func splitScriptTargetAddress(address string) (host, port string) {
+	address = strings.TrimSpace(address)
+	if address == "" {
+		return "", ""
+	}
+	if parsedHost, parsedPort, err := net.SplitHostPort(address); err == nil {
+		return parsedHost, parsedPort
+	}
+	return address, ""
+}
+
+// DirectNetworkInfo obtains the device's public IPv4 through the built-in
+// DIRECT adapter. The endpoints are fixed in the core so a signed external
+// script cannot issue arbitrary direct requests that bypass the selected node.
+func DirectNetworkInfo() string {
+	configApplyMu.RLock()
+	direct, exists := tunnel.Proxies()["DIRECT"]
+	configApplyMu.RUnlock()
+	if !exists || direct.Type() != C.Direct {
+		return marshalJSON(map[string]any{"ok": false, "error": "DIRECT 出站不可用"})
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	providers := []struct {
+		url  string
+		name string
+	}{
+		{url: "https://myip.ipip.net", name: "ipip.net"},
+		{url: "https://api.ip.sb/geoip", name: "ip.sb"},
+		{url: "https://ipwho.is/", name: "ipwho.is"},
+	}
+	for _, provider := range providers {
+		data, err := directNetworkGET(ctx, direct, provider.url)
+		if err != nil {
+			continue
+		}
+		if result, ok := parseDirectNetworkInfo(data); ok {
+			result["ok"] = true
+			result["provider"] = provider.name
+			return marshalJSON(result)
+		}
+	}
+	return marshalJSON(map[string]any{"ok": false, "error": "直连公网信息查询失败"})
+}
+
+func directNetworkGET(ctx context.Context, proxy C.Proxy, rawURL string) ([]byte, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil || !strings.EqualFold(u.Scheme, "https") || u.Hostname() == "" {
+		return nil, errors.New("直连查询地址无效")
+	}
+	port := u.Port()
+	if port == "" {
+		port = "443"
+	}
+	tlsConfig, err := ca.GetTLSConfig(ca.Option{})
+	if err != nil {
+		return nil, err
+	}
+	transport := &stdHTTP.Transport{
+		DialContext: func(dialCtx context.Context, _, address string) (net.Conn, error) {
+			if _, _, splitErr := net.SplitHostPort(address); splitErr != nil {
+				address = net.JoinHostPort(address, port)
+			}
+			var metadata C.Metadata
+			if metadataErr := metadata.SetRemoteAddress(address); metadataErr != nil {
+				return nil, metadataErr
+			}
+			return proxy.DialContext(dialCtx, &metadata)
+		},
+		DisableKeepAlives:   true,
+		TLSClientConfig:     tlsConfig,
+		TLSHandshakeTimeout: 5 * time.Second,
+	}
+	client := &stdHTTP.Client{Transport: transport}
+	defer client.CloseIdleConnections()
+	req, err := stdHTTP.NewRequestWithContext(ctx, stdHTTP.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "Cora/1.0 NetworkInfo")
+	req.Header.Set("Accept", "application/json, text/plain;q=0.9")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("直连公网接口返回 HTTP %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 32<<10))
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+func parseDirectNetworkInfo(data []byte) (map[string]any, bool) {
+	text := strings.TrimSpace(string(data))
+	if text == "" {
+		return nil, false
+	}
+	if strings.Contains(text, "当前 IP：") && strings.Contains(text, "来自于：") {
+		parts := strings.SplitN(text, "当前 IP：", 2)
+		if len(parts) == 2 {
+			fields := strings.SplitN(parts[1], "来自于：", 2)
+			ip := strings.TrimSpace(fields[0])
+			if parsed, err := netip.ParseAddr(ip); err == nil && parsed.Unmap().Is4() {
+				result := map[string]any{"ip": parsed.Unmap().String()}
+				if len(fields) == 2 && strings.TrimSpace(fields[1]) != "" {
+					result["location"] = strings.TrimSpace(fields[1])
+				}
+				return result, true
+			}
+		}
+	}
+
+	var object map[string]any
+	if json.Unmarshal(data, &object) != nil {
+		return nil, false
+	}
+	ip := scriptJSONText(object["ip"])
+	if parsed, err := netip.ParseAddr(ip); err != nil || !parsed.Unmap().Is4() {
+		return nil, false
+	}
+	result := map[string]any{"ip": ip}
+	location := scriptJoinText(
+		scriptJSONText(object["country"]),
+		scriptJSONText(object["region"]),
+		scriptJSONText(object["city"]),
+	)
+	if location != "" {
+		result["location"] = location
+	}
+	if asn := scriptJSONText(object["asn"]); asn != "" {
+		result["asn"] = asn
+	}
+	if organization := scriptFirstJSONText(object["organization"], object["asn_organization"], object["org"]); organization != "" {
+		result["organization"] = organization
+	}
+	if connection, ok := object["connection"].(map[string]any); ok {
+		if result["asn"] == nil {
+			result["asn"] = scriptJSONText(connection["asn"])
+		}
+		if result["organization"] == nil {
+			result["organization"] = scriptFirstJSONText(connection["org"], connection["isp"])
+		}
+	}
+	return result, true
+}
+
+func scriptJSONText(value any) string {
+	if text, ok := value.(string); ok {
+		return strings.TrimSpace(text)
+	}
+	if number, ok := value.(json.Number); ok {
+		return number.String()
+	}
+	if number, ok := value.(float64); ok {
+		return fmt.Sprintf("%v", number)
+	}
+	return ""
+}
+
+func scriptFirstJSONText(values ...any) string {
+	for _, value := range values {
+		if text := scriptJSONText(value); text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
+func scriptJoinText(values ...string) string {
+	items := make([]string, 0, len(values))
+	for _, value := range values {
+		if text := strings.TrimSpace(value); text != "" {
+			items = append(items, text)
+		}
+	}
+	return strings.Join(items, " / ")
 }
 
 func resolveScriptProxy(name, group string, proxies map[string]C.Proxy) (C.Proxy, error) {

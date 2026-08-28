@@ -816,6 +816,16 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             ipcQueue.async {
                 reply(Data(MihomoScriptFetch(requestJSON).utf8))
             }
+        case "scriptTargetInfo":
+            let name = (obj?["name"] as? String) ?? ""
+            let group = (obj?["group"] as? String) ?? ""
+            ipcQueue.async {
+                reply(Data(MihomoScriptTargetInfo(name, group).utf8))
+            }
+        case "directNetworkInfo":
+            ipcQueue.async {
+                reply(Data(MihomoDirectNetworkInfo().utf8))
+            }
         case "connections":
             let limit = (obj?["limit"] as? NSNumber)?.intValue ?? 200
             ipcQueue.async {
