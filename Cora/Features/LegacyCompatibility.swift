@@ -99,4 +99,35 @@ extension View {
             self
         }
     }
+
+    /// Inset list section spacing is configurable starting with iOS 17.
+    /// Older systems keep their native grouped-list rhythm.
+    @ViewBuilder
+    func coraListSectionSpacing(_ spacing: CGFloat) -> some View {
+        if #available(iOS 17.0, *) {
+            listSectionSpacing(spacing)
+        } else {
+            self
+        }
+    }
+
+    /// iOS 16 has no programmatic searchable presentation binding. Creating
+    /// the field only after the toolbar action keeps it nonpersistent there.
+    @ViewBuilder
+    func coraDrawerSearchable(text: Binding<String>,
+                              isPresented: Binding<Bool>,
+                              prompt: String) -> some View {
+        if #available(iOS 17.0, *) {
+            searchable(text: text,
+                       isPresented: isPresented,
+                       placement: .navigationBarDrawer(displayMode: .automatic),
+                       prompt: prompt)
+        } else if isPresented.wrappedValue {
+            searchable(text: text,
+                       placement: .navigationBarDrawer(displayMode: .automatic),
+                       prompt: prompt)
+        } else {
+            self
+        }
+    }
 }

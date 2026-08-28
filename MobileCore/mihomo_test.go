@@ -891,6 +891,42 @@ func TestScriptTargetAddressAndDirectNetworkInfoParsing(t *testing.T) {
 	}
 }
 
+func TestScriptTargetIPCacheFallsBackToBoundedStaleValue(t *testing.T) {
+	const host = "node.example.com"
+	now := time.Now()
+	scriptTargetIPCacheMu.Lock()
+	previous := scriptTargetIPCache
+	scriptTargetIPCache = map[string]scriptTargetIPCacheEntry{
+		scriptTargetIPCacheKey(host): {
+			ip:         "203.0.113.7",
+			freshUntil: now.Add(time.Minute),
+			expiresAt:  now.Add(2 * time.Minute),
+		},
+	}
+	scriptTargetIPCacheMu.Unlock()
+	t.Cleanup(func() {
+		scriptTargetIPCacheMu.Lock()
+		scriptTargetIPCache = previous
+		scriptTargetIPCacheMu.Unlock()
+	})
+
+	if got := cachedScriptTargetIP(host, false, now); got != "203.0.113.7" {
+		t.Fatalf("fresh cache = %q, want 203.0.113.7", got)
+	}
+	if got := cachedScriptTargetIP(host, false, now.Add(90*time.Second)); got != "" {
+		t.Fatalf("expired fresh cache = %q, want empty", got)
+	}
+	if got := cachedScriptTargetIP(host, true, now.Add(90*time.Second)); got != "203.0.113.7" {
+		t.Fatalf("stale cache = %q, want 203.0.113.7", got)
+	}
+	if got := cachedScriptTargetIP(host, true, now.Add(3*time.Minute)); got != "" {
+		t.Fatalf("expired cache = %q, want empty", got)
+	}
+	if usableScriptTargetIP(netip.MustParseAddr("198.18.0.105")) {
+		t.Fatal("reserved synthetic IP accepted as a node entrance")
+	}
+}
+
 func TestConnectionsIPCEmptySnapshotAndMissingClose(t *testing.T) {
 	var snapshot struct {
 		Connections []json.RawMessage `json:"connections"`

@@ -55,7 +55,7 @@ struct ProxiesView: View {
                             layoutMenu
 
                             Button {
-                                isSearchPresented = true
+                                toggleSearchPresentation()
                             } label: {
                                 Image(systemName: "magnifyingglass")
                             }
@@ -146,12 +146,19 @@ struct ProxiesView: View {
     @ViewBuilder private var navigationContent: some View {
         if showsSearch && isSearchPresented {
             content
-                .searchable(text: $searchText,
-                            isPresented: $isSearchPresented,
-                            placement: .navigationBarDrawer(displayMode: .automatic),
-                            prompt: "搜索策略组或节点")
+                .coraDrawerSearchable(text: $searchText,
+                                      isPresented: $isSearchPresented,
+                                      prompt: "搜索策略组或节点")
         } else {
             content
+        }
+    }
+
+    private func toggleSearchPresentation() {
+        if #available(iOS 17.0, *) {
+            isSearchPresented = true
+        } else {
+            isSearchPresented.toggle()
         }
     }
 
@@ -1991,18 +1998,12 @@ private struct UnlockTestOverlay: View {
             Divider()
 
             ScrollView {
-                VStack(alignment: .leading, spacing: 7) {
-                    ForEach(Array(result.message.split(whereSeparator: { $0.isNewline }).enumerated()), id: \.offset) { _, line in
-                        Text(String(line))
-                            .font(.system(.subheadline, design: .rounded))
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 7)
-                            .background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
+                Text(result.message)
+                    .font(.system(size: 13, weight: .regular, design: .rounded))
+                    .lineSpacing(0)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
             .frame(maxHeight: 320)
         }

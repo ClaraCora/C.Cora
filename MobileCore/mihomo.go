@@ -69,6 +69,13 @@ const (
 	maxScriptResponseHeaderBytes = 32 << 10
 	maxScriptRequestTimeoutMs    = 15_000
 	maxScriptRequestCountPerRun  = 12
+
+	// DNS failures must not make a manually queried node lose its known
+	// entrance address immediately. The cache is session-local, bounded and
+	// never persisted with subscription data.
+	scriptTargetIPCacheFreshTTL = 15 * time.Minute
+	scriptTargetIPCacheStaleTTL = 6 * time.Hour
+	scriptTargetIPCacheLimit    = 128
 )
 
 const controlProtocolVersion = 1
@@ -108,6 +115,12 @@ type proxyDelayBatchSession struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	done   chan struct{}
+}
+
+type scriptTargetIPCacheEntry struct {
+	ip         string
+	freshUntil time.Time
+	expiresAt  time.Time
 }
 
 // dnsSystemNameServerTemplate only retains a DNS list that actually declared
@@ -189,6 +202,8 @@ var (
 	coreStartedAt           time.Time
 	snellCellularTCPMu      sync.RWMutex
 	snellCellularTCPNodes   []string
+	scriptTargetIPCacheMu   sync.Mutex
+	scriptTargetIPCache     = make(map[string]scriptTargetIPCacheEntry)
 )
 
 // lockConfigApplyForWrite cancels the active multi-node delay run before it
@@ -2935,18 +2950,127 @@ func ScriptTargetInfo(name, group string) string {
 	}
 
 	if ip, err := netip.ParseAddr(host); err == nil {
-		result["ip"] = ip.Unmap().String()
+		if usableScriptTargetIP(ip) {
+			result["ip"] = ip.Unmap().String()
+		} else {
+			result["resolutionError"] = "节点入口不是可查询的公网地址"
+		}
 		return marshalJSON(result)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if ip, err := resolver.ResolveIP(ctx, host); err == nil {
-		result["ip"] = ip.String()
+	if cachedIP := cachedScriptTargetIP(host, false, time.Now()); cachedIP != "" {
+		result["ip"] = cachedIP
+		return marshalJSON(result)
+	}
+	if ip, err := resolveScriptTargetIP(host); err == nil {
+		cacheScriptTargetIP(host, ip)
+		result["ip"] = ip
+	} else if cachedIP := cachedScriptTargetIP(host, true, time.Now()); cachedIP != "" {
+		// DNS can briefly fail after an interface switch. A stale entry is better
+		// than hiding a known endpoint, and is discarded after a bounded lifetime.
+		result["ip"] = cachedIP
+		result["resolutionError"] = "节点入口 DNS 暂时不可用，沿用上次解析结果"
 	} else {
 		// A hostname is still useful to show when its temporary DNS lookup fails.
 		result["resolutionError"] = "节点入口域名暂时无法解析"
 	}
 	return marshalJSON(result)
+}
+
+func resolveScriptTargetIP(host string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ip, resolveErr := resolver.ResolveIP(ctx, host)
+	cancel()
+	if resolveErr == nil && usableScriptTargetIP(ip) {
+		return ip.Unmap().String(), nil
+	}
+
+	// mihomo DNS can be restarting while the tunnel is reasserting. The system
+	// resolver is a bounded fallback for this display-only lookup; the actual
+	// test request still always travels through the selected mihomo proxy.
+	fallbackCtx, fallbackCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer fallbackCancel()
+	addresses, fallbackErr := net.DefaultResolver.LookupNetIP(fallbackCtx, "ip", host)
+	if fallbackErr == nil {
+		for _, address := range addresses {
+			if usableScriptTargetIP(address) {
+				return address.Unmap().String(), nil
+			}
+		}
+		fallbackErr = errors.New("节点入口没有可用 IP 地址")
+	}
+	if resolveErr != nil {
+		return "", resolveErr
+	}
+	return "", fallbackErr
+}
+
+func usableScriptTargetIP(ip netip.Addr) bool {
+	ip = ip.Unmap()
+	if !ip.IsValid() || ip.IsUnspecified() || ip.IsLoopback() {
+		return false
+	}
+	for _, reserved := range coraReservedSyntheticIPPrefixes {
+		if reserved.Contains(ip) {
+			return false
+		}
+	}
+	return true
+}
+
+func cachedScriptTargetIP(host string, allowStale bool, now time.Time) string {
+	key := scriptTargetIPCacheKey(host)
+	if key == "" {
+		return ""
+	}
+	scriptTargetIPCacheMu.Lock()
+	defer scriptTargetIPCacheMu.Unlock()
+	entry, exists := scriptTargetIPCache[key]
+	if !exists || now.After(entry.expiresAt) {
+		if exists {
+			delete(scriptTargetIPCache, key)
+		}
+		return ""
+	}
+	if !allowStale && now.After(entry.freshUntil) {
+		return ""
+	}
+	return entry.ip
+}
+
+func cacheScriptTargetIP(host, ip string) {
+	key := scriptTargetIPCacheKey(host)
+	if key == "" {
+		return
+	}
+	parsed, err := netip.ParseAddr(ip)
+	if err != nil || !usableScriptTargetIP(parsed) {
+		return
+	}
+	now := time.Now()
+	scriptTargetIPCacheMu.Lock()
+	defer scriptTargetIPCacheMu.Unlock()
+	if _, exists := scriptTargetIPCache[key]; !exists && len(scriptTargetIPCache) >= scriptTargetIPCacheLimit {
+		for cachedKey, entry := range scriptTargetIPCache {
+			if now.After(entry.expiresAt) {
+				delete(scriptTargetIPCache, cachedKey)
+			}
+		}
+		if len(scriptTargetIPCache) >= scriptTargetIPCacheLimit {
+			for cachedKey := range scriptTargetIPCache {
+				delete(scriptTargetIPCache, cachedKey)
+				break
+			}
+		}
+	}
+	scriptTargetIPCache[key] = scriptTargetIPCacheEntry{
+		ip:         parsed.Unmap().String(),
+		freshUntil: now.Add(scriptTargetIPCacheFreshTTL),
+		expiresAt:  now.Add(scriptTargetIPCacheStaleTTL),
+	}
+}
+
+func scriptTargetIPCacheKey(host string) string {
+	return strings.ToLower(strings.TrimSpace(host))
 }
 
 func splitScriptTargetAddress(address string) (host, port string) {

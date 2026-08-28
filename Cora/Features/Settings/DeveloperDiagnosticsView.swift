@@ -114,7 +114,7 @@ struct DeveloperDiagnosticsView: View {
         .scrollContentBackground(.hidden)
         .background(AppAmbientBackground())
         .listStyle(.insetGrouped)
-        .listSectionSpacing(18)
+        .coraListSectionSpacing(18)
         .listRowSeparatorTint(Color.primary.opacity(0.08))
         .navigationTitle("开发者模式")
         .navigationBarTitleDisplayMode(.inline)
