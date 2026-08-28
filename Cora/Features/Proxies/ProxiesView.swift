@@ -18,6 +18,7 @@ struct ProxiesView: View {
     @State private var groupGradients: [String: Int] = [:]
     @State private var activeNodeTestTarget: ProxyNodeTestTarget?
     @StateObject private var unlockTests = UnlockTestController.shared
+    @ObservedObject private var detectionScripts = ExternalScriptStore.shared
     @AppStorage("proxyNodeLayout") private var layoutRawValue = ProxyNodeLayout.grid.rawValue
     @AppStorage("proxyGroupGradients") private var gradientStorage = "{}"
     @AppStorage("proxyShowHiddenGroups") private var showHiddenGroups = false
@@ -33,6 +34,7 @@ struct ProxiesView: View {
                         isRunning: unlockTests.isRunning,
                         nodeName: unlockTests.runningNodeName ?? unlockTests.result?.nodeName ?? "",
                         groupName: unlockTests.runningGroupName ?? unlockTests.result?.groupName ?? "",
+                        scriptName: unlockTests.runningScriptName ?? unlockTests.result?.scriptName ?? "检测",
                         result: unlockTests.result,
                         onDismiss: { unlockTests.result = nil })
                         .transition(.opacity)
@@ -97,6 +99,9 @@ struct ProxiesView: View {
             .task {
                 loadGroupGradients()
                 assignMissingGradients()
+                if !detectionScripts.hasManifest {
+                    try? await detectionScripts.refreshManifest()
+                }
             }
             .onChange(of: controller.catalogRevision) { _, _ in
                 assignMissingGradients()
@@ -355,12 +360,11 @@ struct ProxiesView: View {
             delays: controller.delays,
             currentSelectionDelay: currentSelectionDelay(for: group),
             isTestingCurrentSelection: isTestingCurrentSelection(for: group),
-            gradientIndex: groupGradient(for: group.name),
-            onToggle: { toggleListGroup(group.name) },
-            onTest: { Task { await controller.testGroup(group.name) } },
-            onTestActiveNodeDelay: testActiveNodeDelay,
-            onTestActiveNodeUnlock: testActiveNodeUnlock,
-            onPrepareTestTarget: prepareNodeTestTarget,
+             gradientIndex: groupGradient(for: group.name),
+             onToggle: { toggleListGroup(group.name) },
+             onTest: { Task { await controller.testGroup(group.name) } },
+             onTestActiveNodeDelay: testActiveNodeDelay,
+             onPrepareTestTarget: prepareNodeTestTarget,
             onGradient: { setGradient($0, for: group.name) },
             onRandomizeAll: randomizeAllGradients,
             onSelect: { name in selectNode(name, in: group.name) })
@@ -573,12 +577,11 @@ struct ProxiesView: View {
             selecting: controller.selecting[result.group.name],
             testingNodes: controller.testingNodes,
             delays: controller.delays,
-            gradientIndex: groupGradient(for: result.group.name),
-            onToggle: onToggle,
-            onTest: { Task { await controller.testGroup(result.group.name) } },
-            onTestActiveNodeDelay: testActiveNodeDelay,
-            onTestActiveNodeUnlock: testActiveNodeUnlock,
-            onPrepareTestTarget: prepareNodeTestTarget,
+             gradientIndex: groupGradient(for: result.group.name),
+             onToggle: onToggle,
+             onTest: { Task { await controller.testGroup(result.group.name) } },
+             onTestActiveNodeDelay: testActiveNodeDelay,
+             onPrepareTestTarget: prepareNodeTestTarget,
             onGradient: { setGradient($0, for: result.group.name) },
             onRandomizeAll: randomizeAllGradients,
             onSelect: { name in selectNode(name, in: result.group.name) })
@@ -622,14 +625,6 @@ struct ProxiesView: View {
         guard let target = consumeNodeTestTarget() else { return }
         Task {
             await controller.testNode(target.nodeName, in: target.groupName)
-        }
-    }
-
-    private func testActiveNodeUnlock() {
-        guard let target = consumeNodeTestTarget() else { return }
-        Task {
-            await unlockTests.run(nodeName: target.nodeName,
-                                  groupName: target.groupName)
         }
     }
 
@@ -1165,7 +1160,6 @@ private struct StrategyGroupListPanel: View {
     let onToggle: () -> Void
     let onTest: () -> Void
     let onTestActiveNodeDelay: () -> Void
-    let onTestActiveNodeUnlock: () -> Void
     let onPrepareTestTarget: (ProxyNodeTestTarget) -> Void
     let onGradient: (Int) -> Void
     let onRandomizeAll: () -> Void
@@ -1192,15 +1186,9 @@ private struct StrategyGroupListPanel: View {
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
             .contextMenu {
-                Button {
-                    Task {
-                        await UnlockTestController.shared.run(nodeName: group.now,
-                                                              groupName: group.name)
-                    }
-                } label: {
-                    Label("测试当前节点解锁", systemImage: "play.tv")
-                }
-                .disabled(!canTest || group.now.isEmpty)
+                ExternalDetectionMenu(nodeName: group.now,
+                                      groupName: group.name,
+                                      canTest: canTest)
                 GradientMenu(selected: gradientIndex,
                              onSelect: onGradient,
                              onRandomizeAll: onRandomizeAll)
@@ -1235,10 +1223,9 @@ private struct StrategyGroupListPanel: View {
                             isTestingDelay: testingNodes.contains(
                                 ProxyNodeTestKey(group: group.name, node: item.name)),
                             delay: ProxyDelayResolver.delay(for: item.name,
-                                                            index: groupIndex,
-                                                            delays: delays),
+                                                             index: groupIndex,
+                                                             delays: delays),
                             onTestDelay: onTestActiveNodeDelay,
-                            onTestUnlock: onTestActiveNodeUnlock,
                             onPrepareTestTarget: { onPrepareTestTarget(testTarget) },
                             onSelect: { onSelect(item.name) })
                         .padding(.horizontal, 14)
@@ -1381,7 +1368,6 @@ private struct ProxyNodeListRow: View {
     let isTestingDelay: Bool
     let delay: Int?
     let onTestDelay: () -> Void
-    let onTestUnlock: () -> Void
     let onPrepareTestTarget: () -> Void
     let onSelect: () -> Void
 
@@ -1398,10 +1384,9 @@ private struct ProxyNodeListRow: View {
                           systemImage: isTestingDelay ? "hourglass" : "speedometer")
                 }
                 .disabled(!canTest || isTestingDelay)
-                Button(action: onTestUnlock) {
-                    Label("解锁测试", systemImage: "play.tv")
-                }
-                .disabled(!canTest)
+                ExternalDetectionMenu(nodeName: node,
+                                      groupName: testTarget.groupName,
+                                      canTest: canTest)
             }
             .proxyNodeInteraction(onTouchBegan: onPrepareTestTarget,
                                   onTap: selectIfAllowed)
@@ -1475,15 +1460,9 @@ private struct GroupGridCard: View {
         .background(GroupGradient.background(for: gradientIndex))
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         .contextMenu {
-            Button {
-                Task {
-                    await UnlockTestController.shared.run(nodeName: group.now,
-                                                          groupName: group.name)
-                }
-            } label: {
-                Label("测试当前节点解锁", systemImage: "play.tv")
-            }
-            .disabled(!canTest || group.now.isEmpty)
+            ExternalDetectionMenu(nodeName: group.now,
+                                  groupName: group.name,
+                                  canTest: canTest)
             GradientMenu(selected: gradientIndex, onSelect: onGradient,
                          onRandomizeAll: onRandomizeAll)
         }
@@ -1511,7 +1490,6 @@ private struct GroupExpandedPanel: View {
     let onToggle: () -> Void
     let onTest: () -> Void
     let onTestActiveNodeDelay: () -> Void
-    let onTestActiveNodeUnlock: () -> Void
     let onPrepareTestTarget: (ProxyNodeTestTarget) -> Void
     let onGradient: (Int) -> Void
     let onRandomizeAll: (() -> Void)?
@@ -1526,15 +1504,9 @@ private struct GroupExpandedPanel: View {
                                 onToggle: onToggle,
                                 onTest: onTest)
             .contextMenu {
-                Button {
-                    Task {
-                        await UnlockTestController.shared.run(nodeName: group.now,
-                                                              groupName: group.name)
-                    }
-                } label: {
-                    Label("测试当前节点解锁", systemImage: "play.tv")
-                }
-                .disabled(!canTest || group.now.isEmpty)
+                ExternalDetectionMenu(nodeName: group.now,
+                                      groupName: group.name,
+                                      canTest: canTest)
                 GradientMenu(selected: gradientIndex,
                              onSelect: onGradient,
                              onRandomizeAll: onRandomizeAll)
@@ -1564,7 +1536,6 @@ private struct GroupExpandedPanel: View {
                                                                       index: groupIndex,
                                                                       delays: delays),
                                       onTestDelay: onTestActiveNodeDelay,
-                                      onTestUnlock: onTestActiveNodeUnlock,
                                       onPrepareTestTarget: { onPrepareTestTarget(testTarget) },
                                       onSelect: { onSelect(item.name) })
                 }
@@ -1764,7 +1735,6 @@ private struct GroupNodeGridCell: View {
     let isTestingDelay: Bool
     let delay: Int?
     let onTestDelay: () -> Void
-    let onTestUnlock: () -> Void
     let onPrepareTestTarget: () -> Void
     let onSelect: () -> Void
 
@@ -1781,10 +1751,9 @@ private struct GroupNodeGridCell: View {
                           systemImage: isTestingDelay ? "hourglass" : "speedometer")
                 }
                 .disabled(!canTest || isTestingDelay)
-                Button(action: onTestUnlock) {
-                    Label("解锁测试", systemImage: "play.tv")
-                }
-                .disabled(!canTest)
+                ExternalDetectionMenu(nodeName: node.name,
+                                      groupName: testTarget.groupName,
+                                      canTest: canTest)
             }
             .proxyNodeInteraction(onTouchBegan: onPrepareTestTarget,
                                   onTap: selectIfAllowed)
@@ -1877,10 +1846,36 @@ private struct GradientMenu: View {
     }
 }
 
+/// Context-menu entries are driven by the signed Cora script manifest. The
+/// app only supplies the node/group identity; detection logic stays external.
+private struct ExternalDetectionMenu: View {
+    @ObservedObject private var scripts = ExternalScriptStore.shared
+    let nodeName: String
+    let groupName: String
+    let canTest: Bool
+
+    var body: some View {
+        ForEach(scripts.availableScripts) { script in
+            Button {
+                Task {
+                    await UnlockTestController.shared.run(nodeName: nodeName,
+                                                          groupName: groupName,
+                                                          scriptID: script.id)
+                }
+            } label: {
+                Label(script.name, systemImage: script.icon)
+            }
+            .disabled(!canTest || scripts.isUpdating ||
+                      nodeName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        }
+    }
+}
+
 private struct UnlockTestOverlay: View {
     let isRunning: Bool
     let nodeName: String
     let groupName: String
+    let scriptName: String
     let result: UnlockTestResult?
     let onDismiss: () -> Void
 
@@ -1927,7 +1922,7 @@ private struct UnlockTestOverlay: View {
             UnlockTestRunningIndicator(reduceMotion: reduceMotion)
 
             VStack(spacing: 5) {
-                Text("正在检测解锁")
+                Text("正在\(scriptName)")
                     .font(.headline)
                 Text(nodeName.isEmpty ? "当前节点" : nodeName)
                     .font(.subheadline)
@@ -1946,13 +1941,13 @@ private struct UnlockTestOverlay: View {
         }
         .frame(maxWidth: .infinity)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("正在检测节点 \(nodeName) 的解锁能力")
+        .accessibilityLabel("正在\(scriptName)节点 \(nodeName)")
     }
 
     private func resultContent(_ result: UnlockTestResult) -> some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .top, spacing: 12) {
-                Image(systemName: "lock.shield.fill")
+                Image(systemName: result.scriptIcon)
                     .font(.system(size: 24, weight: .semibold))
                     .foregroundStyle(Color.accentColor)
                     .frame(width: 32, height: 32)
@@ -1984,7 +1979,7 @@ private struct UnlockTestOverlay: View {
                 if !result.groupName.isEmpty {
                     Label(result.groupName, systemImage: "square.stack.3d.up")
                 }
-                Label("脚本 \(result.scriptVersion)", systemImage: "doc.text")
+                Label("\(result.scriptName) · \(result.scriptVersion)", systemImage: "doc.text")
             }
             .font(.caption)
             .foregroundStyle(.secondary)
@@ -1993,10 +1988,18 @@ private struct UnlockTestOverlay: View {
             Divider()
 
             ScrollView {
-                Text(result.message)
-                    .font(.system(.subheadline, design: .rounded))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                VStack(alignment: .leading, spacing: 7) {
+                    ForEach(Array(result.message.split(whereSeparator: { $0.isNewline }).enumerated()), id: \.offset) { _, line in
+                        Text(String(line))
+                            .font(.system(.subheadline, design: .rounded))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 7)
+                            .background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
             .frame(maxHeight: 320)
         }

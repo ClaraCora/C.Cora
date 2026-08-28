@@ -492,7 +492,7 @@ private struct UnlockScriptSettingsView: View {
         Form {
             Section {
                 HStack {
-                    InfoLabel(title: "当前版本", message: "长按节点或分组进行解锁测试时使用本地已验证的脚本版本。")
+                    InfoLabel(title: "解锁脚本版本", message: "长按节点或分组检测时使用本地已验证的脚本版本。")
                     Spacer()
                     Text(scripts.cachedVersion ?? "未下载")
                         .foregroundStyle(.secondary)
@@ -532,6 +532,23 @@ private struct UnlockScriptSettingsView: View {
             }
             .listRowBackground(AppListRowBackground())
 
+            Section("可用检测") {
+                ForEach(scripts.availableScripts) { script in
+                    HStack(spacing: 12) {
+                        Image(systemName: script.icon)
+                            .foregroundStyle(Color.accentColor)
+                            .frame(width: 24)
+                        Text(script.name)
+                        Spacer()
+                        Text(script.version.isEmpty ? "待更新" : script.version)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                }
+            }
+            .listRowBackground(AppListRowBackground())
+
             Section {
                 Text("脚本只允许通过受限的 mihomo 节点请求访问检测地址，不会把检测逻辑编译进 App。")
                     .font(.caption)
@@ -548,7 +565,7 @@ private struct UnlockScriptSettingsView: View {
 
     private func updateScript() async {
         do {
-            _ = try await scripts.refreshUnlockScript()
+            _ = try await scripts.refreshAllScripts()
         } catch {
             // ExternalScriptStore publishes the verified failure reason and keeps the old cache.
         }

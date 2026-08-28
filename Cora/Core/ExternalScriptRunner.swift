@@ -3,18 +3,22 @@ import CryptoKit
 import Foundation
 @preconcurrency import JavaScriptCore
 
-struct ExternalDetectionScript: Codable, Sendable {
+struct ExternalDetectionScript: Codable, Sendable, Identifiable, Hashable {
     let id: String
     let name: String
     let version: String
     let scriptURL: URL
     let sha256: String
+    let icon: String
 }
 
 struct UnlockTestResult: Identifiable, Sendable {
     let id = UUID()
     let nodeName: String
     let groupName: String
+    let scriptID: String
+    let scriptName: String
+    let scriptIcon: String
     let scriptVersion: String
     let title: String
     let message: String
@@ -39,6 +43,12 @@ final class ExternalScriptStore: ObservableObject {
             .appendingPathComponent("CoraScripts", isDirectory: true)
     }()
 
+    private static let fallbackScripts: [ExternalDetectionScript] = [
+        ExternalDetectionScript(id: "node-unlock-detection", name: "节点解锁检测", version: "",
+                                scriptURL: URL(string: "https://raw.githubusercontent.com/ClaraCora/lo/main/cora/NodeUnlockDetection.js")!,
+                                sha256: "", icon: "play.tv"),
+    ]
+
     private struct Manifest: Decodable {
         let apiVersion: Int
         let scripts: [ManifestScript]
@@ -51,10 +61,14 @@ final class ExternalScriptStore: ObservableObject {
         let scriptURL: URL
         let sha256: String
         let requiredCapabilities: [String]
+        let icon: String?
     }
 
     private struct CachedScript: Codable {
         let id: String
+        let name: String?
+        let icon: String?
+        let scriptURL: URL?
         let version: String
         let sha256: String
         let updatedAt: Date?
@@ -64,23 +78,63 @@ final class ExternalScriptStore: ObservableObject {
     @Published private(set) var cachedUpdatedAt: Date?
     @Published private(set) var isUpdating = false
     @Published private(set) var updateMessage: String?
+    @Published private(set) var availableScripts: [ExternalDetectionScript]
+    @Published private(set) var hasManifest = false
 
     private init() {
+        availableScripts = Self.fallbackScripts
+        if let cachedManifest = Self.loadCachedManifest() {
+            let definitions = Self.definitions(from: cachedManifest)
+            availableScripts = Self.mergedDefinitions(definitions)
+            hasManifest = Self.requiredScriptIDs.isSubset(of: Set(definitions.map(\.id)))
+        }
         refreshCacheState()
     }
 
     func loadUnlockScript() async throws -> ExternalDetectionScript {
-        if let cached = validCachedScript() {
-            publishCacheState(cached.metadata)
+        try await loadScript(id: "node-unlock-detection")
+    }
+
+    func loadScript(id: String) async throws -> ExternalDetectionScript {
+        if let cached = validCachedScript(id: id) {
+            if id == "node-unlock-detection" { publishCacheState(cached.metadata) }
             return metadata(from: cached.metadata)
         }
-        return try await refreshUnlockScript()
+        return try await refreshScript(id: id)
     }
 
     /// 设置页调用的显式更新。签名或下载失败时保留旧缓存。
     func refreshUnlockScript() async throws -> ExternalDetectionScript {
+        try await refreshScript(id: "node-unlock-detection")
+    }
+
+    /// Refreshes the signed manifest so new scripts can appear in node menus.
+    @discardableResult
+    func refreshManifest() async throws -> [ExternalDetectionScript] {
+        guard !isUpdating else { throw ScriptLoadError.updateInProgress }
+        isUpdating = true
+        defer { isUpdating = false }
+        do {
+            let manifestData = try await Self.download(Self.manifestURL, maxBytes: 256 * 1024)
+            let signatureData = try await Self.download(Self.signatureURL, maxBytes: 8 * 1024)
+            try Self.verify(manifestData: manifestData, signature: signatureData)
+            let manifest = try JSONDecoder().decode(Manifest.self, from: manifestData)
+            guard manifest.apiVersion == 1 else { throw ScriptLoadError.invalidManifest }
+            let definitions = Self.definitions(from: manifest)
+            guard !definitions.isEmpty else { throw ScriptLoadError.invalidManifest }
+            try Self.saveManifest(manifestData)
+            availableScripts = Self.mergedDefinitions(definitions)
+            hasManifest = Self.requiredScriptIDs.isSubset(of: Set(definitions.map(\.id)))
+            return definitions
+        } catch {
+            updateMessage = "更新失败：\(error.localizedDescription)"
+            throw error
+        }
+    }
+
+    func refreshScript(id: String) async throws -> ExternalDetectionScript {
         if isUpdating {
-            if let cached = validCachedScript() {
+            if let cached = validCachedScript(id: id) {
                 return metadata(from: cached.metadata)
             }
             throw ScriptLoadError.updateInProgress
@@ -95,24 +149,74 @@ final class ExternalScriptStore: ObservableObject {
             try Self.verify(manifestData: manifestData, signature: signatureData)
             let manifest = try JSONDecoder().decode(Manifest.self, from: manifestData)
             guard manifest.apiVersion == 1,
-                  let entry = manifest.scripts.first(where: { $0.id == "node-unlock-detection" }),
+                  let entry = manifest.scripts.first(where: { $0.id == id }),
                   entry.requiredCapabilities.contains("node-http") else {
                 throw ScriptLoadError.invalidManifest
             }
+            let definitions = Self.definitions(from: manifest)
+            try Self.saveManifest(manifestData)
+            availableScripts = Self.mergedDefinitions(definitions)
+            hasManifest = Self.requiredScriptIDs.isSubset(of: Set(definitions.map(\.id)))
             let scriptData = try await Self.download(entry.scriptURL, maxBytes: 512 * 1024)
             guard Self.sha256(scriptData) == entry.sha256.lowercased() else {
                 throw ScriptLoadError.hashMismatch
             }
             let cached = CachedScript(id: entry.id,
+                                      name: entry.name,
+                                      icon: entry.icon,
+                                      scriptURL: entry.scriptURL,
                                       version: entry.version,
                                       sha256: entry.sha256,
                                       updatedAt: Date())
             try Self.save(scriptData: scriptData, metadata: cached)
-            publishCacheState(cached)
-            updateMessage = "脚本已更新"
-            return ExternalDetectionScript(id: entry.id, name: entry.name,
-                                           version: entry.version, scriptURL: entry.scriptURL,
-                                           sha256: entry.sha256)
+            if id == "node-unlock-detection" { publishCacheState(cached) }
+            updateMessage = id == "node-unlock-detection" ? "脚本已更新" : "检测脚本已就绪"
+            return metadata(from: cached)
+        } catch {
+            updateMessage = "更新失败：\(error.localizedDescription)"
+            throw error
+        }
+    }
+
+    /// User-initiated update for the settings screen. Downloads scripts one by
+    /// one so a failed update preserves every previously verified cache.
+    @discardableResult
+    func refreshAllScripts() async throws -> [ExternalDetectionScript] {
+        guard !isUpdating else { throw ScriptLoadError.updateInProgress }
+        isUpdating = true
+        updateMessage = nil
+        defer { isUpdating = false }
+
+        do {
+            let manifestData = try await Self.download(Self.manifestURL, maxBytes: 256 * 1024)
+            let signatureData = try await Self.download(Self.signatureURL, maxBytes: 8 * 1024)
+            try Self.verify(manifestData: manifestData, signature: signatureData)
+            let manifest = try JSONDecoder().decode(Manifest.self, from: manifestData)
+            guard manifest.apiVersion == 1 else { throw ScriptLoadError.invalidManifest }
+            let definitions = Self.definitions(from: manifest)
+            guard !definitions.isEmpty else { throw ScriptLoadError.invalidManifest }
+
+            for definition in definitions {
+                let scriptData = try await Self.download(definition.scriptURL, maxBytes: 512 * 1024)
+                guard Self.sha256(scriptData) == definition.sha256.lowercased() else {
+                    throw ScriptLoadError.hashMismatch
+                }
+                try Self.save(scriptData: scriptData,
+                              metadata: CachedScript(id: definition.id,
+                                                     name: definition.name,
+                                                     icon: definition.icon,
+                                                     scriptURL: definition.scriptURL,
+                                                     version: definition.version,
+                                                     sha256: definition.sha256,
+                                                     updatedAt: Date()))
+            }
+
+            try Self.saveManifest(manifestData)
+            availableScripts = Self.mergedDefinitions(definitions)
+            hasManifest = Self.requiredScriptIDs.isSubset(of: Set(definitions.map(\.id)))
+            publishCacheState(Self.loadCachedMetadata())
+            updateMessage = "检测脚本已更新"
+            return definitions
         } catch {
             updateMessage = "更新失败：\(error.localizedDescription)"
             throw error
@@ -123,25 +227,26 @@ final class ExternalScriptStore: ObservableObject {
         publishCacheState(Self.loadCachedMetadata())
     }
 
-    func scriptSource() -> (script: String, metadata: ExternalDetectionScript)? {
-        guard let cached = validCachedScript(),
+    func scriptSource(for id: String = "node-unlock-detection") -> (script: String, metadata: ExternalDetectionScript)? {
+        guard let cached = validCachedScript(id: id),
               let source = String(data: cached.data, encoding: .utf8) else { return nil }
         return (source, metadata(from: cached.metadata))
     }
 
-    private func validCachedScript() -> (metadata: CachedScript, data: Data)? {
-        guard let metadata = Self.loadCachedMetadata(),
-              let data = Self.loadCachedScript(),
+    private func validCachedScript(id: String) -> (metadata: CachedScript, data: Data)? {
+        guard let metadata = Self.loadCachedMetadata(id: id),
+              let data = Self.loadCachedScript(id: id),
               Self.sha256(data) == metadata.sha256.lowercased() else { return nil }
         return (metadata, data)
     }
 
     private func metadata(from cached: CachedScript) -> ExternalDetectionScript {
         ExternalDetectionScript(id: cached.id,
-                                name: "节点解锁检测",
+                                name: cached.name ?? Self.fallbackScripts.first(where: { $0.id == cached.id })?.name ?? cached.id,
                                 version: cached.version,
-                                scriptURL: Self.manifestURL,
-                                sha256: cached.sha256)
+                                scriptURL: cached.scriptURL ?? Self.fallbackScripts.first(where: { $0.id == cached.id })?.scriptURL ?? Self.manifestURL,
+                                sha256: cached.sha256,
+                                icon: cached.icon ?? Self.fallbackScripts.first(where: { $0.id == cached.id })?.icon ?? "doc.text")
     }
 
     private func publishCacheState(_ metadata: CachedScript?) {
@@ -174,19 +279,64 @@ final class ExternalScriptStore: ObservableObject {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
-    private static func loadCachedScript() -> Data? {
-        try? Data(contentsOf: cacheDirectory.appendingPathComponent("node-unlock-detection.js"))
+    private static func loadCachedScript(id: String) -> Data? {
+        try? Data(contentsOf: cacheDirectory.appendingPathComponent(fileName(id: id, suffix: "js")))
+    }
+
+    private static func loadCachedMetadata(id: String) -> CachedScript? {
+        guard let data = try? Data(contentsOf: cacheDirectory.appendingPathComponent(fileName(id: id, suffix: "json"))) else { return nil }
+        return try? JSONDecoder().decode(CachedScript.self, from: data)
     }
 
     private static func loadCachedMetadata() -> CachedScript? {
-        guard let data = try? Data(contentsOf: cacheDirectory.appendingPathComponent("node-unlock-detection.json")) else { return nil }
-        return try? JSONDecoder().decode(CachedScript.self, from: data)
+        loadCachedMetadata(id: "node-unlock-detection")
     }
 
     private static func save(scriptData: Data, metadata: CachedScript) throws {
         try FileManager.default.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
-        try scriptData.write(to: cacheDirectory.appendingPathComponent("node-unlock-detection.js"), options: .atomic)
-        try JSONEncoder().encode(metadata).write(to: cacheDirectory.appendingPathComponent("node-unlock-detection.json"), options: .atomic)
+        try scriptData.write(to: cacheDirectory.appendingPathComponent(fileName(id: metadata.id, suffix: "js")), options: .atomic)
+        try JSONEncoder().encode(metadata).write(to: cacheDirectory.appendingPathComponent(fileName(id: metadata.id, suffix: "json")), options: .atomic)
+    }
+
+    private static func fileName(id: String, suffix: String) -> String {
+        let safe = id.replacingOccurrences(of: "[^A-Za-z0-9._-]", with: "-", options: .regularExpression)
+        return "\(safe).\(suffix)"
+    }
+
+    private static func definitions(from manifest: Manifest) -> [ExternalDetectionScript] {
+        manifest.scripts.compactMap { entry in
+            guard entry.requiredCapabilities.contains("node-http"),
+                  !entry.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  !entry.sha256.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+            return ExternalDetectionScript(id: entry.id,
+                                           name: entry.name,
+                                           version: entry.version,
+                                           scriptURL: entry.scriptURL,
+                                           sha256: entry.sha256,
+                                           icon: entry.icon ?? fallbackScripts.first(where: { $0.id == entry.id })?.icon ?? "doc.text")
+        }
+    }
+
+    private static let requiredScriptIDs: Set<String> = [
+        "node-unlock-detection",
+        "network-entry-exit",
+        "ip-quality-detection",
+    ]
+
+    private static func mergedDefinitions(_ definitions: [ExternalDetectionScript]) -> [ExternalDetectionScript] {
+        definitions + fallbackScripts.filter { fallback in
+            !definitions.contains(where: { $0.id == fallback.id })
+        }
+    }
+
+    private static func saveManifest(_ data: Data) throws {
+        try FileManager.default.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+        try data.write(to: cacheDirectory.appendingPathComponent("manifest.json"), options: .atomic)
+    }
+
+    private static func loadCachedManifest() -> Manifest? {
+        guard let data = try? Data(contentsOf: cacheDirectory.appendingPathComponent("manifest.json")) else { return nil }
+        return try? JSONDecoder().decode(Manifest.self, from: data)
     }
 
     enum ScriptLoadError: LocalizedError {
@@ -213,32 +363,35 @@ final class UnlockTestController: ObservableObject {
     @Published private(set) var isRunning = false
     @Published private(set) var runningNodeName: String?
     @Published private(set) var runningGroupName: String?
+    @Published private(set) var runningScriptName: String?
     @Published var result: UnlockTestResult?
     @Published var error: String?
 
     private init() {}
 
-    func run(nodeName: String, groupName: String) async {
+    func run(nodeName: String, groupName: String, scriptID: String = "node-unlock-detection") async {
         guard !isRunning else { return }
         let status = CoreStateManager.shared.status
         guard status == .connected || status == .reasserting else {
-            error = "连接 VPN 后才能进行解锁测试"
+            error = "连接 VPN 后才能进行检测"
             return
         }
         isRunning = true
         runningNodeName = nodeName
         runningGroupName = groupName
+        runningScriptName = ExternalScriptStore.shared.availableScripts.first(where: { $0.id == scriptID })?.name
         result = nil
         error = nil
         defer {
             isRunning = false
             runningNodeName = nil
             runningGroupName = nil
+            runningScriptName = nil
         }
         do {
             let store = ExternalScriptStore.shared
-            _ = try await store.loadUnlockScript()
-            guard let source = store.scriptSource() else {
+            let script = try await store.loadScript(id: scriptID)
+            guard let source = store.scriptSource(for: script.id) else {
                 throw ExternalScriptStore.ScriptLoadError.invalidManifest
             }
             let output = try await ScriptExecution(
@@ -386,6 +539,9 @@ private final class ScriptExecution: @unchecked Sendable {
         let html = object["htmlMessage"] as? String ?? object["message"] as? String ?? "脚本没有返回检测结果"
         completion(.success(UnlockTestResult(nodeName: nodeName,
                                               groupName: groupName,
+                                              scriptID: metadata.id,
+                                              scriptName: metadata.name,
+                                              scriptIcon: metadata.icon,
                                               scriptVersion: metadata.version,
                                               title: title,
                                               message: Self.plainText(html))))
