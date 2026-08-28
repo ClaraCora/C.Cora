@@ -12,6 +12,7 @@ struct ProxiesView: View {
     @State private var gridScrollRequest: GridScrollRequest?
     @State private var gridExpansion: GridExpansionState?
     @State private var pendingGridGroupName: String?
+    @State private var gridColumnCount = ProxyGridLayout.defaultColumnCount
     @State private var toolbarControlsVisible = true
     @State private var searchText = ""
     @State private var isSearchPresented = false
@@ -135,6 +136,9 @@ struct ProxiesView: View {
                 pendingGridGroupName = ProxyNodeLayout(rawValue: value) == .grid ? retained : nil
                 toolbarControlsVisible = true
                 activeNodeTestTarget = nil
+            }
+            .onChange(of: gridColumnCount) { _ in
+                synchronizeDisplayedGroups()
             }
             .onChange(of: showHiddenGroups) { _ in
                 resetDisplayedGroupState()
@@ -392,12 +396,10 @@ struct ProxiesView: View {
 
     private var gridGroupList: some View {
         let results = displayedGroups
-        let rows = stride(from: 0, to: results.count, by: 2).map { index in
-            Array(results[index..<min(index + 2, results.count)])
-        }
-        let upwardExpansionStart = max(0, rows.count - 3)
-        let activeGroupName = gridExpansion?.groupName
         return GeometryReader { viewport in
+            let rows = gridRows(results, columnCount: gridColumnCount)
+            let upwardExpansionStart = max(0, rows.count - 3)
+            let activeGroupName = gridExpansion?.groupName
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 14) {
@@ -442,6 +444,12 @@ struct ProxiesView: View {
                 }
                 .onPreferenceChange(ExpandedPanelFramePreferenceKey.self) { frames in
                     geometryCache.expandedPanelFrames = frames
+                }
+                .onAppear {
+                    updateGridColumnCount(for: viewport.size.width)
+                }
+                .onChange(of: viewport.size.width) { width in
+                    updateGridColumnCount(for: width)
                 }
                 .task(id: gridScrollRequest) {
                     guard let request = gridScrollRequest else { return }
@@ -549,7 +557,7 @@ struct ProxiesView: View {
                     onRandomizeAll: randomizeAllGradients)
                     .frame(maxWidth: .infinity)
             }
-            if row.count == 1 {
+            if gridColumnCount > 1, row.count == 1 {
                 Color.clear
                     .frame(maxWidth: .infinity, minHeight: 76)
                     .accessibilityHidden(true)
@@ -875,7 +883,20 @@ struct ProxiesView: View {
         guard let index = displayedGroups.firstIndex(where: { $0.group.name == name }) else {
             return nil
         }
-        return index / 2
+        return index / gridColumnCount
+    }
+
+    private func gridRows(_ groups: [DisplayedProxyGroup],
+                          columnCount: Int) -> [[DisplayedProxyGroup]] {
+        stride(from: 0, to: groups.count, by: columnCount).map { index in
+            Array(groups[index..<min(index + columnCount, groups.count)])
+        }
+    }
+
+    private func updateGridColumnCount(for viewportWidth: CGFloat) {
+        let resolvedCount = ProxyGridLayout.columnCount(for: viewportWidth)
+        guard gridColumnCount != resolvedCount else { return }
+        gridColumnCount = resolvedCount
     }
 
     private func strategyToolbarGesture() -> some Gesture {
@@ -919,7 +940,7 @@ struct ProxiesView: View {
                 geometryCache.expandedPanelFrames.removeAll()
                 return
             }
-            let updatedRowIndex = index / 2
+            let updatedRowIndex = index / gridColumnCount
             if updatedRowIndex != expansion.rowIndex {
                 gridExpansion = nil
                 expanded = []
@@ -989,6 +1010,27 @@ private enum ProxyNodeLayout: String {
 
     var systemImage: String {
         self == .list ? "list.bullet" : "square.grid.2x2"
+    }
+}
+
+/// A two-column grid is only useful while each card can preserve its title,
+/// selected-node summary, and delay badge. On narrower phones the same grid
+/// naturally becomes a single-column card layout instead of truncating its
+/// primary information.
+private enum ProxyGridLayout {
+    static let horizontalInset: CGFloat = 14
+    static let cardSpacing: CGFloat = 12
+    static let minimumCardWidth: CGFloat = 168
+    static let defaultColumnCount = 2
+
+    static func columnCount(for viewportWidth: CGFloat) -> Int {
+        let contentWidth = max(0, viewportWidth - horizontalInset * 2)
+        let twoColumnWidth = minimumCardWidth * 2 + cardSpacing
+        return contentWidth >= twoColumnWidth ? 2 : 1
+    }
+
+    static var expandedNodeColumns: [GridItem] {
+        [GridItem(.adaptive(minimum: minimumCardWidth), spacing: cardSpacing)]
     }
 }
 
@@ -1522,10 +1564,7 @@ private struct GroupExpandedPanel: View {
                              onRandomizeAll: onRandomizeAll)
             }
 
-            LazyVGrid(columns: [
-                GridItem(.flexible(), spacing: 12),
-                GridItem(.flexible(), spacing: 12),
-            ], spacing: 8) {
+            LazyVGrid(columns: ProxyGridLayout.expandedNodeColumns, spacing: 8) {
                 ForEach(group.nodes) { item in
                     let testTarget = ProxyNodeTestTarget(groupName: group.name,
                                                          nodeName: item.name,
