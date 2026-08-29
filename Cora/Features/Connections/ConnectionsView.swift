@@ -204,14 +204,13 @@ private struct HostTrafficCard: View {
                     .padding(.vertical, 18)
             } else {
                 ForEach(Array(totals.enumerated()), id: \.element.id) { index, total in
-                    NavigationLink {
+                    TrafficNavigationButton {
+                        HostTrafficRow(total: total, totalTraffic: totalTraffic)
+                    } destination: {
                         HostTrafficDetailView(host: total.name,
                                               volume: total,
                                               controller: controller)
-                    } label: {
-                        HostTrafficRow(total: total, totalTraffic: totalTraffic)
                     }
-                    .buttonStyle(.plain)
 
                     if index < totals.count - 1 {
                         Divider().padding(.leading, 14)
@@ -243,9 +242,6 @@ private struct HostTrafficRow: View {
                     .font(.subheadline.monospacedDigit().weight(.medium))
                     .foregroundStyle(.primary)
                     .lineLimit(1)
-                Image(systemName: "chevron.right")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.tertiary)
             }
             TrafficProgress(value: total.total,
                             maximum: max(totalTraffic, total.total),
@@ -264,16 +260,15 @@ private struct StrategyTrafficListView: View {
 
     var body: some View {
         List(totals) { total in
-            NavigationLink {
+            TrafficNavigationButton {
+                TrafficAggregateRow(item: total)
+            } destination: {
                 ConnectionListView(title: total.name,
                                    entries: [],
                                    controller: controller,
                                    historyQuery: ConnectionHistoryQuery(strategyName: total.name))
-            } label: {
-                TrafficAggregateRow(item: total)
             }
-            .buttonStyle(.plain)
-            .listRowInsets(EdgeInsets(top: 5, leading: 0, bottom: 5, trailing: 0))
+            .listRowInsets(EdgeInsets(top: 5, leading: 16, bottom: 5, trailing: 16))
             .listRowSeparator(.hidden)
             .listRowBackground(Color.clear)
         }
@@ -309,24 +304,23 @@ private struct HostTrafficDetailView: View {
             Section {
                 ConnectionTrafficHeader(title: host, total: total, volume: volume)
             }
-            .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0))
+            .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
             .listRowSeparator(.hidden)
             .listRowBackground(Color.clear)
 
             Section("策略") {
                 ForEach(strategyTotals) { item in
-                    NavigationLink {
+                    TrafficNavigationButton {
+                        TrafficAggregateRow(item: item)
+                    } destination: {
                         ConnectionListView(title: item.name,
                                            entries: [],
                                            controller: controller,
                                            historyQuery: ConnectionHistoryQuery(
                                                strategyName: item.name,
                                                hostName: host))
-                    } label: {
-                        TrafficAggregateRow(item: item)
                     }
-                    .buttonStyle(.plain)
-                    .listRowInsets(EdgeInsets(top: 5, leading: 0, bottom: 5, trailing: 0))
+                    .listRowInsets(EdgeInsets(top: 5, leading: 16, bottom: 5, trailing: 16))
                     .listRowSeparator(.hidden)
                     .listRowBackground(Color.clear)
                 }
@@ -335,14 +329,16 @@ private struct HostTrafficDetailView: View {
             Section("连接") {
                 if entries.isEmpty && isLoadingHistory {
                     ProgressView("读取连接记录...")
+                        .listRowInsets(EdgeInsets(top: 18, leading: 16, bottom: 18, trailing: 16))
                         .listRowBackground(Color.clear)
                 } else if entries.isEmpty {
                     CoraUnavailableState("暂无连接记录", systemImage: "network.slash")
+                        .listRowInsets(EdgeInsets(top: 18, leading: 16, bottom: 18, trailing: 16))
                         .listRowBackground(Color.clear)
                 } else {
                     ForEach(entries) { entry in
                         ConnectionRecordRow(entry: entry, controller: controller)
-                            .listRowInsets(EdgeInsets(top: 5, leading: 0, bottom: 5, trailing: 0))
+                            .listRowInsets(EdgeInsets(top: 5, leading: 16, bottom: 5, trailing: 16))
                             .listRowSeparator(.hidden)
                             .listRowBackground(Color.clear)
                     }
@@ -356,7 +352,7 @@ private struct HostTrafficDetailView: View {
                             }
                             Spacer()
                         }
-                        .listRowInsets(EdgeInsets(top: 6, leading: 0, bottom: 10, trailing: 0))
+                        .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 10, trailing: 16))
                         .listRowBackground(Color.clear)
                     }
                 }
@@ -920,14 +916,38 @@ private struct TrafficAggregateRow: View {
                     .foregroundStyle(.primary)
                     .lineLimit(1)
                     .minimumScaleFactor(0.78)
-                Image(systemName: "chevron.right")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.tertiary)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .coraListRowSurface(tint: item.color)
         .contentShape(Rectangle())
+    }
+}
+
+/// A tappable row that navigates without NavigationLink's trailing disclosure indicator.
+/// The destination remains local to each lazy row, preserving List performance.
+private struct TrafficNavigationButton<Label: View, Destination: View>: View {
+    let label: () -> Label
+    let destination: () -> Destination
+    @State private var isShowingDestination = false
+
+    init(@ViewBuilder label: @escaping () -> Label,
+         @ViewBuilder destination: @escaping () -> Destination) {
+        self.label = label
+        self.destination = destination
+    }
+
+    var body: some View {
+        Button {
+            isShowingDestination = true
+        } label: {
+            label()
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(.isButton)
+        .navigationDestination(isPresented: $isShowingDestination) {
+            destination()
+        }
     }
 }
 
