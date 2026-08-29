@@ -86,3 +86,63 @@ struct AppListRowBackground: View {
         Rectangle().fill(.regularMaterial)
     }
 }
+
+/// Shared low-cost surface for dashboard cards.  The material and border are
+/// intentionally static so scrolling never starts a new blur or animation.
+struct CoraGlassSurfaceModifier: ViewModifier {
+    let tint: Color?
+    let cornerRadius: CGFloat
+
+    func body(content: Content) -> some View {
+        content
+            .background(.regularMaterial, in: shape)
+            .overlay {
+                shape.stroke(strokeColor, lineWidth: 1)
+            }
+    }
+
+    private var shape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+    }
+
+    private var strokeColor: Color {
+        tint?.opacity(0.18) ?? Color.primary.opacity(0.09)
+    }
+}
+
+/// Inset list row surface used by connection, traffic and log lists.  Keeping
+/// the padding here gives every list the same rhythm while retaining List's
+/// lazy rendering and native navigation behavior.
+struct CoraListRowSurfaceModifier: ViewModifier {
+    let tint: Color?
+
+    func body(content: Content) -> some View {
+        content
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(.regularMaterial, in: shape)
+            .overlay {
+                shape.stroke(strokeColor, lineWidth: 1)
+            }
+    }
+
+    private var shape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: 14, style: .continuous)
+    }
+
+    private var strokeColor: Color {
+        tint?.opacity(0.16) ?? Color.primary.opacity(0.08)
+    }
+}
+
+extension View {
+    func coraGlassSurface(tint: Color? = nil,
+                          cornerRadius: CGFloat = 16) -> some View {
+        modifier(CoraGlassSurfaceModifier(tint: tint,
+                                           cornerRadius: cornerRadius))
+    }
+
+    func coraListRowSurface(tint: Color? = nil) -> some View {
+        modifier(CoraListRowSurfaceModifier(tint: tint))
+    }
+}

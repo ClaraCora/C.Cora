@@ -20,7 +20,6 @@ struct ConnectionsView: View {
                 }
             } else {
                 ConnectionOverview(controller: controller,
-                                   history: controller.history,
                                    isRefreshing: controller.isLoading,
                                    error: controller.error,
                                    onRefresh: { await controller.refresh(showLoading: false) })
@@ -38,7 +37,6 @@ struct ConnectionsView: View {
 
 private struct ConnectionOverview: View {
     @ObservedObject var controller: ConnectionsController
-    let history: [ConnectionHistoryEntry]
     let isRefreshing: Bool
     let error: String?
     let onRefresh: () async -> Void
@@ -56,13 +54,12 @@ private struct ConnectionOverview: View {
 
     var body: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 22) {
+            LazyVStack(alignment: .leading, spacing: 20) {
                 HStack(spacing: 12) {
                     NavigationLink {
                         ConnectionListView(title: "全部连接",
-                                           entries: history,
                                            controller: controller,
-                                           showsRetentionNote: true)
+                                           historyQuery: .all)
                     } label: {
                         ConnectionCountCard(title: "全部连接",
                                             value: controller.historySummary.recordCount,
@@ -73,8 +70,8 @@ private struct ConnectionOverview: View {
 
                     NavigationLink {
                         ConnectionListView(title: "活跃连接",
-                                           entries: history.filter(\.isActive),
                                            controller: controller,
+                                           historyQuery: ConnectionHistoryQuery(isActive: true),
                                            initialStatus: .active)
                     } label: {
                         ConnectionCountCard(title: "活跃连接",
@@ -91,8 +88,7 @@ private struct ConnectionOverview: View {
                         .foregroundStyle(.orange)
                         .padding(.horizontal, 14)
                         .padding(.vertical, 10)
-                        .background(Color.orange.opacity(0.10),
-                                    in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        .coraGlassSurface(tint: .orange, cornerRadius: 14)
                 }
 
                 NavigationLink {
@@ -126,7 +122,7 @@ private struct ConnectionOverview: View {
 
     private func sectionHeading(_ title: String, symbol: String) -> some View {
         Label(title, systemImage: symbol)
-            .font(.title3.weight(.semibold))
+            .font(.headline.weight(.semibold))
             .foregroundStyle(.primary)
     }
 }
@@ -138,26 +134,27 @@ private struct ConnectionCountCard: View {
     let tint: Color
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Image(systemName: symbol)
-                .font(.title3.weight(.semibold))
-                .foregroundStyle(tint)
-            Text(title)
-                .font(.headline)
-                .foregroundStyle(.primary)
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: symbol)
+                    .font(.headline.weight(.semibold))
+                    .foregroundStyle(tint)
+                Text(title)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+            }
             Text(value.formatted())
-                .font(.title2.monospacedDigit().weight(.semibold))
+                .font(.title3.monospacedDigit().weight(.semibold))
                 .foregroundStyle(.primary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.70)
         }
-        .frame(maxWidth: .infinity, minHeight: 108, alignment: .leading)
-        .padding(16)
-        .background(.regularMaterial,
-                    in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .stroke(tint.opacity(0.14), lineWidth: 1)
-        }
-        .contentShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .frame(maxWidth: .infinity, minHeight: 116, alignment: .leading)
+        .padding(14)
+        .coraGlassSurface(tint: tint)
+        .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
     }
 }
 
@@ -189,9 +186,8 @@ private struct StrategyTrafficCard: View {
 
             FlowLegend(totals: displayedTotals)
         }
-        .padding(16)
-        .background(.regularMaterial,
-                    in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .padding(14)
+        .coraGlassSurface()
     }
 }
 
@@ -224,8 +220,7 @@ private struct HostTrafficCard: View {
             }
         }
         .padding(10)
-        .background(.regularMaterial,
-                    in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .coraGlassSurface()
     }
 }
 
@@ -236,6 +231,9 @@ private struct HostTrafficRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
             HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Circle()
+                    .fill(total.color)
+                    .frame(width: 8, height: 8)
                 Text(total.name)
                     .font(.subheadline)
                     .foregroundStyle(.primary)
@@ -245,6 +243,9 @@ private struct HostTrafficRow: View {
                     .font(.subheadline.monospacedDigit().weight(.medium))
                     .foregroundStyle(.primary)
                     .lineLimit(1)
+                Image(systemName: "chevron.right")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.tertiary)
             }
             TrafficProgress(value: total.total,
                             maximum: max(totalTraffic, total.total),
@@ -269,24 +270,14 @@ private struct StrategyTrafficListView: View {
                                    controller: controller,
                                    historyQuery: ConnectionHistoryQuery(strategyName: total.name))
             } label: {
-                VStack(alignment: .leading, spacing: 5) {
-                    HStack {
-                        Text(total.name)
-                        Spacer()
-                        Text(ByteFormat.size(total.total))
-                            .font(.subheadline.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                    }
-                    HStack(spacing: 8) {
-                        Label(ByteFormat.size(total.upload), systemImage: "arrow.up")
-                        Label(ByteFormat.size(total.download), systemImage: "arrow.down")
-                    }
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                }
+                TrafficAggregateRow(item: total)
             }
-            .listRowBackground(AppListRowBackground())
+            .buttonStyle(.plain)
+            .listRowInsets(EdgeInsets(top: 5, leading: 0, bottom: 5, trailing: 0))
+            .listRowSeparator(.hidden)
+            .listRowBackground(Color.clear)
         }
+        .listStyle(.plain)
         .scrollContentBackground(.hidden)
         .background(AppAmbientBackground())
         .navigationTitle("策略")
@@ -318,7 +309,9 @@ private struct HostTrafficDetailView: View {
             Section {
                 ConnectionTrafficHeader(title: host, total: total, volume: volume)
             }
-            .listRowBackground(AppListRowBackground())
+            .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0))
+            .listRowSeparator(.hidden)
+            .listRowBackground(Color.clear)
 
             Section("策略") {
                 ForEach(strategyTotals) { item in
@@ -332,18 +325,26 @@ private struct HostTrafficDetailView: View {
                     } label: {
                         TrafficAggregateRow(item: item)
                     }
+                    .buttonStyle(.plain)
+                    .listRowInsets(EdgeInsets(top: 5, leading: 0, bottom: 5, trailing: 0))
+                    .listRowSeparator(.hidden)
+                    .listRowBackground(Color.clear)
                 }
             }
-            .listRowBackground(AppListRowBackground())
 
             Section("连接") {
                 if entries.isEmpty && isLoadingHistory {
                     ProgressView("读取连接记录...")
+                        .listRowBackground(Color.clear)
                 } else if entries.isEmpty {
                     CoraUnavailableState("暂无连接记录", systemImage: "network.slash")
+                        .listRowBackground(Color.clear)
                 } else {
                     ForEach(entries) { entry in
                         ConnectionRecordRow(entry: entry, controller: controller)
+                            .listRowInsets(EdgeInsets(top: 5, leading: 0, bottom: 5, trailing: 0))
+                            .listRowSeparator(.hidden)
+                            .listRowBackground(Color.clear)
                     }
                     if hasMoreHistory {
                         HStack {
@@ -355,11 +356,13 @@ private struct HostTrafficDetailView: View {
                             }
                             Spacer()
                         }
+                        .listRowInsets(EdgeInsets(top: 6, leading: 0, bottom: 10, trailing: 0))
+                        .listRowBackground(Color.clear)
                     }
                 }
             }
-            .listRowBackground(AppListRowBackground())
         }
+        .listStyle(.plain)
         .scrollContentBackground(.hidden)
         .background(AppAmbientBackground())
         .navigationTitle("主机名")
@@ -410,18 +413,19 @@ private struct ConnectionTrafficHeader: View {
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
         }
-        .padding(.vertical, 4)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(14)
+        .coraGlassSurface()
     }
 }
 
 struct ConnectionListView: View {
     let title: String
-    let entries: [ConnectionHistoryEntry]
+    var entries: [ConnectionHistoryEntry] = []
     @ObservedObject var controller: ConnectionsController
     var historyQuery: ConnectionHistoryQuery? = nil
     var initialStatus: ConnectionStatusFilter = .all
     var initialStrategy: String? = nil
-    var showsRetentionNote = false
 
     @State private var query = ""
     @State private var status: ConnectionStatusFilter = .all
@@ -437,25 +441,27 @@ struct ConnectionListView: View {
         List {
             Section {
                 filterBar
-            } footer: {
-                if showsRetentionNote {
-                    Text("记录保留最近 7 天，最多 20,000 条或 50 MB；达到任一上限会自动删除最旧记录。")
-                }
             }
             .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0))
             .listRowBackground(Color.clear)
 
             if filteredEntries.isEmpty && isLoadingQueryHistory {
                 ProgressView("读取连接记录...")
+                    .listRowInsets(EdgeInsets(top: 18, leading: 0, bottom: 18, trailing: 0))
+                    .listRowSeparator(.hidden)
                     .listRowBackground(Color.clear)
             } else if filteredEntries.isEmpty {
                 CoraUnavailableState(query.isEmpty ? "没有匹配的连接" : "没有搜索结果",
                                      systemImage: "line.3.horizontal.decrease.circle")
+                    .listRowInsets(EdgeInsets(top: 18, leading: 0, bottom: 18, trailing: 0))
+                    .listRowSeparator(.hidden)
                     .listRowBackground(Color.clear)
             } else {
                 ForEach(filteredEntries) { entry in
                     ConnectionRecordRow(entry: entry, controller: controller)
-                        .listRowBackground(AppListRowBackground())
+                        .listRowInsets(EdgeInsets(top: 5, leading: 0, bottom: 5, trailing: 0))
+                        .listRowSeparator(.hidden)
+                        .listRowBackground(Color.clear)
                 }
                 if query.isEmpty, status == .all, network == .all, strategy.isEmpty,
                    canLoadMoreHistory {
@@ -468,6 +474,7 @@ struct ConnectionListView: View {
                         }
                         Spacer()
                     }
+                    .listRowInsets(EdgeInsets(top: 6, leading: 0, bottom: 10, trailing: 0))
                     .listRowBackground(Color.clear)
                 }
             }
@@ -511,11 +518,16 @@ struct ConnectionListView: View {
 
     private var databaseQuery: ConnectionHistoryQuery? {
         guard let historyQuery else { return nil }
+        // A detail screen may provide a base status (for example, the
+        // overview's active-connections link). Keep that constraint when the
+        // user leaves the status filter at "全部", while still allowing an
+        // explicit filter choice to override it.
+        let activeFilter = status == .all ? historyQuery.isActive : status == .active
         return ConnectionHistoryQuery(
             strategyName: strategy.isEmpty ? historyQuery.strategyName : strategy,
             hostName: historyQuery.hostName,
             network: network == .all ? nil : network.rawValue,
-            isActive: status == .all ? nil : status == .active,
+            isActive: activeFilter,
             searchText: query)
     }
 
@@ -564,8 +576,11 @@ struct ConnectionListView: View {
                     }
                 }
             }
-            .padding(.horizontal, 16)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
         }
+        .coraGlassSurface(cornerRadius: 14)
+        .padding(.horizontal, 14)
     }
 
     private var availableStrategies: [String] {
@@ -608,11 +623,16 @@ private struct MenuFilter<Content: View>: View {
                 Text(title).lineLimit(1)
                 Image(systemName: "chevron.down").font(.caption2.weight(.semibold))
             }
-            .font(.subheadline)
-            .foregroundStyle(.secondary)
+            .font(.footnote.weight(.medium))
+            .foregroundStyle(.primary)
             .padding(.horizontal, 12)
-            .frame(height: 34)
-            .background(Color(uiColor: .tertiarySystemFill), in: Capsule())
+            .frame(minHeight: 36)
+            .background(.thinMaterial, in: Capsule())
+            .overlay {
+                Capsule().stroke(Color.primary.opacity(0.09), lineWidth: 1)
+            }
+            .lineLimit(1)
+            .minimumScaleFactor(0.78)
         }
     }
 }
@@ -652,9 +672,13 @@ private struct ConnectionRecordContent: View {
                     .padding(.vertical, 2)
                     .background(networkTint.opacity(0.12), in: Capsule())
                 Spacer(minLength: 4)
-                Image(systemName: entry.isActive ? "lock.open" : "lock")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
+                HStack(spacing: 7) {
+                    Image(systemName: entry.isActive ? "lock.open" : "lock")
+                    Image(systemName: "chevron.right")
+                        .font(.caption2.weight(.semibold))
+                }
+                .font(.caption)
+                .foregroundStyle(.tertiary)
             }
 
             Text(connection.destinationAddressOrTitle)
@@ -686,7 +710,7 @@ private struct ConnectionRecordContent: View {
             .font(.caption.monospacedDigit())
             .foregroundStyle(.secondary)
         }
-        .padding(.vertical, 6)
+        .coraListRowSurface(tint: entry.isActive ? .green : nil)
         .contentShape(Rectangle())
         .accessibilityElement(children: .combine)
     }
@@ -726,15 +750,19 @@ private struct ConnectionDetailView: View {
                             .foregroundStyle(networkTint)
                     }
                     Text(connection.destinationAddressOrTitle)
-                        .font(.title3.weight(.semibold))
+                        .font(.headline.weight(.semibold))
                         .lineLimit(2)
                     Text(connection.recordTimeText)
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
                 }
-                .padding(.vertical, 4)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(14)
+                .coraGlassSurface(tint: isActive ? .green : nil)
             }
-            .listRowBackground(AppListRowBackground())
+            .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0))
+            .listRowSeparator(.hidden)
+            .listRowBackground(Color.clear)
 
             Section("路由") {
                 ConnectionDetailValue(title: "策略组",
@@ -754,7 +782,9 @@ private struct ConnectionDetailView: View {
                                           systemImage: "list.bullet.rectangle")
                 }
             }
-            .listRowBackground(AppListRowBackground())
+            .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
+            .listRowSeparator(.hidden)
+            .listRowBackground(Color.clear)
 
             Section("连接信息") {
                 if !connection.sourceAddress.isEmpty {
@@ -774,7 +804,9 @@ private struct ConnectionDetailView: View {
                                           systemImage: "clock")
                 }
             }
-            .listRowBackground(AppListRowBackground())
+            .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
+            .listRowSeparator(.hidden)
+            .listRowBackground(Color.clear)
 
             Section("流量") {
                 ConnectionDetailValue(title: "上行", value: ByteFormat.size(connection.upload),
@@ -784,7 +816,9 @@ private struct ConnectionDetailView: View {
                 ConnectionDetailValue(title: "合计", value: ByteFormat.size(connection.transferred),
                                       systemImage: "sum")
             }
-            .listRowBackground(AppListRowBackground())
+            .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
+            .listRowSeparator(.hidden)
+            .listRowBackground(Color.clear)
 
             if isActive {
                 Section {
@@ -798,12 +832,18 @@ private struct ConnectionDetailView: View {
                                 ProgressView().controlSize(.small)
                             }
                         }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(14)
+                        .coraGlassSurface(tint: .red)
                     }
                     .disabled(controller.closingIDs.contains(connection.id))
                 }
-                .listRowBackground(AppListRowBackground())
+                .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0))
+                .listRowSeparator(.hidden)
+                .listRowBackground(Color.clear)
             }
         }
+        .listStyle(.plain)
         .scrollContentBackground(.hidden)
         .background(AppAmbientBackground())
         .navigationTitle("连接详情")
@@ -830,9 +870,13 @@ private struct ConnectionDetailValue: View {
                 .multilineTextAlignment(.trailing)
                 .textSelection(.enabled)
                 .foregroundStyle(.secondary)
+                .lineLimit(3)
+                .minimumScaleFactor(0.82)
         } label: {
             Label(title, systemImage: systemImage)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .coraListRowSurface()
     }
 }
 
@@ -840,14 +884,41 @@ private struct TrafficAggregateRow: View {
     let item: TrafficAggregate
 
     var body: some View {
-        HStack {
-            Circle().fill(item.color).frame(width: 9, height: 9)
-            Text(item.name)
-            Spacer()
-            Text(ByteFormat.size(item.total))
-                .font(.subheadline.monospacedDigit())
+        HStack(spacing: 10) {
+            Circle()
+                .fill(item.color)
+                .frame(width: 10, height: 10)
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text(item.name)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+
+                HStack(spacing: 10) {
+                    Label(ByteFormat.size(item.upload), systemImage: "arrow.up")
+                    Label(ByteFormat.size(item.download), systemImage: "arrow.down")
+                }
+                .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
+            }
+
+            Spacer(minLength: 8)
+
+            VStack(alignment: .trailing, spacing: 5) {
+                Text(ByteFormat.size(item.total))
+                    .font(.subheadline.monospacedDigit().weight(.semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.78)
+                Image(systemName: "chevron.right")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+            }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .coraListRowSurface(tint: item.color)
+        .contentShape(Rectangle())
     }
 }
 

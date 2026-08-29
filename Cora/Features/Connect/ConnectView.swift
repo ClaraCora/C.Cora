@@ -45,14 +45,13 @@ private struct OverviewConnectionLinks: View {
 
     var body: some View {
         LazyVGrid(columns: [
-            GridItem(.flexible(), spacing: 10),
-            GridItem(.flexible(), spacing: 10),
-        ], spacing: 10) {
+            GridItem(.flexible(minimum: 0), spacing: 12),
+            GridItem(.flexible(minimum: 0), spacing: 12),
+        ], spacing: 12) {
             NavigationLink {
                 ConnectionListView(title: "全部连接",
-                                   entries: controller.history,
                                    controller: controller,
-                                   showsRetentionNote: true)
+                                   historyQuery: .all)
             } label: {
                 OverviewConnectionCard(title: "全部连接",
                                         value: controller.historySummary.recordCount,
@@ -63,8 +62,8 @@ private struct OverviewConnectionLinks: View {
 
             NavigationLink {
                 ConnectionListView(title: "活跃连接",
-                                   entries: controller.history.filter(\.isActive),
                                    controller: controller,
+                                   historyQuery: ConnectionHistoryQuery(isActive: true),
                                    initialStatus: .active)
             } label: {
                 OverviewConnectionCard(title: "活跃连接",
@@ -84,25 +83,26 @@ private struct OverviewConnectionCard: View {
     let tint: Color
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Image(systemName: symbol)
-                .font(.title3.weight(.semibold))
-                .foregroundStyle(tint)
-            Text(title)
-                .font(.subheadline.weight(.medium))
-                .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: symbol)
+                    .font(.headline.weight(.semibold))
+                    .foregroundStyle(tint)
+                Text(title)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+            }
             Text(value.formatted())
-                .font(.title2.monospacedDigit().weight(.semibold))
+                .font(.title3.monospacedDigit().weight(.semibold))
                 .foregroundStyle(.primary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.70)
         }
-        .frame(maxWidth: .infinity, minHeight: 96, alignment: .leading)
+        .frame(maxWidth: .infinity, minHeight: 116, alignment: .leading)
         .padding(14)
-        .background(.regularMaterial,
-                    in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(tint.opacity(0.14), lineWidth: 1)
-        }
+        .coraGlassSurface(tint: tint)
         .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .accessibilityElement(children: .combine)
     }
@@ -320,9 +320,9 @@ private struct RuntimeMetricsGrid: View {
 
     var body: some View {
         LazyVGrid(columns: [
-            GridItem(.flexible(), spacing: 10),
-            GridItem(.flexible(), spacing: 10),
-        ], spacing: 10) {
+            GridItem(.flexible(minimum: 0), spacing: 12),
+            GridItem(.flexible(minimum: 0), spacing: 12),
+        ], spacing: 12) {
             RateMetricWidget(title: "下行", value: ByteFormat.rate(down),
                              systemImage: "arrow.down", tint: .blue,
                              samples: samples, direction: .down)
@@ -369,9 +369,9 @@ private struct RateMetricWidget: View {
                 .minimumScaleFactor(0.64)
             miniChart
         }
-        .padding(12)
+        .padding(14)
         .frame(maxWidth: .infinity, minHeight: 116, alignment: .leading)
-        .background(metricSurface)
+        .coraGlassSurface(tint: tint)
         .accessibilityElement(children: .combine)
     }
 
@@ -401,18 +401,6 @@ private struct RateMetricWidget: View {
         .chartYScale(domain: 0...upperBound)
         .frame(height: 34)
         .accessibilityHidden(true)
-    }
-
-    private var metricSurface: some View {
-        RoundedRectangle(cornerRadius: 14, style: .continuous)
-            .fill(.regularMaterial)
-            .overlay(alignment: .bottom) {
-                Rectangle()
-                    .fill(tint.opacity(0.72))
-                    .frame(height: 2)
-                    .clipShape(Capsule())
-                    .padding(.horizontal, 12)
-            }
     }
 
     private func value(for sample: KernelController.TrafficSample) -> Double {
@@ -449,12 +437,9 @@ private struct MetricWidget: View {
                 .minimumScaleFactor(0.65)
                 .foregroundStyle(.primary)
         }
-        .padding(12)
-        .frame(maxWidth: .infinity, minHeight: 78, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(.regularMaterial)
-        )
+        .padding(14)
+        .frame(maxWidth: .infinity, minHeight: 116, alignment: .leading)
+        .coraGlassSurface(tint: tint)
         .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         .accessibilityElement(children: .combine)
     }

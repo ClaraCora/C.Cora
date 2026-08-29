@@ -155,9 +155,10 @@ struct LogsView: View {
                 .foregroundStyle(.secondary)
         }
         .font(.caption)
-        .padding(.horizontal, 16)
-        .frame(height: 34)
-        .background(.thinMaterial)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .coraGlassSurface(cornerRadius: 14)
+        .padding(.horizontal, 14)
         .accessibilityElement(children: .combine)
     }
 
@@ -167,9 +168,9 @@ struct LogsView: View {
                 List(controller.lines) { line in
                     LogRow(line: line)
                         .id(line.id)
-                        .listRowInsets(EdgeInsets(top: 6, leading: 14, bottom: 6, trailing: 12))
+                        .listRowInsets(EdgeInsets(top: 5, leading: 0, bottom: 5, trailing: 0))
                         .listRowSeparator(.hidden)
-                        .listRowBackground(AppListRowBackground())
+                        .listRowBackground(Color.clear)
                 }
                 .listStyle(.plain)
                 .scrollContentBackground(.hidden)
@@ -293,6 +294,8 @@ private struct LogRow: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
+        .coraListRowSurface(tint: levelColor)
+        .contentShape(Rectangle())
         .buttonStyle(.plain)
         .accessibilityElement(children: .combine)
     }
@@ -322,18 +325,27 @@ private struct LogDetailView: View {
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(14)
+                .coraGlassSurface(tint: levelColor)
             }
-            .listRowBackground(AppListRowBackground())
+            .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0))
+            .listRowSeparator(.hidden)
+            .listRowBackground(Color.clear)
 
             Section("日志内容") {
                 Text(line.payload)
                     .font(.system(.footnote, design: .monospaced))
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.vertical, 4)
+                    .padding(14)
+                    .coraGlassSurface()
             }
-            .listRowBackground(AppListRowBackground())
+            .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
+            .listRowSeparator(.hidden)
+            .listRowBackground(Color.clear)
         }
+        .listStyle(.plain)
         .scrollContentBackground(.hidden)
         .background(AppAmbientBackground())
         .navigationTitle("日志详情")
