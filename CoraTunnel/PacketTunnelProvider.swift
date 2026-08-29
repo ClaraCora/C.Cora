@@ -36,9 +36,20 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     }
     private let ipcResponseLock = NSLock()
     private var storedIPCResponses: [String: StoredIPCResponse] = [:]
+    private var storedIPCResponseBytes = 0
+    private var ipcResponseCachingEnabled = true
+    // Async IPC work can finish after stopTunnel and even after a new tunnel
+    // session starts. Responses are tied to this generation so an old task
+    // cannot populate the new session's chunk cache.
+    private var ipcSessionGeneration: UInt64 = 0
+    private var ipcResponseCleanupWorkItem: DispatchWorkItem?
     private static let ipcInlineResponseLimit = 16 * 1_024
     private static let ipcResponseChunkSize = 12 * 1_024
     private static let ipcMaximumResponseSize = 8 * 1_024 * 1_024
+    // A chunked response is only a short-lived hand-off to the App. Keep the
+    // aggregate budget bounded when a caller disappears before fetching it.
+    private static let ipcMaximumStoredResponseBytes = 8 * 1_024 * 1_024
+    private static let ipcMaximumStoredResponses = 2
     private static let ipcResponseLifetime: TimeInterval = 30
     private var trollStoreIPCServer: TrollStoreFileIPCServer?
     /// 仅在开发者模式开启时创建，普通 VPN 会话不持有诊断定时器、压力监听或文件句柄。
@@ -116,6 +127,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             tunnelFileDescriptor = nil
         }
         stopTrollStoreIPC()
+        clearStoredIPCResponses(enableCaching: true)
         // 每次启动只清空进程内缓冲；FileLog 会把上一会话的持久化日志轮换为
         // ne.previous.log，避免 NE 被系统停止后事故现场被新会话覆盖。
         // 隧道建立前先抓物理网络 DNS；隧道起来后系统主解析器会变成隧道自己的 DNS。
@@ -330,6 +342,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         FileLog.write("stopTunnel，原因 rawValue=\(reason.rawValue)")
         log.info("stopTunnel，原因：\(reason.rawValue, privacy: .public)")
         stopTrollStoreIPC()
+        clearStoredIPCResponses(enableCaching: false)
         runtimeQueue.sync {
             isStopping = true
             tunnelFileDescriptor = nil
@@ -700,12 +713,15 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                                   completionHandler: ((Data?) -> Void)?) {
         let obj = (try? JSONSerialization.jsonObject(with: messageData)) as? [String: Any]
         let cmd = (obj?["cmd"] as? String) ?? String(data: messageData, encoding: .utf8) ?? ""
+        let sessionGeneration = currentIPCSessionGeneration()
         let reply: (Data?) -> Void = { [weak self] data in
             guard let self, let data else {
                 completionHandler?(data)
                 return
             }
-            self.completeAppMessage(data, completionHandler: completionHandler)
+            self.completeAppMessage(data,
+                                    completionHandler: completionHandler,
+                                    generation: sessionGeneration)
         }
         let protocolVersion = (obj?["v"] as? NSNumber)?.intValue
         if let protocolVersion, protocolVersion != 1 {
@@ -896,7 +912,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             }
         case "readResponseChunk":
             completionHandler?(responseChunk(token: obj?["token"] as? String,
-                                              offset: (obj?["offset"] as? NSNumber)?.intValue))
+                                              offset: (obj?["offset"] as? NSNumber)?.intValue,
+                                              generation: sessionGeneration))
         case "getLogs":
             // 日志可能很大，IPC 响应有体积上限 → 只回传末尾约 24KB，取最新内容。
             let body = "[cmd=\(cmd)]\n" + collectLogs()
@@ -916,7 +933,19 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     /// NetworkExtension may turn an oversized provider reply into nil. Large
     /// replies are retained briefly and fetched by the app in bounded chunks.
     private func completeAppMessage(_ data: Data,
-                                    completionHandler: ((Data?) -> Void)?) {
+                                    completionHandler: ((Data?) -> Void)?,
+                                    generation: UInt64) {
+        ipcResponseLock.lock()
+        let isCurrentSession = ipcResponseCachingEnabled
+            && generation == ipcSessionGeneration
+        ipcResponseLock.unlock()
+        guard isCurrentSession else {
+            completionHandler?(Self.jsonData([
+                "ok": false,
+                "error": "IPC 响应已过期",
+            ]))
+            return
+        }
         guard data.count > Self.ipcInlineResponseLimit else {
             completionHandler?(data)
             return
@@ -932,11 +961,35 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         let token = UUID().uuidString
         let now = Date()
         ipcResponseLock.lock()
-        storedIPCResponses = storedIPCResponses.filter { $0.value.expiresAt > now }
+        guard ipcResponseCachingEnabled, generation == ipcSessionGeneration else {
+            ipcResponseLock.unlock()
+            completionHandler?(Self.jsonData([
+                "ok": false,
+                "error": "IPC 响应已过期",
+            ]))
+            return
+        }
+        purgeExpiredIPCResponsesLocked(now: now)
+        // The app normally consumes a token immediately. If it does not,
+        // evict the oldest hand-off before retaining another response so a
+        // failed UI request cannot accumulate several megabytes in the NE.
+        while storedIPCResponses.count >= Self.ipcMaximumStoredResponses
+                || storedIPCResponseBytes + data.count > Self.ipcMaximumStoredResponseBytes {
+            guard let oldest = storedIPCResponses.min(by: {
+                $0.value.expiresAt < $1.value.expiresAt
+            })?.key else { break }
+            removeStoredIPCResponseLocked(forKey: oldest)
+        }
         storedIPCResponses[token] = StoredIPCResponse(
             data: data,
             expiresAt: now.addingTimeInterval(Self.ipcResponseLifetime))
+        storedIPCResponseBytes += data.count
         ipcResponseLock.unlock()
+
+        // Expiration must not depend on a later IPC request. A single
+        // coalesced work item services the whole bounded cache, so repeated
+        // large replies cannot enqueue an unbounded number of delayed blocks.
+        scheduleIPCResponseCleanup(generation: generation)
 
         completionHandler?(Self.jsonData([
             "_coraTransfer": "chunked-v1",
@@ -946,7 +999,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         ]))
     }
 
-    private func responseChunk(token: String?, offset: Int?) -> Data {
+    private func responseChunk(token: String?, offset: Int?, generation: UInt64) -> Data {
         guard let token, UUID(uuidString: token) != nil,
               let offset, offset >= 0 else {
             return Self.jsonData(["ok": false, "error": "分块响应参数无效"])
@@ -954,17 +1007,88 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
         ipcResponseLock.lock()
         defer { ipcResponseLock.unlock() }
+        guard ipcResponseCachingEnabled, generation == ipcSessionGeneration else {
+            return Data()
+        }
+        purgeExpiredIPCResponsesLocked(now: Date())
         guard let stored = storedIPCResponses[token], stored.expiresAt > Date(),
               offset < stored.data.count else {
-            storedIPCResponses.removeValue(forKey: token)
+            removeStoredIPCResponseLocked(forKey: token)
             return Data()
         }
         let end = min(offset + Self.ipcResponseChunkSize, stored.data.count)
         let chunk = stored.data.subdata(in: offset..<end)
         if end == stored.data.count {
-            storedIPCResponses.removeValue(forKey: token)
+            removeStoredIPCResponseLocked(forKey: token)
         }
         return chunk
+    }
+
+    private func scheduleIPCResponseCleanup(generation: UInt64) {
+        ipcResponseLock.lock()
+        guard ipcResponseCachingEnabled,
+              generation == ipcSessionGeneration,
+              ipcResponseCleanupWorkItem == nil,
+              !storedIPCResponses.isEmpty else {
+            ipcResponseLock.unlock()
+            return
+        }
+        let work = DispatchWorkItem { [weak self] in
+            self?.runIPCResponseCleanup(generation: generation)
+        }
+        ipcResponseCleanupWorkItem = work
+        ipcResponseLock.unlock()
+        DispatchQueue.global(qos: .utility).asyncAfter(
+            deadline: .now() + Self.ipcResponseLifetime,
+            execute: work)
+    }
+
+    private func runIPCResponseCleanup(generation: UInt64) {
+        ipcResponseLock.lock()
+        guard generation == ipcSessionGeneration else {
+            ipcResponseLock.unlock()
+            return
+        }
+        ipcResponseCleanupWorkItem = nil
+        purgeExpiredIPCResponsesLocked(now: Date())
+        let hasResponses = !storedIPCResponses.isEmpty
+        ipcResponseLock.unlock()
+        if hasResponses {
+            scheduleIPCResponseCleanup(generation: generation)
+        }
+    }
+
+    private func purgeExpiredIPCResponsesLocked(now: Date) {
+        let expiredKeys = storedIPCResponses.compactMap { key, value in
+            value.expiresAt <= now ? key : nil
+        }
+        for key in expiredKeys {
+            removeStoredIPCResponseLocked(forKey: key)
+        }
+    }
+
+    private func removeStoredIPCResponseLocked(forKey key: String) {
+        guard let response = storedIPCResponses.removeValue(forKey: key) else { return }
+        storedIPCResponseBytes = max(0, storedIPCResponseBytes - response.data.count)
+    }
+
+    private func clearStoredIPCResponses(enableCaching: Bool? = nil) {
+        ipcResponseLock.lock()
+        ipcSessionGeneration &+= 1
+        ipcResponseCleanupWorkItem?.cancel()
+        ipcResponseCleanupWorkItem = nil
+        storedIPCResponses.removeAll(keepingCapacity: false)
+        storedIPCResponseBytes = 0
+        if let enableCaching {
+            ipcResponseCachingEnabled = enableCaching
+        }
+        ipcResponseLock.unlock()
+    }
+
+    private func currentIPCSessionGeneration() -> UInt64 {
+        ipcResponseLock.lock()
+        defer { ipcResponseLock.unlock() }
+        return ipcSessionGeneration
     }
 
     private static func jsonData(_ object: [String: Any]) -> Data {

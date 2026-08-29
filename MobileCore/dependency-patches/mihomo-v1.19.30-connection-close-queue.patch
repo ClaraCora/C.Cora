@@ -1,5 +1,5 @@
 diff --git a/tunnel/statistic/manager.go b/tunnel/statistic/manager.go
-index c69746d..3c1e29b 100644
+index c69746d..466346d 100644
 --- a/tunnel/statistic/manager.go
 +++ b/tunnel/statistic/manager.go
 @@ -2,13 +2,18 @@ package statistic
@@ -33,7 +33,7 @@ index c69746d..3c1e29b 100644
  	uploadBlip    atomic.Int64
  	downloadBlip  atomic.Int64
  	uploadTotal   atomic.Int64
-@@ -37,12 +47,127 @@ type Manager struct {
+@@ -37,12 +47,178 @@ type Manager struct {
  	memory        uint64
  }
  
@@ -79,6 +79,14 @@ index c69746d..3c1e29b 100644
 +
 +	m.closedMu.Lock()
 +	defer m.closedMu.Unlock()
++	// Release references at or before the supplied cursor at the start of each
++	// read, while keeping cursor values for overflow detection.
++	for index := 0; index < m.closedCount; index++ {
++		slot := (m.closedStart + index) % maxClosedConnectionSnapshots
++		if m.closed[slot].cursor <= cursor {
++			m.closed[slot].info = nil
++		}
++	}
 +	next = cursor
 +	if m.closedCount == 0 {
 +		return next, false, nil
@@ -91,6 +99,14 @@ index c69746d..3c1e29b 100644
 +		if snapshot.cursor <= cursor {
 +			continue
 +		}
++		if snapshot.info == nil {
++			// A second consumer can arrive with an older cursor after another
++			// consumer acknowledged this entry. Surface the loss and advance so
++			// that it cannot retry the same unavailable slot forever.
++			dropped = true
++			next = snapshot.cursor
++			continue
++		}
 +		infos = append(infos, snapshot.info)
 +		next = snapshot.cursor
 +		if len(infos) == limit {
@@ -100,17 +116,52 @@ index c69746d..3c1e29b 100644
 +	return next, dropped, infos
 +}
 +
++// ClosedPending returns the number of snapshots that still hold TrackerInfo
++// references. Consumed entries retain only their cursor, so this value reflects
++// the memory that the close queue can currently keep alive.
++func (m *Manager) ClosedPending() int {
++	m.closedMu.Lock()
++	defer m.closedMu.Unlock()
++	pending := 0
++	for index := 0; index < m.closedCount; index++ {
++		if m.closed[(m.closedStart+index)%maxClosedConnectionSnapshots].info != nil {
++			pending++
++		}
++	}
++	return pending
++}
++
++// DiscardClosed releases every retained completed tracker. It is used at a
++// core shutdown boundary where the Network Extension recorder is already
++// stopped and cannot persist the final close snapshots.
++func (m *Manager) DiscardClosed() {
++	m.closedMu.Lock()
++	for index := 0; index < m.closedCount; index++ {
++		slot := (m.closedStart + index) % maxClosedConnectionSnapshots
++		m.closed[slot].info = nil
++		m.closed[slot].cursor = 0
++	}
++	m.closedStart = 0
++	m.closedCount = 0
++	m.closedCursor = 0
++	m.closedMu.Unlock()
++}
++
 +func cloneTrackerInfo(info *TrackerInfo) *TrackerInfo {
 +	if info == nil {
 +		return nil
 +	}
-+	copyInfo := *info
-+	copyInfo.UploadTotal = atomic.NewInt64(info.UploadTotal.Load())
-+	copyInfo.DownloadTotal = atomic.NewInt64(info.DownloadTotal.Load())
-+	copyInfo.Chain = boundedChain(info.Chain)
-+	copyInfo.ProviderChain = boundedChain(info.ProviderChain)
-+	copyInfo.Rule = boundedString(info.Rule, 96)
-+	copyInfo.RulePayload = boundedString(info.RulePayload, 256)
++	// The history schema does not consume ProviderChain, so do not retain a
++	// duplicate provider-name chain in the bounded close queue.
++	copyInfo := &TrackerInfo{
++		UUID:          info.UUID,
++		UploadTotal:   atomic.NewInt64(info.UploadTotal.Load()),
++		DownloadTotal: atomic.NewInt64(info.DownloadTotal.Load()),
++		Start:         info.Start,
++		Chain:         boundedChain(info.Chain),
++		Rule:          boundedString(info.Rule, 96),
++		RulePayload:   boundedString(info.RulePayload, 256),
++	}
 +	if info.Metadata != nil {
 +		metadata := info.Metadata
 +		copyInfo.Metadata = &C.Metadata{
@@ -126,7 +177,7 @@ index c69746d..3c1e29b 100644
 +			SniffHost:   boundedString(metadata.SniffHost, 256),
 +		}
 +	}
-+	return &copyInfo
++	return copyInfo
 +}
 +
 +func boundedChain(chain C.Chain) C.Chain {

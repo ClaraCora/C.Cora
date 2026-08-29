@@ -762,20 +762,21 @@ func TestRuntimeStatsReturnsDiagnosticSnapshot(t *testing.T) {
 		t.Fatalf("RuntimeStats returned invalid JSON: %v", err)
 	}
 	for _, key := range []string{"heapAlloc", "sys", "goroutines", "connections",
-		"proxyProviders", "ruleProviders", "proxyGroups"} {
+		"proxyProviders", "ruleProviders", "proxyGroups", "closedQueuePending"} {
 		if _, exists := fields[key]; !exists {
 			t.Fatalf("RuntimeStats omitted %q", key)
 		}
 	}
 
 	var snapshot struct {
-		HeapAlloc      uint64 `json:"heapAlloc"`
-		Sys            uint64 `json:"sys"`
-		Goroutines     int    `json:"goroutines"`
-		Connections    int    `json:"connections"`
-		ProxyProviders int    `json:"proxyProviders"`
-		RuleProviders  int    `json:"ruleProviders"`
-		ProxyGroups    int    `json:"proxyGroups"`
+		HeapAlloc          uint64 `json:"heapAlloc"`
+		Sys                uint64 `json:"sys"`
+		Goroutines         int    `json:"goroutines"`
+		Connections        int    `json:"connections"`
+		ProxyProviders     int    `json:"proxyProviders"`
+		RuleProviders      int    `json:"ruleProviders"`
+		ProxyGroups        int    `json:"proxyGroups"`
+		ClosedQueuePending int    `json:"closedQueuePending"`
 	}
 	if err := json.Unmarshal([]byte(RuntimeStats()), &snapshot); err != nil {
 		t.Fatalf("RuntimeStats returned invalid JSON: %v", err)

@@ -1,26 +1,24 @@
 diff --git a/common/pool/alloc.go b/common/pool/alloc.go
-index cb58644..c7ffeb6 100644
+index cb58644..4f4e4ff 100644
 --- a/common/pool/alloc.go
 +++ b/common/pool/alloc.go
-@@ -8,6 +8,10 @@ import (
+@@ -8,6 +8,9 @@ import (
  	"sync"
-+	"sync/atomic"
  )
  
 +const maxPooledSize = (1 << 16) + 16
-+const maxOversizeBuffers = 16
++const maxOversizeBuffers = 8
 +
  var DefaultAllocator = NewAllocator()
  
  type Allocator interface {
-@@ -17,12 +19,13 @@ type Allocator interface {
+@@ -17,12 +19,12 @@ type Allocator interface {
  
  // defaultAllocator for incoming frames, optimized to prevent overwriting after zeroing
  type defaultAllocator struct {
 -	buffers [11]sync.Pool
-+	buffers       [11]sync.Pool
-+	oversize      sync.Pool
-+	oversizeCount int32
++	buffers  [11]sync.Pool
++	oversize chan *[maxPooledSize]byte
  }
  
 -// NewAllocator initiates a []byte allocator for frames less than 65536 bytes,
@@ -35,13 +33,13 @@ index cb58644..c7ffeb6 100644
  			{New: func() any { return new([1 << 15]byte) }},
  			{New: func() any { return new([1 << 16]byte) }},
  		},
-+		// Oversize frames are pooled only up to a fixed budget. A sync.Pool can
-+		// otherwise retain one large buffer per worker after a burst.
-+		oversize: sync.Pool{},
++		// A bounded channel keeps the retained-memory budget exact and remains
++		// reusable across garbage collections.
++		oversize: make(chan *[maxPooledSize]byte, maxOversizeBuffers),
  	}
  }
  
-@@ -48,8 +51,14 @@ func (alloc *defaultAllocator) Get(size int) []byte {
+@@ -48,8 +51,15 @@ func (alloc *defaultAllocator) Get(size int) []byte {
  		panic("alloc.Get: len out of range")
  	case size == 0:
  		return nil
@@ -49,15 +47,16 @@ index cb58644..c7ffeb6 100644
 +	case size > maxPooledSize:
  		return make([]byte, size)
 +	case size > 1<<16:
-+		if value := alloc.oversize.Get(); value != nil {
-+			atomic.AddInt32(&alloc.oversizeCount, -1)
-+			return value.(*[maxPooledSize]byte)[:size]
++		select {
++		case value := <-alloc.oversize:
++			return value[:size]
++		default:
++			return make([]byte, maxPooledSize)[:size]
 +		}
-+		return make([]byte, maxPooledSize)[:size]
  	default:
  		var index uint16
  		if size > 64 {
-@@ -91,8 +97,17 @@ func (alloc *defaultAllocator) Get(size int) []byte {
+@@ -91,8 +97,16 @@ func (alloc *defaultAllocator) Get(size int) []byte {
  }
  
  // Put returns a []byte to pool for future use,
@@ -66,10 +65,9 @@ index cb58644..c7ffeb6 100644
  func (alloc *defaultAllocator) Put(buf []byte) error {
 +	if cap(buf) == maxPooledSize {
 +		buf = buf[:maxPooledSize]
-+		if atomic.AddInt32(&alloc.oversizeCount, 1) <= maxOversizeBuffers {
-+			alloc.oversize.Put((*[maxPooledSize]byte)(buf))
-+		} else {
-+			atomic.AddInt32(&alloc.oversizeCount, -1)
++		select {
++		case alloc.oversize <- (*[maxPooledSize]byte)(buf):
++		default:
 +		}
 +		return nil
 +	}
@@ -78,13 +76,16 @@ index cb58644..c7ffeb6 100644
  	}
 diff --git a/common/pool/oversize_pool_test.go b/common/pool/oversize_pool_test.go
 new file mode 100644
-index 0000000..80cdffa
+index 0000000..34d6e61
 --- /dev/null
 +++ b/common/pool/oversize_pool_test.go
-@@ -0,0 +1,40 @@
+@@ -0,0 +1,72 @@
 +package pool
 +
-+import "testing"
++import (
++	"runtime"
++	"testing"
++)
 +
 +func TestOversizePoolBoundary(t *testing.T) {
 +	tests := []struct {
@@ -113,6 +114,22 @@ index 0000000..80cdffa
 +	}
 +}
 +
++func TestOversizePoolRetentionIsBounded(t *testing.T) {
++	allocator := NewAllocator().(*defaultAllocator)
++	for index := 0; index <= maxOversizeBuffers; index++ {
++		if err := allocator.Put(make([]byte, maxPooledSize)); err != nil {
++			t.Fatal(err)
++		}
++	}
++	if got := len(allocator.oversize); got != maxOversizeBuffers {
++		t.Fatalf("retained buffers = %d, want %d", got, maxOversizeBuffers)
++	}
++	runtime.GC()
++	if got := len(allocator.oversize); got != maxOversizeBuffers {
++		t.Fatalf("retained buffers after GC = %d, want %d", got, maxOversizeBuffers)
++	}
++}
++
 +func BenchmarkOversizePool65551(b *testing.B) {
 +	b.ReportAllocs()
 +	for i := 0; i < b.N; i++ {
@@ -121,4 +138,17 @@ index 0000000..80cdffa
 +			b.Fatal(err)
 +		}
 +	}
++}
++
++func BenchmarkOversizePool65551Parallel(b *testing.B) {
++	allocator := NewAllocator()
++	b.ReportAllocs()
++	b.RunParallel(func(pb *testing.PB) {
++		for pb.Next() {
++			data := allocator.Get(65551)
++			if err := allocator.Put(data); err != nil {
++				b.Fatal(err)
++			}
++		}
++	})
 +}

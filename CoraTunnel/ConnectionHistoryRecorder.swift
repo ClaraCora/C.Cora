@@ -149,16 +149,16 @@ final class ConnectionHistoryRecorder {
         autoreleasepool {
             let closedPayload = Data(MihomoClosedConnectionsSnapshot(
                 closedCursor, Self.closedBatchLimit).utf8)
-            if let root = try? JSONSerialization.jsonObject(with: closedPayload) as? [String: Any] {
-                closedCursor = (root["cursor"] as? NSNumber)?.int64Value ?? closedCursor
-                if (root["dropped"] as? Bool) == true {
+            if let snapshot = ConnectionHistoryRecord.coreSnapshot(from: closedPayload) {
+                closedCursor = snapshot.cursor ?? closedCursor
+                if snapshot.dropped {
                     FileLog.write("连接历史关闭队列溢出：极高短连接负载下可能漏记少量详情，VPN 转发未受影响")
                 }
-                if let closed = ConnectionHistoryRecord.records(fromCoreSnapshot: closedPayload) {
+                if !snapshot.records.isEmpty {
                     // The close queue contains final tracker counters, so update
                     // the row before marking it inactive.
-                    store.upsertActive(closed)
-                    store.finish(ids: Set(closed.map { $0.id }))
+                    store.upsertActive(snapshot.records)
+                    store.finish(ids: Set(snapshot.records.map { $0.id }))
                 }
             }
             runMaintenanceIfNeededLocked(store: store)

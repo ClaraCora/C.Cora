@@ -3452,7 +3452,9 @@ func ConnectionsSnapshot(limit int) string {
 // ClosedConnectionsSnapshot returns a small batch of connection snapshots that
 // have just left Mihomo's tracker manager. The manager's internal queue is
 // capped at 512 entries and is drained by the Network Extension into its
-// bounded SQLite history, never retained as a long-lived Go slice.
+// bounded SQLite history. The manager releases each acknowledged TrackerInfo
+// reference on the following read, so the ring retains only a small in-flight
+// window instead of a long-lived history payload.
 func ClosedConnectionsSnapshot(cursor int64, limit int) string {
 	if cursor < 0 {
 		cursor = 0
@@ -3587,6 +3589,7 @@ func RuntimeStats() string {
 		ActiveDelayBatches      int     `json:"activeDelayBatches"`
 		ConnectionSnapshotBytes int64   `json:"connectionSnapshotBytes"`
 		ClosedSnapshotBytes     int64   `json:"closedSnapshotBytes"`
+		ClosedQueuePending      int     `json:"closedQueuePending"`
 	}{
 		HeapAlloc:               mem.HeapAlloc,
 		HeapObjects:             mem.HeapObjects,
@@ -3630,6 +3633,7 @@ func RuntimeStats() string {
 		ActiveDelayBatches:      int(atomic.LoadInt32(&activeProxyDelayBatches)),
 		ConnectionSnapshotBytes: atomic.LoadInt64(&lastConnectionSnapshotBytes),
 		ClosedSnapshotBytes:     atomic.LoadInt64(&lastClosedSnapshotBytes),
+		ClosedQueuePending:      statistic.DefaultManager.ClosedPending(),
 	}
 	out, err := json.Marshal(snapshot)
 	if err != nil {
@@ -4089,6 +4093,10 @@ func Stop() {
 	activeDNSGeneration = 0
 	coreStartedAt = time.Time{}
 	CloseAllConnections()
+	// The recorder is stopped by the Swift host before MihomoStop runs. Do not
+	// leave the final close snapshots in the bounded ring when no consumer can
+	// persist them; the next tunnel session starts with a fresh cursor.
+	statistic.DefaultManager.DiscardClosed()
 	executor.Shutdown()
 	tunnel.SetReservedSyntheticIPPrefixes(nil)
 	// 旧运行时必须在下一次 StartWithConfig 前尽量归还 Go 堆页，

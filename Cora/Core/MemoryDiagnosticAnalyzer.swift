@@ -30,6 +30,7 @@ struct MemoryDiagnosticSample: Decodable {
         let activeDelayBatches: Int?
         let connectionSnapshotBytes: Int64?
         let closedSnapshotBytes: Int64?
+        let closedQueuePending: Int?
         let upTotal: Int64?
         let downTotal: Int64?
     }
@@ -72,6 +73,7 @@ enum MemoryDiagnosticAnalyzer {
         let delayBatches = last.go?.activeDelayBatches.map { String($0) } ?? "未知"
         let snapshotBytes = last.go?.connectionSnapshotBytes.map { formatBytes(UInt64(max(0, $0))) } ?? "未知"
         let closedSnapshotBytes = last.go?.closedSnapshotBytes.map { formatBytes(UInt64(max(0, $0))) } ?? "未知"
+        let closedQueuePending = last.go?.closedQueuePending.map { String($0) } ?? "未知"
         let lastEvent = last.event ?? "未知"
         let duration = durationText(from: first.t, to: last.t)
         let pressure = last.pressureEvents.map { String($0) } ?? "未知"
@@ -119,7 +121,7 @@ enum MemoryDiagnosticAnalyzer {
             "连接：\(connections)（TCP \(tcp) / UDP \(udp)）",
             "Provider：节点 \(proxyProviders) / 规则 \(ruleProviders)，策略组 \(proxyGroups)",
             "测速资源：并发槽位 \(delaySlots)/\(delaySlotLimit)，活动批次 \(delayBatches)",
-            "连接快照：活动 \(snapshotBytes)，关闭队列 \(closedSnapshotBytes)",
+            "连接快照：活动 \(snapshotBytes)，关闭队列 \(closedSnapshotBytes)，待释放 \(closedQueuePending) 条",
             "goroutine：\(goroutines)",
             "诊断压力事件：\(pressure)（冷却合并 \(pressureSuppressed)），最近采样耗时：\(sampleDuration)",
             "",

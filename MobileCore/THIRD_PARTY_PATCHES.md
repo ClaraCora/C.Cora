@@ -157,7 +157,16 @@ it leaves the live manager. Each copy owns its counter data and retains only
 bounded routing and metadata text, so the released tracker cannot mutate
 history. The ring does not reallocate while it is full. `ClosedSince` exposes
 incremental batches behind a cursor and reports when an old cursor fell behind
-the FIFO.
+the FIFO. After the caller advances its cursor, the next read clears consumed
+`TrackerInfo` references and keeps only cursor numbers for overflow detection;
+`ClosedPending` exposes the remaining in-flight count for diagnostics.
+The Packet Tunnel parses each close-queue payload once, reusing the parsed cursor
+and overflow flag alongside its records. Its history writer finalizes each
+per-row SQLite update before preparing the next one, so a full batch does not
+hold hundreds of native statements until the transaction ends.
+At the stop boundary, after closing tracked connections, Cora calls
+`DiscardClosed` because the recorder has already stopped and no final rows can
+be persisted; this releases the ring immediately and resets its session cursor.
 The Packet Tunnel drains this queue every two seconds into its SQLite history;
 the active-connection snapshot is sampled separately every eight seconds.
 SQLite retains at most seven days, 20,000 rows, or 50 MiB, with retention/WAL
@@ -173,8 +182,10 @@ forwarding, active connections, and the extension memory limit are unaffected.
 The Mihomo preparation script verifies the exact upstream source and patched
 SHA-256 hashes. CI runs `./tunnel/statistic` together with the existing pool
 and config checks in both default and `with_low_memory` modes. The patch suite
-checks an empty cursor response and confirms copied tracker counters are no
-longer aliased to the live tracker.
+checks an empty cursor response, confirms copied tracker counters are no longer
+aliased to the live tracker, verifies that closed snapshots do not retain the
+runtime-only provider-name chain, and confirms `DiscardClosed` releases the
+entire ring at shutdown.
 
 ### Rollback
 
@@ -215,19 +226,19 @@ buffer boundary and Mihomo's installed allocator must support this size.
 ### Local behavior
 
 The sing fallback allocator and Mihomo's installed allocator each have one
-dedicated, exact 65552-byte `sync.Pool` bucket. Sizes from 65536 through 65552
-are managed: 65536 keeps using the existing 64 KiB bucket, while 65537 through
+dedicated, exact 65552-byte bounded channel. Sizes from 65536 through 65552 are
+managed: 65536 keeps using the existing 64 KiB bucket, while 65537 through
 65552 use the new bucket. Sizes below 65536 and above 65552 retain their
 upstream behavior. In particular, this does not add a generic 128 KiB bucket,
 change cipher framing, retain a record buffer on each connection, or copy
 plaintext on the relay path.
 
-During contention the pool can retain multiple 65552-byte backing arrays, so
-memory after a traffic burst can remain higher than immediate live demand.
-Retention follows concurrent demand and Go's scheduler/pool behavior rather
-than a hard item limit. Released arrays are reusable, and Go may discard pooled
-items during garbage collection; this replaces per-record backing allocation
-with shared capacity without adding per-connection retention.
+During contention each allocator now retains at most eight 65552-byte backing
+arrays (about 512 KiB per allocator, 16 arrays and about 1 MiB combined across
+sing and Mihomo). The dedicated channel has an exact capacity, so garbage
+collection cannot desynchronize a separate counter and disable reuse; normal
+power-of-two buckets keep their upstream `sync.Pool` behavior. This replaces
+per-record backing allocation without adding per-connection retention.
 
 ### Verification
 
@@ -235,7 +246,8 @@ The preparation scripts lock both module versions and verify SHA-256 hashes
 before and after applying each patch. CI runs both allocator boundary suites in
 default and low-memory modes. Mihomo's test imports sing, verifies that its
 allocator replacement is installed, and asserts that `buf.NewSize(65551)` uses
-the exact bucket. The patched SS2 module is also forced to resolve this exact
+the exact bucket and that the bounded oversize channel never exceeds its eight
+buffer limit. The patched SS2 module is also forced to resolve this exact
 patched sing directory before its Reader tests run, preventing a standalone
 dependency test from silently selecting sing v0.5.4.
 

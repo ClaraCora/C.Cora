@@ -52,6 +52,10 @@ struct ConnectionHistoryRecord: Identifiable, Sendable {
     struct CoreSnapshot: Sendable {
         let records: [ConnectionHistoryRecord]
         let isTruncated: Bool
+        // Close-queue payloads also carry a cursor and overflow flag. Keeping
+        // them with the parsed records lets the tunnel consume one JSON tree.
+        let cursor: Int64?
+        let dropped: Bool
     }
 
     static func coreSnapshot(from data: Data,
@@ -64,7 +68,9 @@ struct ConnectionHistoryRecord: Identifiable, Sendable {
             records: rawConnections.compactMap {
                 ConnectionHistoryRecord(object: $0, capturedAt: capturedAt)
             },
-            isTruncated: (root["truncated"] as? Bool) ?? false)
+            isTruncated: (root["truncated"] as? Bool) ?? false,
+            cursor: (root["cursor"] as? NSNumber)?.int64Value,
+            dropped: (root["dropped"] as? Bool) ?? false)
     }
 
     static func records(fromCoreSnapshot data: Data,
@@ -382,15 +388,20 @@ final class ConnectionHistoryStore: @unchecked Sendable {
             guard database != nil else { return }
             do {
                 try execute("BEGIN IMMEDIATE TRANSACTION")
-                for id in ids {
-                    var statement: OpaquePointer?
-                    try prepare("UPDATE connection_history SET is_active = 0, ended_at = ? "
-                                + "WHERE id = ? AND is_active = 1", into: &statement)
-                    defer { sqlite3_finalize(statement) }
-                    sqlite3_bind_double(statement, 1, date.timeIntervalSince1970)
-                    bindText(id, to: statement, index: 2)
-                    try stepDone(statement)
+                // One batch statement avoids retaining/creating up to 512
+                // native SQLite statements during a close-queue drain.
+                let placeholders = Array(repeating: "?", count: ids.count)
+                    .joined(separator: ", ")
+                let sql = "UPDATE connection_history SET is_active = 0, ended_at = ? "
+                    + "WHERE is_active = 1 AND id IN (\(placeholders))"
+                var statement: OpaquePointer?
+                try prepare(sql, into: &statement)
+                defer { sqlite3_finalize(statement) }
+                sqlite3_bind_double(statement, 1, date.timeIntervalSince1970)
+                for (index, id) in ids.sorted().enumerated() {
+                    bindText(id, to: statement, index: Int32(index + 2))
                 }
+                try stepDone(statement)
                 try execute("COMMIT")
             } catch {
                 try? execute("ROLLBACK")
