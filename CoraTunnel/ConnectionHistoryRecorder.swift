@@ -6,8 +6,10 @@ import Mihomo
 /// map is capped well below a Packet Tunnel's memory budget and is never sent
 /// across IPC as a history payload.
 final class ConnectionHistoryRecorder {
-    private static let pollInterval: TimeInterval = 2
-    private static let snapshotLimit = 500
+    // Keep the NE-side JSON and SQLite batch bounded. The App can still page
+    // the complete on-disk history; this only limits transient active data.
+    private static let pollInterval: TimeInterval = 3
+    private static let snapshotLimit = 256
     private static let closedBatchLimit = 512
     private static let storeRetryIntervals: [TimeInterval] = [5, 10, 20, 40, 60]
 
@@ -107,31 +109,32 @@ final class ConnectionHistoryRecorder {
 
     private func sampleLocked() {
         guard let store else { return }
-        let payload = Data(MihomoConnectionsSnapshot(Self.snapshotLimit).utf8)
-        if let snapshot = ConnectionHistoryRecord.coreSnapshot(from: payload) {
-            store.upsertActive(snapshot.records)
-            // The IPC snapshot is normally complete. When it is capped, a
-            // missing ID might still be live, so rely on Mihomo's bounded
-            // close queue instead of falsely ending it.
-            if !snapshot.isTruncated {
-                store.finishActive(except: Set(snapshot.records.map { $0.id }))
+        autoreleasepool {
+            let payload = Data(MihomoConnectionsSnapshot(Self.snapshotLimit).utf8)
+            if let snapshot = ConnectionHistoryRecord.coreSnapshot(from: payload) {
+                store.upsertActive(snapshot.records)
+                // The IPC snapshot is normally complete. When it is capped, a
+                // missing ID might still be live, so rely on Mihomo's bounded
+                // close queue instead of falsely ending it.
+                if !snapshot.isTruncated {
+                    store.finishActive(except: Set(snapshot.records.map { $0.id }))
+                }
+            }
+
+            let closedPayload = Data(MihomoClosedConnectionsSnapshot(
+                closedCursor, Self.closedBatchLimit).utf8)
+            if let root = try? JSONSerialization.jsonObject(with: closedPayload) as? [String: Any] {
+                closedCursor = (root["cursor"] as? NSNumber)?.int64Value ?? closedCursor
+                if (root["dropped"] as? Bool) == true {
+                    FileLog.write("连接历史关闭队列溢出：极高短连接负载下可能漏记少量详情，VPN 转发未受影响")
+                }
+                if let closed = ConnectionHistoryRecord.records(fromCoreSnapshot: closedPayload) {
+                    // The close queue contains final tracker counters, so update
+                    // the row before marking it inactive.
+                    store.upsertActive(closed)
+                    store.finish(ids: Set(closed.map { $0.id }))
+                }
             }
         }
-
-        let closedPayload = Data(MihomoClosedConnectionsSnapshot(
-            closedCursor, Self.closedBatchLimit).utf8)
-        if let root = try? JSONSerialization.jsonObject(with: closedPayload) as? [String: Any] {
-            closedCursor = (root["cursor"] as? NSNumber)?.int64Value ?? closedCursor
-            if (root["dropped"] as? Bool) == true {
-                FileLog.write("连接历史关闭队列溢出：极高短连接负载下可能漏记少量详情，VPN 转发未受影响")
-            }
-            if let closed = ConnectionHistoryRecord.records(fromCoreSnapshot: closedPayload) {
-                // The close queue contains final tracker counters, so update
-                // the row before marking it inactive.
-                store.upsertActive(closed)
-                store.finish(ids: Set(closed.map { $0.id }))
-            }
-        }
-
     }
 }

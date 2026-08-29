@@ -12,6 +12,8 @@ struct MemoryDiagnosticSample: Decodable {
         let heapInuse: UInt64?
         let heapReleased: UInt64?
         let heapSys: UInt64?
+        let goMemoryLimit: Int64?
+        let goGCPercent: Int?
         let goroutines: Int?
         let connections: Int?
         let tcpConnections: Int?
@@ -19,6 +21,11 @@ struct MemoryDiagnosticSample: Decodable {
         let proxyProviders: Int?
         let ruleProviders: Int?
         let proxyGroups: Int?
+        let delaySlotsInUse: Int?
+        let delaySlotLimit: Int?
+        let activeDelayBatches: Int?
+        let connectionSnapshotBytes: Int64?
+        let closedSnapshotBytes: Int64?
         let upTotal: Int64?
         let downTotal: Int64?
     }
@@ -47,6 +54,8 @@ enum MemoryDiagnosticAnalyzer {
         let heapDelta = signedDelta(last.go?.heapAlloc, first.go?.heapAlloc)
         let inuseDelta = signedDelta(last.go?.heapInuse, first.go?.heapInuse)
         let released = last.go?.heapReleased.map { formatBytes($0) } ?? "未知"
+        let memoryLimit = last.go?.goMemoryLimit.map { formatBytes(UInt64(max(0, $0))) } ?? "未知"
+        let gcPercent = last.go?.goGCPercent.map { String($0) } ?? "未知"
         let connections = last.go?.connections.map { String($0) } ?? "未知"
         let goroutines = last.go?.goroutines.map { String($0) } ?? "未知"
         let tcp = last.go?.tcpConnections.map { String($0) } ?? "未知"
@@ -54,6 +63,11 @@ enum MemoryDiagnosticAnalyzer {
         let proxyProviders = last.go?.proxyProviders.map { String($0) } ?? "未知"
         let ruleProviders = last.go?.ruleProviders.map { String($0) } ?? "未知"
         let proxyGroups = last.go?.proxyGroups.map { String($0) } ?? "未知"
+        let delaySlots = last.go?.delaySlotsInUse.map { String($0) } ?? "未知"
+        let delaySlotLimit = last.go?.delaySlotLimit.map { String($0) } ?? "未知"
+        let delayBatches = last.go?.activeDelayBatches.map { String($0) } ?? "未知"
+        let snapshotBytes = last.go?.connectionSnapshotBytes.map { formatBytes(UInt64(max(0, $0))) } ?? "未知"
+        let closedSnapshotBytes = last.go?.closedSnapshotBytes.map { formatBytes(UInt64(max(0, $0))) } ?? "未知"
         let lastEvent = last.event ?? "未知"
         let duration = durationText(from: first.t, to: last.t)
 
@@ -91,8 +105,11 @@ enum MemoryDiagnosticAnalyzer {
             "Go 堆 Alloc：\(formatBytes(last.go?.heapAlloc ?? 0))（变化 \(signedSize(heapDelta))）",
             "Go 堆 Inuse：\(formatBytes(last.go?.heapInuse ?? 0))（变化 \(signedSize(inuseDelta))）",
             "Go 已归还：\(released)",
+            "Go GC 目标：\(memoryLimit)，GOGC=\(gcPercent)%",
             "连接：\(connections)（TCP \(tcp) / UDP \(udp)）",
             "Provider：节点 \(proxyProviders) / 规则 \(ruleProviders)，策略组 \(proxyGroups)",
+            "测速资源：并发槽位 \(delaySlots)/\(delaySlotLimit)，活动批次 \(delayBatches)",
+            "连接快照：活动 \(snapshotBytes)，关闭队列 \(closedSnapshotBytes)",
             "goroutine：\(goroutines)",
             "",
             "判断：",

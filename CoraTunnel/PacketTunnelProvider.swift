@@ -43,6 +43,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private var trollStoreIPCServer: TrollStoreFileIPCServer?
     /// 仅在开发者模式开启时创建，普通 VPN 会话不持有诊断定时器、压力监听或文件句柄。
     private var memoryDiagnostics: MemoryDiagnostics?
+    /// 普通模式只保留这个无状态的压力响应器，不采样、不写诊断文件。
+    private var memoryPressureGuard: MemoryPressureGuard?
     private var developerModeEnabled = false
     // Observability is kept outside the packet data path. The recorder writes
     // bounded rows to the App Group SQLite file.
@@ -235,6 +237,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                     }
                     self.connectionHistoryRecorder.start()
                     self.startPathMonitor() // 开始把真实出站接口喂给内核
+                    if !developerMode, self.memoryPressureGuard == nil {
+                        let guarder = MemoryPressureGuard()
+                        guarder.start()
+                        self.memoryPressureGuard = guarder
+                    }
                     self.memoryDiagnostics?.record(event: "tunnelStarted")
                 }
                 return ok
@@ -332,6 +339,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             }
             stopPathMonitor()
             connectionHistoryRecorder.stop()
+            memoryPressureGuard?.stop()
+            memoryPressureGuard = nil
             memoryDiagnostics?.record(event: "tunnelStopping")
             memoryDiagnostics?.stop(event: "stop")
             memoryDiagnostics = nil
@@ -994,10 +1003,21 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         if persistState {
             Self.persistDeveloperMode(enabled, home: home)
         }
+        // The always-on guard is mutually exclusive with detailed diagnostics.
+        // Reconfigure it here so a live developer-mode toggle takes effect
+        // without requiring a tunnel restart.
+        memoryPressureGuard?.stop()
+        memoryPressureGuard = nil
         memoryDiagnostics?.stop(event: "reconfigure")
         memoryDiagnostics = nil
         developerModeEnabled = enabled
-        guard enabled else { return }
+        guard enabled else {
+            guard tunnelFileDescriptor != nil else { return }
+            let guarder = MemoryPressureGuard()
+            guarder.start()
+            memoryPressureGuard = guarder
+            return
+        }
         let diagnostics = MemoryDiagnostics()
         diagnostics.start(directoryPath: home)
         memoryDiagnostics = diagnostics

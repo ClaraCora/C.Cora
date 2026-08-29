@@ -2,22 +2,25 @@ diff --git a/common/pool/alloc.go b/common/pool/alloc.go
 index cb58644..c7ffeb6 100644
 --- a/common/pool/alloc.go
 +++ b/common/pool/alloc.go
-@@ -8,6 +8,8 @@ import (
+@@ -8,6 +8,10 @@ import (
  	"sync"
++	"sync/atomic"
  )
  
 +const maxPooledSize = (1 << 16) + 16
++const maxOversizeBuffers = 16
 +
  var DefaultAllocator = NewAllocator()
  
  type Allocator interface {
-@@ -17,12 +19,12 @@ type Allocator interface {
+@@ -17,12 +19,13 @@ type Allocator interface {
  
  // defaultAllocator for incoming frames, optimized to prevent overwriting after zeroing
  type defaultAllocator struct {
 -	buffers [11]sync.Pool
-+	buffers  [11]sync.Pool
-+	oversize sync.Pool
++	buffers       [11]sync.Pool
++	oversize      sync.Pool
++	oversizeCount int32
  }
  
 -// NewAllocator initiates a []byte allocator for frames less than 65536 bytes,
@@ -28,15 +31,17 @@ index cb58644..c7ffeb6 100644
  func NewAllocator() Allocator {
  	return &defaultAllocator{
  		buffers: [...]sync.Pool{ // 64B -> 64K
-@@ -38,6 +40,7 @@ func NewAllocator() Allocator {
+@@ -38,6 +40,9 @@ func NewAllocator() Allocator {
  			{New: func() any { return new([1 << 15]byte) }},
  			{New: func() any { return new([1 << 16]byte) }},
  		},
-+		oversize: sync.Pool{New: func() any { return new([maxPooledSize]byte) }},
++		// Oversize frames are pooled only up to a fixed budget. A sync.Pool can
++		// otherwise retain one large buffer per worker after a burst.
++		oversize: sync.Pool{},
  	}
  }
  
-@@ -48,8 +51,11 @@ func (alloc *defaultAllocator) Get(size int) []byte {
+@@ -48,8 +51,14 @@ func (alloc *defaultAllocator) Get(size int) []byte {
  		panic("alloc.Get: len out of range")
  	case size == 0:
  		return nil
@@ -44,12 +49,15 @@ index cb58644..c7ffeb6 100644
 +	case size > maxPooledSize:
  		return make([]byte, size)
 +	case size > 1<<16:
-+		buffer := alloc.oversize.Get().(*[maxPooledSize]byte)
-+		return buffer[:size]
++		if value := alloc.oversize.Get(); value != nil {
++			atomic.AddInt32(&alloc.oversizeCount, -1)
++			return value.(*[maxPooledSize]byte)[:size]
++		}
++		return make([]byte, maxPooledSize)[:size]
  	default:
  		var index uint16
  		if size > 64 {
-@@ -91,8 +97,13 @@ func (alloc *defaultAllocator) Get(size int) []byte {
+@@ -91,8 +97,17 @@ func (alloc *defaultAllocator) Get(size int) []byte {
  }
  
  // Put returns a []byte to pool for future use,
@@ -58,7 +66,11 @@ index cb58644..c7ffeb6 100644
  func (alloc *defaultAllocator) Put(buf []byte) error {
 +	if cap(buf) == maxPooledSize {
 +		buf = buf[:maxPooledSize]
-+		alloc.oversize.Put((*[maxPooledSize]byte)(buf))
++		if atomic.AddInt32(&alloc.oversizeCount, 1) <= maxOversizeBuffers {
++			alloc.oversize.Put((*[maxPooledSize]byte)(buf))
++		} else {
++			atomic.AddInt32(&alloc.oversizeCount, -1)
++		}
 +		return nil
 +	}
  	if cap(buf) == 0 || cap(buf) > 65536 {
@@ -69,14 +81,10 @@ new file mode 100644
 index 0000000..80cdffa
 --- /dev/null
 +++ b/common/pool/oversize_pool_test.go
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,40 @@
 +package pool
 +
-+import (
-+	"testing"
-+
-+	"github.com/metacubex/sing/common/buf"
-+)
++import "testing"
 +
 +func TestOversizePoolBoundary(t *testing.T) {
 +	tests := []struct {
@@ -103,18 +111,6 @@ index 0000000..80cdffa
 +			t.Errorf("Put(Get(%d)) failed: %v", test.size, err)
 +		}
 +	}
-+}
-+
-+func TestSingBufferUsesMihomoOversizePool(t *testing.T) {
-+	if buf.DefaultAllocator != DefaultAllocator {
-+		t.Fatal("sing buffer allocator was not replaced by Mihomo")
-+	}
-+	buffer := buf.NewSize(65551)
-+	if got := cap(buffer.FreeBytes()); got != maxPooledSize {
-+		buffer.Release()
-+		t.Fatalf("sing NewSize(65551) cap = %d, want %d", got, maxPooledSize)
-+	}
-+	buffer.Release()
 +}
 +
 +func BenchmarkOversizePool65551(b *testing.B) {

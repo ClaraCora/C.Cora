@@ -2,22 +2,25 @@ diff --git a/common/buf/alloc.go b/common/buf/alloc.go
 index 6d2f7b7..20cd57f 100644
 --- a/common/buf/alloc.go
 +++ b/common/buf/alloc.go
-@@ -8,6 +8,8 @@ import (
+@@ -8,6 +8,10 @@ import (
  	"sync"
++	"sync/atomic"
  )
  
 +const maxPooledSize = (1 << 16) + 16
++const maxOversizeBuffers = 16
 +
  var DefaultAllocator = newDefaultAllocator()
  
  type Allocator interface {
-@@ -18,12 +20,13 @@ type Allocator interface {
+@@ -18,12 +20,14 @@ type Allocator interface {
  
  // defaultAllocator for incoming frames, optimized to prevent overwriting after zeroing
  type defaultAllocator struct {
 -	buffers [11]sync.Pool
-+	buffers  [11]sync.Pool
-+	oversize sync.Pool
++	buffers       [11]sync.Pool
++	oversize      sync.Pool
++	oversizeCount int32
  }
  
 -// NewAllocator initiates a []byte allocator for frames less than 65536 bytes,
@@ -29,11 +32,13 @@ index 6d2f7b7..20cd57f 100644
  func newDefaultAllocator() Allocator {
  	return &defaultAllocator{
  		buffers: [...]sync.Pool{ // 64B -> 64K
-@@ -39,14 +43,19 @@ func newDefaultAllocator() Allocator {
+@@ -39,14 +43,24 @@ func newDefaultAllocator() Allocator {
  			{New: func() any { return new([1 << 15]byte) }},
  			{New: func() any { return new([1 << 16]byte) }},
  		},
-+		oversize: sync.Pool{New: func() any { return new([maxPooledSize]byte) }},
++		// Oversize frames are pooled only up to a fixed budget. A sync.Pool can
++		// otherwise retain one large buffer per worker after a burst.
++		oversize: sync.Pool{},
  	}
  }
  
@@ -44,13 +49,16 @@ index 6d2f7b7..20cd57f 100644
  		return nil
  	}
 +	if size > 1<<16 {
-+		buffer := alloc.oversize.Get().(*[maxPooledSize]byte)
-+		return buffer[:size]
++		if value := alloc.oversize.Get(); value != nil {
++			atomic.AddInt32(&alloc.oversizeCount, -1)
++			return value.(*[maxPooledSize]byte)[:size]
++		}
++		return make([]byte, maxPooledSize)[:size]
 +	}
  
  	var index uint16
  	if size > 64 {
-@@ -86,8 +94,13 @@ func (alloc *defaultAllocator) Get(size int) []byte {
+@@ -86,8 +94,17 @@ func (alloc *defaultAllocator) Get(size int) []byte {
  }
  
  // Put returns a []byte to pool for future use,
@@ -59,7 +67,11 @@ index 6d2f7b7..20cd57f 100644
  func (alloc *defaultAllocator) Put(buf []byte) error {
 +	if cap(buf) == maxPooledSize {
 +		buf = buf[:maxPooledSize]
-+		alloc.oversize.Put((*[maxPooledSize]byte)(buf))
++		if atomic.AddInt32(&alloc.oversizeCount, 1) <= maxOversizeBuffers {
++			alloc.oversize.Put((*[maxPooledSize]byte)(buf))
++		} else {
++			atomic.AddInt32(&alloc.oversizeCount, -1)
++		}
 +		return nil
 +	}
  	bits := msb(cap(buf))

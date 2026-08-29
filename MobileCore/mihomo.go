@@ -27,6 +27,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -62,6 +63,11 @@ const minimumTunnelMTU = 576
 const maxRunLogBytes int64 = 2 << 20
 
 const maxRunLogLineBytes = 64 << 10
+
+const (
+	goMemoryLimitBytes int64 = 35 << 20
+	goGCPercent              = 50
+)
 
 const (
 	maxScriptRequestBodyBytes    = 32 << 10
@@ -177,6 +183,7 @@ var (
 	homeDir                string
 	logCaptureMu           sync.Once
 	logFileMu              sync.Mutex
+	forceGCMu              sync.Mutex
 	runLogFile             *os.File
 	runLogBytes            int64 = -1
 	runLogGeneration       int64
@@ -189,21 +196,24 @@ var (
 	physicalIface          string
 
 	// 最近一次合并配置时收集的：不适用内容提示 + 各节点协议摘要（供主 App 经 IPC 取用）。
-	configNotices           []string
-	proxyDetailsMap         = map[string]string{}
-	activeDNSConfig         *config.DNS
-	activeDNSSystemTemplate *dnsSystemTemplate
-	activeGeneralIPv6       bool
-	activeSystemDNS         []string
-	activeUsesSystemDNS     bool
-	pendingUsesSystemDNS    bool
-	pendingSourceDNSMode    string
-	activeDNSGeneration     uint64
-	coreStartedAt           time.Time
-	snellCellularTCPMu      sync.RWMutex
-	snellCellularTCPNodes   []string
-	scriptTargetIPCacheMu   sync.Mutex
-	scriptTargetIPCache     = make(map[string]scriptTargetIPCacheEntry)
+	configNotices               []string
+	proxyDetailsMap             = map[string]string{}
+	activeDNSConfig             *config.DNS
+	activeDNSSystemTemplate     *dnsSystemTemplate
+	activeGeneralIPv6           bool
+	activeSystemDNS             []string
+	activeUsesSystemDNS         bool
+	pendingUsesSystemDNS        bool
+	pendingSourceDNSMode        string
+	activeDNSGeneration         uint64
+	coreStartedAt               time.Time
+	snellCellularTCPMu          sync.RWMutex
+	snellCellularTCPNodes       []string
+	scriptTargetIPCacheMu       sync.Mutex
+	scriptTargetIPCache         = make(map[string]scriptTargetIPCacheEntry)
+	activeProxyDelayBatches     int32
+	lastConnectionSnapshotBytes int64
+	lastClosedSnapshotBytes     int64
 )
 
 // lockConfigApplyForWrite cancels the active multi-node delay run before it
@@ -245,6 +255,7 @@ func beginProxyDelayBatch() *proxyDelayBatchSession {
 		ctx: ctx, cancel: cancel, done: make(chan struct{}),
 	}
 	activeProxyDelayBatch = session
+	atomic.AddInt32(&activeProxyDelayBatches, 1)
 	configApplyMu.RLock()
 	proxyDelayBatchMu.Unlock()
 	return session
@@ -257,6 +268,7 @@ func finishProxyDelayBatch(session *proxyDelayBatchSession) {
 	if activeProxyDelayBatch == session {
 		activeProxyDelayBatch = nil
 	}
+	atomic.AddInt32(&activeProxyDelayBatches, -1)
 	close(session.done)
 	proxyDelayBatchMu.Unlock()
 }
@@ -462,15 +474,24 @@ func Setup(home string) {
 // 栈外内存留出余量；SetGCPercent(50) 进一步压低堆峰值。若真机观测到 GC
 // 过于频繁（CPU 发热），可上调上限或回调 GCPercent。
 func configureMemoryLimits() {
-	debug.SetMemoryLimit(35 << 20)
-	debug.SetGCPercent(50)
+	debug.SetMemoryLimit(goMemoryLimitBytes)
+	debug.SetGCPercent(goGCPercent)
 }
 
 // ForceGC 供 Swift 侧内存压力事件（warning/critical）调用：立即 full GC
 // 并把空闲页归还 OS，压低 phys_footprint，降低被 jetsam 的概率。
 func ForceGC() {
+	forceGCMu.Lock()
+	defer forceGCMu.Unlock()
+	// Apply the tighter target only for the pressure window. Keeping the
+	// normal profile at GOGC=50 avoids turning ordinary packet forwarding into
+	// a continuous GC workload.
+	previousGC := debug.SetGCPercent(25)
+	previousLimit := debug.SetMemoryLimit(28 << 20)
 	runtime.GC()
 	debug.FreeOSMemory()
+	debug.SetGCPercent(previousGC)
+	debug.SetMemoryLimit(previousLimit)
 }
 
 // startLogCapture 订阅 mihomo 内核日志（官方 log.Subscribe），逐条写入
@@ -865,6 +886,13 @@ func applyRuntimeConfig(fd int, tunnelMTU int, configYAML string, st appSettings
 		appendRunLog("启动 ParseRawConfig 失败: " + err.Error())
 		return err
 	}
+	// ParseRawConfig has copied the fields needed by the runtime. Drop the
+	// merged YAML and raw parse tree before applying the live configuration so
+	// a large subscription is not held alongside its parsed representation.
+	rawCfg = nil
+	merged = nil
+	configYAML = ""
+	runtime.GC()
 	dnsSystemTemplate := captureDNSSystemTemplate(cfg.DNS)
 	if resolvedDNS, replacements := materializeSystemDNSConfig(
 		cfg.DNS, dnsSystemTemplate, st.SystemDNS); replacements > 0 {
@@ -1955,11 +1983,18 @@ func updateRuntimeProviders(names []string, update func(string) error) string {
 		}
 		updated = append(updated, name)
 	}
-	return marshalJSON(map[string]any{
+	result := marshalJSON(map[string]any{
 		"ok":       len(failures) == 0,
 		"updated":  updated,
 		"failures": failures,
 	})
+	// Provider refresh can temporarily retain both the downloaded payload and
+	// the parsed provider. Reclaim the old payload before returning to Swift;
+	// this runs only after an explicit refresh, never on the packet path.
+	if len(updated) > 0 {
+		runtime.GC()
+	}
+	return result
 }
 
 type runtimeRemoteResourceStatus struct {
@@ -3419,6 +3454,7 @@ func ConnectionsSnapshot(limit int) string {
 		if err != nil {
 			return `{"downloadTotal":0,"uploadTotal":0,"connections":[],"total":0,"truncated":false}`
 		}
+		atomic.StoreInt64(&lastConnectionSnapshotBytes, int64(len(out)))
 		return string(out)
 	}
 	if limit < 0 {
@@ -3463,6 +3499,7 @@ func ConnectionsSnapshot(limit int) string {
 	if err != nil {
 		return `{"downloadTotal":0,"uploadTotal":0,"connections":[],"total":0,"truncated":false}`
 	}
+	atomic.StoreInt64(&lastConnectionSnapshotBytes, int64(len(out)))
 	return string(out)
 }
 
@@ -3492,6 +3529,7 @@ func ClosedConnectionsSnapshot(cursor int64, limit int) string {
 	if err != nil {
 		return `{"cursor":0,"dropped":false,"connections":[]}`
 	}
+	atomic.StoreInt64(&lastClosedSnapshotBytes, int64(len(out)))
 	return string(out)
 }
 
@@ -3561,77 +3599,91 @@ func RuntimeStats() string {
 	}
 
 	snapshot := struct {
-		HeapAlloc      uint64  `json:"heapAlloc"`
-		HeapObjects    uint64  `json:"heapObjects"`
-		HeapInuse      uint64  `json:"heapInuse"`
-		HeapIdle       uint64  `json:"heapIdle"`
-		HeapReleased   uint64  `json:"heapReleased"`
-		HeapSys        uint64  `json:"heapSys"`
-		StackInuse     uint64  `json:"stackInuse"`
-		StackSys       uint64  `json:"stackSys"`
-		MSpanInuse     uint64  `json:"mspanInuse"`
-		MCacheInuse    uint64  `json:"mcacheInuse"`
-		BuckHashSys    uint64  `json:"buckHashSys"`
-		GCSys          uint64  `json:"gcSys"`
-		OtherSys       uint64  `json:"otherSys"`
-		Sys            uint64  `json:"sys"`
-		TotalAlloc     uint64  `json:"totalAlloc"`
-		Mallocs        uint64  `json:"mallocs"`
-		Frees          uint64  `json:"frees"`
-		NextGC         uint64  `json:"nextGC"`
-		LastGC         uint64  `json:"lastGC"`
-		NumGC          uint32  `json:"numGC"`
-		NumForcedGC    uint32  `json:"numForcedGC"`
-		PauseTotalNs   uint64  `json:"pauseTotalNs"`
-		LastPauseNs    uint64  `json:"lastPauseNs"`
-		GCCPUFraction  float64 `json:"gcCPUFraction"`
-		Goroutines     int     `json:"goroutines"`
-		Connections    int     `json:"connections"`
-		TCPConnections int     `json:"tcpConnections"`
-		UDPConnections int     `json:"udpConnections"`
-		ProxyProviders int     `json:"proxyProviders"`
-		RuleProviders  int     `json:"ruleProviders"`
-		ProxyGroups    int     `json:"proxyGroups"`
-		Upload         int64   `json:"up"`
-		Download       int64   `json:"down"`
-		UploadTotal    int64   `json:"upTotal"`
-		DownloadTotal  int64   `json:"downTotal"`
+		HeapAlloc               uint64  `json:"heapAlloc"`
+		HeapObjects             uint64  `json:"heapObjects"`
+		HeapInuse               uint64  `json:"heapInuse"`
+		HeapIdle                uint64  `json:"heapIdle"`
+		HeapReleased            uint64  `json:"heapReleased"`
+		HeapSys                 uint64  `json:"heapSys"`
+		StackInuse              uint64  `json:"stackInuse"`
+		StackSys                uint64  `json:"stackSys"`
+		MSpanInuse              uint64  `json:"mspanInuse"`
+		MCacheInuse             uint64  `json:"mcacheInuse"`
+		BuckHashSys             uint64  `json:"buckHashSys"`
+		GCSys                   uint64  `json:"gcSys"`
+		OtherSys                uint64  `json:"otherSys"`
+		Sys                     uint64  `json:"sys"`
+		TotalAlloc              uint64  `json:"totalAlloc"`
+		Mallocs                 uint64  `json:"mallocs"`
+		Frees                   uint64  `json:"frees"`
+		NextGC                  uint64  `json:"nextGC"`
+		LastGC                  uint64  `json:"lastGC"`
+		NumGC                   uint32  `json:"numGC"`
+		NumForcedGC             uint32  `json:"numForcedGC"`
+		PauseTotalNs            uint64  `json:"pauseTotalNs"`
+		LastPauseNs             uint64  `json:"lastPauseNs"`
+		GCCPUFraction           float64 `json:"gcCPUFraction"`
+		GoMemoryLimit           int64   `json:"goMemoryLimit"`
+		GoGCPercent             int     `json:"goGCPercent"`
+		Goroutines              int     `json:"goroutines"`
+		Connections             int     `json:"connections"`
+		TCPConnections          int     `json:"tcpConnections"`
+		UDPConnections          int     `json:"udpConnections"`
+		ProxyProviders          int     `json:"proxyProviders"`
+		RuleProviders           int     `json:"ruleProviders"`
+		ProxyGroups             int     `json:"proxyGroups"`
+		Upload                  int64   `json:"up"`
+		Download                int64   `json:"down"`
+		UploadTotal             int64   `json:"upTotal"`
+		DownloadTotal           int64   `json:"downTotal"`
+		DelaySlotsInUse         int     `json:"delaySlotsInUse"`
+		DelaySlotLimit          int     `json:"delaySlotLimit"`
+		ActiveDelayBatches      int     `json:"activeDelayBatches"`
+		ConnectionSnapshotBytes int64   `json:"connectionSnapshotBytes"`
+		ClosedSnapshotBytes     int64   `json:"closedSnapshotBytes"`
 	}{
-		HeapAlloc:      mem.HeapAlloc,
-		HeapObjects:    mem.HeapObjects,
-		HeapInuse:      mem.HeapInuse,
-		HeapIdle:       mem.HeapIdle,
-		HeapReleased:   mem.HeapReleased,
-		HeapSys:        mem.HeapSys,
-		StackInuse:     mem.StackInuse,
-		StackSys:       mem.StackSys,
-		MSpanInuse:     mem.MSpanInuse,
-		MCacheInuse:    mem.MCacheInuse,
-		BuckHashSys:    mem.BuckHashSys,
-		GCSys:          mem.GCSys,
-		OtherSys:       mem.OtherSys,
-		Sys:            mem.Sys,
-		TotalAlloc:     mem.TotalAlloc,
-		Mallocs:        mem.Mallocs,
-		Frees:          mem.Frees,
-		NextGC:         mem.NextGC,
-		LastGC:         mem.LastGC,
-		NumGC:          mem.NumGC,
-		NumForcedGC:    mem.NumForcedGC,
-		PauseTotalNs:   mem.PauseTotalNs,
-		LastPauseNs:    lastPause,
-		GCCPUFraction:  mem.GCCPUFraction,
-		Goroutines:     runtime.NumGoroutine(),
-		Connections:    connections,
-		TCPConnections: tcpConnections,
-		UDPConnections: udpConnections,
-		ProxyProviders: proxyProviderCount,
-		RuleProviders:  ruleProviderCount,
-		ProxyGroups:    proxyGroupCount,
-		Upload:         up,
-		Download:       down,
-		UploadTotal:    upTotal,
-		DownloadTotal:  downTotal,
+		HeapAlloc:               mem.HeapAlloc,
+		HeapObjects:             mem.HeapObjects,
+		HeapInuse:               mem.HeapInuse,
+		HeapIdle:                mem.HeapIdle,
+		HeapReleased:            mem.HeapReleased,
+		HeapSys:                 mem.HeapSys,
+		StackInuse:              mem.StackInuse,
+		StackSys:                mem.StackSys,
+		MSpanInuse:              mem.MSpanInuse,
+		MCacheInuse:             mem.MCacheInuse,
+		BuckHashSys:             mem.BuckHashSys,
+		GCSys:                   mem.GCSys,
+		OtherSys:                mem.OtherSys,
+		Sys:                     mem.Sys,
+		TotalAlloc:              mem.TotalAlloc,
+		Mallocs:                 mem.Mallocs,
+		Frees:                   mem.Frees,
+		NextGC:                  mem.NextGC,
+		LastGC:                  mem.LastGC,
+		NumGC:                   mem.NumGC,
+		NumForcedGC:             mem.NumForcedGC,
+		PauseTotalNs:            mem.PauseTotalNs,
+		LastPauseNs:             lastPause,
+		GCCPUFraction:           mem.GCCPUFraction,
+		GoMemoryLimit:           goMemoryLimitBytes,
+		GoGCPercent:             goGCPercent,
+		Goroutines:              runtime.NumGoroutine(),
+		Connections:             connections,
+		TCPConnections:          tcpConnections,
+		UDPConnections:          udpConnections,
+		ProxyProviders:          proxyProviderCount,
+		RuleProviders:           ruleProviderCount,
+		ProxyGroups:             proxyGroupCount,
+		Upload:                  up,
+		Download:                down,
+		UploadTotal:             upTotal,
+		DownloadTotal:           downTotal,
+		DelaySlotsInUse:         len(proxyDelaySlots),
+		DelaySlotLimit:          proxyDelaySlotLimit,
+		ActiveDelayBatches:      int(atomic.LoadInt32(&activeProxyDelayBatches)),
+		ConnectionSnapshotBytes: atomic.LoadInt64(&lastConnectionSnapshotBytes),
+		ClosedSnapshotBytes:     atomic.LoadInt64(&lastClosedSnapshotBytes),
 	}
 	out, err := json.Marshal(snapshot)
 	if err != nil {
@@ -4086,6 +4138,8 @@ func Stop() {
 	storePhysicalInterface("")
 	activeDNSConfig = nil
 	activeDNSSystemTemplate = nil
+	configNotices = nil
+	proxyDetailsMap = nil
 	activeSystemDNS = nil
 	activeGeneralIPv6 = false
 	activeUsesSystemDNS = false
