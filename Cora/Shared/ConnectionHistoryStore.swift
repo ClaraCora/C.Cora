@@ -312,7 +312,14 @@ final class ConnectionHistoryStore: @unchecked Sendable {
             } else {
                 try applySteadyStatePageLimitLocked()
             }
-            try execute("PRAGMA temp_store = MEMORY")
+            // The Network Extension opens the store with migrations disabled.
+            // Keep SQLite temporary work on disk there so an aggregate or
+            // checkpoint cannot consume the same small memory budget as the
+            // packet tunnel. The App can use a modest in-memory temp cache.
+            let temporaryStore = performMigrations ? "MEMORY" : "FILE"
+            let cacheSize = performMigrations ? -2048 : -512
+            try execute("PRAGMA temp_store = \(temporaryStore)")
+            try execute("PRAGMA cache_size = \(cacheSize)")
             try execute("PRAGMA busy_timeout = \(Self.runtimeBusyTimeoutMilliseconds)")
         } catch {
             try? execute("PRAGMA max_page_count = \(Self.maximumDatabasePages)")
@@ -333,10 +340,6 @@ final class ConnectionHistoryStore: @unchecked Sendable {
         queue.sync {
             guard database != nil else { return }
             do {
-                // Trim before opening the batch transaction. This makes the
-                // row cap a real ceiling even when the database has not yet
-                // reached its SQLite page cap.
-                try trimLocked(now: Date())
                 try execute("BEGIN IMMEDIATE TRANSACTION")
                 var recordCount = try totalRecordCountLocked()
                 var knownIDs = try existingIDsLocked(for: records)
@@ -357,7 +360,6 @@ final class ConnectionHistoryStore: @unchecked Sendable {
                         recordCount += 1
                     }
                 }
-                try trimLocked(now: Date())
                 try execute("COMMIT")
             } catch StoreError.sqlite(let code) where code == SQLITE_FULL {
                 try? execute("ROLLBACK")
@@ -389,7 +391,6 @@ final class ConnectionHistoryStore: @unchecked Sendable {
                     bindText(id, to: statement, index: 2)
                     try stepDone(statement)
                 }
-                try trimLocked(now: date)
                 try execute("COMMIT")
             } catch {
                 try? execute("ROLLBACK")
@@ -421,7 +422,6 @@ final class ConnectionHistoryStore: @unchecked Sendable {
                     }
                     try stepDone(statement)
                 }
-                try trimLocked(now: date)
                 try execute("COMMIT")
             } catch {
                 try? execute("ROLLBACK")
@@ -438,6 +438,21 @@ final class ConnectionHistoryStore: @unchecked Sendable {
                             + "\(date.timeIntervalSince1970) WHERE is_active = 1")
                 try trimLocked(now: date)
             } catch { }
+        }
+    }
+
+    /// Runs retention, page-cap and WAL maintenance outside the hot sampling
+    /// path. The caller should invoke this at a coarse interval (for example,
+    /// once per minute) so normal connection updates stay short and bounded.
+    func maintenance(now: Date = Date()) {
+        queue.sync {
+            guard database != nil else { return }
+            do {
+                try trimLocked(now: now)
+            } catch {
+                // History is observability only. A maintenance failure must
+                // never affect tunnel forwarding or the next sample.
+            }
         }
     }
 

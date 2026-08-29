@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ConnectionsView: View {
     @EnvironmentObject private var core: CoreStateManager
+    @Environment(\.scenePhase) private var scenePhase
     @ObservedObject var controller: ConnectionsController
 
     var body: some View {
@@ -27,6 +28,11 @@ struct ConnectionsView: View {
         }
         .navigationTitle("")
         .navigationBarTitleDisplayMode(.inline)
+        .onAppear { controller.setFullSnapshotEnabled(true) }
+        .onDisappear { controller.setFullSnapshotEnabled(false) }
+        .onChange(of: scenePhase) { phase in
+            controller.setFullSnapshotEnabled(phase == .active)
+        }
     }
 }
 

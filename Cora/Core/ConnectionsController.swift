@@ -308,6 +308,7 @@ final class ConnectionsController: ObservableObject {
     private static let maximumHostStatistics = 4_096
     private static let persistenceKey = "connectionSession.v1"
     private static let persistenceInterval: TimeInterval = 5
+    private static let pollIntervalNanoseconds: UInt64 = 3_000_000_000
 
     @Published private(set) var snapshot: ConnectionsSnapshot?
     @Published private(set) var history: [ConnectionHistoryEntry] = []
@@ -332,6 +333,11 @@ final class ConnectionsController: ObservableObject {
     private let historyStore = ConnectionHistoryStore.openShared()
     private var historyOffset = 0
     private var lastHistoryRefreshDate = Date.distantPast
+    // The overview only needs totals. A full connection array is requested
+    // while the record screen is visible, avoiding a large JSON allocation in
+    // the App every second when the user is on another tab.
+    private var wantsFullSnapshot = false
+    private var isRefreshInFlight = false
 
     private struct ActiveConnectionSample: Codable {
         let upload: Int64
@@ -361,14 +367,23 @@ final class ConnectionsController: ObservableObject {
 
     /// 由页面 `.task` 持有生命周期；离开页面后 SwiftUI 会取消轮询。
     func poll() async {
-        await refresh(showLoading: true)
+        await refresh(showLoading: wantsFullSnapshot)
         while !Task.isCancelled {
             do {
-                try await Task.sleep(nanoseconds: 1_000_000_000)
+                try await Task.sleep(nanoseconds: Self.pollIntervalNanoseconds)
             } catch {
                 return
             }
             await refresh(showLoading: false)
+        }
+    }
+
+    func setFullSnapshotEnabled(_ enabled: Bool) {
+        guard wantsFullSnapshot != enabled else { return }
+        wantsFullSnapshot = enabled
+        guard enabled else { return }
+        Task { [weak self] in
+            await self?.refresh(showLoading: true)
         }
     }
 
@@ -394,6 +409,7 @@ final class ConnectionsController: ObservableObject {
         error = nil
         lastPersistenceDate = .distantPast
         UserDefaults.standard.removeObject(forKey: Self.persistenceKey)
+        KernelController.shared.updateConnectionTotals(download: 0, upload: 0)
     }
 
     /// Flushes only compact view statistics. Full connection records live in
@@ -404,30 +420,47 @@ final class ConnectionsController: ObservableObject {
 
     func refresh(showLoading: Bool = true) async {
         let currentGeneration = generation
+        guard !isRefreshInFlight else { return }
+        isRefreshInFlight = true
+        defer { isRefreshInFlight = false }
         if showLoading { isLoading = true }
         defer { if showLoading { isLoading = false } }
 
+        let fullSnapshot = wantsFullSnapshot
         let result = await CoreStateManager.shared.sendMessage([
             "cmd": "connections",
-            "limit": 200,
+            "limit": fullSnapshot ? 200 : 0,
         ])
         switch result {
         case .ok(let data):
             do {
                 let latest = try JSONDecoder().decode(ConnectionsSnapshot.self, from: data)
                 guard !Task.isCancelled, generation == currentGeneration else { return }
-                snapshot = latest
+                KernelController.shared.updateConnectionTotals(download: latest.downloadTotal,
+                                                                upload: latest.uploadTotal)
+                let retainedConnections = fullSnapshot
+                    ? latest.connections
+                    : (snapshot?.connections ?? [])
+                snapshot = ConnectionsSnapshot(downloadTotal: latest.downloadTotal,
+                                               uploadTotal: latest.uploadTotal,
+                                               connections: retainedConnections)
                 if hasStartedNewKernelSession(with: latest) {
                     clearSessionState()
                 }
-                mergeSessionStatistics(with: latest.connections)
-                reconcileSessionTotals(uploadTotal: latest.uploadTotal,
-                                       downloadTotal: latest.downloadTotal)
                 lastKernelUploadTotal = latest.uploadTotal
                 lastKernelDownloadTotal = latest.downloadTotal
-                persistSession()
-                reloadHistoryFromStore(activeConnections: latest.connections,
-                                       force: showLoading)
+                if fullSnapshot {
+                    mergeSessionStatistics(with: latest.connections)
+                    reconcileSessionTotals(uploadTotal: latest.uploadTotal,
+                                           downloadTotal: latest.downloadTotal)
+                    persistSession()
+                    reloadHistoryFromStore(activeConnections: latest.connections,
+                                           force: showLoading)
+                } else {
+                    // Refresh counts and totals from SQLite without loading
+                    // another connection array into the App process.
+                    reloadHistoryFromStore(force: false)
+                }
                 error = nil
             } catch {
                 guard !Task.isCancelled, generation == currentGeneration else { return }

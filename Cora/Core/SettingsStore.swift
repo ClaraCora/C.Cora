@@ -3,7 +3,7 @@ import Foundation
 /// 内核相关设置（持久化到 UserDefaults）。
 ///
 /// 这些影响 NE 内 mihomo 的启动配置：连接时序列化为 JSON 经 startVPNTunnel(options) 下发，
-/// Go 侧 StartWithConfig 据此覆盖 tun.stack / ipv6 / geo / log-level 和 Snell 蜂窝 TCP 策略。
+/// Go 侧 StartWithConfig 据此覆盖 tun.stack / ipv6 / geo / log-level 等运行设置。
 /// 因此**修改后需重新连接才生效**。
 @MainActor
 final class SettingsStore: ObservableObject {
@@ -68,11 +68,6 @@ final class SettingsStore: ObservableObject {
                 try? value.write(to: stateURL, atomically: true, encoding: .utf8)
             }
         }
-    }
-    /// 指定在蜂窝网络使用普通 TCP 的 Snell 节点。Wi-Fi 下仍保留节点原有 TFO 行为。
-    /// 节点名按配置原文精确保存；默认空集合，不迁移旧版自适应开关。
-    @Published var snellCellularTCPNodes: Set<String> {
-        didSet { d.set(snellCellularTCPNodes.sorted(), forKey: K.snellCellularTCPNodes) }
     }
     /// 策略组与节点测速使用的 HTTP(S) 地址，仅由主 App 的测速 IPC 使用，无需重连。
     @Published var delayTestURL: String { didSet { d.set(delayTestURL, forKey: K.delayTestURL) } }
@@ -166,7 +161,6 @@ final class SettingsStore: ObservableObject {
         static let remoteResourceInterval = "set.remoteResourceUpdateInterval"
         static let logLevel = "set.logLevel"
         static let developerMode = "set.developerMode"
-        static let snellCellularTCPNodes = "set.snellCellularTCPNodes"
         static let delayTestURL = "set.delayTestURL"
         static let directDelayTestURL = "set.directDelayTestURL"
         static let unifiedDelay = "set.unifiedDelay"
@@ -202,7 +196,6 @@ final class SettingsStore: ObservableObject {
             : min(max(remoteInterval, 1), 168)
         logLevel = d.string(forKey: K.logLevel) ?? "info"
         developerMode = d.object(forKey: K.developerMode) as? Bool ?? false
-        snellCellularTCPNodes = Set(d.stringArray(forKey: K.snellCellularTCPNodes) ?? [])
         delayTestURL = d.string(forKey: K.delayTestURL) ?? Self.defaultDelayTestURL
         directDelayTestURL = d.string(forKey: K.directDelayTestURL)
             ?? Self.defaultDirectDelayTestURL
@@ -241,7 +234,6 @@ final class SettingsStore: ObservableObject {
             "remoteResourceUpdateInterval": remoteResourceUpdateInterval,
             "logLevel": logLevel,
             "developerMode": developerMode,
-            "snellCellularTCPNodes": snellCellularTCPNodes.sorted(),
             "unifiedDelay": unifiedDelay,
             "mixedPort": mixedPort,
             "blockDirectSTUN": blockDirectSTUN,

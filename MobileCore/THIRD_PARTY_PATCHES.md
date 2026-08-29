@@ -135,75 +135,6 @@ Revert the commit that added this section and remove:
 
 No stored configuration or user-data migration is involved.
 
-## mihomo-v1.19.30-snell-cellular-tcp
-
-- Added: 2026-08-23
-- Upstream module: `github.com/metacubex/mihomo v1.19.30`
-- Patched files: `component/dialer/options.go`,
-  `component/dialer/dialer.go`, `adapter/outbound/snell.go`; added
-  `component/dialer/snell_cellular_tcp.go` and its regression tests
-- Build tags: default and `with_low_memory`
-
-### Reason
-
-On Darwin, Mihomo's `tfo-go` dependency forces TCP Fast Open on and bypasses
-the operating system's native TFO backoff. Some cellular entrances silently
-drop the SYN payload even though `connectx` reports success, while the same
-Snell endpoint works over ordinary TCP. A process-wide `DisableTFO` workaround
-restores those entrances but unnecessarily disables TFO for working nodes.
-
-The previous adaptive implementation tried to classify an entrance by opening
-disposable Snell sessions and waiting for a standalone protocol Ping/Pong.
-That is not equivalent to the successful single-node URL test, which opens an
-ordinary TCP Snell tunnel and then sends real destination traffic. On the
-affected entrance, both disposable TFO and ordinary-TCP Ping/Pong timed out
-even though ordinary TCP with real traffic worked. The probe therefore could
-not reliably distinguish a TFO SYN-data black hole from a server or path that
-does not answer that synthetic transaction. It also put an avoidable failed
-probe on the user's connection path.
-
-### Local behavior
-
-Cora stores an explicit list of exact Snell proxy names that require ordinary
-TCP on cellular networks. `adapter/outbound/snell.go` passes each Snell proxy's
-name into its dialer. After Mihomo resolves the active interface, but before it
-opens the socket, the dialer skips TFO only when both conditions are true:
-
-- the interface name starts with `pdp_ip` (case-insensitive); and
-- the exact Snell proxy name is present in Cora's configured list.
-
-Selected nodes keep their configured TFO behavior on Wi-Fi. Unselected Snell
-nodes, every other protocol, and Mihomo's process-wide `DisableTFO` behavior
-remain unchanged. Node names are matched exactly so similarly named entrances
-cannot inherit the workaround accidentally.
-
-The selected-name snapshot is immutable, replaced atomically, and bounded to
-4,096 names. The hot dial path performs one map lookup and adds no probes,
-retries, sockets, timers, caches, payload retention, or background goroutines.
-The list is applied when the VPN starts and cleared when the core stops, so
-changing it requires a VPN reconnect. This deliberately trades automatic
-inference for a predictable, user-controlled transport decision with no
-ten-minute retry interruption.
-
-### Verification
-
-The preparation script verifies exact SHA-256 values for every upstream,
-patched, and added file. CI runs the dialer and Snell outbound tests and `vet`
-in default and low-memory builds. Regression tests cover exact-name matching,
-atomic list replacement, case-insensitive `pdp_ip*` recognition, unselected
-nodes, and preservation of TFO on Wi-Fi.
-
-### Rollback
-
-Revert the commit that added this section and remove:
-
-- `dependency-patches/mihomo-v1.19.30-snell-cellular-tcp.patch`;
-- its preparation-script SHA and apply wiring;
-- `SetSnellCellularTCPNodes` calls and related logging in MobileCore; and
-- the `Snell 蜂窝普通 TCP` settings page and its stored node-name list.
-
-The UserDefaults array can remain because older builds ignore unknown keys.
-
 ## mihomo-v1.19.30-connection-close-queue
 
 - Added: 2026-08-13
@@ -228,8 +159,9 @@ history. The ring does not reallocate while it is full. `ClosedSince` exposes
 incremental batches behind a cursor and reports when an old cursor fell behind
 the FIFO.
 The Packet Tunnel drains this queue every two seconds into its SQLite history;
-SQLite retains at most seven days, 20,000 rows, or 50 MiB, removing only the
-oldest completed rows. Live packets never wait for this database work.
+the active-connection snapshot is sampled separately every eight seconds.
+SQLite retains at most seven days, 20,000 rows, or 50 MiB, with retention/WAL
+maintenance performed once per minute. Live packets never wait for this work.
 
 At more than roughly 256 short-lived connections per second for a sustained
 two-second interval, the FIFO can overflow. Some finished detail rows can then

@@ -5,6 +5,10 @@ struct MemoryDiagnosticSample: Decodable {
     let t: Int64?
     let event: String?
     let physFootprint: UInt64?
+    let sampleCount: UInt64?
+    let pressureEvents: UInt64?
+    let pressureSuppressed: UInt64?
+    let sampleDurationMs: Int64?
     let go: GoRuntimeDiagnostic?
 
     struct GoRuntimeDiagnostic: Decodable {
@@ -70,6 +74,9 @@ enum MemoryDiagnosticAnalyzer {
         let closedSnapshotBytes = last.go?.closedSnapshotBytes.map { formatBytes(UInt64(max(0, $0))) } ?? "未知"
         let lastEvent = last.event ?? "未知"
         let duration = durationText(from: first.t, to: last.t)
+        let pressure = last.pressureEvents.map { String($0) } ?? "未知"
+        let pressureSuppressed = last.pressureSuppressed.map { String($0) } ?? "未知"
+        let sampleDuration = last.sampleDurationMs.map { "\($0)ms" } ?? "未知"
 
         var findings: [String] = []
         if let value = last.go?.connections, value > 0,
@@ -94,6 +101,9 @@ enum MemoryDiagnosticAnalyzer {
            let initial = first.go?.ruleProviders, providers > initial {
             findings.append("规则 Provider 数量在采样期间增加，规则数据加载可能推动 Go 堆增长。")
         }
+        if let pressureSuppressed = last.pressureSuppressed, pressureSuppressed > 0 {
+            findings.append("检测到重复内存压力事件；其中 \(pressureSuppressed) 次按冷却策略合并处理，避免诊断触发 GC 风暴。")
+        }
         if findings.isEmpty {
             findings.append("当前采样没有显示单一类别持续增长；请在测速前后各保持几分钟再分析。")
         }
@@ -111,6 +121,7 @@ enum MemoryDiagnosticAnalyzer {
             "测速资源：并发槽位 \(delaySlots)/\(delaySlotLimit)，活动批次 \(delayBatches)",
             "连接快照：活动 \(snapshotBytes)，关闭队列 \(closedSnapshotBytes)",
             "goroutine：\(goroutines)",
+            "诊断压力事件：\(pressure)（冷却合并 \(pressureSuppressed)），最近采样耗时：\(sampleDuration)",
             "",
             "判断：",
             findings.map { "• \($0)" }.joined(separator: "\n")

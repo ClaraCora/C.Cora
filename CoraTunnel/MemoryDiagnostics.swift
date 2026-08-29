@@ -11,6 +11,11 @@ final class MemoryDiagnostics: @unchecked Sendable {
     // 同时避免采样和磁盘同步本身给 NE 增加持续负担。
     private static let sampleInterval = DispatchTimeInterval.seconds(5)
     private static let goStatsInterval: TimeInterval = 5
+    // DispatchSourceMemoryPressure may deliver a burst of warning/critical
+    // events while one allocation storm is still in progress. Treat that
+    // burst as one diagnostic action; repeated synchronous stats/GC calls can
+    // otherwise create a GC storm and increase phys_footprint themselves.
+    private static let pressureCooldown: TimeInterval = 20
 
     private let queue = DispatchQueue(label: "com.cora.tunnel.memory-diagnostics",
                                       qos: .utility)
@@ -23,6 +28,11 @@ final class MemoryDiagnostics: @unchecked Sendable {
     private var sessionID = ""
     private var lastGoStats = "{}"
     private var lastGoStatsUptime: TimeInterval?
+    private var lastPressureUptime: TimeInterval = -.infinity
+    private var sampleCount: UInt64 = 0
+    private var pressureEventCount: UInt64 = 0
+    private var pressureSuppressedCount: UInt64 = 0
+    private var lastSampleDurationMs: Int64 = 0
     private var didReportFileError = false
 
     func start(directoryPath: String) {
@@ -35,6 +45,11 @@ final class MemoryDiagnostics: @unchecked Sendable {
             sessionID = UUID().uuidString
             lastGoStats = "{}"
             lastGoStatsUptime = nil
+            lastPressureUptime = -.infinity
+            sampleCount = 0
+            pressureEventCount = 0
+            pressureSuppressedCount = 0
+            lastSampleDurationMs = 0
             didReportFileError = false
             prepareFilesForNewSessionLocked()
             guard fileHandle != nil else { return }
@@ -53,10 +68,7 @@ final class MemoryDiagnostics: @unchecked Sendable {
             let pressure = DispatchSource.makeMemoryPressureSource(
                 eventMask: [.warning, .critical], queue: queue)
             pressure.setEventHandler { [weak self] in
-                self?.writeSampleLocked(event: "memoryPressure", synchronize: true)
-                // 压力事件时让 Go 侧立即 GC 并归还空闲页，压低 phys_footprint。
-                // 本 handler 在 .utility 队列，GC 短暂停顿不影响转发。
-                MihomoForceGC()
+                self?.handlePressureLocked()
             }
             pressureSource = pressure
             pressure.resume()
@@ -105,6 +117,8 @@ final class MemoryDiagnostics: @unchecked Sendable {
     private func writeSampleLocked(event: String, synchronize: Bool) {
         autoreleasepool {
             guard fileHandle != nil else { return }
+            sampleCount &+= 1
+            let sampleStarted = ProcessInfo.processInfo.systemUptime
             let timestampMs = Int64(Date().timeIntervalSince1970 * 1_000)
             let uptime = ProcessInfo.processInfo.systemUptime
             let uptimeMs = Int64(uptime * 1_000)
@@ -117,10 +131,15 @@ final class MemoryDiagnostics: @unchecked Sendable {
                 lastGoStats = MihomoRuntimeStats()
                 lastGoStatsUptime = uptime
             }
+            lastSampleDurationMs = Int64(
+                max(0, (ProcessInfo.processInfo.systemUptime - sampleStarted) * 1_000))
             let goStatsUptimeMs = Int64((lastGoStatsUptime ?? uptime) * 1_000)
             let line = "{\"v\":1,\"t\":\(timestampMs),\"uptimeMs\":\(uptimeMs),"
                 + "\"session\":\"\(sessionID)\",\"event\":\"\(event)\","
                 + "\"physFootprint\":\(footprint),\"availableMemory\":\(available),"
+                + "\"sampleCount\":\(sampleCount),\"pressureEvents\":\(pressureEventCount),"
+                + "\"pressureSuppressed\":\(pressureSuppressedCount),"
+                + "\"sampleDurationMs\":\(lastSampleDurationMs),"
                 + "\"goStatsUptimeMs\":\(goStatsUptimeMs),\"go\":\(lastGoStats)}\n"
             let data = Data(line.utf8)
             rotateIfNeededLocked(incomingBytes: UInt64(data.count))
@@ -137,6 +156,20 @@ final class MemoryDiagnostics: @unchecked Sendable {
                 self.fileHandle = nil
             }
         }
+    }
+
+    private func handlePressureLocked() {
+        pressureEventCount &+= 1
+        let uptime = ProcessInfo.processInfo.systemUptime
+        guard uptime - lastPressureUptime >= Self.pressureCooldown else {
+            pressureSuppressedCount &+= 1
+            return
+        }
+        lastPressureUptime = uptime
+        writeSampleLocked(event: "memoryPressure", synchronize: true)
+        // The handler runs on a utility queue. Keep one bounded recovery action
+        // for the pressure window; the cooldown above prevents re-entry bursts.
+        MihomoForceGC()
     }
 
     private func rotateIfNeededLocked(incomingBytes: UInt64) {

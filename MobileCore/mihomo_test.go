@@ -367,51 +367,6 @@ func TestNetworkInterfaceUpdates(t *testing.T) {
 	}
 }
 
-func TestSnellCellularTCPNodeNormalizationAndStatus(t *testing.T) {
-	if !isCellularInterface("pdp_ip0") || !isCellularInterface("PDP_IP1") {
-		t.Fatal("pdp_ip interfaces should be recognized as cellular")
-	}
-	if isCellularInterface("en0") || isCellularInterface("") {
-		t.Fatal("Wi-Fi and empty interfaces should not be recognized as cellular")
-	}
-
-	got := normalizeSnellCellularTCPNodes([]string{
-		"  Tokyo CM  ", "Shanghai BGP", "Tokyo CM", "", "   ", "Shanghai BGP",
-	})
-	want := []string{"  Tokyo CM  ", "Shanghai BGP", "Tokyo CM"}
-	if !equalStringSlices(got, want) {
-		t.Fatalf("normalizeSnellCellularTCPNodes() = %v, want %v", got, want)
-	}
-
-	setSnellCellularTCPNodes(got)
-	t.Cleanup(func() { setSnellCellularTCPNodes(nil) })
-	if !snellCellularTCPSelected("Tokyo CM") || snellCellularTCPSelected("tokyo cm") {
-		t.Fatal("Snell cellular TCP selection must use the exact normalized node name")
-	}
-	if !snellCellularTCPSelected("  Tokyo CM  ") || snellCellularTCPSelected("Tokyo CM ") {
-		t.Fatal("Snell cellular TCP selection must preserve surrounding characters")
-	}
-	if status := snellCellularTCPStatus("Tokyo CM", "pdp_ip0"); !strings.Contains(status, "普通 TCP") {
-		t.Fatalf("cellular selected status = %q", status)
-	}
-	if status := snellCellularTCPStatus("Tokyo CM", "en0"); !strings.Contains(status, "按节点配置使用 TFO") {
-		t.Fatalf("Wi-Fi selected status = %q", status)
-	}
-	if status := snellCellularTCPStatus("Other", "pdp_ip0"); !strings.Contains(status, "未指定") {
-		t.Fatalf("unselected status = %q", status)
-	}
-}
-
-func TestSnellCellularTCPNodeNormalizationIsBounded(t *testing.T) {
-	names := make([]string, maxSnellCellularTCPNodes+2)
-	for index := range names {
-		names[index] = fmt.Sprintf("node-%05d", index)
-	}
-	if got := len(normalizeSnellCellularTCPNodes(names)); got != maxSnellCellularTCPNodes {
-		t.Fatalf("normalized node count = %d, want %d", got, maxSnellCellularTCPNodes)
-	}
-}
-
 func TestProxyDelayErrorResponseIsAlwaysValidJSON(t *testing.T) {
 	encoded := proxyDelayErrorResponse(fmt.Errorf("Snell handshake: EOF\nserver said %q", `try "TCP"`))
 	var got struct {
@@ -1115,23 +1070,12 @@ func TestParseSettingsGeoDefaultsAndOverride(t *testing.T) {
 		t.Errorf("remote resource update defaults = %q/%d, want inherit/24",
 			defaults.RemoteResourceUpdatePolicy, defaults.RemoteResourceUpdateInterval)
 	}
-	if len(defaults.SnellCellularTCPNodes) != 0 {
-		t.Errorf("SnellCellularTCPNodes default = %v, want empty", defaults.SnellCellularTCPNodes)
-	}
-	legacy := parseSettings(`{
-		"cellularSnellCompatibility": true,
-		"snellAdaptiveTFOHoldUntilNetworkChange": true
-	}`)
-	if len(legacy.SnellCellularTCPNodes) != 0 {
-		t.Errorf("legacy adaptive TFO settings selected nodes: %v", legacy.SnellCellularTCPNodes)
-	}
 	if defaults.GeoMMDBURL == "" || defaults.GeoIPDatURL == "" || defaults.GeoSiteURL == "" {
 		t.Error("default GEO download URLs must not be empty")
 	}
 	custom := parseSettings(`{
 		"geoEnabled": false,
 		"ignoreGeoNegation": true,
-		"snellCellularTCPNodes": ["Tokyo CM", "Shanghai BGP", "Tokyo CM", ""],
 		"geodataMode": false,
 		"geoIPDatURL": "https://example.com/GeoIP.dat",
 		"geoMMDBURL": "https://example.com/geoip.metadb",
@@ -1144,9 +1088,6 @@ func TestParseSettingsGeoDefaultsAndOverride(t *testing.T) {
 	}
 	if !custom.IgnoreGeoNegation {
 		t.Error("IgnoreGeoNegation override = false, want true")
-	}
-	if want := []string{"Shanghai BGP", "Tokyo CM"}; !equalStringSlices(custom.SnellCellularTCPNodes, want) {
-		t.Errorf("SnellCellularTCPNodes = %v, want %v", custom.SnellCellularTCPNodes, want)
 	}
 	if custom.GeodataMode {
 		t.Error("GeodataMode override = true, want false")

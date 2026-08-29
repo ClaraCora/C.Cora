@@ -11,11 +11,6 @@ readonly TEST_REL="common/pool/oversize_pool_test.go"
 readonly CONFIG_REL="config/config.go"
 readonly HISTORY_REL="tunnel/statistic/manager.go"
 readonly HISTORY_TEST_REL="tunnel/statistic/closed_snapshot_test.go"
-readonly DIALER_OPTIONS_REL="component/dialer/options.go"
-readonly DIALER_REL="component/dialer/dialer.go"
-readonly SNELL_REL="adapter/outbound/snell.go"
-readonly CELLULAR_TCP_REL="component/dialer/snell_cellular_tcp.go"
-readonly CELLULAR_TCP_TEST_REL="component/dialer/snell_cellular_tcp_test.go"
 readonly TUNNEL_REL="tunnel/tunnel.go"
 readonly RESERVED_SYNTHETIC_IP_REL="tunnel/reserved_synthetic_ip.go"
 readonly RESERVED_SYNTHETIC_IP_TEST_REL="tunnel/reserved_synthetic_ip_test.go"
@@ -37,14 +32,6 @@ readonly EXPECTED_CONFIG_PATCHED_SHA="a41d06def9ac2d44acf86dec94f4bbbd26dffba333
 readonly EXPECTED_HISTORY_SOURCE_SHA="508daa254d05b6414e899e4eb154cb3b83572d6223e5662da9463728cb588886"
 readonly EXPECTED_HISTORY_PATCHED_SHA="179b38a46b37a6ce04dc28b7bff3a70443b2bc1e6f1d5a6a56a774c51ae8e8d5"
 readonly EXPECTED_HISTORY_TEST_SHA="b27fab6962dbdad97ab7b8d24504e9a636e3e7813a0a5118f77eeed5f7c0522c"
-readonly EXPECTED_DIALER_OPTIONS_SOURCE_SHA="6225560d4f010f5db68f88dc93f61df848c6d0d3258e3183a459c185678c4e07"
-readonly EXPECTED_DIALER_OPTIONS_PATCHED_SHA="00330ab908367b4484b2d2ce28c73fd1b99aba2f1d312b5be553f371caeffa51"
-readonly EXPECTED_DIALER_SOURCE_SHA="1cd130049e1c8aec826d8eb5a625f4e64d2eccf6f1091b0cca2d1540ec49a531"
-readonly EXPECTED_DIALER_PATCHED_SHA="2531b3155a0e8b58a300e693cbf879104037b5164d7d105c2e9cfae7c73442fa"
-readonly EXPECTED_SNELL_SOURCE_SHA="2fe5b01ee473842d383a2f80d89ba079992892cf344ddb9472a64c53590cbe43"
-readonly EXPECTED_SNELL_PATCHED_SHA="3d9cd57b8d9b9eb4dbe23d8c7dce5758db22f5cbb9659563adb5b379f9719f83"
-readonly EXPECTED_CELLULAR_TCP_SHA="d4590f8cf6ab975c6189af5fd060fc9107bd37a46a4ecfb4598e0bf684ae1676"
-readonly EXPECTED_CELLULAR_TCP_TEST_SHA="c5889973a0a896bb13ddbb7f797b46ec1078aea78af623e8ba28069ab4489aff"
 readonly EXPECTED_TUNNEL_SOURCE_SHA="bd0818dddd04779aad3f078819b3ca050bd8bdce29ba57e5a377770539278596"
 readonly EXPECTED_TUNNEL_PATCHED_SHA="99e18df9de2c3d647801432a8374454d7d02a9b1aed64086aca8f42b362db849"
 readonly EXPECTED_RESERVED_SYNTHETIC_IP_SHA="ce60c6ca3272304af315297f81fca2083721c30eefdcb42fce58abb5cb2e24e5"
@@ -71,7 +58,6 @@ readonly PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/mihomo-
 readonly CONFIG_PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/mihomo-v1.19.30-progressive-config-parse.patch"
 readonly HISTORY_PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/mihomo-v1.19.30-connection-close-queue.patch"
 readonly HISTORY_TEST_PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/mihomo-v1.19.30-connection-close-queue-test.patch"
-readonly CELLULAR_TCP_PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/mihomo-v1.19.30-snell-cellular-tcp.patch"
 readonly RESERVED_SYNTHETIC_IP_PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/mihomo-v1.19.30-reserved-synthetic-ip-guard.patch"
 readonly ATOMIC_DNS_RUNTIME_PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/mihomo-v1.19.30-atomic-dns-runtime.patch"
 readonly PATCHED_DIR="${RUNNER_TEMP:?}/mihomo-v1.19.30-ios-cora-v7"
@@ -120,9 +106,6 @@ fi
 check_sha256 "$EXPECTED_SOURCE_SHA" "$SOURCE_DIR/$SOURCE_REL"
 check_sha256 "$EXPECTED_CONFIG_SHA" "$SOURCE_DIR/$CONFIG_REL"
 check_sha256 "$EXPECTED_HISTORY_SOURCE_SHA" "$SOURCE_DIR/$HISTORY_REL"
-check_sha256 "$EXPECTED_DIALER_OPTIONS_SOURCE_SHA" "$SOURCE_DIR/$DIALER_OPTIONS_REL"
-check_sha256 "$EXPECTED_DIALER_SOURCE_SHA" "$SOURCE_DIR/$DIALER_REL"
-check_sha256 "$EXPECTED_SNELL_SOURCE_SHA" "$SOURCE_DIR/$SNELL_REL"
 check_sha256 "$EXPECTED_TUNNEL_SOURCE_SHA" "$SOURCE_DIR/$TUNNEL_REL"
 check_sha256 "$EXPECTED_DNS_DIRECT_SOURCE_SHA" "$SOURCE_DIR/$DNS_DIRECT_REL"
 check_sha256 "$EXPECTED_DNS_HOST_SOURCE_SHA" "$SOURCE_DIR/$DNS_HOST_REL"
@@ -132,12 +115,6 @@ check_sha256 "$EXPECTED_DNS_SERVER_SOURCE_SHA" "$SOURCE_DIR/$DNS_SERVER_REL"
 check_sha256 "$EXPECTED_DNS_EXECUTOR_SOURCE_SHA" "$SOURCE_DIR/$DNS_EXECUTOR_REL"
 check_sha256 "$EXPECTED_DNS_ROUTE_SOURCE_SHA" "$SOURCE_DIR/$DNS_ROUTE_REL"
 check_sha256 "$EXPECTED_DOH_ROUTE_SOURCE_SHA" "$SOURCE_DIR/$DOH_ROUTE_REL"
-for added_rel in "$CELLULAR_TCP_REL" "$CELLULAR_TCP_TEST_REL"; do
-  if [[ -e "$SOURCE_DIR/$added_rel" ]]; then
-    echo "Unexpected upstream Snell cellular TCP file: $SOURCE_DIR/$added_rel" >&2
-    exit 1
-  fi
-done
 for added_rel in "$RESERVED_SYNTHETIC_IP_REL" "$RESERVED_SYNTHETIC_IP_TEST_REL"; do
   if [[ -e "$SOURCE_DIR/$added_rel" ]]; then
     echo "Unexpected upstream reserved synthetic IP file: $SOURCE_DIR/$added_rel" >&2
@@ -179,10 +156,6 @@ git -c core.autocrlf=false -C "$PATCHED_DIR" \
 git -c core.autocrlf=false -C "$PATCHED_DIR" \
   apply --whitespace=error-all "$HISTORY_TEST_PATCH_FILE"
 git -c core.autocrlf=false -C "$PATCHED_DIR" \
-  apply --check --whitespace=error-all "$CELLULAR_TCP_PATCH_FILE"
-git -c core.autocrlf=false -C "$PATCHED_DIR" \
-  apply --whitespace=error-all "$CELLULAR_TCP_PATCH_FILE"
-git -c core.autocrlf=false -C "$PATCHED_DIR" \
   apply --check --whitespace=error-all "$RESERVED_SYNTHETIC_IP_PATCH_FILE"
 git -c core.autocrlf=false -C "$PATCHED_DIR" \
   apply --whitespace=error-all "$RESERVED_SYNTHETIC_IP_PATCH_FILE"
@@ -195,11 +168,6 @@ check_sha256 "$EXPECTED_TEST_SHA" "$PATCHED_DIR/$TEST_REL"
 check_sha256 "$EXPECTED_CONFIG_PATCHED_SHA" "$PATCHED_DIR/$CONFIG_REL"
 check_sha256 "$EXPECTED_HISTORY_PATCHED_SHA" "$PATCHED_DIR/$HISTORY_REL"
 check_sha256 "$EXPECTED_HISTORY_TEST_SHA" "$PATCHED_DIR/$HISTORY_TEST_REL"
-check_sha256 "$EXPECTED_DIALER_OPTIONS_PATCHED_SHA" "$PATCHED_DIR/$DIALER_OPTIONS_REL"
-check_sha256 "$EXPECTED_DIALER_PATCHED_SHA" "$PATCHED_DIR/$DIALER_REL"
-check_sha256 "$EXPECTED_SNELL_PATCHED_SHA" "$PATCHED_DIR/$SNELL_REL"
-check_sha256 "$EXPECTED_CELLULAR_TCP_SHA" "$PATCHED_DIR/$CELLULAR_TCP_REL"
-check_sha256 "$EXPECTED_CELLULAR_TCP_TEST_SHA" "$PATCHED_DIR/$CELLULAR_TCP_TEST_REL"
 check_sha256 "$EXPECTED_TUNNEL_PATCHED_SHA" "$PATCHED_DIR/$TUNNEL_REL"
 check_sha256 "$EXPECTED_RESERVED_SYNTHETIC_IP_SHA" "$PATCHED_DIR/$RESERVED_SYNTHETIC_IP_REL"
 check_sha256 "$EXPECTED_RESERVED_SYNTHETIC_IP_TEST_SHA" "$PATCHED_DIR/$RESERVED_SYNTHETIC_IP_TEST_REL"

@@ -54,7 +54,6 @@ final class KernelController: ObservableObject {
     private var memoryRefreshTask: Task<Int64?, Never>?
     private var memoryRefreshGeneration = 0
     private var modeTask: Task<Void, Never>?
-    private var totalsTask: Task<Void, Never>?
     private var sampleIndex = 0
     private let maxSamples = 60
 
@@ -65,7 +64,6 @@ final class KernelController: ObservableObject {
         }
         if trafficTask == nil { startTraffic() }
         if memoryTask == nil { startMemoryPolling() }
-        if totalsTask == nil { startTotalsPolling() }
     }
 
     /// 断开后调用：停止采样。
@@ -74,7 +72,7 @@ final class KernelController: ObservableObject {
         modeTask = nil
         stopTraffic()
         stopMemoryPolling()
-        stopTotalsPolling()
+        resetConnectionTotals()
         setReachable(false)
     }
 
@@ -185,24 +183,14 @@ final class KernelController: ObservableObject {
         if memoryFootprint != nil { memoryFootprint = nil }
     }
 
-    private func startTotalsPolling() {
-        totalsTask = Task { [weak self] in
-            while !Task.isCancelled {
-                let result = await CoreStateManager.shared.sendMessage(["cmd": "connections", "limit": 0])
-                guard !Task.isCancelled else { return }
-                if case .ok(let data) = result,
-                   let snapshot = try? JSONDecoder().decode(ConnectionsSnapshot.self, from: data) {
-                    self?.totalDownload = snapshot.downloadTotal
-                    self?.totalUpload = snapshot.uploadTotal
-                }
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
-            }
-        }
+    /// Connection totals are supplied by ConnectionsController's shared,
+    /// totals-only IPC poll. Keeping one owner avoids duplicate full snapshots.
+    func updateConnectionTotals(download: Int64, upload: Int64) {
+        if totalDownload != download { totalDownload = download }
+        if totalUpload != upload { totalUpload = upload }
     }
 
-    private func stopTotalsPolling() {
-        totalsTask?.cancel()
-        totalsTask = nil
+    private func resetConnectionTotals() {
         totalDownload = 0
         totalUpload = 0
     }

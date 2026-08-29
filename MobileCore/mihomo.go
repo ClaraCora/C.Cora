@@ -92,8 +92,6 @@ const maxConnectionSnapshotLimit = 500
 
 const defaultRunLogChunkBytes = 48 << 10
 
-const maxSnellCellularTCPNodes = 4096
-
 var coraReservedSyntheticIPPrefixes = [...]netip.Prefix{
 	netip.MustParsePrefix("198.18.0.0/15"),
 }
@@ -207,8 +205,6 @@ var (
 	pendingSourceDNSMode        string
 	activeDNSGeneration         uint64
 	coreStartedAt               time.Time
-	snellCellularTCPMu          sync.RWMutex
-	snellCellularTCPNodes       []string
 	scriptTargetIPCacheMu       sync.Mutex
 	scriptTargetIPCache         = make(map[string]scriptTargetIPCacheEntry)
 	activeProxyDelayBatches     int32
@@ -478,8 +474,9 @@ func configureMemoryLimits() {
 	debug.SetGCPercent(goGCPercent)
 }
 
-// ForceGC 供 Swift 侧内存压力事件（warning/critical）调用：立即 full GC
-// 并把空闲页归还 OS，压低 phys_footprint，降低被 jetsam 的概率。
+// ForceGC 供 Swift 侧内存压力事件（warning/critical）调用：在一次受控的
+// 压力窗口内归还空闲页，压低 phys_footprint，降低被 jetsam 的概率。
+// FreeOSMemory 本身会先完成一次 GC，因此不要再额外调用 runtime.GC。
 func ForceGC() {
 	forceGCMu.Lock()
 	defer forceGCMu.Unlock()
@@ -488,7 +485,6 @@ func ForceGC() {
 	// a continuous GC workload.
 	previousGC := debug.SetGCPercent(25)
 	previousLimit := debug.SetMemoryLimit(28 << 20)
-	runtime.GC()
 	debug.FreeOSMemory()
 	debug.SetGCPercent(previousGC)
 	debug.SetMemoryLimit(previousLimit)
@@ -564,7 +560,6 @@ type appSettings struct {
 	RemoteResourceUpdatePolicy   string                 `json:"remoteResourceUpdatePolicy"`
 	RemoteResourceUpdateInterval int                    `json:"remoteResourceUpdateInterval"`
 	LogLevel                     string                 `json:"logLevel"`
-	SnellCellularTCPNodes        []string               `json:"snellCellularTCPNodes"`
 	UnifiedDelay                 bool                   `json:"unifiedDelay"`
 	MixedPort                    int                    `json:"mixedPort"`
 	BlockDirectSTUN              bool                   `json:"blockDirectSTUN"`
@@ -651,7 +646,6 @@ func parseSettings(settingsJSON string) appSettings {
 	if s.RemoteResourceUpdateInterval < 1 || s.RemoteResourceUpdateInterval > 168 {
 		s.RemoteResourceUpdateInterval = 24
 	}
-	s.SnellCellularTCPNodes = normalizeSnellCellularTCPNodes(s.SnellCellularTCPNodes)
 	if s.GeoIPDatURL == "" {
 		s.GeoIPDatURL = "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat"
 	}
@@ -838,11 +832,9 @@ func StartWithConfig(fd int, tunnelMTU int, configYAML string, settingsJSON stri
 
 	resetError := resetRunLog()
 	st := parseSettings(settingsJSON)
-	setSnellCellularTCPNodes(st.SnellCellularTCPNodes)
-	appendRunLog(fmt.Sprintf("StartWithConfig: fd=%d mtu=%d stack=%s ipv6=%v geo=%v(mode=%v,%s,ignoreNegation=%v) log=%s snellCellularTCPNodes=%d",
+	appendRunLog(fmt.Sprintf("StartWithConfig: fd=%d mtu=%d stack=%s ipv6=%v geo=%v(mode=%v,%s,ignoreNegation=%v) log=%s",
 		fd, tunnelMTU, st.Stack, st.IPv6, st.GeoEnabled, st.GeodataMode, st.GeoLoader,
-		st.IgnoreGeoNegation, st.LogLevel, snellCellularTCPNodeCount()))
-	logSnellCellularTCPState(currentPhysicalInterface(), "启动")
+		st.IgnoreGeoNegation, st.LogLevel))
 	if resetError != nil {
 		appendRunLog("run.log 重置失败: " + resetError.Error())
 	}
@@ -2427,23 +2419,6 @@ func GroupDelay(group, url, directURL string, timeoutMs int) string {
 		return `{"error":"不是策略组"}`
 	}
 	members := g.Proxies()
-	snellNames := make(map[string]struct{})
-	for _, member := range members {
-		if member.Type() == C.Snell {
-			snellNames[member.Name()] = struct{}{}
-		}
-	}
-	if len(snellNames) > 0 {
-		interfaceName := currentPhysicalInterface()
-		manualTCP := 0
-		for name := range snellNames {
-			if snellCellularTCPSelected(name) && isCellularInterface(interfaceName) {
-				manualTCP++
-			}
-		}
-		appendRunLog(fmt.Sprintf("Snell 蜂窝 TCP：分组测速 %s，Snell 节点=%d，普通 TCP=%d，接口=%s",
-			group, len(snellNames), manualTCP, displayInterfaceName(interfaceName)))
-	}
 	url, directURL, timeoutMs = normalizeProxyDelayOptions(url, directURL, timeoutMs)
 	workerCount := min(proxyGroupDelayWorkerCount(), len(members))
 	ctx, cancel := proxyDelayRunContext(session.ctx, len(members), timeoutMs, workerCount)
@@ -2500,16 +2475,6 @@ produce:
 	}
 	close(jobs)
 	wait.Wait()
-	if len(snellNames) > 0 {
-		timedOut := 0
-		for name := range snellNames {
-			if dm[name] == 0 {
-				timedOut++
-			}
-		}
-		appendRunLog(fmt.Sprintf("Snell 蜂窝 TCP：分组测速 %s 完成，Snell 节点超时 %d/%d",
-			group, timedOut, len(snellNames)))
-	}
 	if producerCanceled && session.ctx.Err() != nil {
 		return marshalProxyDelayMap(dm, true)
 	}
@@ -2733,14 +2698,6 @@ func measureProxyDelay(parent context.Context,
 	directURL string,
 	timeoutMs int,
 	operation string) (uint16, error) {
-	snellNode := proxy.Type() == C.Snell
-	if snellNode {
-		interfaceName := currentPhysicalInterface()
-		appendRunLog(fmt.Sprintf("Snell 蜂窝 TCP：%s %s，接口=%s，%s",
-			operation, name, displayInterfaceName(interfaceName),
-			snellCellularTCPStatus(name, interfaceName)))
-	}
-
 	ctx, cancel := context.WithTimeout(parent, time.Millisecond*time.Duration(timeoutMs))
 	defer cancel()
 	var expectedStatus utils.IntRanges[uint16]
@@ -2750,24 +2707,13 @@ func measureProxyDelay(parent context.Context,
 	})
 	if err != nil {
 		timedOut := proxyDelayTimedOut(ctx, err)
-		if snellNode {
-			appendRunLog(fmt.Sprintf("Snell 蜂窝 TCP：%s %s 失败：%v",
-				operation, name, err))
-		}
 		if timedOut {
 			return 0, context.DeadlineExceeded
 		}
 		return 0, err
 	}
 	if delay == 0 {
-		if snellNode {
-			appendRunLog(fmt.Sprintf("Snell 蜂窝 TCP：%s %s 超时", operation, name))
-		}
 		return 0, nil
-	}
-	if snellNode {
-		appendRunLog(fmt.Sprintf("Snell 蜂窝 TCP：%s %s 成功，延迟=%dms",
-			operation, name, delay))
 	}
 	return delay, nil
 }
@@ -3730,8 +3676,6 @@ func NotifyNetworkChange(name string, systemDNSJSON string, reason string,
 	if resetConnections {
 		iface.FlushCache()
 	}
-	logSnellCellularTCPState(name, "网络路径变化")
-
 	resolverUpdated := false
 	var resolverErr error
 	if dnsErr == nil && len(newSystemDNS) > 0 &&
@@ -4134,7 +4078,6 @@ func Stop() {
 	lockConfigApplyForWrite()
 	defer unlockConfigApplyForWrite()
 	appendRunLog("Stop: 关闭内核")
-	setSnellCellularTCPNodes(nil)
 	storePhysicalInterface("")
 	activeDNSConfig = nil
 	activeDNSSystemTemplate = nil
@@ -4169,88 +4112,6 @@ func currentPhysicalInterface() string {
 
 func isCellularInterface(name string) bool {
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(name)), "pdp_ip")
-}
-
-func normalizeSnellCellularTCPNodes(names []string) []string {
-	capacity := len(names)
-	if capacity > maxSnellCellularTCPNodes {
-		capacity = maxSnellCellularTCPNodes
-	}
-	result := make([]string, 0, capacity)
-	seen := make(map[string]struct{}, capacity)
-	for _, name := range names {
-		if strings.TrimSpace(name) == "" {
-			continue
-		}
-		if _, exists := seen[name]; exists {
-			continue
-		}
-		seen[name] = struct{}{}
-		result = append(result, name)
-		if len(result) == maxSnellCellularTCPNodes {
-			break
-		}
-	}
-	sort.Strings(result)
-	return result
-}
-
-func setSnellCellularTCPNodes(names []string) {
-	snapshot := append([]string(nil), names...)
-	snellCellularTCPMu.Lock()
-	snellCellularTCPNodes = snapshot
-	snellCellularTCPMu.Unlock()
-	dialer.SetSnellCellularTCPNodes(snapshot)
-}
-
-func snellCellularTCPNodeCount() int {
-	snellCellularTCPMu.RLock()
-	count := len(snellCellularTCPNodes)
-	snellCellularTCPMu.RUnlock()
-	return count
-}
-
-func snellCellularTCPSelected(name string) bool {
-	snellCellularTCPMu.RLock()
-	defer snellCellularTCPMu.RUnlock()
-	for _, selected := range snellCellularTCPNodes {
-		if selected == name {
-			return true
-		}
-	}
-	return false
-}
-
-func snellCellularTCPStatus(name, interfaceName string) string {
-	if !snellCellularTCPSelected(name) {
-		return "未指定，按节点配置使用 TFO"
-	}
-	if !isCellularInterface(interfaceName) {
-		return "已指定但当前不是蜂窝网络，按节点配置使用 TFO"
-	}
-	return "已指定，使用普通 TCP（TFO 已关闭）"
-}
-
-func logSnellCellularTCPState(interfaceName, reason string) {
-	count := snellCellularTCPNodeCount()
-	mode := "名单为空，所有节点按原配置使用 TFO"
-	if count > 0 {
-		if isCellularInterface(interfaceName) {
-			mode = fmt.Sprintf("%d 个指定 Snell 节点使用普通 TCP", count)
-		} else {
-			mode = fmt.Sprintf("%d 个指定节点待机，Wi-Fi/非蜂窝保持原 TFO", count)
-		}
-	}
-	appendRunLog(fmt.Sprintf("Snell 蜂窝 TCP：接口=%s，%s（原因：%s）",
-		displayInterfaceName(interfaceName), mode, reason))
-}
-
-func displayInterfaceName(name string) string {
-	name = strings.TrimSpace(name)
-	if name == "" {
-		return "未知"
-	}
-	return name
 }
 
 // appendRunLog 追加一行到 <home>/run.log（封装层自己的标记，便于和内核日志混排）。

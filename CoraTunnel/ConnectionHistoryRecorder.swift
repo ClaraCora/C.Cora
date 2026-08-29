@@ -6,9 +6,12 @@ import Mihomo
 /// map is capped well below a Packet Tunnel's memory budget and is never sent
 /// across IPC as a history payload.
 final class ConnectionHistoryRecorder {
-    // Keep the NE-side JSON and SQLite batch bounded. The App can still page
-    // the complete on-disk history; this only limits transient active data.
-    private static let pollInterval: TimeInterval = 3
+    // Keep the NE-side JSON and SQLite batch bounded. Activity is sampled less
+    // often than the close queue because active rows change continuously while
+    // closed rows need prompt final counters for the record screen.
+    private static let snapshotInterval: TimeInterval = 8
+    private static let closedQueueInterval: TimeInterval = 2
+    private static let maintenanceInterval: TimeInterval = 60
     private static let snapshotLimit = 256
     private static let closedBatchLimit = 512
     private static let storeRetryIntervals: [TimeInterval] = [5, 10, 20, 40, 60]
@@ -16,13 +19,15 @@ final class ConnectionHistoryRecorder {
     private let queue = DispatchQueue(label: "com.cora.tunnel.connection-history",
                                       qos: .utility)
     private var store: ConnectionHistoryStore?
-    private var timer: DispatchSourceTimer?
+    private var snapshotTimer: DispatchSourceTimer?
+    private var closedQueueTimer: DispatchSourceTimer?
     private var storeRetryWorkItem: DispatchWorkItem?
     private var closedCursor: Int64 = 0
     private var isStopped = true
     private var didLogStoreFailure = false
     private var storeRetryAttempt = 0
     private var sessionGeneration: UInt64 = 0
+    private var lastMaintenanceDate = Date.distantPast
 
     func start() {
         queue.async { [weak self] in
@@ -44,9 +49,12 @@ final class ConnectionHistoryRecorder {
             sessionGeneration &+= 1
             storeRetryWorkItem?.cancel()
             storeRetryWorkItem = nil
-            timer?.setEventHandler {}
-            timer?.cancel()
-            timer = nil
+            snapshotTimer?.setEventHandler {}
+            snapshotTimer?.cancel()
+            snapshotTimer = nil
+            closedQueueTimer?.setEventHandler {}
+            closedQueueTimer?.cancel()
+            closedQueueTimer = nil
             // The extension owns the definitive session boundary. Clear here
             // as well as in the App so a Control Center disconnect while the
             // App is terminated cannot leak totals into the next VPN session.
@@ -54,11 +62,13 @@ final class ConnectionHistoryRecorder {
             store = nil
             didLogStoreFailure = false
             storeRetryAttempt = 0
+            lastMaintenanceDate = .distantPast
         }
     }
 
     private func openStoreAndStartTimerLocked(generation: UInt64) {
-        guard !isStopped, generation == sessionGeneration, timer == nil else { return }
+        guard !isStopped, generation == sessionGeneration,
+              snapshotTimer == nil, closedQueueTimer == nil else { return }
         // Never run schema migration inside the memory-constrained NE. The
         // main App owns upgrades; this recorder retries once the schema is ready.
         store = store ?? ConnectionHistoryStore.openShared(performMigrations: false)
@@ -79,15 +89,25 @@ final class ConnectionHistoryRecorder {
         // A prior extension instance can be killed without stopTunnel. Mark
         // any stale active rows as finished before this instance begins.
         store.finishAllActive()
-        sampleLocked()
+        sampleActiveLocked()
+        drainClosedQueueLocked()
+        lastMaintenanceDate = Date()
 
-        let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now() + Self.pollInterval,
-                       repeating: Self.pollInterval,
-                       leeway: .milliseconds(250))
-        timer.setEventHandler { [weak self] in self?.sampleLocked() }
-        self.timer = timer
-        timer.resume()
+        let snapshotTimer = DispatchSource.makeTimerSource(queue: queue)
+        snapshotTimer.schedule(deadline: .now() + Self.snapshotInterval,
+                               repeating: Self.snapshotInterval,
+                               leeway: .milliseconds(250))
+        snapshotTimer.setEventHandler { [weak self] in self?.sampleActiveLocked() }
+        self.snapshotTimer = snapshotTimer
+        snapshotTimer.resume()
+
+        let closedQueueTimer = DispatchSource.makeTimerSource(queue: queue)
+        closedQueueTimer.schedule(deadline: .now() + Self.closedQueueInterval,
+                                  repeating: Self.closedQueueInterval,
+                                  leeway: .milliseconds(100))
+        closedQueueTimer.setEventHandler { [weak self] in self?.drainClosedQueueLocked() }
+        self.closedQueueTimer = closedQueueTimer
+        closedQueueTimer.resume()
     }
 
     private func scheduleStoreRetryLocked(generation: UInt64) {
@@ -107,7 +127,7 @@ final class ConnectionHistoryRecorder {
                          execute: workItem)
     }
 
-    private func sampleLocked() {
+    private func sampleActiveLocked() {
         guard let store else { return }
         autoreleasepool {
             let payload = Data(MihomoConnectionsSnapshot(Self.snapshotLimit).utf8)
@@ -120,7 +140,13 @@ final class ConnectionHistoryRecorder {
                     store.finishActive(except: Set(snapshot.records.map { $0.id }))
                 }
             }
+            runMaintenanceIfNeededLocked(store: store)
+        }
+    }
 
+    private func drainClosedQueueLocked() {
+        guard let store else { return }
+        autoreleasepool {
             let closedPayload = Data(MihomoClosedConnectionsSnapshot(
                 closedCursor, Self.closedBatchLimit).utf8)
             if let root = try? JSONSerialization.jsonObject(with: closedPayload) as? [String: Any] {
@@ -135,6 +161,16 @@ final class ConnectionHistoryRecorder {
                     store.finish(ids: Set(closed.map { $0.id }))
                 }
             }
+            runMaintenanceIfNeededLocked(store: store)
         }
+    }
+
+    private func runMaintenanceIfNeededLocked(store: ConnectionHistoryStore) {
+        let now = Date()
+        guard now.timeIntervalSince(lastMaintenanceDate) >= Self.maintenanceInterval else {
+            return
+        }
+        lastMaintenanceDate = now
+        store.maintenance(now: now)
     }
 }
