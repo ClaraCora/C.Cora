@@ -1904,7 +1904,7 @@ private struct ExternalDetectionMenu: View {
     let canTest: Bool
 
     var body: some View {
-        ForEach(scripts.availableScripts) { script in
+        ForEach(orderedScripts) { script in
             Button {
                 Task {
                     await UnlockTestController.shared.run(nodeName: nodeName,
@@ -1916,6 +1916,30 @@ private struct ExternalDetectionMenu: View {
             }
             .disabled(!canTest || scripts.isUpdating ||
                       nodeName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        }
+    }
+
+    private var orderedScripts: [ExternalDetectionScript] {
+        scripts.availableScripts.sorted { lhs, rhs in
+            let leftRank = rank(for: lhs.id)
+            let rightRank = rank(for: rhs.id)
+            if leftRank == rightRank {
+                return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+            }
+            return leftRank < rightRank
+        }
+    }
+
+    private func rank(for scriptID: String) -> Int {
+        switch scriptID {
+        case "network-entry-exit":
+            return 0
+        case "ip-quality-detection":
+            return 1
+        case "node-unlock-detection":
+            return 2
+        default:
+            return 100
         }
     }
 }
@@ -1956,7 +1980,7 @@ private struct UnlockTestOverlay: View {
             }
         }
         .padding(20)
-        .frame(maxWidth: 360)
+        .frame(maxWidth: dialogWidth)
         .background(.regularMaterial,
                     in: RoundedRectangle(cornerRadius: 18, style: .continuous))
         .overlay {
@@ -1964,6 +1988,11 @@ private struct UnlockTestOverlay: View {
                 .stroke(Color.primary.opacity(0.1), lineWidth: 1)
         }
         .shadow(color: Color.black.opacity(0.2), radius: 24, y: 10)
+    }
+
+    private var dialogWidth: CGFloat {
+        guard let result, !isRunning else { return 360 }
+        return isCompactResult(result) ? 300 : 360
     }
 
     private var runningContent: some View {
@@ -2036,16 +2065,36 @@ private struct UnlockTestOverlay: View {
 
             Divider()
 
+            resultMessage(result)
+        }
+    }
+
+    @ViewBuilder
+    private func resultMessage(_ result: UnlockTestResult) -> some View {
+        if isCompactResult(result) {
+            Text(result.message)
+                .font(.body.weight(.medium))
+                .lineSpacing(3)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        } else {
             ScrollView {
                 Text(result.message)
-                    .font(.system(size: 13, weight: .regular, design: .rounded))
-                    .lineSpacing(0)
+                    .font(.callout)
+                    .lineSpacing(1)
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             .frame(maxHeight: 320)
         }
+    }
+
+    private func isCompactResult(_ result: UnlockTestResult) -> Bool {
+        let lines = result.message
+            .split(separator: "\n", omittingEmptySubsequences: false)
+        return result.message.count <= 160 && lines.count <= 6
     }
 }
 

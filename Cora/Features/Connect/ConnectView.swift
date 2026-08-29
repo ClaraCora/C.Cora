@@ -438,7 +438,7 @@ private struct MetricWidget: View {
                 .foregroundStyle(.primary)
         }
         .padding(14)
-        .frame(maxWidth: .infinity, minHeight: 116, alignment: .leading)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .coraGlassSurface(tint: tint)
         .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         .accessibilityElement(children: .combine)

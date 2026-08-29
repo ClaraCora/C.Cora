@@ -442,24 +442,24 @@ struct ConnectionListView: View {
             Section {
                 filterBar
             }
-            .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0))
+            .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
             .listRowBackground(Color.clear)
 
             if filteredEntries.isEmpty && isLoadingQueryHistory {
                 ProgressView("读取连接记录...")
-                    .listRowInsets(EdgeInsets(top: 18, leading: 0, bottom: 18, trailing: 0))
+                    .listRowInsets(EdgeInsets(top: 18, leading: 16, bottom: 18, trailing: 16))
                     .listRowSeparator(.hidden)
                     .listRowBackground(Color.clear)
             } else if filteredEntries.isEmpty {
                 CoraUnavailableState(query.isEmpty ? "没有匹配的连接" : "没有搜索结果",
                                      systemImage: "line.3.horizontal.decrease.circle")
-                    .listRowInsets(EdgeInsets(top: 18, leading: 0, bottom: 18, trailing: 0))
+                    .listRowInsets(EdgeInsets(top: 18, leading: 16, bottom: 18, trailing: 16))
                     .listRowSeparator(.hidden)
                     .listRowBackground(Color.clear)
             } else {
                 ForEach(filteredEntries) { entry in
                     ConnectionRecordRow(entry: entry, controller: controller)
-                        .listRowInsets(EdgeInsets(top: 5, leading: 0, bottom: 5, trailing: 0))
+                        .listRowInsets(EdgeInsets(top: 5, leading: 16, bottom: 5, trailing: 16))
                         .listRowSeparator(.hidden)
                         .listRowBackground(Color.clear)
                 }
@@ -474,7 +474,7 @@ struct ConnectionListView: View {
                         }
                         Spacer()
                     }
-                    .listRowInsets(EdgeInsets(top: 6, leading: 0, bottom: 10, trailing: 0))
+                    .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 10, trailing: 16))
                     .listRowBackground(Color.clear)
                 }
             }
@@ -580,7 +580,6 @@ struct ConnectionListView: View {
             .padding(.vertical, 8)
         }
         .coraGlassSurface(cornerRadius: 14)
-        .padding(.horizontal, 14)
     }
 
     private var availableStrategies: [String] {
@@ -640,14 +639,19 @@ private struct MenuFilter<Content: View>: View {
 private struct ConnectionRecordRow: View {
     let entry: ConnectionHistoryEntry
     @ObservedObject var controller: ConnectionsController
+    @State private var isShowingDetail = false
 
     var body: some View {
-        NavigationLink {
-            ConnectionDetailView(entry: entry, controller: controller)
+        Button {
+            isShowingDetail = true
         } label: {
             ConnectionRecordContent(entry: entry)
         }
         .buttonStyle(.plain)
+        .accessibilityAddTraits(.isButton)
+        .navigationDestination(isPresented: $isShowingDetail) {
+            ConnectionDetailView(entry: entry, controller: controller)
+        }
     }
 }
 
@@ -756,7 +760,7 @@ private struct ConnectionDetailView: View {
                 .padding(14)
                 .coraGlassSurface(tint: isActive ? .green : nil)
             }
-            .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0))
+            .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
             .listRowSeparator(.hidden)
             .listRowBackground(Color.clear)
 
@@ -775,9 +779,10 @@ private struct ConnectionDetailView: View {
                     }
                 }
                 .padding(.vertical, 4)
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .coraGlassSurface()
             }
-            .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
+            .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 16))
             .listRowSeparator(.hidden)
             .listRowBackground(Color.clear)
 
@@ -800,9 +805,10 @@ private struct ConnectionDetailView: View {
                     }
                 }
                 .padding(.vertical, 4)
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .coraGlassSurface()
             }
-            .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
+            .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 16))
             .listRowSeparator(.hidden)
             .listRowBackground(Color.clear)
 
@@ -815,9 +821,10 @@ private struct ConnectionDetailView: View {
                     ConnectionDetailValue(title: "合计", value: ByteFormat.size(connection.transferred), systemImage: "sum")
                 }
                 .padding(.vertical, 4)
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .coraGlassSurface()
             }
-            .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
+            .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 16))
             .listRowSeparator(.hidden)
             .listRowBackground(Color.clear)
 
@@ -839,7 +846,7 @@ private struct ConnectionDetailView: View {
                     }
                     .disabled(controller.closingIDs.contains(connection.id))
                 }
-                .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0))
+                .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
                 .listRowSeparator(.hidden)
                 .listRowBackground(Color.clear)
             }
