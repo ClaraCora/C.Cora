@@ -672,12 +672,8 @@ private struct ConnectionRecordContent: View {
                     .padding(.vertical, 2)
                     .background(networkTint.opacity(0.12), in: Capsule())
                 Spacer(minLength: 4)
-                HStack(spacing: 7) {
-                    Image(systemName: entry.isActive ? "lock.open" : "lock")
-                    Image(systemName: "chevron.right")
-                        .font(.caption2.weight(.semibold))
-                }
-                .font(.caption)
+                Image(systemName: entry.isActive ? "lock.open" : "lock")
+                    .font(.caption)
                 .foregroundStyle(.tertiary)
             }
 
@@ -765,56 +761,61 @@ private struct ConnectionDetailView: View {
             .listRowBackground(Color.clear)
 
             Section("路由") {
-                ConnectionDetailValue(title: "策略组",
-                                      value: connection.strategyName,
-                                      systemImage: "slider.horizontal.3")
-                ConnectionDetailValue(title: "出口节点",
-                                      value: connection.proxyNodeName,
-                                      systemImage: "point.3.connected.trianglepath.dotted")
-                if connection.chains.count > 1 {
-                    ConnectionDetailValue(title: "完整链路",
-                                          value: connection.routeText,
-                                          systemImage: "arrow.triangle.branch")
+                VStack(spacing: 0) {
+                    ConnectionDetailValue(title: "策略组", value: connection.strategyName, systemImage: "slider.horizontal.3")
+                    Divider().opacity(0.35)
+                    ConnectionDetailValue(title: "出口节点", value: connection.proxyNodeName, systemImage: "point.3.connected.trianglepath.dotted")
+                    if connection.chains.count > 1 {
+                        Divider().opacity(0.35)
+                        ConnectionDetailValue(title: "完整链路", value: connection.routeText, systemImage: "arrow.triangle.branch")
+                    }
+                    if !connection.ruleText.isEmpty {
+                        Divider().opacity(0.35)
+                        ConnectionDetailValue(title: "命中规则", value: connection.ruleText, systemImage: "list.bullet.rectangle")
+                    }
                 }
-                if !connection.ruleText.isEmpty {
-                    ConnectionDetailValue(title: "命中规则",
-                                          value: connection.ruleText,
-                                          systemImage: "list.bullet.rectangle")
-                }
+                .padding(.vertical, 4)
+                .coraGlassSurface()
             }
             .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
             .listRowSeparator(.hidden)
             .listRowBackground(Color.clear)
 
             Section("连接信息") {
-                if !connection.sourceAddress.isEmpty {
-                    ConnectionDetailValue(title: "来源", value: connection.sourceAddress,
-                                          systemImage: "iphone")
+                VStack(spacing: 0) {
+                    if !connection.sourceAddress.isEmpty {
+                        ConnectionDetailValue(title: "来源", value: connection.sourceAddress, systemImage: "iphone")
+                    }
+                    if !connection.destinationAddress.isEmpty {
+                        if !connection.sourceAddress.isEmpty { Divider().opacity(0.35) }
+                        ConnectionDetailValue(title: "目标地址", value: connection.destinationAddress, systemImage: "network")
+                    }
+                    if !connection.metadata.process.isEmpty {
+                        if !connection.sourceAddress.isEmpty || !connection.destinationAddress.isEmpty { Divider().opacity(0.35) }
+                        ConnectionDetailValue(title: "进程", value: connection.metadata.process, systemImage: "app.dashed")
+                    }
+                    if !connection.durationText.isEmpty {
+                        if !connection.sourceAddress.isEmpty || !connection.destinationAddress.isEmpty || !connection.metadata.process.isEmpty { Divider().opacity(0.35) }
+                        ConnectionDetailValue(title: "持续时间", value: connection.durationText, systemImage: "clock")
+                    }
                 }
-                if !connection.destinationAddress.isEmpty {
-                    ConnectionDetailValue(title: "目标地址", value: connection.destinationAddress,
-                                          systemImage: "network")
-                }
-                if !connection.metadata.process.isEmpty {
-                    ConnectionDetailValue(title: "进程", value: connection.metadata.process,
-                                          systemImage: "app.dashed")
-                }
-                if !connection.durationText.isEmpty {
-                    ConnectionDetailValue(title: "持续时间", value: connection.durationText,
-                                          systemImage: "clock")
-                }
+                .padding(.vertical, 4)
+                .coraGlassSurface()
             }
             .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
             .listRowSeparator(.hidden)
             .listRowBackground(Color.clear)
 
             Section("流量") {
-                ConnectionDetailValue(title: "上行", value: ByteFormat.size(connection.upload),
-                                      systemImage: "arrow.up")
-                ConnectionDetailValue(title: "下行", value: ByteFormat.size(connection.download),
-                                      systemImage: "arrow.down")
-                ConnectionDetailValue(title: "合计", value: ByteFormat.size(connection.transferred),
-                                      systemImage: "sum")
+                VStack(spacing: 0) {
+                    ConnectionDetailValue(title: "上行", value: ByteFormat.size(connection.upload), systemImage: "arrow.up")
+                    Divider().opacity(0.35)
+                    ConnectionDetailValue(title: "下行", value: ByteFormat.size(connection.download), systemImage: "arrow.down")
+                    Divider().opacity(0.35)
+                    ConnectionDetailValue(title: "合计", value: ByteFormat.size(connection.transferred), systemImage: "sum")
+                }
+                .padding(.vertical, 4)
+                .coraGlassSurface()
             }
             .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
             .listRowSeparator(.hidden)
@@ -876,7 +877,8 @@ private struct ConnectionDetailValue: View {
             Label(title, systemImage: systemImage)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .coraListRowSurface()
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
     }
 }
 
