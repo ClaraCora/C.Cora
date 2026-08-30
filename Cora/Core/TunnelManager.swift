@@ -555,8 +555,42 @@ final class TunnelManager {
         case .ok(let data):
             return String(data: data, encoding: .utf8) ?? "(响应非文本)"
         case .failure(let reason):
+            if let persisted = Self.persistedMemoryDiagnostics() {
+                return persisted + "\n\n(实时 IPC 不可用：\(reason))"
+            }
             return "(内存诊断不可用：\(reason))"
         }
+    }
+
+    /// NE 可能已被系统停止，此时实时 IPC 无法建立；开发者模式的诊断文件
+    /// 仍可能已经落盘。读取时保留与 NE 相同的有界尾部，不把历史数据全部载入。
+    private static func persistedMemoryDiagnostics() -> String? {
+        guard let directory = AppGroup.containerURL else { return nil }
+        let files: [(String, UInt64)] = [
+            ("memory-diagnostic.summary.previous.json", 24 * 1024),
+            ("memory-diagnostic.summary.json", 24 * 1024),
+            ("memory-diagnostic.previous.ndjson", 96 * 1024),
+            ("memory-diagnostic.ndjson", 96 * 1024),
+        ]
+        var sections: [String] = []
+        for (name, maxBytes) in files {
+            let url = directory.appendingPathComponent(name)
+            guard let handle = try? FileHandle(forReadingFrom: url) else { continue }
+            defer { try? handle.close() }
+            do {
+                let size = try handle.seekToEnd()
+                let offset = size > maxBytes ? size - maxBytes : 0
+                try handle.seek(toOffset: offset)
+                let data = try handle.readToEnd() ?? Data()
+                guard let text = String(data: data, encoding: .utf8), !text.isEmpty else {
+                    continue
+                }
+                sections.append("===== \(name) =====\n\(text)")
+            } catch {
+                continue
+            }
+        }
+        return sections.isEmpty ? nil : sections.joined(separator: "\n\n")
     }
 
     /// 清理 NE 侧诊断文件；普通模式下不会创建这些文件。

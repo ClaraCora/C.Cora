@@ -888,7 +888,10 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 let diagnostics = self.runtimeQueue.sync {
                     self.collectMemoryDiagnostics()
                 }
-                reply(Self.tailData(diagnostics, maxBytes: 128 * 1024))
+                // Diagnostic data is already bounded (two 96KB tails plus two
+                // small summaries). Keep enough room for both sessions so the
+                // analyzer can still see the long-lived summary after rotation.
+                reply(Self.tailData(diagnostics, maxBytes: 512 * 1024))
             }
         case "clearMemoryDiagnostics":
             let result = clearMemoryDiagnostics()
@@ -1072,6 +1075,21 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         storedIPCResponseBytes = max(0, storedIPCResponseBytes - response.data.count)
     }
 
+    private func memoryDiagnosticSupplementalStats() -> MemoryDiagnostics.SupplementalStats {
+        ipcResponseLock.lock()
+        let responseCount = storedIPCResponses.count
+        let responseBytes = storedIPCResponseBytes
+        ipcResponseLock.unlock()
+
+        let logStats = FileLog.stats()
+        return MemoryDiagnostics.SupplementalStats(
+            ipcResponseCount: responseCount,
+            ipcResponseBytes: UInt64(max(0, responseBytes)),
+            logBufferedLines: logStats.bufferedLines,
+            logBufferedBytes: logStats.bufferedBytes,
+            logPersistedBytes: logStats.persistedBytes)
+    }
+
     private func clearStoredIPCResponses(enableCaching: Bool? = nil) {
         ipcResponseLock.lock()
         ipcSessionGeneration &+= 1
@@ -1142,7 +1160,10 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             memoryPressureGuard = guarder
             return
         }
-        let diagnostics = MemoryDiagnostics()
+        let diagnostics = MemoryDiagnostics(
+            supplementalStatsProvider: { [weak self] in
+                self?.memoryDiagnosticSupplementalStats() ?? .empty
+            })
         diagnostics.start(directoryPath: home)
         memoryDiagnostics = diagnostics
         FileLog.write("开发者模式：已开启 NE 内存诊断（5 秒采样，文件上限 256KB）")
@@ -1181,11 +1202,16 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             memoryDiagnostics = nil
             let directory = URL(fileURLWithPath: home, isDirectory: true)
             let manager = FileManager.default
-            for name in ["memory-diagnostic.ndjson", "memory-diagnostic.previous.ndjson"] {
+            for name in ["memory-diagnostic.ndjson", "memory-diagnostic.previous.ndjson",
+                         "memory-diagnostic.summary.json",
+                         "memory-diagnostic.summary.previous.json"] {
                 try? manager.removeItem(at: directory.appendingPathComponent(name))
             }
             if shouldRestart {
-                let diagnostics = MemoryDiagnostics()
+                let diagnostics = MemoryDiagnostics(
+                    supplementalStatsProvider: { [weak self] in
+                        self?.memoryDiagnosticSupplementalStats() ?? .empty
+                    })
                 diagnostics.start(directoryPath: home)
                 memoryDiagnostics = diagnostics
             }
@@ -1199,13 +1225,21 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             return "(隧道尚未启动)"
         }
         let directory = URL(fileURLWithPath: home, isDirectory: true)
+        let previousSummary = Self.tailTextFile(
+            directory.appendingPathComponent("memory-diagnostic.summary.previous.json").path,
+            maxBytes: 24 * 1024) ?? "(不存在)"
+        let currentSummary = Self.tailTextFile(
+            directory.appendingPathComponent("memory-diagnostic.summary.json").path,
+            maxBytes: 24 * 1024) ?? "(不存在)"
         let previous = Self.tailTextFile(
             directory.appendingPathComponent("memory-diagnostic.previous.ndjson").path,
             maxBytes: 96 * 1024) ?? "(不存在)"
         let current = Self.tailTextFile(
             directory.appendingPathComponent("memory-diagnostic.ndjson").path,
             maxBytes: 96 * 1024) ?? "(不存在)"
-        return "===== memory diagnostic（上一段）=====\n\(previous)\n\n"
+        return "===== memory diagnostic summary（上一会话）=====\n\(previousSummary)\n\n"
+            + "===== memory diagnostic summary（当前会话）=====\n\(currentSummary)\n\n"
+            + "===== memory diagnostic（上一段）=====\n\(previous)\n\n"
             + "===== memory diagnostic（当前段）=====\n\(current)"
     }
 
@@ -1246,7 +1280,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private static func tailData(_ s: String, maxBytes: Int) -> Data {
         let data = Data(s.utf8)
         guard data.count > maxBytes else { return data }
-        return Data("…（已截断，仅显示最新 \(maxBytes / 1024)KB）\n".utf8) + data.suffix(maxBytes)
+        // Decode the tail before rebuilding the response. A raw byte suffix
+        // can start in the middle of a Chinese UTF-8 sequence, which would
+        // make the App-side String(data:encoding:) conversion fail entirely.
+        let tail = String(decoding: data.suffix(maxBytes), as: UTF8.self)
+        return Data("…（已截断，仅显示最新 \(maxBytes / 1024)KB）\n\(tail)".utf8)
     }
 
     /// 汇总 NE 步骤日志、mihomo 日志和持久化内存诊断。

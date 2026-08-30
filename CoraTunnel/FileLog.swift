@@ -18,7 +18,14 @@ enum FileLog {
     private static let currentFileName = "ne.log"
     private static let previousFileName = "ne.previous.log"
     private static var buffer: [String] = []
+    private static var bufferedBytes: UInt64 = 0
     private static var persistedBytes: UInt64 = 0
+
+    struct Stats {
+        let bufferedLines: Int
+        let bufferedBytes: UInt64
+        let persistedBytes: UInt64
+    }
 
     private static let formatter: DateFormatter = {
         let f = DateFormatter()
@@ -32,6 +39,7 @@ enum FileLog {
     static func reset() {
         queue.sync {
             buffer.removeAll()
+            bufferedBytes = 0
             persistedBytes = 0
             rotatePersistedLogLocked()
         }
@@ -42,8 +50,14 @@ enum FileLog {
         queue.sync {
             let line = "\(formatter.string(from: Date())) [NE] \(message)"
             buffer.append(line)
+            bufferedBytes += UInt64(line.utf8.count)
             if buffer.count >= trimBufferedLinesAt {
-                buffer.removeFirst(buffer.count - maxBufferedLines)
+                let removeCount = buffer.count - maxBufferedLines
+                for removed in buffer.prefix(removeCount) {
+                    bufferedBytes = bufferedBytes >= UInt64(removed.utf8.count)
+                        ? bufferedBytes - UInt64(removed.utf8.count) : 0
+                }
+                buffer.removeFirst(removeCount)
             }
 
             // best-effort：App Group 可用时也落一份有界文件，便于将来排查。
@@ -142,5 +156,13 @@ enum FileLog {
     /// 导出当前缓冲全部内容（供 handleAppMessage 回传主 App）。
     static func dump() -> String {
         queue.sync { buffer.joined(separator: "\n") }
+    }
+
+    static func stats() -> Stats {
+        queue.sync {
+            Stats(bufferedLines: buffer.count,
+                  bufferedBytes: bufferedBytes,
+                  persistedBytes: persistedBytes)
+        }
     }
 }

@@ -49,7 +49,7 @@ struct DeveloperDiagnosticsView: View {
                 }
                 .tint(.accentColor)
             } footer: {
-                Text("开启后每 5 秒记录一次物理内存、Go 堆、连接和 goroutine 快照，最多保留 256KB。关闭后不会持续采样；诊断数据可能包含连接数量等运行态信息。")
+                Text("开启后每 5 秒记录一次物理内存、VM、Go 堆、连接和 goroutine 快照，并保留当前/上一会话的数字摘要。关闭后不会持续采样；诊断数据可能包含连接数量等运行态信息。")
             }
             .listRowBackground(AppListRowBackground())
 
@@ -74,7 +74,8 @@ struct DeveloperDiagnosticsView: View {
                     } label: {
                         Label("读取并分析", systemImage: "chart.bar.xaxis")
                     }
-                    .disabled(isLoading || !core.isActive)
+                    // NE 被 Jetsam 停止后仍可从 App Group 读取已经落盘的摘要。
+                    .disabled(isLoading)
 
                     Button {
                         copyRawDiagnostics()
@@ -119,7 +120,7 @@ struct DeveloperDiagnosticsView: View {
         .navigationTitle("开发者模式")
         .navigationBarTitleDisplayMode(.inline)
         .task {
-            guard settings.developerMode, core.isActive else { return }
+            guard settings.developerMode else { return }
             await loadDiagnostics()
         }
     }
