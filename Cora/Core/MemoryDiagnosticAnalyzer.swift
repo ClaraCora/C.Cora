@@ -203,7 +203,8 @@ enum MemoryDiagnosticAnalyzer {
         let resident = latest("residentSize", summary: summary, fallback: last?.vm?.residentSize)
         let residentPeak = latest("residentSizePeak", summary: summary,
                                   fallback: last?.vm?.residentSizePeak)
-        let internal = latest("internalSize", summary: summary, fallback: last?.vm?.internalSize)
+        let internalSize = latest("internalSize", summary: summary,
+                                  fallback: last?.vm?.internalSize)
         let compressed = latest("compressedSize", summary: summary,
                                 fallback: last?.vm?.compressedSize)
         let compressedPeak = latest("compressedSizePeak", summary: summary,
@@ -317,7 +318,7 @@ enum MemoryDiagnosticAnalyzer {
         let vmLine = [
             "常驻 \(formatBytes(resident))",
             "峰值 \(formatBytes(residentPeak))",
-            "internal \(formatBytes(internal))",
+            "internal \(formatBytes(internalSize))",
             "compressed \(formatBytes(compressed))",
             "compressed 峰值 \(formatBytes(compressedPeak))",
             "reusable \(formatBytes(reusable))",
