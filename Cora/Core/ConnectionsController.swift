@@ -35,7 +35,7 @@ struct ConnectionsSnapshot: Decodable, Sendable {
         uploadTotal = values.lossyInt64(forKey: .uploadTotal)
         let decoded = try values.decodeIfPresent([ActiveConnection].self, forKey: .connections) ?? []
         connections = decoded.sorted { $0.start > $1.start }
-        total = max(0, values.decodeIfPresent(Int.self, forKey: .total) ?? connections.count)
+        total = max(0, try values.decodeIfPresent(Int.self, forKey: .total) ?? connections.count)
         let counts = Self.networkCounts(connections)
         tcpCount = counts.tcp
         udpCount = counts.udp
