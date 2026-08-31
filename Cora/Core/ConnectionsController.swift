@@ -5,22 +5,28 @@ struct ConnectionsSnapshot: Decodable, Sendable {
     let downloadTotal: Int64
     let uploadTotal: Int64
     let connections: [ActiveConnection]
+    /// Total number of live connections reported by the core. This remains
+    /// available for totals-only snapshots where `connections` is intentionally
+    /// empty to keep the App memory footprint low.
+    let total: Int
     let tcpCount: Int
     let udpCount: Int
 
     init(downloadTotal: Int64 = 0,
          uploadTotal: Int64 = 0,
-         connections: [ActiveConnection] = []) {
+         connections: [ActiveConnection] = [],
+         total: Int? = nil) {
         self.downloadTotal = downloadTotal
         self.uploadTotal = uploadTotal
         self.connections = connections
+        self.total = max(0, total ?? connections.count)
         let counts = Self.networkCounts(connections)
         tcpCount = counts.tcp
         udpCount = counts.udp
     }
 
     private enum CodingKeys: String, CodingKey {
-        case downloadTotal, uploadTotal, connections
+        case downloadTotal, uploadTotal, connections, total
     }
 
     init(from decoder: Decoder) throws {
@@ -29,6 +35,7 @@ struct ConnectionsSnapshot: Decodable, Sendable {
         uploadTotal = values.lossyInt64(forKey: .uploadTotal)
         let decoded = try values.decodeIfPresent([ActiveConnection].self, forKey: .connections) ?? []
         connections = decoded.sorted { $0.start > $1.start }
+        total = max(0, values.decodeIfPresent(Int.self, forKey: .total) ?? connections.count)
         let counts = Self.networkCounts(connections)
         tcpCount = counts.tcp
         udpCount = counts.udp
@@ -333,6 +340,7 @@ final class ConnectionsController: ObservableObject {
     private let historyStore = ConnectionHistoryStore.openShared()
     private var historyOffset = 0
     private var lastHistoryRefreshDate = Date.distantPast
+    private var lastHistoryCountRefreshDate = Date.distantPast
     // The overview only needs totals. A full connection array is requested
     // while the record screen is visible, avoiding a large JSON allocation in
     // the App every second when the user is on another tab.
@@ -362,7 +370,10 @@ final class ConnectionsController: ObservableObject {
 
     init() {
         restorePersistedSession()
-        reloadHistoryFromStore()
+        // The root view starts with a totals-only IPC poll. Load only the
+        // counts needed by the overview here; the record page fetches its
+        // first detail page when it becomes visible.
+        reloadHistoryCountsFromStore(force: true)
     }
 
     /// 由页面 `.task` 持有生命周期；离开页面后 SwiftUI 会取消轮询。
@@ -381,7 +392,29 @@ final class ConnectionsController: ObservableObject {
     func setFullSnapshotEnabled(_ enabled: Bool) {
         guard wantsFullSnapshot != enabled else { return }
         wantsFullSnapshot = enabled
-        guard enabled else { return }
+        guard enabled else {
+            // Detail rows are owned by the record screen. Once that screen is
+            // gone (or the app enters the background), release its bounded
+            // page and chart aggregates while retaining the scalar counters
+            // used by the overview cards.
+            snapshot = snapshot.map {
+                ConnectionsSnapshot(downloadTotal: $0.downloadTotal,
+                                    uploadTotal: $0.uploadTotal,
+                                    connections: [],
+                                    total: $0.total)
+            }
+            history.removeAll(keepingCapacity: false)
+            historyOffset = 0
+            hasMoreHistory = false
+            historySummary = ConnectionHistorySummary(
+                recordCount: historySummary.recordCount,
+                activeCount: historySummary.activeCount,
+                uploadTotal: historySummary.uploadTotal,
+                downloadTotal: historySummary.downloadTotal,
+                strategyVolumes: [],
+                hostVolumes: [])
+            return
+        }
         Task { [weak self] in
             await self?.refresh(showLoading: true)
         }
@@ -396,6 +429,7 @@ final class ConnectionsController: ObservableObject {
         historyOffset = 0
         hasMoreHistory = false
         lastHistoryRefreshDate = .distantPast
+        lastHistoryCountRefreshDate = .distantPast
         isLoadingMoreHistory = false
         sessionSummary = ConnectionSessionSummary()
         activeSamples = [:]
@@ -438,12 +472,15 @@ final class ConnectionsController: ObservableObject {
                 guard !Task.isCancelled, generation == currentGeneration else { return }
                 KernelController.shared.updateConnectionTotals(download: latest.downloadTotal,
                                                                 upload: latest.uploadTotal)
-                let retainedConnections = fullSnapshot
-                    ? latest.connections
-                    : (snapshot?.connections ?? [])
+                // A totals-only poll deliberately drops any previously loaded
+                // detail array. Keeping the old 200-row snapshot alive while
+                // the overview is visible only increases App memory; the
+                // record page will request a fresh bounded page when opened.
+                let retainedConnections = fullSnapshot ? latest.connections : []
                 snapshot = ConnectionsSnapshot(downloadTotal: latest.downloadTotal,
                                                uploadTotal: latest.uploadTotal,
-                                               connections: retainedConnections)
+                                               connections: retainedConnections,
+                                               total: latest.total)
                 if hasStartedNewKernelSession(with: latest) {
                     clearSessionState()
                 }
@@ -457,9 +494,9 @@ final class ConnectionsController: ObservableObject {
                     reloadHistoryFromStore(activeConnections: latest.connections,
                                            force: showLoading)
                 } else {
-                    // Refresh counts and totals from SQLite without loading
-                    // another connection array into the App process.
-                    reloadHistoryFromStore(force: false)
+                    // The overview only needs counts and totals. Avoid loading
+                    // a page and running strategy/host GROUP BY on every poll.
+                    reloadHistoryCountsFromStore(force: false)
                 }
                 error = nil
             } catch {
@@ -489,7 +526,8 @@ final class ConnectionsController: ObservableObject {
                 snapshot = ConnectionsSnapshot(
                     downloadTotal: current.downloadTotal,
                     uploadTotal: current.uploadTotal,
-                    connections: current.connections.filter { $0.id != connection.id })
+                    connections: current.connections.filter { $0.id != connection.id },
+                    total: max(0, current.total - 1))
                 mergeSessionStatistics(with: snapshot?.connections ?? [])
                 persistSession(force: true)
                 reloadHistoryFromStore(activeConnections: snapshot?.connections ?? [])
@@ -514,7 +552,8 @@ final class ConnectionsController: ObservableObject {
             if let current = snapshot {
                 snapshot = ConnectionsSnapshot(
                     downloadTotal: current.downloadTotal,
-                    uploadTotal: current.uploadTotal)
+                    uploadTotal: current.uploadTotal,
+                    total: 0)
                 mergeSessionStatistics(with: [])
                 persistSession(force: true)
                 reloadHistoryFromStore(activeConnections: [])
@@ -562,6 +601,49 @@ final class ConnectionsController: ObservableObject {
         historyOffset = persisted.count
         hasMoreHistory = persisted.count == ConnectionHistoryStore.defaultFetchPageSize
         historySummary = historyStore.summary()
+    }
+
+    /// Refreshes only the values shown by the overview connection cards.
+    /// Keeping this path separate from `reloadHistoryFromStore` avoids
+    /// materializing connection details and aggregate dictionaries during the
+    /// normal three-second totals poll.
+    private func reloadHistoryCountsFromStore(force: Bool = false) {
+        guard let historyStore else {
+            let activeCount = snapshot?.total ?? snapshot?.connections.count ?? 0
+            let recordCount = max(history.count, activeCount)
+            let current = historySummary
+            guard current.recordCount != recordCount ||
+                    current.activeCount != activeCount else { return }
+            historySummary = ConnectionHistorySummary(
+                recordCount: recordCount,
+                activeCount: activeCount,
+                uploadTotal: current.uploadTotal,
+                downloadTotal: current.downloadTotal,
+                strategyVolumes: current.strategyVolumes,
+                hostVolumes: current.hostVolumes)
+            return
+        }
+
+        let now = Date()
+        guard force || now.timeIntervalSince(lastHistoryCountRefreshDate) >= 2 else {
+            return
+        }
+        lastHistoryCountRefreshDate = now
+        let counts = historyStore.countSummary()
+        let current = historySummary
+        guard current.recordCount != counts.recordCount ||
+                current.activeCount != counts.activeCount ||
+                current.uploadTotal != counts.uploadTotal ||
+                current.downloadTotal != counts.downloadTotal else {
+            return
+        }
+        historySummary = ConnectionHistorySummary(
+            recordCount: counts.recordCount,
+            activeCount: counts.activeCount,
+            uploadTotal: counts.uploadTotal,
+            downloadTotal: counts.downloadTotal,
+            strategyVolumes: current.strategyVolumes,
+            hostVolumes: current.hostVolumes)
     }
 
     /// Loads one bounded page for a strategy/host detail screen. The filter is

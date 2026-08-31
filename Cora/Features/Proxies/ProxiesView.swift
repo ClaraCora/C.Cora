@@ -1154,37 +1154,46 @@ private struct ProxyNodeTestTargetModifier: ViewModifier {
     let onTouchBegan: () -> Void
     let onTap: () -> Void
 
-    @State private var touchStartedAt: Date?
-    @State private var maximumMovement: CGFloat = 0
+    // Gesture callbacks can fire dozens of times during one scroll. Keep the
+    // transient bookkeeping in a reference object so those updates do not
+    // invalidate the row view on every pointer sample.
+    @State private var tracker = ProxyTouchTracker()
 
     func body(content: Content) -> some View {
         content.simultaneousGesture(
             DragGesture(minimumDistance: 0, coordinateSpace: .local)
                 .onChanged { value in
-                    if touchStartedAt == nil {
-                        touchStartedAt = value.time
-                        maximumMovement = 0
+                    if tracker.touchStartedAt == nil {
+                        tracker.touchStartedAt = value.time
+                        tracker.maximumMovement = 0
                         onTouchBegan()
                     }
-                    maximumMovement = max(
-                        maximumMovement,
+                    tracker.maximumMovement = max(
+                        tracker.maximumMovement,
                         hypot(value.translation.width, value.translation.height))
                 }
                 .onEnded { value in
-                    guard let startedAt = touchStartedAt else { return }
+                    guard let startedAt = tracker.touchStartedAt else { return }
                     let duration = value.time.timeIntervalSince(startedAt)
                     let movement = max(
-                        maximumMovement,
+                        tracker.maximumMovement,
                         hypot(value.translation.width, value.translation.height))
                     let shouldTap = duration <= Self.maximumTapDuration &&
                         movement <= Self.maximumTapMovement
 
-                    touchStartedAt = nil
-                    maximumMovement = 0
+                    tracker.touchStartedAt = nil
+                    tracker.maximumMovement = 0
                     if shouldTap { onTap() }
                 }
         )
     }
+}
+
+/// Mutable gesture bookkeeping intentionally has no publisher. Mutating it
+/// must not trigger a SwiftUI body pass while a finger is moving.
+private final class ProxyTouchTracker {
+    var touchStartedAt: Date?
+    var maximumMovement: CGFloat = 0
 }
 
 private extension View {
@@ -1218,6 +1227,8 @@ private struct StrategyGroupListPanel: View {
     let onSelect: (String) -> Void
 
     var body: some View {
+        // Keep expanded node rows lazy as a group can contain many providers;
+        // this prevents a large expansion from materializing every row at once.
         LazyVStack(spacing: 0) {
             Group {
                 if isExpanded {
@@ -1683,6 +1694,8 @@ private struct GroupCompactHeader: View {
                             .font(.headline)
                             .lineLimit(1)
                             .truncationMode(.tail)
+                            .allowsTightening(true)
+                            .minimumScaleFactor(0.72)
                         Spacer(minLength: 2)
                         GroupHeaderDelayBadge(delay: delay,
                                               isTesting: isTestingDelay)
@@ -1693,6 +1706,8 @@ private struct GroupCompactHeader: View {
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                             .truncationMode(.tail)
+                            .allowsTightening(true)
+                            .minimumScaleFactor(0.72)
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -1703,6 +1718,8 @@ private struct GroupCompactHeader: View {
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .truncationMode(.tail)
+                .allowsTightening(true)
+                .minimumScaleFactor(0.72)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
         .frame(maxWidth: .infinity, minHeight: 54, alignment: .leading)

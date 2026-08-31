@@ -460,6 +460,7 @@ private final class ScriptExecution: @unchecked Sendable {
     private var context: JSContext?
     private var completed = false
     private var requestCount = 0
+    private var timeoutWorkItem: DispatchWorkItem?
 
     init(source: String,
          metadata: ExternalDetectionScript,
@@ -489,8 +490,8 @@ private final class ScriptExecution: @unchecked Sendable {
         let fail: (String) -> Void = { [weak self] message in
             self?.queue.async { [weak self] in
                 guard let self, !self.completed else { return }
-                self.completed = true
-                completion(.failure(ScriptExecutionError.runtime(message)))
+                self.complete(.failure(ScriptExecutionError.runtime(message)),
+                              completion: completion)
             }
         }
         js.exceptionHandler = { _, exception in
@@ -531,11 +532,14 @@ private final class ScriptExecution: @unchecked Sendable {
         if js.evaluateScript(source) == nil {
             fail("脚本无法执行")
         }
-        queue.asyncAfter(deadline: .now() + ExternalScriptLimits.maxExecutionSeconds) { [self] in
-            guard !self.completed else { return }
-            self.completed = true
-            completion(.failure(ScriptExecutionError.timeout))
+        guard !completed else { return }
+        let timeout = DispatchWorkItem { [weak self] in
+            guard let self, !self.completed else { return }
+            self.complete(.failure(ScriptExecutionError.timeout), completion: completion)
         }
+        timeoutWorkItem = timeout
+        queue.asyncAfter(deadline: .now() + ExternalScriptLimits.maxExecutionSeconds,
+                         execute: timeout)
     }
 
     private func fetch(method: String, options: NSDictionary, callback: JSValue) {
@@ -590,18 +594,28 @@ private final class ScriptExecution: @unchecked Sendable {
 
     private func finish(value: JSValue, completion: @escaping (Result<UnlockTestResult, Error>) -> Void) {
         guard !completed else { return }
-        completed = true
         let object = value.toDictionary() as? [String: Any] ?? [:]
         let title = object["title"] as? String ?? "节点解锁检测"
         let html = object["htmlMessage"] as? String ?? object["message"] as? String ?? "脚本没有返回检测结果"
-        completion(.success(UnlockTestResult(nodeName: nodeName,
-                                              groupName: groupName,
-                                              scriptID: metadata.id,
-                                              scriptName: metadata.name,
-                                              scriptIcon: metadata.icon,
-                                              scriptVersion: metadata.version,
-                                              title: title,
-                                              message: Self.plainText(html))))
+        let result = UnlockTestResult(nodeName: nodeName,
+                                      groupName: groupName,
+                                      scriptID: metadata.id,
+                                      scriptName: metadata.name,
+                                      scriptIcon: metadata.icon,
+                                      scriptVersion: metadata.version,
+                                      title: title,
+                                      message: Self.plainText(html))
+        complete(.success(result), completion: completion)
+    }
+
+    private func complete(_ result: Result<UnlockTestResult, Error>,
+                          completion: @escaping (Result<UnlockTestResult, Error>) -> Void) {
+        guard !completed else { return }
+        completed = true
+        timeoutWorkItem?.cancel()
+        timeoutWorkItem = nil
+        context = nil
+        completion(result)
     }
 
     private static func plainText(_ html: String) -> String {

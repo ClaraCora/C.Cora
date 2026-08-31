@@ -25,6 +25,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -3371,10 +3372,18 @@ func TrafficNow() string {
 	if !coreStartedAt.IsZero() {
 		uptime = int64(time.Since(coreStartedAt) / time.Second)
 	}
-	out, err := json.Marshal(map[string]int64{"up": up, "down": down, "uptime": uptime})
-	if err != nil {
-		return `{"up":0,"down":0,"uptime":0}`
-	}
+	// This response is emitted once per second while the tunnel is visible.
+	// Build the three integer fields directly so the hot path does not pay the
+	// reflection and intermediate value allocations of json.Marshal.
+	var storage [64]byte
+	out := storage[:0]
+	out = append(out, `{"up":`...)
+	out = strconv.AppendInt(out, up, 10)
+	out = append(out, `,"down":`...)
+	out = strconv.AppendInt(out, down, 10)
+	out = append(out, `,"uptime":`...)
+	out = strconv.AppendInt(out, uptime, 10)
+	out = append(out, '}')
 	return string(out)
 }
 
@@ -3386,6 +3395,14 @@ func TrafficNow() string {
 func ConnectionsSnapshot(limit int) string {
 	uploadTotal, downloadTotal := statistic.DefaultManager.Total()
 	if limit == 0 {
+		// Keep the response detail-free, but still expose the live count used by
+		// the overview card. Range only visits tracker references; it does not
+		// call Info or allocate connection metadata.
+		liveCount := 0
+		statistic.DefaultManager.Range(func(_ statistic.Tracker) bool {
+			liveCount++
+			return true
+		})
 		out, err := json.Marshal(struct {
 			DownloadTotal int64                    `json:"downloadTotal"`
 			UploadTotal   int64                    `json:"uploadTotal"`
@@ -3396,6 +3413,7 @@ func ConnectionsSnapshot(limit int) string {
 			DownloadTotal: downloadTotal,
 			UploadTotal:   uploadTotal,
 			Connections:   make([]*statistic.TrackerInfo, 0),
+			Total:         liveCount,
 		})
 		if err != nil {
 			return `{"downloadTotal":0,"uploadTotal":0,"connections":[],"total":0,"truncated":false}`

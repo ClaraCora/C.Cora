@@ -7,7 +7,6 @@ import NetworkExtension
 struct RootView: View {
     @EnvironmentObject private var core: CoreStateManager
     @EnvironmentObject private var subscriptions: SubscriptionStore
-    @EnvironmentObject private var kernel: KernelController
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var connections = ConnectionsController()
     @StateObject private var proxies = ProxyController()
@@ -29,7 +28,8 @@ struct RootView: View {
             handleScenePhase(phase)
         }
         .onAppear { syncStreams() }
-        .task(id: core.status.rawValue) {
+        .task(id: connectionPollContext) {
+            guard connectionPollContext.isForeground else { return }
             switch core.status {
             case .connecting:
                 connections.reset()
@@ -70,10 +70,14 @@ struct RootView: View {
         if core.status == .connecting {
             LogStreamController.shared.start(awaitingNewSession: true)
         } else if core.status == .connected || core.status == .reasserting {
-            kernel.start()
+            if scenePhase == .active {
+                KernelController.shared.start()
+            } else {
+                KernelController.shared.pauseMonitoring()
+            }
             LogStreamController.shared.start()
         } else if core.status == .disconnected || core.status == .invalid {
-            kernel.stop()
+            KernelController.shared.stop()
             LogStreamController.shared.stop()
         }
     }
@@ -83,6 +87,11 @@ struct RootView: View {
                          subscriptionID: subscriptions.selectedID,
                          configurationUpdatedAt: subscriptions.selected?.updatedAt,
                          providerRevision: subscriptions.providerCacheRevision)
+    }
+
+    private var connectionPollContext: ConnectionPollContext {
+        ConnectionPollContext(status: core.status.rawValue,
+                               isForeground: scenePhase == .active)
     }
 
     private func syncProxySession(for rawStatus: Int) {
@@ -104,16 +113,23 @@ struct RootView: View {
                 await core.refreshStatus()
                 syncStreams()
                 if core.status == .connected || core.status == .reasserting {
-                    await kernel.refreshMemory()
+                    KernelController.shared.start()
+                    await KernelController.shared.refreshMemory()
                 }
             }
         case .inactive, .background:
             connections.flushPersistence()
+            KernelController.shared.pauseMonitoring()
             Task { await subscriptions.flushPersistence() }
         default:
             break
         }
     }
+}
+
+private struct ConnectionPollContext: Hashable {
+    let status: Int
+    let isForeground: Bool
 }
 
 private struct ProxyLoadContext: Hashable {

@@ -110,9 +110,11 @@ struct CoraGlassSurfaceModifier: ViewModifier {
     }
 }
 
-/// Inset list row surface used by connection, traffic and log lists.  Keeping
+/// Inset list row surface used by connection, traffic and log lists. Keeping
 /// the padding here gives every list the same rhythm while retaining List's
-/// lazy rendering and native navigation behavior.
+/// lazy rendering and native navigation behavior. `thinMaterial` is intentional:
+/// these rows can be repeated hundreds of times, and a lighter blur avoids
+/// making scrolling pay the cost of a full regular-material backdrop per row.
 struct CoraListRowSurfaceModifier: ViewModifier {
     let tint: Color?
 
@@ -120,7 +122,7 @@ struct CoraListRowSurfaceModifier: ViewModifier {
         content
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
-            .background(.regularMaterial, in: shape)
+            .background(.thinMaterial, in: shape)
             .overlay {
                 shape.stroke(strokeColor, lineWidth: 1)
             }

@@ -135,6 +135,17 @@ final class SubscriptionStore: ObservableObject {
     @Published private(set) var providerCacheRevision = 0
     @Published private(set) var resourceUpdateRevision = 0
 
+    private struct RemoteResourceCacheKey: Equatable {
+        let persistenceRevision: Int
+        let providerCacheRevision: Int
+        let resourceUpdateRevision: Int
+    }
+
+    private struct RemoteResourceCacheEntry {
+        let key: RemoteResourceCacheKey
+        let resources: [RemoteResource]
+    }
+
     private static let fileURL: URL = {
         let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         return dir.appendingPathComponent("subscriptions.json")
@@ -150,6 +161,10 @@ final class SubscriptionStore: ObservableObject {
     private var activeRefreshes: [UUID: ActiveSubscriptionRefresh] = [:]
     private var activeRefreshCount = 0
     private var pendingRuntimeApplyYAML: [UUID: String] = [:]
+    // SwiftUI can evaluate the settings page body frequently. Keep the
+    // parsed resource manifest and provider metadata out of that render path
+    // until subscription or provider state actually changes.
+    private var remoteResourceCache: [UUID: RemoteResourceCacheEntry] = [:]
     private init() { load() }
 
     /// 当前选中的订阅原文。固定覆写由 NE 按该配置的开关统一应用。
@@ -293,6 +308,7 @@ final class SubscriptionStore: ObservableObject {
     func remove(_ id: UUID) {
         invalidateRefresh(id)
         removeProviderCache(id)
+        remoteResourceCache.removeValue(forKey: id)
         subscriptions.removeAll { $0.id == id }
         if selectedID == id { selectedID = subscriptions.first?.id }
         save()
@@ -510,10 +526,45 @@ final class SubscriptionStore: ObservableObject {
         lastError = failures.isEmpty ? nil : "Provider 刷新未全部完成：\n" + failures.joined(separator: "\n")
     }
 
+    /// 返回所有配置中的远程资源。保留该入口供需要跨配置汇总的调用使用。
     func remoteResources() -> [RemoteResource] {
-        subscriptions.flatMap { subscription -> [RemoteResource] in
+        makeRemoteResources(for: nil)
+    }
+
+    /// 返回当前选中配置引用的远程资源。
+    ///
+    /// 把“当前配置”这一选择语义收口在 Store，避免设置页或其他调用方
+    /// 误用 `remoteResources()` 而重新解析并展示所有配置的 Provider。
+    var selectedRemoteResources: [RemoteResource] {
+        guard let selectedID else { return [] }
+        return remoteResources(for: selectedID)
+    }
+
+    /// 返回指定配置引用的远程资源，避免解析和读取其他配置的 Provider。
+    func remoteResources(for subscriptionID: UUID) -> [RemoteResource] {
+        makeRemoteResources(for: subscriptionID)
+    }
+
+    private func makeRemoteResources(for subscriptionID: UUID?) -> [RemoteResource] {
+        let matchingSubscriptions = subscriptions.filter {
+            subscriptionID == nil || $0.id == subscriptionID
+        }
+        return matchingSubscriptions.flatMap { subscription -> [RemoteResource] in
+            let cacheKey = RemoteResourceCacheKey(
+                persistenceRevision: persistenceRevision,
+                providerCacheRevision: providerCacheRevision,
+                resourceUpdateRevision: resourceUpdateRevision)
+            if let cached = remoteResourceCache[subscription.id], cached.key == cacheKey {
+                return cached.resources
+            }
+
             guard !subscription.yaml.isEmpty,
-                  let manifest = try? Self.remoteResourceManifest(subscription.yaml) else { return [] }
+                  let manifest = try? Self.remoteResourceManifest(subscription.yaml) else {
+                remoteResourceCache[subscription.id] = RemoteResourceCacheEntry(
+                    key: cacheKey,
+                    resources: [])
+                return []
+            }
             // 只读取一次订阅级缓存。资源列表渲染不触发网络或 NE IPC。
             let proxyCache = Self.loadProviderCache(subscription.id)
             let cacheUpdatedAt = Self.providerCacheModificationDate(subscription.id)
@@ -543,7 +594,11 @@ final class SubscriptionStore: ObservableObject {
                                       updatedAt: subscription.resourceUpdatedAt[key],
                                       updateTimeIsApproximate: false)
             }
-            return proxyResources + ruleResources
+            let resources = proxyResources + ruleResources
+            remoteResourceCache[subscription.id] = RemoteResourceCacheEntry(
+                key: cacheKey,
+                resources: resources)
+            return resources
         }
     }
 
@@ -632,7 +687,11 @@ final class SubscriptionStore: ObservableObject {
     }
 
     func refreshAllProxyProviders() async {
-        let resources = remoteResources().filter { $0.kind == .proxyProvider }
+        guard let selectedID else {
+            lastError = "请先选择一个配置"
+            return
+        }
+        let resources = remoteResources(for: selectedID).filter { $0.kind == .proxyProvider }
         guard !resources.isEmpty else {
             lastError = "没有可刷新的远程 Proxy Provider"
             return
@@ -666,7 +725,7 @@ final class SubscriptionStore: ObservableObject {
 
     func refreshAllRuleProviders() async {
         guard let selectedID, runtimeCanUpdateRules(for: selectedID) else { return }
-        let resources = remoteResources().filter {
+        let resources = remoteResources(for: selectedID).filter {
             $0.kind == .ruleProvider && $0.subscriptionID == selectedID
         }
         guard !resources.isEmpty else {

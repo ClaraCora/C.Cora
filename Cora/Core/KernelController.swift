@@ -62,8 +62,29 @@ final class KernelController: ObservableObject {
         if modeTask == nil {
             modeTask = Task { [weak self] in await self?.loadMode() }
         }
-        if trafficTask == nil { startTraffic() }
+        // Resuming after the app returns to the foreground must not clear the
+        // last rate sample. `startTraffic()` intentionally resets the chart
+        // for an explicit caller, while this path only recreates the polling
+        // task that was paused in the background.
+        if trafficTask == nil { startTrafficPolling() }
         if memoryTask == nil { startMemoryPolling() }
+    }
+
+    /// 暂停前台监控任务，但保留当前速率、累计流量、运行时长和内存显示。
+    ///
+    /// Network Extension 的转发路径不依赖这些 UI 轮询；应用进入后台时
+    /// 取消 IPC 采样可避免主 App 与 NE 之间继续产生无意义的消息和解码
+    /// 分配。回到前台后由 `start()` 无损恢复。
+    func pauseMonitoring() {
+        modeTask?.cancel()
+        modeTask = nil
+        trafficTask?.cancel()
+        trafficTask = nil
+        memoryTask?.cancel()
+        memoryTask = nil
+        memoryRefreshGeneration &+= 1
+        memoryRefreshTask?.cancel()
+        memoryRefreshTask = nil
     }
 
     /// 断开后调用：停止采样。
@@ -102,6 +123,12 @@ final class KernelController: ObservableObject {
     /// 开始速率轮询（连接后调用）。每秒 IPC traffic，内核直接给每秒速率，无需差值计算。
     func startTraffic() {
         stopTraffic()
+        startTrafficPolling()
+    }
+
+    /// 重建速率轮询但保留现有速率曲线。仅供前后台切换使用。
+    private func startTrafficPolling() {
+        guard trafficTask == nil else { return }
         trafficTask = Task { [weak self] in
             while !Task.isCancelled {
                 let result = await CoreStateManager.shared.sendMessage(["cmd": "traffic"])
@@ -162,7 +189,10 @@ final class KernelController: ObservableObject {
 
     /// phys_footprint 正常每 5 秒查询；首次失败时每秒重试，直到拿到第一个数值。
     private func startMemoryPolling() {
-        stopMemoryPolling()
+        // Foreground/background transitions cancel only the polling task. Keep
+        // the last footprint visible and avoid restarting an already-running
+        // sampler when multiple scene/status callbacks arrive together.
+        guard memoryTask == nil else { return }
         memoryTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }

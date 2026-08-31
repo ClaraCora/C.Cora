@@ -4,7 +4,6 @@ import Charts
 /// 总览：以连接控制为中心，运行状态与流量指标围绕主操作展开。
 struct ConnectView: View {
     @EnvironmentObject private var core: CoreStateManager
-    @EnvironmentObject private var kernel: KernelController
     @ObservedObject var connections: ConnectionsController
 
     var body: some View {
@@ -17,11 +16,11 @@ struct ConnectView: View {
                         ConnectionHero()
 
                         if core.isActive {
-                            RuntimeMetricsGrid(up: kernel.up,
-                                               down: kernel.down,
-                                               totalDownload: kernel.totalDownload,
-                                               totalUpload: kernel.totalUpload,
-                                               samples: kernel.samples)
+                            // Keep the high-frequency traffic publisher scoped to
+                            // the metrics child.  The surrounding scroll view and
+                            // connection links no longer re-evaluate on every
+                            // one-second sample tick.
+                            RuntimeMetricsGrid()
                         }
 
                         OverviewConnectionLinks(controller: connections)
@@ -312,26 +311,22 @@ private extension KernelController.Mode {
 }
 
 private struct RuntimeMetricsGrid: View {
-    let up: Int64
-    let down: Int64
-    let totalDownload: Int64
-    let totalUpload: Int64
-    let samples: [KernelController.TrafficSample]
+    @EnvironmentObject private var kernel: KernelController
 
     var body: some View {
         LazyVGrid(columns: [
             GridItem(.flexible(minimum: 0), spacing: 12),
             GridItem(.flexible(minimum: 0), spacing: 12),
         ], spacing: 12) {
-            RateMetricWidget(title: "下行", value: ByteFormat.rate(down),
+            RateMetricWidget(title: "下行", value: ByteFormat.rate(kernel.down),
                              systemImage: "arrow.down", tint: .blue,
-                             samples: samples, direction: .down)
-            RateMetricWidget(title: "上行", value: ByteFormat.rate(up),
+                             samples: kernel.samples, direction: .down)
+            RateMetricWidget(title: "上行", value: ByteFormat.rate(kernel.up),
                              systemImage: "arrow.up", tint: .orange,
-                             samples: samples, direction: .up)
-            MetricWidget(title: "累计下行", value: ByteFormat.size(totalDownload),
+                             samples: kernel.samples, direction: .up)
+            MetricWidget(title: "累计下行", value: ByteFormat.size(kernel.totalDownload),
                          systemImage: "arrow.down.circle", tint: .blue)
-            MetricWidget(title: "累计上行", value: ByteFormat.size(totalUpload),
+            MetricWidget(title: "累计上行", value: ByteFormat.size(kernel.totalUpload),
                          systemImage: "arrow.up.circle", tint: .orange)
         }
     }
@@ -360,6 +355,13 @@ private struct RateMetricWidget: View {
     let samples: [KernelController.TrafficSample]
     let direction: TrafficDirection
 
+    /// Charts are relatively expensive compared with the numeric readout. A
+    /// short rolling window keeps the visual trend while bounding mark count
+    /// when the controller has accumulated a longer session history.
+    private var chartSamples: ArraySlice<KernelController.TrafficSample> {
+        samples.suffix(36)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
             metricHeader
@@ -383,7 +385,7 @@ private struct RateMetricWidget: View {
 
     private var miniChart: some View {
         Chart {
-            ForEach(samples) { sample in
+            ForEach(chartSamples) { sample in
                 AreaMark(x: .value("时间", sample.id),
                          y: .value("速率", value(for: sample)))
                     .foregroundStyle(tint.opacity(0.13))
@@ -399,6 +401,12 @@ private struct RateMetricWidget: View {
         .chartYAxis(.hidden)
         .chartXScale(domain: xDomain)
         .chartYScale(domain: 0...upperBound)
+        // Traffic samples arrive every second. Do not interpolate the entire
+        // chart for each tick; the rolling window already provides visual
+        // continuity and this keeps the SE-class device responsive.
+        .transaction { transaction in
+            transaction.animation = nil
+        }
         .frame(height: 34)
         .accessibilityHidden(true)
     }
@@ -408,12 +416,12 @@ private struct RateMetricWidget: View {
     }
 
     private var xDomain: ClosedRange<Int> {
-        let first = samples.first?.id ?? 0
-        return first...max(samples.last?.id ?? 1, first + 1)
+        let first = chartSamples.first?.id ?? 0
+        return first...max(chartSamples.last?.id ?? 1, first + 1)
     }
 
     private var upperBound: Double {
-        max(samples.map { value(for: $0) }.max() ?? 0, 1)
+        max(chartSamples.map { value(for: $0) }.max() ?? 0, 1)
     }
 }
 

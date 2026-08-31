@@ -262,6 +262,15 @@ struct ConnectionHistorySummary: Sendable {
                                                 hostVolumes: [])
 }
 
+/// 总览轮询所需的最小历史统计。与完整 summary 分开，避免每次只更新
+/// “全部连接/活跃连接”卡片时重新执行策略和主机聚合查询。
+struct ConnectionHistoryCountSummary: Sendable, Equatable {
+    let recordCount: Int
+    let activeCount: Int
+    let uploadTotal: Int64
+    let downloadTotal: Int64
+}
+
 /// Shared, bounded connection history. Both the App and Network Extension use
 /// their own SQLite handle; WAL plus a short busy timeout makes those writers
 /// cooperate without putting a database-sized cache in either process.
@@ -383,6 +392,12 @@ final class ConnectionHistoryStore: @unchecked Sendable {
     }
 
     func finish(ids: Set<String>, at date: Date = Date()) {
+        finish(ids: Array(ids), at: date)
+    }
+
+    /// Marks the supplied rows inactive without sorting/copying a Set on the
+    /// hot close-queue path. The recorder already provides a bounded array.
+    func finish(ids: [String], at date: Date = Date()) {
         guard !ids.isEmpty else { return }
         queue.sync {
             guard database != nil else { return }
@@ -398,7 +413,7 @@ final class ConnectionHistoryStore: @unchecked Sendable {
                 try prepare(sql, into: &statement)
                 defer { sqlite3_finalize(statement) }
                 sqlite3_bind_double(statement, 1, date.timeIntervalSince1970)
-                for (index, id) in ids.sorted().enumerated() {
+                for (index, id) in ids.enumerated() {
                     bindText(id, to: statement, index: Int32(index + 2))
                 }
                 try stepDone(statement)
@@ -413,6 +428,12 @@ final class ConnectionHistoryStore: @unchecked Sendable {
     /// rows no longer reported by that snapshot, avoiding an App-side cache of
     /// all active IDs in the Network Extension.
     func finishActive(except ids: Set<String>, at date: Date = Date()) {
+        finishActive(except: Array(ids), at: date)
+    }
+
+    /// Array variant used by the periodic active snapshot path to avoid
+    /// materializing and sorting a temporary Set of IDs.
+    func finishActive(except ids: [String], at date: Date = Date()) {
         queue.sync {
             guard database != nil else { return }
             do {
@@ -428,7 +449,7 @@ final class ConnectionHistoryStore: @unchecked Sendable {
                     try prepare(sql, into: &statement)
                     defer { sqlite3_finalize(statement) }
                     sqlite3_bind_double(statement, 1, date.timeIntervalSince1970)
-                    for (index, id) in ids.sorted().enumerated() {
+                    for (index, id) in ids.enumerated() {
                         bindText(id, to: statement, index: Int32(index + 2))
                     }
                     try stepDone(statement)
@@ -542,6 +563,33 @@ final class ConnectionHistoryStore: @unchecked Sendable {
                                             downloadTotal: totals.int(3),
                                             strategyVolumes: strategies,
                                             hostVolumes: hosts)
+        }
+    }
+
+    /// 读取总览需要的计数和累计流量，不加载任何连接详情，也不执行 GROUP BY。
+    /// 该查询在 App 的轻量总览轮询中使用；进入记录页后仍由 `summary` 提供
+    /// 策略/主机排行和分页数据。
+    func countSummary() -> ConnectionHistoryCountSummary {
+        queue.sync {
+            guard database != nil else {
+                return ConnectionHistoryCountSummary(recordCount: 0,
+                                                      activeCount: 0,
+                                                      uploadTotal: 0,
+                                                      downloadTotal: 0)
+            }
+            let sql = "SELECT COUNT(*), COALESCE(SUM(is_active), 0), "
+                + "COALESCE(SUM(upload), 0), COALESCE(SUM(download), 0) "
+                + "FROM connection_history"
+            guard let row = row(for: sql) else {
+                return ConnectionHistoryCountSummary(recordCount: 0,
+                                                      activeCount: 0,
+                                                      uploadTotal: 0,
+                                                      downloadTotal: 0)
+            }
+            return ConnectionHistoryCountSummary(recordCount: Int(row.int(0)),
+                                                  activeCount: Int(row.int(1)),
+                                                  uploadTotal: row.int(2),
+                                                  downloadTotal: row.int(3))
         }
     }
 

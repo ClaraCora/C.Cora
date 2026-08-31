@@ -42,7 +42,9 @@ private struct ActivitySectionControl: View {
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(selection == section ? .white : .primary)
                         .frame(maxWidth: .infinity)
-                        .frame(height: 40)
+                        // Keep both segmented controls at the iOS minimum
+                        // hit target without changing their shared padding.
+                        .frame(minHeight: 44)
                         .background {
                             if selection == section {
                                 LinearGradient(colors: [.blue, .cyan],

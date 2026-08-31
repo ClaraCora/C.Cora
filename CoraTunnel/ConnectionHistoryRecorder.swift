@@ -137,7 +137,7 @@ final class ConnectionHistoryRecorder {
                 // missing ID might still be live, so rely on Mihomo's bounded
                 // close queue instead of falsely ending it.
                 if !snapshot.isTruncated {
-                    store.finishActive(except: Set(snapshot.records.map { $0.id }))
+                    store.finishActive(except: snapshot.records.map { $0.id })
                 }
             }
             runMaintenanceIfNeededLocked(store: store)
@@ -158,7 +158,7 @@ final class ConnectionHistoryRecorder {
                     // The close queue contains final tracker counters, so update
                     // the row before marking it inactive.
                     store.upsertActive(snapshot.records)
-                    store.finish(ids: Set(snapshot.records.map { $0.id }))
+                    store.finish(ids: snapshot.records.map { $0.id })
                 }
             }
             runMaintenanceIfNeededLocked(store: store)

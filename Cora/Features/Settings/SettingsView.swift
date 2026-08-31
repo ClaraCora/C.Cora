@@ -107,22 +107,26 @@ struct RemoteResourcesView: View {
     @State private var showUpdateSettings = false
 
     var body: some View {
-        Form {
-            remoteSection(kind: .proxyProvider,
-                          title: "节点来源",
-                          emptyMessage: "没有远程节点来源",
-                          isBatchRefreshing: proxyResources.contains {
-                              subscriptions.refreshingResourceIDs.contains($0.id)
-                          },
-                          batchAction: refreshAllProxyProviders)
+        TimelineView(.periodic(from: .now, by: 60)) { context in
+            Form {
+                remoteSection(kind: .proxyProvider,
+                              title: "节点来源",
+                              emptyMessage: "没有远程节点来源",
+                              isBatchRefreshing: proxyResources.contains {
+                                  subscriptions.refreshingResourceIDs.contains($0.id)
+                              },
+                              now: context.date,
+                              batchAction: refreshAllProxyProviders)
 
-            remoteSection(kind: .ruleProvider,
-                          title: "规则来源",
-                          emptyMessage: "没有远程规则来源",
-                          isBatchRefreshing: ruleResources.contains {
-                              subscriptions.refreshingResourceIDs.contains($0.id)
-                          },
-                          batchAction: refreshAllRuleProviders)
+                remoteSection(kind: .ruleProvider,
+                              title: "规则来源",
+                              emptyMessage: "没有远程规则来源",
+                              isBatchRefreshing: ruleResources.contains {
+                                  subscriptions.refreshingResourceIDs.contains($0.id)
+                              },
+                              now: context.date,
+                              batchAction: refreshAllRuleProviders)
+            }
         }
         .scrollContentBackground(.hidden)
         .background(AppAmbientBackground())
@@ -175,7 +179,7 @@ struct RemoteResourcesView: View {
     }
 
     private var resources: [RemoteResource] {
-        subscriptions.remoteResources()
+        subscriptions.selectedRemoteResources
     }
 
     private var proxyResources: [RemoteResource] {
@@ -191,6 +195,7 @@ struct RemoteResourcesView: View {
                                title: String,
                                emptyMessage: String,
                                isBatchRefreshing: Bool,
+                               now: Date,
                                batchAction: @escaping () async -> Void) -> some View {
         let sectionResources = resources.filter { $0.kind == kind }
         Section {
@@ -205,7 +210,8 @@ struct RemoteResourcesView: View {
                         resource: resource,
                         isRefreshing: subscriptions.refreshingResourceIDs.contains(resource.id),
                         canRefresh: resource.kind == .proxyProvider ||
-                            subscriptions.runtimeCanUpdateRules(for: resource.subscriptionID))
+                            subscriptions.runtimeCanUpdateRules(for: resource.subscriptionID),
+                        now: now)
                     .contextMenu {
                         Button {
                             Task { await showContent(resource) }
@@ -299,6 +305,7 @@ private struct RemoteResourceRow: View {
     let resource: RemoteResource
     let isRefreshing: Bool
     let canRefresh: Bool
+    let now: Date
 
     var body: some View {
         HStack(spacing: 12) {
@@ -339,13 +346,11 @@ private struct RemoteResourceRow: View {
                         .accessibilityLabel("连接对应配置后可更新")
                 }
 
-                TimelineView(.periodic(from: .now, by: 60)) { _ in
-                    updateText
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .monospacedDigit()
-                        .lineLimit(1)
-                }
+                updateText
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+                    .lineLimit(1)
             }
             .frame(minWidth: 86, alignment: .trailing)
         }
@@ -358,11 +363,11 @@ private struct RemoteResourceRow: View {
             return Text("未更新")
         }
         return Text(resource.updateTimeIsApproximate ? "缓存 · " : "更新 · ")
-            + Text(Self.relativeUpdateText(updatedAt))
+            + Text(Self.relativeUpdateText(updatedAt, now: now))
     }
 
-    private static func relativeUpdateText(_ date: Date) -> String {
-        let elapsed = max(0, Date().timeIntervalSince(date))
+    private static func relativeUpdateText(_ date: Date, now: Date) -> String {
+        let elapsed = max(0, now.timeIntervalSince(date))
         if elapsed < 60 {
             return "刚刚"
         }

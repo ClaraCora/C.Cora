@@ -20,6 +20,13 @@ enum FileLog {
     private static var buffer: [String] = []
     private static var bufferedBytes: UInt64 = 0
     private static var persistedBytes: UInt64 = 0
+    private static var pendingPersistedData = Data()
+    private static var persistedHandle: FileHandle?
+    private static let persistBatchLines = 32
+    private static let persistBatchBytes = 16 * 1024
+    private static let persistBatchDelay: TimeInterval = 0.1
+    private static var persistFlushScheduled = false
+    private static var persistFlushGeneration: UInt64 = 0
 
     struct Stats {
         let bufferedLines: Int
@@ -38,6 +45,7 @@ enum FileLog {
     /// 开始新会话：清空内存缓冲，但保留上一会话的持久化日志。
     static func reset() {
         queue.sync {
+            flushPersistedLogLocked(close: true)
             buffer.removeAll()
             bufferedBytes = 0
             persistedBytes = 0
@@ -63,15 +71,25 @@ enum FileLog {
             // best-effort：App Group 可用时也落一份有界文件，便于将来排查。
             if let url = AppGroup.containerURL?.appendingPathComponent(currentFileName) {
                 let data = Data((line + "\n").utf8.prefix(64 * 1024))
-                if persistedBytes + UInt64(data.count) > maxFileBytes {
+                if persistedBytes + UInt64(pendingPersistedData.count) + UInt64(data.count) > maxFileBytes {
+                    flushPersistedLogLocked(close: true)
                     rotatePersistedLogLocked()
                     persistedBytes = 0
                 }
-                if let handle = try? FileHandle(forWritingTo: url) {
-                    defer { try? handle.close() }
-                    persistedBytes = (try? handle.seekToEnd()) ?? persistedBytes
-                    try? handle.write(contentsOf: data)
-                    persistedBytes += UInt64(data.count)
+                if persistedHandle == nil {
+                    if !FileManager.default.fileExists(atPath: url.path) {
+                        _ = FileManager.default.createFile(atPath: url.path, contents: nil)
+                    }
+                    persistedHandle = try? FileHandle(forWritingTo: url)
+                    if let handle = persistedHandle { persistedBytes = (try? handle.seekToEnd()) ?? persistedBytes }
+                }
+                if persistedHandle != nil {
+                    pendingPersistedData.append(data)
+                    if pendingPersistedData.count >= persistBatchBytes || buffer.count % persistBatchLines == 0 {
+                        flushPersistedLogLocked(close: false)
+                    } else {
+                        schedulePersistFlushLocked()
+                    }
                 } else if (try? data.write(to: url, options: .atomic)) != nil {
                     persistedBytes = UInt64(data.count)
                 }
@@ -83,6 +101,7 @@ enum FileLog {
     /// 不把完整日志长期留在进程内；无 App Group 时退回当前内存缓冲。
     static func export() -> String {
         queue.sync {
+            flushPersistedLogLocked(close: true)
             guard let directory = AppGroup.containerURL else {
                 let current = buffer.joined(separator: "\n")
                 return current.isEmpty ? "(App Group 不可用，暂无 NE 持久化日志)" : current
@@ -104,6 +123,50 @@ enum FileLog {
                 return fallback.isEmpty ? "(暂无 NE 日志)" : fallback
             }
             return sections.joined(separator: "\n\n")
+        }
+    }
+
+    private static func flushPersistedLogLocked(close: Bool) {
+        persistFlushGeneration &+= 1
+        persistFlushScheduled = false
+        if pendingPersistedData.isEmpty {
+            if close, let handle = persistedHandle {
+                try? handle.synchronize()
+                try? handle.close()
+                persistedHandle = nil
+            }
+            return
+        }
+        guard let directory = AppGroup.containerURL else {
+            pendingPersistedData.removeAll(keepingCapacity: true)
+            if close, let handle = persistedHandle {
+                try? handle.close()
+                persistedHandle = nil
+            }
+            return
+        }
+        let url = directory.appendingPathComponent(currentFileName)
+        if persistedHandle == nil { persistedHandle = try? FileHandle(forWritingTo: url) }
+        if let handle = persistedHandle {
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: pendingPersistedData)
+            persistedBytes += UInt64(pendingPersistedData.count)
+            try? handle.synchronize()
+            if close { try? handle.close(); persistedHandle = nil }
+            pendingPersistedData.removeAll(keepingCapacity: true)
+        }
+    }
+
+    /// Flush low-volume logs after a short delay so a quiet NE still leaves
+    /// recent diagnostics on disk, while keeping the common burst path batched.
+    private static func schedulePersistFlushLocked() {
+        guard !persistFlushScheduled, !pendingPersistedData.isEmpty else { return }
+        persistFlushScheduled = true
+        let generation = persistFlushGeneration
+        queue.asyncAfter(deadline: .now() + persistBatchDelay) {
+            guard generation == persistFlushGeneration else { return }
+            persistFlushScheduled = false
+            flushPersistedLogLocked(close: false)
         }
     }
 
