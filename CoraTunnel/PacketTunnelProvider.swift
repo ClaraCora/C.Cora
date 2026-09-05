@@ -34,6 +34,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     // or connection snapshots. A concurrent queue without admission control
     // lets repeated App requests retain an unbounded backlog in the NE.
     private let ipcWorkSlots = DispatchSemaphore(value: 2)
+    // The signed unlock scripts intentionally fan out several HTTPS checks at
+    // once (the bundled script starts eight Promise.all requests). Keep their
+    // fan-out bounded by the runner's per-run request limit without applying
+    // the two-request control-plane limit to every script callback.
+    private let scriptIPCWorkSlots = DispatchSemaphore(value: 12)
     private struct StoredIPCResponse {
         let data: Data
         let expiresAt: Date
@@ -848,7 +853,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 reply(Self.jsonData(["ok": false, "error": "脚本请求参数无效"]))
                 return
             }
-            enqueueIPCWork(generation: sessionGeneration, reply: reply) {
+            enqueueIPCWork(generation: sessionGeneration,
+                           reply: reply,
+                           semaphore: scriptIPCWorkSlots) {
                 reply(Data(MihomoScriptFetch(requestJSON).utf8))
             }
         case "scriptTargetInfo":
@@ -954,13 +961,15 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     /// prevents an abandoned caller from leaving a large queued backlog.
     private func enqueueIPCWork(generation: UInt64,
                                 reply: @escaping (Data?) -> Void,
+                                semaphore: DispatchSemaphore? = nil,
                                 operation: @escaping () -> Void) {
-        guard ipcWorkSlots.wait(timeout: .now()) == .success else {
+        let workSlots = semaphore ?? ipcWorkSlots
+        guard workSlots.wait(timeout: .now()) == .success else {
             reply(Self.jsonData(["ok": false, "error": "控制请求繁忙，请稍后重试"]))
             return
         }
         ipcQueue.async { [self] in
-            defer { ipcWorkSlots.signal() }
+            defer { workSlots.signal() }
             guard isCurrentIPCSession(generation) else {
                 reply(Self.jsonData(["ok": false, "error": "控制请求已过期"]))
                 return
