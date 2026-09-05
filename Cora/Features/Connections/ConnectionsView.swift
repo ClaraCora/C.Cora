@@ -259,18 +259,28 @@ private struct StrategyTrafficListView: View {
     @ObservedObject var controller: ConnectionsController
 
     var body: some View {
-        List(totals) { total in
-            TrafficNavigationButton {
-                TrafficAggregateRow(item: total)
-            } destination: {
-                ConnectionListView(title: total.name,
-                                   entries: [],
-                                   controller: controller,
-                                   historyQuery: ConnectionHistoryQuery(strategyName: total.name))
+        List {
+            if totals.isEmpty {
+                CoraUnavailableState("暂无策略流量", systemImage: "chart.bar.xaxis")
+                    .frame(maxWidth: .infinity)
+                    .listRowInsets(EdgeInsets(top: 18, leading: 16, bottom: 18, trailing: 16))
+                    .listRowSeparator(.hidden)
+                    .listRowBackground(Color.clear)
+            } else {
+                ForEach(totals) { total in
+                    TrafficNavigationButton {
+                        TrafficAggregateRow(item: total)
+                    } destination: {
+                        ConnectionListView(title: total.name,
+                                           entries: [],
+                                           controller: controller,
+                                           historyQuery: ConnectionHistoryQuery(strategyName: total.name))
+                    }
+                    .listRowInsets(EdgeInsets(top: 5, leading: 16, bottom: 5, trailing: 16))
+                    .listRowSeparator(.hidden)
+                    .listRowBackground(Color.clear)
+                }
             }
-            .listRowInsets(EdgeInsets(top: 5, leading: 16, bottom: 5, trailing: 16))
-            .listRowSeparator(.hidden)
-            .listRowBackground(Color.clear)
         }
         .listStyle(.plain)
         .scrollContentBackground(.hidden)

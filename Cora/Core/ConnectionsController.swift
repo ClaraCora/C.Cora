@@ -395,8 +395,11 @@ final class ConnectionsController: ObservableObject {
         guard enabled else {
             // Detail rows are owned by the record screen. Once that screen is
             // gone (or the app enters the background), release its bounded
-            // page and chart aggregates while retaining the scalar counters
-            // used by the overview cards.
+            // page while retaining the small chart aggregates used by the
+            // overview and its navigation destinations. Do not rewrite
+            // historySummary here: ConnectionsView can disappear while a
+            // strategy detail is being pushed, and replacing the published
+            // value at that point can rebuild the destination with no rows.
             snapshot = snapshot.map {
                 ConnectionsSnapshot(downloadTotal: $0.downloadTotal,
                                     uploadTotal: $0.uploadTotal,
@@ -406,13 +409,6 @@ final class ConnectionsController: ObservableObject {
             history.removeAll(keepingCapacity: false)
             historyOffset = 0
             hasMoreHistory = false
-            historySummary = ConnectionHistorySummary(
-                recordCount: historySummary.recordCount,
-                activeCount: historySummary.activeCount,
-                uploadTotal: historySummary.uploadTotal,
-                downloadTotal: historySummary.downloadTotal,
-                strategyVolumes: [],
-                hostVolumes: [])
             return
         }
         Task { [weak self] in
