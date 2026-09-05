@@ -598,12 +598,13 @@ final class TunnelManager {
         // 诊断文件位于 App Group。VPN 已停止或 NE 被 Jetsam 回收时没有可用
         // 的 IPC server，此时由主 App 直接清理；运行中的 NE 仍通过命令暂停
         // 采样器后再删除，避免与采样写入并发。
-        if let mgr = try? await loadSavedManager(),
-           let connection = mgr?.connection,
-           connection.status == .connected ||
-           connection.status == .connecting ||
-           connection.status == .reasserting {
-            return await clearMemoryDiagnosticsThroughIPC()
+        if let mgr = try? await loadSavedManager() {
+            let status: NEVPNStatus = mgr.connection.status
+            if status == NEVPNStatus.connected ||
+               status == NEVPNStatus.connecting ||
+               status == NEVPNStatus.reasserting {
+                return await clearMemoryDiagnosticsThroughIPC()
+            }
         }
         return Self.clearPersistedMemoryDiagnostics()
     }

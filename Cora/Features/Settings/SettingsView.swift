@@ -841,9 +841,11 @@ private struct TunnelRouteSettingsView: View {
 
     var body: some View {
         Form {
-            Section("流量接管") {
+            Section {
                 InfoToggleRow(title: "接管全部流量", message: "将系统默认排除的流量也纳入隧道。只有需要完整 VPN 覆盖时才建议开启。", systemImage: "network", isOn: $settings.includeAllNetworks)
                 InfoToggleRow(title: "强制路由", message: "即使未接管全部流量，也强制按规则路由隧道流量。", systemImage: "arrow.triangle.branch", isOn: $settings.enforceRoutes)
+            } header: {
+                Text("流量接管")
             } footer: {
                 if settings.includeAllNetworks {
                     Text("完整接管可能影响局域网、系统服务和电池消耗；系统服务排除项仍按下方设置处理。")
