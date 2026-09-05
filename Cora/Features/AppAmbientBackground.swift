@@ -112,16 +112,23 @@ struct CoraGlassSurfaceModifier: ViewModifier {
 
 /// Inset list row surface used by connection, traffic and log lists. Keeping
 /// the padding here gives every list the same rhythm while retaining List's
-/// lazy rendering and native navigation behavior. `thinMaterial` is intentional:
+/// lazy rendering and native navigation behavior. Repeated lists can opt into a
+/// smaller vertical inset. `thinMaterial` is intentional:
 /// these rows can be repeated hundreds of times, and a lighter blur avoids
 /// making scrolling pay the cost of a full regular-material backdrop per row.
 struct CoraListRowSurfaceModifier: ViewModifier {
     let tint: Color?
+    let verticalPadding: CGFloat
+
+    init(tint: Color?, verticalPadding: CGFloat = 10) {
+        self.tint = tint
+        self.verticalPadding = verticalPadding
+    }
 
     func body(content: Content) -> some View {
         content
             .padding(.horizontal, 14)
-            .padding(.vertical, 10)
+            .padding(.vertical, verticalPadding)
             .background(.thinMaterial, in: shape)
             .overlay {
                 shape.stroke(strokeColor, lineWidth: 1)
@@ -144,7 +151,9 @@ extension View {
                                            cornerRadius: cornerRadius))
     }
 
-    func coraListRowSurface(tint: Color? = nil) -> some View {
-        modifier(CoraListRowSurfaceModifier(tint: tint))
+    func coraListRowSurface(tint: Color? = nil,
+                            verticalPadding: CGFloat = 10) -> some View {
+        modifier(CoraListRowSurfaceModifier(tint: tint,
+                                             verticalPadding: verticalPadding))
     }
 }

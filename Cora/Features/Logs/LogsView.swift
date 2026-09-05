@@ -135,11 +135,11 @@ struct LogsView: View {
                 set: { controller.setLevel($0) }
             )) {
                 ForEach(SettingsStore.logLevelOptions, id: \.self) {
-                    Text($0.uppercased()).tag($0)
+                    Text(logLevelTitle($0)).tag($0)
                 }
             }
         } label: {
-            Label(controller.level.uppercased(), systemImage: "line.3.horizontal.decrease.circle")
+            Label(logLevelTitle(controller.level), systemImage: "line.3.horizontal.decrease.circle")
                 .font(.subheadline)
         }
     }
@@ -168,7 +168,7 @@ struct LogsView: View {
                 List(controller.lines) { line in
                     LogRow(line: line)
                         .id(line.id)
-                        .listRowInsets(EdgeInsets(top: 5, leading: 0, bottom: 5, trailing: 0))
+                        .listRowInsets(EdgeInsets(top: 3, leading: 0, bottom: 3, trailing: 0))
                         .listRowSeparator(.hidden)
                         .listRowBackground(Color.clear)
                 }
@@ -269,44 +269,36 @@ private struct LogRow: View {
         NavigationLink {
             LogDetailView(line: line)
         } label: {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 7) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(alignment: .firstTextBaseline, spacing: 7) {
                     Circle()
                         .fill(levelColor)
                         .frame(width: 8, height: 8)
-                    Text(line.time, format: .dateTime.hour().minute().second())
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                    Text(line.type.uppercased())
-                        .font(.caption2.monospaced().weight(.bold))
+                    Text(logLevelTitle(line.type))
+                        .font(.caption.weight(.semibold))
                         .foregroundStyle(levelColor)
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 2)
-                        .background(levelColor.opacity(0.12), in: Capsule())
                     Spacer(minLength: 0)
+                    Text(line.time, format: .dateTime.hour().minute().second())
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
                 }
 
                 Text(line.payload)
-                    .font(.subheadline)
+                    .font(.system(.footnote, design: .monospaced))
                     .foregroundStyle(.primary)
                     .lineLimit(2)
                     .multilineTextAlignment(.leading)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
-        .coraListRowSurface(tint: levelColor)
+        .coraListRowSurface(tint: levelColor, verticalPadding: 7)
         .contentShape(Rectangle())
         .buttonStyle(.plain)
         .accessibilityElement(children: .combine)
     }
 
     private var levelColor: Color {
-        switch line.type.lowercased() {
-        case "error": return .red
-        case "warning", "warn": return .orange
-        case "debug": return .gray
-        default: return .blue
-        }
+        logLevelColor(line.type)
     }
 }
 
@@ -318,7 +310,7 @@ private struct LogDetailView: View {
             Section {
                 HStack(spacing: 7) {
                     Circle().fill(levelColor).frame(width: 8, height: 8)
-                    Text(line.type.uppercased())
+                    Text(logLevelTitle(line.type))
                         .font(.subheadline.weight(.semibold))
                     Spacer()
                     Text(line.time, format: .dateTime.hour().minute().second())
@@ -363,11 +355,28 @@ private struct LogDetailView: View {
     }
 
     private var levelColor: Color {
-        switch line.type.lowercased() {
-        case "error": return .red
-        case "warning", "warn": return .orange
-        case "debug": return .gray
-        default: return .blue
-        }
+        logLevelColor(line.type)
+    }
+}
+
+private func logLevelTitle(_ rawLevel: String) -> String {
+    switch rawLevel.lowercased() {
+    case "error": return "错误"
+    case "warning", "warn": return "警告"
+    case "debug": return "调试"
+    case "info": return "信息"
+    case "silent": return "静默"
+    case "wrap": return "会话"
+    default: return rawLevel.uppercased()
+    }
+}
+
+private func logLevelColor(_ rawLevel: String) -> Color {
+    switch rawLevel.lowercased() {
+    case "error": return .red
+    case "warning", "warn": return .orange
+    case "debug": return .gray
+    case "wrap": return .purple
+    default: return .blue
     }
 }

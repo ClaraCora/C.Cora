@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// 配置与订阅页：管理配置列表，并提供订阅 UA 和配置覆写入口。
+/// 配置与订阅页：管理配置列表，并提供页面级同步、订阅 UA 和配置覆写入口。
 struct SubscriptionsView: View {
     @EnvironmentObject private var store: SubscriptionStore
     @EnvironmentObject private var settings: SettingsStore
@@ -11,6 +11,46 @@ struct SubscriptionsView: View {
 
     var body: some View {
         List {
+            Section("快速操作") {
+                Button {
+                    Task { await store.refreshRemoteSubscriptions() }
+                } label: {
+                    HStack {
+                        Label("刷新订阅", systemImage: "arrow.clockwise")
+                        Spacer()
+                        if store.isBusy {
+                            ProgressView().controlSize(.small)
+                        }
+                    }
+                }
+                .disabled(store.isBusy || isRefreshingSelectedProviders || !store.hasRemoteSubscriptions)
+
+                Button {
+                    guard let selectedID = store.selectedID else { return }
+                    Task { await store.refreshProxyProviders(selectedID) }
+                } label: {
+                    HStack {
+                        Label("刷新远程 Provider", systemImage: "arrow.triangle.2.circlepath")
+                        Spacer()
+                        if isRefreshingSelectedProviders {
+                            ProgressView().controlSize(.small)
+                        } else if !selectedProxyProviders.isEmpty {
+                            Text("当前配置 · \(selectedProxyProviders.count) 个")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                .disabled(store.isBusy || isRefreshingSelectedProviders || selectedProxyProviders.isEmpty)
+            } footer: {
+                if let selected = store.selected {
+                    Text("刷新订阅会重新下载远程配置；Provider 刷新只作用于当前配置“\(selected.name)”并保留本地缓存。")
+                } else {
+                    Text("请先添加并选择一个配置。")
+                }
+            }
+            .listRowBackground(AppListRowBackground())
+
             Section("配置") {
                 if store.subscriptions.isEmpty {
                     CoraUnavailableState("还没有配置",
@@ -72,23 +112,11 @@ struct SubscriptionsView: View {
         }
         .scrollContentBackground(.hidden)
         .background(AppAmbientBackground())
+        .listStyle(.insetGrouped)
+        .coraListSectionSpacing(12)
         .navigationTitle("配置与订阅")
         .task { await core.refreshStatus() }
         .toolbar {
-            ToolbarItem(placement: .navigationBarLeading) {
-                Button {
-                    Task { await store.refreshRemoteSubscriptions() }
-                } label: {
-                    if store.isBusy {
-                        ProgressView().controlSize(.small)
-                    } else {
-                        Image(systemName: "arrow.clockwise")
-                    }
-                }
-                .disabled(store.isBusy || !store.hasRemoteSubscriptions)
-                .accessibilityLabel("刷新全部远程订阅")
-                .help("刷新全部远程订阅")
-            }
             ToolbarItem(placement: .navigationBarTrailing) {
                 Menu {
                     Button { showAddRemote = true } label: {
@@ -119,6 +147,15 @@ struct SubscriptionsView: View {
         } message: {
             Text(store.lastError ?? "")
         }
+    }
+
+    private var selectedProxyProviders: [RemoteResource] {
+        store.selectedRemoteResources.filter { $0.kind == .proxyProvider }
+    }
+
+    private var isRefreshingSelectedProviders: Bool {
+        guard let selectedID = store.selectedID else { return false }
+        return store.refreshingProviderIDs.contains(selectedID)
     }
 }
 

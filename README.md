@@ -2,7 +2,7 @@
 
 基于 [mihomo](https://github.com/MetaCubeX/mihomo) 内核的 iOS 代理客户端，SwiftUI + MVVM，个人自签测试。
 
-当前版本：**1.0.5**
+当前版本：**1.0.6**
 
 详细路线见 [PLAN.md](PLAN.md)。
 

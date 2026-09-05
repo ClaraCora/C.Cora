@@ -1,16 +1,13 @@
 import SwiftUI
 import UIKit
 
-/// 订阅/配置详情：查看元信息与配置原文（YAML），并可设为当前、刷新（远程）或编辑（本地）。
+/// 订阅/配置详情：查看元信息与配置原文（YAML），并可设为当前或编辑配置。
 struct SubscriptionDetailView: View {
     @EnvironmentObject private var store: SubscriptionStore
     let subID: UUID
 
     @State private var showEditor = false
     @State private var showRemoteEditor = false
-    @State private var refreshing = false
-    @State private var refreshOK = false
-    @State private var providerRefreshOK = false
 
     private var sub: Subscription? {
         store.subscriptions.first(where: { $0.id == subID })
@@ -22,9 +19,6 @@ struct SubscriptionDetailView: View {
                 List {
                     summarySection(sub).listRowBackground(AppListRowBackground())
                     primaryActionSection(sub).listRowBackground(AppListRowBackground())
-                    if !sub.isLocal {
-                        synchronizationSection(sub).listRowBackground(AppListRowBackground())
-                    }
                     configurationSection(sub).listRowBackground(AppListRowBackground())
                     detailsSection(sub).listRowBackground(AppListRowBackground())
                     yamlSection(sub).listRowBackground(AppListRowBackground())
@@ -71,52 +65,6 @@ struct SubscriptionDetailView: View {
                     Label("设为当前配置", systemImage: "checkmark.circle")
                 }
             }
-        }
-    }
-
-    @ViewBuilder private func synchronizationSection(_ sub: Subscription) -> some View {
-        Section("同步") {
-            Button {
-                Task {
-                    refreshing = true
-                    refreshOK = false
-                    await store.refresh(sub.id)
-                    refreshing = false
-                    refreshOK = (store.lastError == nil)
-                }
-            } label: {
-                HStack {
-                    Label("刷新订阅", systemImage: "arrow.clockwise")
-                    Spacer()
-                    if refreshing {
-                        ProgressView()
-                    } else if refreshOK {
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundStyle(.green)
-                    }
-                }
-            }
-            .disabled(refreshing)
-
-            Button {
-                Task {
-                    providerRefreshOK = false
-                    await store.refreshProxyProviders(sub.id)
-                    providerRefreshOK = (store.lastError == nil)
-                }
-            } label: {
-                HStack {
-                    Label("刷新远程 Provider", systemImage: "arrow.triangle.2.circlepath")
-                    Spacer()
-                    if store.refreshingProviderIDs.contains(sub.id) {
-                        ProgressView()
-                    } else if providerRefreshOK {
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundStyle(.green)
-                    }
-                }
-            }
-            .disabled(refreshing || store.refreshingProviderIDs.contains(sub.id))
         }
     }
 

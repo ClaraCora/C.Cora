@@ -107,7 +107,7 @@ struct SettingsView: View {
                 .scrollContentBackground(.hidden)
                 .background(Color.clear)
                 .listStyle(.insetGrouped)
-                .coraListSectionSpacing(18)
+                .coraListSectionSpacing(12)
                 .listRowSeparatorTint(Color.primary.opacity(0.08))
             }
             .navigationTitle("设置")
@@ -125,7 +125,7 @@ struct SettingsView: View {
 
     private var appVersion: String {
         let bundle = Bundle.main
-        let version = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0.5"
+        let version = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0.6"
         let build = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1"
         return "\(version) (\(build))"
     }
@@ -166,7 +166,7 @@ struct RemoteResourcesView: View {
         .scrollContentBackground(.hidden)
         .background(AppAmbientBackground())
         .listStyle(.insetGrouped)
-        .coraListSectionSpacing(18)
+        .coraListSectionSpacing(12)
         .listRowSeparatorTint(Color.primary.opacity(0.08))
         .navigationTitle("远程资源")
         .navigationBarTitleDisplayMode(.inline)
@@ -446,7 +446,7 @@ private struct RemoteResourceUpdateSettingsView: View {
             .scrollContentBackground(.hidden)
             .background(AppAmbientBackground())
             .listStyle(.insetGrouped)
-            .coraListSectionSpacing(18)
+            .coraListSectionSpacing(12)
             .listRowSeparatorTint(Color.primary.opacity(0.08))
             .navigationTitle("自动更新")
             .navigationBarTitleDisplayMode(.inline)
@@ -598,6 +598,9 @@ private struct UnlockScriptSettingsView: View {
         }
         .scrollContentBackground(.hidden)
         .background(AppAmbientBackground())
+        .listStyle(.insetGrouped)
+        .coraListSectionSpacing(12)
+        .listRowSeparatorTint(Color.primary.opacity(0.08))
         .navigationTitle("检测脚本")
         .navigationBarTitleDisplayMode(.inline)
         .task { scripts.refreshCacheState() }
@@ -659,7 +662,7 @@ private struct DelayTestSettingsView: View {
         .scrollContentBackground(.hidden)
         .background(AppAmbientBackground())
         .listStyle(.insetGrouped)
-        .coraListSectionSpacing(18)
+        .coraListSectionSpacing(12)
         .listRowSeparatorTint(Color.primary.opacity(0.08))
         .navigationTitle("测速")
         .navigationBarTitleDisplayMode(.inline)
@@ -775,6 +778,9 @@ private struct KernelSettingsView: View {
         }
         .scrollContentBackground(.hidden)
         .background(AppAmbientBackground())
+        .listStyle(.insetGrouped)
+        .coraListSectionSpacing(12)
+        .listRowSeparatorTint(Color.primary.opacity(0.08))
         .navigationTitle("内核运行")
         .navigationBarTitleDisplayMode(.inline)
         .task(id: core.status.rawValue) { await refreshKernelAvailability() }
@@ -810,7 +816,7 @@ private struct GeoSettingsView: View {
         .scrollContentBackground(.hidden)
         .background(AppAmbientBackground())
         .listStyle(.insetGrouped)
-        .coraListSectionSpacing(18)
+        .coraListSectionSpacing(12)
         .listRowSeparatorTint(Color.primary.opacity(0.08))
         .navigationTitle("规则数据")
         .navigationBarTitleDisplayMode(.inline)
@@ -883,6 +889,9 @@ private struct TunnelRouteSettingsView: View {
         }
         .scrollContentBackground(.hidden)
         .background(AppAmbientBackground())
+        .listStyle(.insetGrouped)
+        .coraListSectionSpacing(12)
+        .listRowSeparatorTint(Color.primary.opacity(0.08))
         .navigationTitle("隧道与隐私")
         .navigationBarTitleDisplayMode(.inline)
         .alert("自动连接设置失败", isPresented: Binding(
@@ -932,7 +941,7 @@ struct SettingsNavigationRow<Destination: View>: View {
             }
             InfoButton(message: message, accessibilityLabel: "查看\(title)说明")
         }
-        .padding(.vertical, 4)
+        .padding(.vertical, 2)
     }
 }
 

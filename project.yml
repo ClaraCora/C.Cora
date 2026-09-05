@@ -19,7 +19,7 @@ options:
 # 全 target 共享的基础构建设置
 settings:
   base:
-    MARKETING_VERSION: "1.0.5"
+    MARKETING_VERSION: "1.0.6"
     CURRENT_PROJECT_VERSION: "1"
     SWIFT_VERSION: "5.0"
     # 本地 Xcode / TestFlight 使用自动签名；CI 仍用命令行参数显式关闭签名。
