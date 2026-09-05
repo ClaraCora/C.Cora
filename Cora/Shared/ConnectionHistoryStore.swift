@@ -31,12 +31,21 @@ struct ConnectionHistoryRecord: Identifiable, Sendable {
         Self.normalizedStrategyName(chains)
     }
 
+    var proxyNodeName: String {
+        Self.normalizedProxyNodeName(chains)
+    }
+
     var hostName: String {
         Self.normalizedHostName(host: host, sniffHost: sniffHost, destinationIP: destinationIP)
     }
 
     static func normalizedStrategyName(_ chains: [String]) -> String {
         let value = chains.last?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return value.isEmpty ? "DIRECT" : value
+    }
+
+    static func normalizedProxyNodeName(_ chains: [String]) -> String {
+        let value = chains.first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return value.isEmpty ? "DIRECT" : value
     }
 
@@ -179,26 +188,33 @@ struct ConnectionHistoryRecord: Identifiable, Sendable {
     }
 }
 
-/// A bounded database-side filter used by record detail pages.
-/// Keeping the filter here lets both the App and the Network Extension share
-/// the same column names without transferring the complete history into RAM.
+/// A bounded history filter used by record detail pages. The node constraint
+/// is the one exception: it is derived from the existing chain JSON in the App
+/// so the Network Extension does not need a schema or index for this UI path.
 struct ConnectionHistoryQuery: Equatable, Hashable, Sendable {
     let strategyName: String?
+    /// Node filters are intentionally evaluated by the App after reading the
+    /// compact chain column. Keeping this out of SQL avoids a NE schema/index
+    /// change solely for an on-demand UI detail view.
+    let proxyNodeName: String?
     let hostName: String?
     let network: String?
     let isActive: Bool?
     let searchText: String?
 
     init(strategyName: String? = nil,
+         proxyNodeName: String? = nil,
          hostName: String? = nil,
          network: String? = nil,
          isActive: Bool? = nil,
          searchText: String? = nil) {
         let strategy = strategyName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let proxyNode = proxyNodeName?.trimmingCharacters(in: .whitespacesAndNewlines)
         let host = hostName?.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalizedNetwork = network?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let normalizedSearch = searchText?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         self.strategyName = strategy?.isEmpty == true ? nil : strategy
+        self.proxyNodeName = proxyNode?.isEmpty == true ? nil : proxyNode
         self.hostName = host?.isEmpty == true ? nil : host
         self.network = normalizedNetwork?.isEmpty == true ? nil : normalizedNetwork
         self.isActive = isActive
@@ -229,21 +245,50 @@ struct ConnectionHistoryQuery: Equatable, Hashable, Sendable {
             clauses.append("(LOWER(host) LIKE ? OR LOWER(sniff_host) LIKE ? "
                            + "OR LOWER(destination_ip) LIKE ? OR LOWER(source_ip) LIKE ? "
                            + "OR LOWER(process) LIKE ? OR LOWER(process_path) LIKE ? "
-                           + "OR LOWER(strategy_name) LIKE ? OR LOWER(host_name) LIKE ? "
+                           + "OR LOWER(chains) LIKE ? OR LOWER(strategy_name) LIKE ? "
+                           + "OR LOWER(host_name) LIKE ? "
                            + "OR LOWER(rule) LIKE ? OR LOWER(rule_payload) LIKE ?)")
             let pattern = "%\(searchText)%"
-            values.append(contentsOf: Array(repeating: pattern, count: 10))
+            values.append(contentsOf: Array(repeating: pattern, count: 11))
         }
         return (clauses.isEmpty ? "" : "WHERE " + clauses.joined(separator: " AND "), values)
     }
 }
 
-struct ConnectionHistoryTrafficVolume: Sendable {
+struct ConnectionHistoryTrafficVolume: Sendable, Equatable {
     let name: String
     let upload: Int64
     let download: Int64
 
     var total: Int64 { upload + download }
+}
+
+enum ConnectionTrafficRankingMetric: String, CaseIterable, Hashable, Identifiable, Sendable {
+    case total
+    case download
+    case upload
+
+    var id: Self { self }
+}
+
+/// All three node rankings produced by one App-side history scan.
+/// The Network Extension never requests this snapshot.
+struct ConnectionTrafficRankingSnapshot: Sendable, Equatable {
+    let total: [ConnectionHistoryTrafficVolume]
+    let download: [ConnectionHistoryTrafficVolume]
+    let upload: [ConnectionHistoryTrafficVolume]
+
+    static let empty = ConnectionTrafficRankingSnapshot(total: [],
+                                                        download: [],
+                                                        upload: [])
+
+    func values(for metric: ConnectionTrafficRankingMetric) -> [ConnectionHistoryTrafficVolume] {
+        switch metric {
+        case .total: return total
+        case .download: return download
+        case .upload: return upload
+        }
+    }
 }
 
 struct ConnectionHistorySummary: Sendable {
@@ -293,6 +338,7 @@ final class ConnectionHistoryStore: @unchecked Sendable {
     private static let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
     private let databaseURL: URL
+    private let allowsAppOnlyQueries: Bool
     private var database: OpaquePointer?
     private let queue = DispatchQueue(label: "com.cora.connection-history.sqlite",
                                       qos: .utility)
@@ -309,6 +355,7 @@ final class ConnectionHistoryStore: @unchecked Sendable {
 
     init(databaseURL: URL, performMigrations: Bool) throws {
         self.databaseURL = databaseURL
+        self.allowsAppOnlyQueries = performMigrations
         try FileManager.default.createDirectory(at: databaseURL.deletingLastPathComponent(),
                                                 withIntermediateDirectories: true)
         var handle: OpaquePointer?
@@ -512,7 +559,9 @@ final class ConnectionHistoryStore: @unchecked Sendable {
             guard database != nil else { return [] }
             let safeOffset = max(0, offset)
             let safeLimit = min(max(1, limit), 250)
+            let nodeFilter = query.proxyNodeName
             let predicate = query.sqlPredicate
+            let paging = nodeFilter == nil ? "LIMIT ? OFFSET ?" : ""
             let sql = """
                 SELECT id, started_at, ended_at, is_active, upload, download, network,
                        connection_type, source_ip, source_port, destination_ip,
@@ -524,7 +573,7 @@ final class ConnectionHistoryStore: @unchecked Sendable {
                          CASE WHEN is_active = 1 THEN started_at
                               ELSE COALESCE(ended_at, started_at) END DESC,
                          id DESC
-                LIMIT ? OFFSET ?
+                \(paging)
                 """
             do {
                 var statement: OpaquePointer?
@@ -533,12 +582,25 @@ final class ConnectionHistoryStore: @unchecked Sendable {
                 for (index, value) in predicate.values.enumerated() {
                     bindText(value, to: statement, index: Int32(index + 1))
                 }
-                let limitIndex = Int32(predicate.values.count + 1)
-                sqlite3_bind_int(statement, limitIndex, Int32(safeLimit))
-                sqlite3_bind_int(statement, limitIndex + 1, Int32(safeOffset))
+                if nodeFilter == nil {
+                    let limitIndex = Int32(predicate.values.count + 1)
+                    sqlite3_bind_int(statement, limitIndex, Int32(safeLimit))
+                    sqlite3_bind_int(statement, limitIndex + 1, Int32(safeOffset))
+                }
                 var result: [ConnectionHistoryRecord] = []
+                var matchedCount = 0
                 while sqlite3_step(statement) == SQLITE_ROW {
-                    if let record = record(from: statement) { result.append(record) }
+                    guard let record = record(from: statement) else { continue }
+                    if let nodeFilter, record.proxyNodeName != nodeFilter { continue }
+                    if nodeFilter != nil && matchedCount < safeOffset {
+                        matchedCount += 1
+                        continue
+                    }
+                    result.append(record)
+                    matchedCount += 1
+                    if nodeFilter != nil && result.count >= safeLimit {
+                        break
+                    }
                 }
                 return result
             } catch {
@@ -590,6 +652,16 @@ final class ConnectionHistoryStore: @unchecked Sendable {
                                                   activeCount: Int(row.int(1)),
                                                   uploadTotal: row.int(2),
                                                   downloadTotal: row.int(3))
+        }
+    }
+
+    /// Scans only the compact chain and byte columns on the App side. This is
+    /// deliberately separate from `summary`: it is lazy UI data and is never
+    /// requested by the Network Extension recorder.
+    func nodeTrafficRankings(limit: Int = 5) -> ConnectionTrafficRankingSnapshot {
+        queue.sync {
+            guard allowsAppOnlyQueries, database != nil else { return .empty }
+            return nodeTrafficRankingsLocked(limit: limit)
         }
     }
 
@@ -861,6 +933,68 @@ final class ConnectionHistoryStore: @unchecked Sendable {
             return values
         } catch {
             return []
+        }
+    }
+
+    private func nodeTrafficRankingsLocked(limit: Int) -> ConnectionTrafficRankingSnapshot {
+        let safeLimit = min(max(1, limit), 20)
+        let sql = "SELECT chains, upload, download FROM connection_history "
+            + "WHERE upload > 0 OR download > 0"
+        var statement: OpaquePointer?
+        do {
+            try prepare(sql, into: &statement)
+            defer { sqlite3_finalize(statement) }
+
+            let decoder = JSONDecoder()
+            var totals: [String: ConnectionTrafficVolume] = [:]
+            while sqlite3_step(statement) == SQLITE_ROW {
+                autoreleasepool {
+                    let chainsText = text(statement, index: 0)
+                    let chains = (try? decoder.decode([String].self,
+                                                      from: Data(chainsText.utf8))) ?? []
+                    let nodeName = ConnectionHistoryRecord.normalizedProxyNodeName(chains)
+                    var volume = totals[nodeName, default: ConnectionTrafficVolume()]
+                    volume.add(upload: max(0, sqlite3_column_int64(statement, 1)),
+                               download: max(0, sqlite3_column_int64(statement, 2)))
+                    totals[nodeName] = volume
+                }
+            }
+
+            let volumes = totals.map { name, volume in
+                ConnectionHistoryTrafficVolume(name: name,
+                                               upload: volume.upload,
+                                               download: volume.download)
+            }
+            return ConnectionTrafficRankingSnapshot(
+                total: topNodeVolumes(volumes, metric: .total, limit: safeLimit),
+                download: topNodeVolumes(volumes, metric: .download, limit: safeLimit),
+                upload: topNodeVolumes(volumes, metric: .upload, limit: safeLimit))
+        } catch {
+            return .empty
+        }
+    }
+
+    private func topNodeVolumes(_ values: [ConnectionHistoryTrafficVolume],
+                                metric: ConnectionTrafficRankingMetric,
+                                limit: Int)
+        -> [ConnectionHistoryTrafficVolume] {
+        values.sorted { left, right in
+            let leftValue = rankingValue(left, metric: metric)
+            let rightValue = rankingValue(right, metric: metric)
+            if leftValue != rightValue { return leftValue > rightValue }
+            if left.total != right.total { return left.total > right.total }
+            return left.name.localizedStandardCompare(right.name) == .orderedAscending
+        }
+        .prefix(limit)
+        .map { $0 }
+    }
+
+    private func rankingValue(_ volume: ConnectionHistoryTrafficVolume,
+                              metric: ConnectionTrafficRankingMetric) -> Int64 {
+        switch metric {
+        case .total: return volume.total
+        case .download: return volume.download
+        case .upload: return volume.upload
         }
     }
 

@@ -341,6 +341,9 @@ final class ConnectionsController: ObservableObject {
     private var historyOffset = 0
     private var lastHistoryRefreshDate = Date.distantPast
     private var lastHistoryCountRefreshDate = Date.distantPast
+    private var nodeRankingCache: CachedNodeRanking?
+    private var nodeRankingTask: Task<ConnectionTrafficRankingSnapshot, Never>?
+    private var nodeRankingRequestID: UInt64 = 0
     // The overview only needs totals. A full connection array is requested
     // while the record screen is visible, avoiding a large JSON allocation in
     // the App every second when the user is on another tab.
@@ -352,6 +355,32 @@ final class ConnectionsController: ObservableObject {
         let download: Int64
         let strategyName: String
         let hostName: String
+    }
+
+    private struct NodeRankingCacheKey: Equatable {
+        let recordCount: Int
+        let activeCount: Int
+        let uploadTotal: Int64
+        let downloadTotal: Int64
+
+        init(summary: ConnectionHistoryCountSummary) {
+            recordCount = summary.recordCount
+            activeCount = summary.activeCount
+            uploadTotal = summary.uploadTotal
+            downloadTotal = summary.downloadTotal
+        }
+
+        init(summary: ConnectionHistorySummary) {
+            recordCount = summary.recordCount
+            activeCount = summary.activeCount
+            uploadTotal = summary.uploadTotal
+            downloadTotal = summary.downloadTotal
+        }
+    }
+
+    private struct CachedNodeRanking {
+        let key: NodeRankingCacheKey
+        let value: ConnectionTrafficRankingSnapshot
     }
 
     /// A compact snapshot of the current VPN session. It stays in the App's own
@@ -418,6 +447,10 @@ final class ConnectionsController: ObservableObject {
 
     func reset() {
         generation &+= 1
+        nodeRankingRequestID &+= 1
+        nodeRankingTask?.cancel()
+        nodeRankingTask = nil
+        nodeRankingCache = nil
         snapshot = nil
         historyStore?.clearAll()
         history = []
@@ -665,6 +698,33 @@ final class ConnectionsController: ObservableObject {
         historyStore?.summary(for: query) ?? .empty
     }
 
+    /// Loads all node metrics in one App-side SQLite scan. The task is lazy,
+    /// cached by the lightweight history totals, and never runs in the NE.
+    func nodeTrafficRankings(force: Bool = false) async -> ConnectionTrafficRankingSnapshot {
+        guard let historyStore else { return .empty }
+        let key = NodeRankingCacheKey(summary: historySummary)
+        if !force, let cached = nodeRankingCache, cached.key == key {
+            return cached.value
+        }
+        if let task = nodeRankingTask {
+            return await task.value
+        }
+
+        nodeRankingRequestID &+= 1
+        let requestID = nodeRankingRequestID
+        let task = Task.detached(priority: .utility) {
+            historyStore.nodeTrafficRankings(limit: 5)
+        }
+        nodeRankingTask = task
+        let value = await task.value
+        guard requestID == nodeRankingRequestID else { return value }
+        nodeRankingTask = nil
+        if NodeRankingCacheKey(summary: historySummary) == key {
+            nodeRankingCache = CachedNodeRanking(key: key, value: value)
+        }
+        return value
+    }
+
     func loadMoreHistory() {
         guard !isLoadingMoreHistory, hasMoreHistory, let historyStore else { return }
         isLoadingMoreHistory = true
@@ -791,6 +851,10 @@ final class ConnectionsController: ObservableObject {
     }
 
     private func clearSessionState() {
+        nodeRankingRequestID &+= 1
+        nodeRankingTask?.cancel()
+        nodeRankingTask = nil
+        nodeRankingCache = nil
         sessionSummary = ConnectionSessionSummary()
         activeSamples = [:]
         rememberedConnectionIDs.removeAll(keepingCapacity: true)
@@ -851,6 +915,7 @@ private extension ConnectionHistoryQuery {
 
     func matches(_ connection: ActiveConnection) -> Bool {
         if let strategyName, connection.strategyName != strategyName { return false }
+        if let proxyNodeName, connection.proxyNodeName != proxyNodeName { return false }
         if let hostName, connection.trafficHostName != hostName { return false }
         return true
     }

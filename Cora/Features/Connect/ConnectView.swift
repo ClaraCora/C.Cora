@@ -20,7 +20,7 @@ struct ConnectView: View {
                             // the metrics child.  The surrounding scroll view and
                             // connection links no longer re-evaluate on every
                             // one-second sample tick.
-                            RuntimeMetricsGrid()
+                            RuntimeMetricsGrid(connections: connections)
                         }
 
                         OverviewConnectionLinks(controller: connections)
@@ -312,6 +312,7 @@ private extension KernelController.Mode {
 
 private struct RuntimeMetricsGrid: View {
     @EnvironmentObject private var kernel: KernelController
+    @ObservedObject var connections: ConnectionsController
 
     var body: some View {
         LazyVGrid(columns: [
@@ -324,10 +325,23 @@ private struct RuntimeMetricsGrid: View {
             RateMetricWidget(title: "上行", value: ByteFormat.rate(kernel.up),
                              systemImage: "arrow.up", tint: .orange,
                              samples: kernel.samples, direction: .up)
-            MetricWidget(title: "累计下行", value: ByteFormat.size(kernel.totalDownload),
-                         systemImage: "arrow.down.circle", tint: .blue)
-            MetricWidget(title: "累计上行", value: ByteFormat.size(kernel.totalUpload),
-                         systemImage: "arrow.up.circle", tint: .orange)
+            NavigationLink {
+                NodeTrafficRankingView(controller: connections,
+                                       initialMetric: .download)
+            } label: {
+                MetricWidget(title: "累计下行", value: ByteFormat.size(kernel.totalDownload),
+                             systemImage: "arrow.down.circle", tint: .blue)
+            }
+            .buttonStyle(.plain)
+
+            NavigationLink {
+                NodeTrafficRankingView(controller: connections,
+                                       initialMetric: .upload)
+            } label: {
+                MetricWidget(title: "累计上行", value: ByteFormat.size(kernel.totalUpload),
+                             systemImage: "arrow.up.circle", tint: .orange)
+            }
+            .buttonStyle(.plain)
         }
     }
 
