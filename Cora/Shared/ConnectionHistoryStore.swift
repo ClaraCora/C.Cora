@@ -320,6 +320,16 @@ struct ConnectionHistoryCountSummary: Sendable, Equatable {
 /// their own SQLite handle; WAL plus a short busy timeout makes those writers
 /// cooperate without putting a database-sized cache in either process.
 final class ConnectionHistoryStore: @unchecked Sendable {
+    private struct NodeTrafficAccumulator {
+        var upload: Int64 = 0
+        var download: Int64 = 0
+
+        mutating func add(upload: Int64, download: Int64) {
+            self.upload += max(0, upload)
+            self.download += max(0, download)
+        }
+    }
+
     static let retentionDays = 7
     static let maximumRecordCount = 20_000
     static let maximumDatabaseBytes: Int64 = 50 * 1_024 * 1_024
@@ -946,14 +956,14 @@ final class ConnectionHistoryStore: @unchecked Sendable {
             defer { sqlite3_finalize(statement) }
 
             let decoder = JSONDecoder()
-            var totals: [String: ConnectionTrafficVolume] = [:]
+            var totals: [String: NodeTrafficAccumulator] = [:]
             while sqlite3_step(statement) == SQLITE_ROW {
                 autoreleasepool {
                     let chainsText = text(statement, index: 0)
                     let chains = (try? decoder.decode([String].self,
                                                       from: Data(chainsText.utf8))) ?? []
                     let nodeName = ConnectionHistoryRecord.normalizedProxyNodeName(chains)
-                    var volume = totals[nodeName, default: ConnectionTrafficVolume()]
+                    var volume = totals[nodeName, default: NodeTrafficAccumulator()]
                     volume.add(upload: max(0, sqlite3_column_int64(statement, 1)),
                                download: max(0, sqlite3_column_int64(statement, 2)))
                     totals[nodeName] = volume

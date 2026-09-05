@@ -45,7 +45,7 @@ struct NodeTrafficRankingView: View {
                         Spacer()
                     }
                 } else if rankings.values(for: metric).isEmpty {
-                    ContentUnavailableView("暂无节点流量", systemImage: "server.rack")
+                    CoraUnavailableState("暂无节点流量", systemImage: "server.rack")
                 } else {
                     ForEach(Array(rankings.values(for: metric).enumerated()), id: \.element.name) {
                         index, volume in
@@ -110,7 +110,7 @@ struct NodeTrafficTopCard: View {
                 }
                 .padding(.vertical, 22)
             } else if rankings.total.isEmpty {
-                ContentUnavailableView("暂无节点流量", systemImage: "server.rack")
+                CoraUnavailableState("暂无节点流量", systemImage: "server.rack")
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 16)
             } else {
