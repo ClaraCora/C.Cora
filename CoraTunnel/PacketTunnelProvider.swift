@@ -30,15 +30,6 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private let ipcQueue = DispatchQueue(label: "com.cora.tunnel.ipc",
                                          qos: .userInitiated,
                                          attributes: .concurrent)
-    // Control-plane requests can carry provider payloads, delay-test results,
-    // or connection snapshots. A concurrent queue without admission control
-    // lets repeated App requests retain an unbounded backlog in the NE.
-    private let ipcWorkSlots = DispatchSemaphore(value: 2)
-    // The signed unlock scripts intentionally fan out several HTTPS checks at
-    // once (the bundled script starts eight Promise.all requests). Keep their
-    // fan-out bounded by the runner's per-run request limit without applying
-    // the two-request control-plane limit to every script callback.
-    private let scriptIPCWorkSlots = DispatchSemaphore(value: 12)
     private struct StoredIPCResponse {
         let data: Data
         let expiresAt: Date
@@ -853,9 +844,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 reply(Self.jsonData(["ok": false, "error": "脚本请求参数无效"]))
                 return
             }
-            enqueueIPCWork(generation: sessionGeneration,
-                           reply: reply,
-                           semaphore: scriptIPCWorkSlots) {
+            enqueueIPCWork(generation: sessionGeneration, reply: reply) {
                 reply(Data(MihomoScriptFetch(requestJSON).utf8))
             }
         case "scriptTargetInfo":
@@ -956,20 +945,13 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
-    /// Admit at most two control-plane operations at a time. The non-blocking
-    /// admission check keeps the Network Extension callback thread free and
-    /// prevents an abandoned caller from leaving a large queued backlog.
+    /// Run control-plane operations asynchronously so the Network Extension
+    /// callback thread remains free. Responses still carry a session
+    /// generation check, so an old task cannot populate a new tunnel session.
     private func enqueueIPCWork(generation: UInt64,
                                 reply: @escaping (Data?) -> Void,
-                                semaphore: DispatchSemaphore? = nil,
                                 operation: @escaping () -> Void) {
-        let workSlots = semaphore ?? ipcWorkSlots
-        guard workSlots.wait(timeout: .now()) == .success else {
-            reply(Self.jsonData(["ok": false, "error": "控制请求繁忙，请稍后重试"]))
-            return
-        }
         ipcQueue.async { [self] in
-            defer { workSlots.signal() }
             guard isCurrentIPCSession(generation) else {
                 reply(Self.jsonData(["ok": false, "error": "控制请求已过期"]))
                 return
