@@ -11,7 +11,7 @@ struct SubscriptionsView: View {
 
     var body: some View {
         List {
-            Section("快速操作") {
+            Section {
                 Button {
                     Task { await store.refreshRemoteSubscriptions() }
                 } label: {
@@ -42,6 +42,8 @@ struct SubscriptionsView: View {
                     }
                 }
                 .disabled(store.isBusy || isRefreshingSelectedProviders || selectedProxyProviders.isEmpty)
+            } header: {
+                Text("快速操作")
             } footer: {
                 if let selected = store.selected {
                     Text("刷新订阅会重新下载远程配置；Provider 刷新只作用于当前配置“\(selected.name)”并保留本地缓存。")
