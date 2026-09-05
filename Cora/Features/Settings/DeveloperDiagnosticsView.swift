@@ -54,12 +54,12 @@ struct DeveloperDiagnosticsView: View {
                         SettingsSymbol(systemImage: "wrench.and.screwdriver")
                     }
                 }
-                .tint(.accentColor)
+                .tint(Color(uiColor: .systemGreen))
                 .disabled(isUpdatingMode)
             } footer: {
                 Text("开启后每 5 秒记录一次物理内存、VM、Go 堆、连接和 goroutine 快照，并保留当前/上一会话的数字摘要。关闭后不会持续采样；诊断数据可能包含连接数量等运行态信息。")
             }
-            .listRowBackground(AppListRowBackground())
+            .settingsSectionStyle()
 
             if settings.developerMode {
                 Section("内存诊断") {
@@ -99,7 +99,7 @@ struct DeveloperDiagnosticsView: View {
                     }
                     .disabled(isLoading)
                 }
-                .listRowBackground(AppListRowBackground())
+                .settingsSectionStyle()
 
                 Section("分析结果") {
                     Text(report)
@@ -108,7 +108,7 @@ struct DeveloperDiagnosticsView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.vertical, 4)
                 }
-                .listRowBackground(AppListRowBackground())
+                .settingsSectionStyle()
             }
 
             if let statusMessage {
@@ -117,7 +117,7 @@ struct DeveloperDiagnosticsView: View {
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
-                .listRowBackground(AppListRowBackground())
+                .settingsSectionStyle()
             }
         }
         .scrollContentBackground(.hidden)
@@ -125,6 +125,7 @@ struct DeveloperDiagnosticsView: View {
         .listStyle(.insetGrouped)
         .coraListSectionSpacing(12)
         .listRowSeparatorTint(Color.primary.opacity(0.08))
+        .settingsChangeAnimation(value: settings.developerMode)
         .navigationTitle("开发者模式")
         .navigationBarTitleDisplayMode(.inline)
         .confirmationDialog("清理已保存的诊断文件？", isPresented: $showClearConfirmation) {

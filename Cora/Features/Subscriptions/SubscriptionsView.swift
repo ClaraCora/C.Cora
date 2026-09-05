@@ -8,40 +8,53 @@ struct SubscriptionsView: View {
     @State private var showAddRemote = false
     @State private var showAddLocal = false
     @State private var editingSub: Subscription?
+    @State private var refreshingSubscriptions = false
+    @State private var refreshingProviders = false
+    @State private var subscriptionRefreshToken = 0
+    @State private var providerRefreshToken = 0
 
     var body: some View {
         List {
             Section {
                 Button {
-                    Task { await store.refreshRemoteSubscriptions() }
+                    Task { await refreshSubscriptions() }
                 } label: {
-                    HStack {
-                        Label("刷新订阅", systemImage: "arrow.clockwise")
+                    HStack(spacing: 12) {
+                        SettingsSymbol(systemImage: "arrow.clockwise", category: .configuration)
+                        Text("刷新订阅")
                         Spacer()
-                        if store.isBusy {
-                            ProgressView().controlSize(.small)
-                        }
+                        SettingsActivityIndicator(isRunning: refreshingSubscriptions || store.isBusy,
+                                                  successToken: subscriptionRefreshToken)
                     }
+                    .frame(minHeight: 44)
+                    .contentShape(Rectangle())
                 }
-                .disabled(store.isBusy || isRefreshingSelectedProviders || !store.hasRemoteSubscriptions)
+                .buttonStyle(SettingsPressStyle())
+                .disabled(refreshActionsBusy || !store.hasRemoteSubscriptions)
 
                 Button {
-                    guard let selectedID = store.selectedID else { return }
-                    Task { await store.refreshProxyProviders(selectedID) }
+                    Task { await refreshProviders() }
                 } label: {
-                    HStack {
-                        Label("刷新远程 Provider", systemImage: "arrow.triangle.2.circlepath")
-                        Spacer()
-                        if isRefreshingSelectedProviders {
-                            ProgressView().controlSize(.small)
-                        } else if !selectedProxyProviders.isEmpty {
-                            Text("当前配置 · \(selectedProxyProviders.count) 个")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                    HStack(spacing: 12) {
+                        SettingsSymbol(systemImage: "arrow.triangle.2.circlepath", category: .resources)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("刷新远程 Provider")
+                                .fixedSize(horizontal: false, vertical: true)
+                            if !selectedProxyProviders.isEmpty {
+                                Text("当前配置 · \(selectedProxyProviders.count) 个")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
                         }
+                        Spacer()
+                        SettingsActivityIndicator(isRunning: refreshingProviders || isRefreshingSelectedProviders,
+                                                  successToken: providerRefreshToken)
                     }
+                    .frame(minHeight: 44)
+                    .contentShape(Rectangle())
                 }
-                .disabled(store.isBusy || isRefreshingSelectedProviders || selectedProxyProviders.isEmpty)
+                .buttonStyle(SettingsPressStyle())
+                .disabled(refreshActionsBusy || selectedProxyProviders.isEmpty)
             } header: {
                 Text("快速操作")
             } footer: {
@@ -51,7 +64,7 @@ struct SubscriptionsView: View {
                     Text("请先添加并选择一个配置。")
                 }
             }
-            .listRowBackground(AppListRowBackground())
+            .settingsSectionStyle()
 
             Section("配置") {
                 if store.subscriptions.isEmpty {
@@ -67,7 +80,7 @@ struct SubscriptionsView: View {
                     } label: {
                         SubscriptionRow(sub: sub, isSelected: sub.id == store.selectedID)
                     }
-                    .listRowBackground(AppListRowBackground())
+                    .settingsSectionStyle()
                     .swipeActions(edge: .trailing) {
                         Button(role: .destructive) {
                             store.remove(sub.id)
@@ -77,6 +90,7 @@ struct SubscriptionsView: View {
                                 Task { await store.refresh(sub.id) }
                             } label: { Label("刷新", systemImage: "arrow.clockwise") }
                             .tint(.blue)
+                            .disabled(refreshActionsBusy)
                             Button {
                                 editingSub = sub
                             } label: { Label("编辑", systemImage: "pencil") }
@@ -93,7 +107,7 @@ struct SubscriptionsView: View {
                     }
                 }
             }
-            .listRowBackground(AppListRowBackground())
+            .settingsSectionStyle()
 
             Section("配置选项") {
                 if !core.configNotices.isEmpty {
@@ -110,7 +124,7 @@ struct SubscriptionsView: View {
                     message: "为当前配置选择是否应用 Cora 的 DNS、嗅探和 TUN 设置。",
                     destination: ConfigOverrideSettingsView())
             }
-            .listRowBackground(AppListRowBackground())
+            .settingsSectionStyle()
         }
         .scrollContentBackground(.hidden)
         .background(AppAmbientBackground())
@@ -144,7 +158,10 @@ struct SubscriptionsView: View {
         .sheet(item: $editingSub) { sub in
             EditSubscriptionView(sub: sub).environmentObject(store)
         }
-        .alert("出错了", isPresented: .constant(store.lastError != nil)) {
+        .alert("出错了", isPresented: Binding(
+            get: { store.lastError != nil },
+            set: { if !$0 { store.lastError = nil } }
+        )) {
             Button("好") { store.lastError = nil }
         } message: {
             Text(store.lastError ?? "")
@@ -153,6 +170,27 @@ struct SubscriptionsView: View {
 
     private var selectedProxyProviders: [RemoteResource] {
         store.selectedRemoteResources.filter { $0.kind == .proxyProvider }
+    }
+
+    private var refreshActionsBusy: Bool {
+        refreshingSubscriptions || refreshingProviders || store.isBusy ||
+            !store.refreshingProviderIDs.isEmpty || !store.refreshingResourceIDs.isEmpty
+    }
+
+    private func refreshSubscriptions() async {
+        guard !refreshActionsBusy, store.hasRemoteSubscriptions else { return }
+        refreshingSubscriptions = true
+        defer { refreshingSubscriptions = false }
+        await store.refreshRemoteSubscriptions()
+        if store.lastError == nil { subscriptionRefreshToken += 1 }
+    }
+
+    private func refreshProviders() async {
+        guard !refreshActionsBusy, let selectedID = store.selectedID else { return }
+        refreshingProviders = true
+        defer { refreshingProviders = false }
+        await store.refreshProxyProviders(selectedID)
+        if store.lastError == nil, store.selectedID == selectedID { providerRefreshToken += 1 }
     }
 
     private var isRefreshingSelectedProviders: Bool {
@@ -205,6 +243,7 @@ private struct SubscriptionUserAgentSetting: View {
             }
         }
         .padding(.vertical, 2)
+        .settingsChangeAnimation(value: selectedPreset)
         .onAppear { synchronizePresetSelection() }
         .onChange(of: userAgent) { _ in
             guard selectedPreset != Self.customPreset else { return }
@@ -347,7 +386,7 @@ private struct AddSubscriptionView: View {
                 Section("名称") {
                     TextField("如：我的机场", text: $name)
                 }
-                .listRowBackground(AppListRowBackground())
+                .settingsSectionStyle()
                 Section("订阅链接") {
                     TextField("https://...", text: $url)
                         .textInputAutocapitalization(.never)
@@ -359,11 +398,11 @@ private struct AddSubscriptionView: View {
                             .foregroundStyle(.red)
                     }
                 }
-                .listRowBackground(AppListRowBackground())
+                .settingsSectionStyle()
                 Text("订阅内容需为 Clash/mihomo YAML。")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
-                    .listRowBackground(AppListRowBackground())
+                    .settingsSectionStyle()
             }
             .scrollContentBackground(.hidden)
             .background(AppAmbientBackground())

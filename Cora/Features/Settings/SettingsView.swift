@@ -15,8 +15,12 @@ struct SettingsView: View {
                 Form {
                     if settings.pendingConnectionApply || configOverrides.pendingConnectionApply {
                         Section {
-                            Label("部分设置将在下次连接时生效。", systemImage: "arrow.triangle.2.circlepath")
-                                .font(.subheadline)
+                            HStack(spacing: 12) {
+                                SettingsSymbol(systemImage: "arrow.triangle.2.circlepath", category: .speed)
+                                Text("部分设置将在下次连接时生效。")
+                                    .font(.subheadline)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
                             if core.isActive {
                                 Button {
                                     Task {
@@ -29,7 +33,7 @@ struct SettingsView: View {
                                     HStack {
                                         Label("应用并重连", systemImage: "arrow.clockwise")
                                         Spacer()
-                                        if core.isBusy { ProgressView().controlSize(.small) }
+                                        SettingsActivityIndicator(isRunning: core.isBusy)
                                     }
                                 }
                                 .disabled(core.isBusy)
@@ -41,7 +45,8 @@ struct SettingsView: View {
                         } footer: {
                             Text("应用过程中会先完整停止旧的隧道，再启动新配置，以避免内存峰值叠加。")
                         }
-                        .listRowBackground(AppListRowBackground())
+                        .settingsSectionStyle()
+                        .transition(.opacity)
                     }
 
                     Section("配置") {
@@ -54,61 +59,72 @@ struct SettingsView: View {
                             title: "远程资源",
                             systemImage: "externaldrive.connected.to.line.below",
                             message: "查看配置引用的节点来源和规则来源。节点来源可离线缓存；规则来源需连接当前配置后更新。",
+                            category: .resources,
                             destination: RemoteResourcesView())
                     }
-                    .listRowBackground(AppListRowBackground())
+                    .settingsSectionStyle()
 
                     Section("运行") {
                         SettingsNavigationRow(
                             title: "内核运行",
                             systemImage: "gearshape.2",
                             message: "设置内核运行参数，并查看连接诊断。",
+                            category: .graphite,
                             destination: KernelSettingsView())
                         SettingsNavigationRow(
                             title: "开发者模式",
                             systemImage: "wrench.and.screwdriver",
                             message: "按需采集和分析 Network Extension 内存快照，普通模式不会持续采样。",
+                            category: .graphite,
                             destination: DeveloperDiagnosticsView())
                         SettingsNavigationRow(
                             title: "规则数据",
                             systemImage: "globe.americas",
                             message: "管理 GEO、GeoSite 和 ASN 规则数据。",
+                            category: .rules,
                             destination: GeoSettingsView())
                         SettingsNavigationRow(
                             title: "隧道与隐私",
                             systemImage: "arrow.triangle.branch",
                             message: "设置流量接管范围、系统服务排除和防泄露选项。",
+                            category: .privacy,
                             destination: TunnelRouteSettingsView())
                         SettingsNavigationRow(
                             title: "测速",
                             systemImage: "speedometer",
                             message: "设置测速地址和测速超时时间。",
+                            category: .speed,
                             destination: DelayTestSettingsView())
                     }
-                    .listRowBackground(AppListRowBackground())
+                    .settingsSectionStyle()
 
                     Section("维护") {
                         SettingsNavigationRow(
                             title: "检测脚本",
                             systemImage: "play.tv",
                             message: "管理节点解锁检测脚本。脚本在 Cora 外部仓库维护，更新前会校验签名和摘要。",
+                            category: .scripts,
                             destination: UnlockScriptSettingsView())
                         HStack(spacing: 12) {
-                            SettingsSymbol(systemImage: "info.circle")
-                            Text("App 版本").font(.body.weight(.medium))
+                            SettingsSymbol(systemImage: "info.circle", category: .graphite)
+                            Text("App 版本").font(.body)
                             Spacer()
                             Text(appVersion)
+                                .font(.subheadline)
                                 .foregroundStyle(.secondary)
                                 .monospacedDigit()
                         }
+                        .frame(minHeight: 44)
+                        .alignmentGuide(.listRowSeparatorLeading) { _ in 42 }
                     }
-                    .listRowBackground(AppListRowBackground())
+                    .settingsSectionStyle()
                 }
                 .scrollContentBackground(.hidden)
                 .background(Color.clear)
                 .listStyle(.insetGrouped)
                 .coraListSectionSpacing(12)
                 .listRowSeparatorTint(Color.primary.opacity(0.08))
+                .settingsChangeAnimation(value: settings.pendingConnectionApply || configOverrides.pendingConnectionApply)
             }
             .navigationTitle("设置")
             .task { await core.refreshStatus() }
@@ -121,6 +137,9 @@ struct SettingsView: View {
                 Text(pendingApplyError ?? "")
             }
         }
+        .environment(\.coraSettingsAppearance, true)
+        .environment(\.defaultMinListRowHeight, 44)
+        .tint(Color(uiColor: .systemBlue))
     }
 
     private var appVersion: String {
@@ -140,6 +159,11 @@ struct RemoteResourcesView: View {
     @State private var selectedContent: RemoteResourceContent?
     @State private var contentError: String?
     @State private var showUpdateSettings = false
+    @State private var refreshingBatch: RemoteResource.Kind?
+    @State private var proxyRefreshToken = 0
+    @State private var ruleRefreshToken = 0
+    @State private var resourceRefreshToken = 0
+    @State private var refreshedResourceID: String?
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 60)) { context in
@@ -147,7 +171,7 @@ struct RemoteResourcesView: View {
                 remoteSection(kind: .proxyProvider,
                               title: "节点来源",
                               emptyMessage: "没有远程节点来源",
-                              isBatchRefreshing: proxyResources.contains {
+                              isBatchRefreshing: refreshingBatch == .proxyProvider || proxyResources.contains {
                                   subscriptions.refreshingResourceIDs.contains($0.id)
                               },
                               now: context.date,
@@ -156,7 +180,7 @@ struct RemoteResourcesView: View {
                 remoteSection(kind: .ruleProvider,
                               title: "规则来源",
                               emptyMessage: "没有远程规则来源",
-                              isBatchRefreshing: ruleResources.contains {
+                              isBatchRefreshing: refreshingBatch == .ruleProvider || ruleResources.contains {
                                   subscriptions.refreshingResourceIDs.contains($0.id)
                               },
                               now: context.date,
@@ -225,6 +249,11 @@ struct RemoteResourcesView: View {
         resources.filter { $0.kind == .ruleProvider }
     }
 
+    private var resourceActionsBusy: Bool {
+        refreshingBatch != nil || subscriptions.isBusy ||
+            !subscriptions.refreshingProviderIDs.isEmpty || !subscriptions.refreshingResourceIDs.isEmpty
+    }
+
     @ViewBuilder
     private func remoteSection(kind: RemoteResource.Kind,
                                title: String,
@@ -246,6 +275,7 @@ struct RemoteResourcesView: View {
                         isRefreshing: subscriptions.refreshingResourceIDs.contains(resource.id),
                         canRefresh: resource.kind == .proxyProvider ||
                             subscriptions.runtimeCanUpdateRules(for: resource.subscriptionID),
+                        successToken: refreshedResourceID == resource.id ? resourceRefreshToken : 0,
                         now: now)
                     .contextMenu {
                         Button {
@@ -258,7 +288,7 @@ struct RemoteResourcesView: View {
                         } label: {
                             Label("刷新此资源", systemImage: "arrow.clockwise")
                         }
-                        .disabled(subscriptions.refreshingResourceIDs.contains(resource.id) ||
+                        .disabled(resourceActionsBusy ||
                                   (resource.kind == .ruleProvider &&
                                    !subscriptions.runtimeCanUpdateRules(for: resource.subscriptionID)))
                     }
@@ -269,29 +299,25 @@ struct RemoteResourcesView: View {
                 Text(title)
                     .font(.subheadline.weight(.semibold))
                 Spacer()
-                if isBatchRefreshing {
-                    ProgressView()
-                        .controlSize(.small)
-                        .frame(width: 44, height: 44)
-                } else {
-                    Button {
-                        Task { await batchAction() }
-                    } label: {
-                        Image(systemName: "arrow.clockwise")
-                            .frame(width: 44, height: 44)
-                    }
-                    .accessibilityLabel("批量刷新\(title)")
-                    .buttonStyle(.borderless)
-                    .disabled(sectionResources.isEmpty ||
-                              (kind == .ruleProvider && !canBatchUpdateRules))
+                Button {
+                    Task { await batchAction() }
+                } label: {
+                    SettingsActivityIndicator(isRunning: isBatchRefreshing,
+                                              successToken: kind == .proxyProvider ? proxyRefreshToken : ruleRefreshToken,
+                                              idleSystemImage: "arrow.clockwise")
+                        .frame(minWidth: 44, minHeight: 44)
                 }
+                .accessibilityLabel("批量刷新\(title)")
+                .buttonStyle(SettingsPressStyle())
+                .disabled(resourceActionsBusy || sectionResources.isEmpty ||
+                          (kind == .ruleProvider && !canBatchUpdateRules))
             }
         } footer: {
             if kind == .ruleProvider && !canBatchUpdateRules && !sectionResources.isEmpty {
                 Text("规则来源由运行中的内核加载。连接对应的当前配置后可更新。")
             }
         }
-        .listRowBackground(AppListRowBackground())
+        .settingsSectionStyle()
     }
 
     private var canBatchUpdateRules: Bool {
@@ -301,13 +327,20 @@ struct RemoteResourcesView: View {
     }
 
     private func refresh(_ resource: RemoteResource) async {
+        guard !resourceActionsBusy,
+              resource.kind == .proxyProvider || subscriptions.runtimeCanUpdateRules(for: resource.subscriptionID)
+        else { return }
         switch resource.kind {
         case .proxyProvider:
             await subscriptions.refreshProxyProvider(resource)
         case .ruleProvider:
             await subscriptions.refreshRuleProvider(resource)
         }
-        resultMessage = subscriptions.lastError ?? "\(resource.name) 已刷新"
+        resultMessage = subscriptions.lastError
+        if resultMessage == nil {
+            refreshedResourceID = resource.id
+            resourceRefreshToken += 1
+        }
     }
 
     private func showContent(_ resource: RemoteResource) async {
@@ -321,13 +354,23 @@ struct RemoteResourcesView: View {
     }
 
     private func refreshAllProxyProviders() async {
+        guard !resourceActionsBusy, !proxyResources.isEmpty else { return }
+        let selectedID = subscriptions.selectedID
+        refreshingBatch = .proxyProvider
+        defer { refreshingBatch = nil }
         await subscriptions.refreshAllProxyProviders()
-        resultMessage = subscriptions.lastError ?? "节点来源已全部刷新"
+        resultMessage = subscriptions.lastError
+        if resultMessage == nil, subscriptions.selectedID == selectedID { proxyRefreshToken += 1 }
     }
 
     private func refreshAllRuleProviders() async {
+        guard !resourceActionsBusy, canBatchUpdateRules else { return }
+        let selectedID = subscriptions.selectedID
+        refreshingBatch = .ruleProvider
+        defer { refreshingBatch = nil }
         await subscriptions.refreshAllRuleProviders()
-        resultMessage = subscriptions.lastError ?? "当前配置的规则来源已全部更新"
+        resultMessage = subscriptions.lastError
+        if resultMessage == nil, subscriptions.selectedID == selectedID { ruleRefreshToken += 1 }
     }
 
     private func refreshRuntimeResourceUpdateTimes() async {
@@ -340,15 +383,28 @@ private struct RemoteResourceRow: View {
     let resource: RemoteResource
     let isRefreshing: Bool
     let canRefresh: Bool
+    let successToken: Int
     let now: Date
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     var body: some View {
+        let layout = dynamicTypeSize.isAccessibilitySize
+            ? AnyLayout(VStackLayout(alignment: .leading, spacing: 8))
+            : AnyLayout(HStackLayout(spacing: 12))
+        layout {
+            resourceLabel
+            statusLabel
+        }
+        .padding(.vertical, 4)
+        .contentShape(Rectangle())
+    }
+
+    private var resourceLabel: some View {
         HStack(spacing: 12) {
-            Image(systemName: resource.kind == .proxyProvider
-                  ? "point.3.connected.trianglepath.dotted"
-                  : "list.bullet.rectangle.portrait")
-                .foregroundStyle(resource.kind == .proxyProvider ? Color.blue : Color.orange)
-                .frame(width: 28)
+            SettingsSymbol(systemImage: resource.kind == .proxyProvider
+                           ? "point.3.connected.trianglepath.dotted"
+                           : "list.bullet.rectangle.portrait",
+                           category: resource.kind == .proxyProvider ? .resources : .rules)
             VStack(alignment: .leading, spacing: 3) {
                 Text(resource.name)
                     .font(.body.weight(.medium))
@@ -364,33 +420,27 @@ private struct RemoteResourceRow: View {
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
             }
-            Spacer(minLength: 8)
-            VStack(alignment: .trailing, spacing: 5) {
-                if isRefreshing {
-                    HStack(spacing: 5) {
-                        ProgressView()
-                            .controlSize(.small)
-                        Text("正在刷新")
-                    }
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                } else if !canRefresh {
-                    Label("待连接", systemImage: "lock")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                        .accessibilityLabel("连接对应配置后可更新")
-                }
-
-                updateText
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .monospacedDigit()
-                    .lineLimit(1)
-            }
-            .frame(minWidth: 86, alignment: .trailing)
         }
-        .padding(.vertical, 4)
-        .contentShape(Rectangle())
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var statusLabel: some View {
+        VStack(alignment: dynamicTypeSize.isAccessibilitySize ? .leading : .trailing, spacing: 5) {
+            SettingsActivityIndicator(isRunning: isRefreshing, successToken: successToken)
+            if !canRefresh && !isRefreshing {
+                Label("待连接", systemImage: "lock")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel("连接对应配置后可更新")
+            }
+
+            updateText
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+                .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 1)
+        }
+        .frame(minWidth: 86, alignment: dynamicTypeSize.isAccessibilitySize ? .leading : .trailing)
     }
 
     private var updateText: Text {
@@ -441,13 +491,14 @@ private struct RemoteResourceUpdateSettingsView: View {
                 } footer: {
                     Text(updateDescription)
                 }
-                .listRowBackground(AppListRowBackground())
+                .settingsSectionStyle()
             }
             .scrollContentBackground(.hidden)
             .background(AppAmbientBackground())
             .listStyle(.insetGrouped)
             .coraListSectionSpacing(12)
             .listRowSeparatorTint(Color.primary.opacity(0.08))
+            .settingsChangeAnimation(value: settings.remoteResourceUpdatePolicy)
             .navigationTitle("自动更新")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -527,6 +578,7 @@ private struct RemoteResourceContentView: View {
 
 private struct UnlockScriptSettingsView: View {
     @ObservedObject private var scripts = ExternalScriptStore.shared
+    @State private var refreshToken = 0
 
     var body: some View {
         Form {
@@ -557,9 +609,7 @@ private struct UnlockScriptSettingsView: View {
                     HStack {
                         Label("检查并更新脚本", systemImage: "arrow.down.circle")
                         Spacer()
-                        if scripts.isUpdating {
-                            ProgressView()
-                        }
+                        SettingsActivityIndicator(isRunning: scripts.isUpdating, successToken: refreshToken)
                     }
                 }
                 .disabled(scripts.isUpdating)
@@ -570,14 +620,12 @@ private struct UnlockScriptSettingsView: View {
                         .foregroundStyle(message.hasPrefix("更新失败") ? .red : .secondary)
                 }
             }
-            .listRowBackground(AppListRowBackground())
+            .settingsSectionStyle()
 
             Section("可用检测") {
                 ForEach(scripts.availableScripts) { script in
                     HStack(spacing: 12) {
-                        Image(systemName: script.icon)
-                            .foregroundStyle(Color.accentColor)
-                            .frame(width: 24)
+                        SettingsSymbol(systemImage: script.icon, category: .scripts)
                         Text(script.name)
                         Spacer()
                         Text(script.version.isEmpty ? "待更新" : script.version)
@@ -587,14 +635,14 @@ private struct UnlockScriptSettingsView: View {
                     }
                 }
             }
-            .listRowBackground(AppListRowBackground())
+            .settingsSectionStyle()
 
             Section {
                 Text("脚本只允许通过受限的 mihomo 节点请求访问检测地址，不会把检测逻辑编译进 App。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            .listRowBackground(AppListRowBackground())
+            .settingsSectionStyle()
         }
         .scrollContentBackground(.hidden)
         .background(AppAmbientBackground())
@@ -609,6 +657,7 @@ private struct UnlockScriptSettingsView: View {
     private func updateScript() async {
         do {
             _ = try await scripts.refreshAllScripts()
+            refreshToken += 1
         } catch {
             // ExternalScriptStore publishes the verified failure reason and keeps the old cache.
         }
@@ -626,7 +675,7 @@ private struct DelayTestSettingsView: View {
                     message: "让 mihomo 的策略组使用统一的测速地址。关闭时保留配置内各策略组自带的测速地址；主 App 手动测速仍使用下方地址。",
                     isOn: $settings.unifiedDelay)
             }
-            .listRowBackground(AppListRowBackground())
+            .settingsSectionStyle()
 
             Section("测试时限") {
                 HStack {
@@ -641,7 +690,7 @@ private struct DelayTestSettingsView: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            .listRowBackground(AppListRowBackground())
+            .settingsSectionStyle()
 
             Section("测试地址") {
                 DelayTestURLField(
@@ -657,7 +706,7 @@ private struct DelayTestSettingsView: View {
                     defaultValue: SettingsStore.defaultDirectDelayTestURL,
                     text: $settings.directDelayTestURL)
             }
-            .listRowBackground(AppListRowBackground())
+            .settingsSectionStyle()
         }
         .scrollContentBackground(.hidden)
         .background(AppAmbientBackground())
@@ -749,7 +798,7 @@ private struct KernelSettingsView: View {
                         .frame(width: 90)
                 }
             }
-            .listRowBackground(AppListRowBackground())
+            .settingsSectionStyle()
 
             Section {
                 NavigationLink {
@@ -761,7 +810,8 @@ private struct KernelSettingsView: View {
                         if isCheckingKernel {
                             ProgressView().controlSize(.small)
                         } else {
-                            Text(isKernelAvailable ? "✅" : "❌")
+                            Image(systemName: isKernelAvailable ? "checkmark.circle.fill" : "xmark.circle.fill")
+                                .foregroundStyle(isKernelAvailable ? Color.green : Color.secondary)
                                 .accessibilityLabel(isKernelAvailable ? "内核可用" : "内核不可用")
                         }
                     }
@@ -774,7 +824,7 @@ private struct KernelSettingsView: View {
                         .monospaced()
                 }
             }
-            .listRowBackground(AppListRowBackground())
+            .settingsSectionStyle()
         }
         .scrollContentBackground(.hidden)
         .background(AppAmbientBackground())
@@ -818,6 +868,9 @@ private struct GeoSettingsView: View {
         .listStyle(.insetGrouped)
         .coraListSectionSpacing(12)
         .listRowSeparatorTint(Color.primary.opacity(0.08))
+        .settingsChangeAnimation(value: settings.geoEnabled)
+        .settingsChangeAnimation(value: settings.geoAutoUpdate)
+        .settingsChangeAnimation(value: settings.geodataMode)
         .navigationTitle("规则数据")
         .navigationBarTitleDisplayMode(.inline)
         .task(id: refreshID) { await refreshInstalledInfo() }
@@ -861,7 +914,7 @@ private struct TunnelRouteSettingsView: View {
                     Text("修改后需要重新连接 VPN 才会更新系统路由。")
                 }
             }
-            .listRowBackground(AppListRowBackground())
+            .settingsSectionStyle()
 
             Section("系统服务") {
                 InfoToggleRow(title: "排除蜂窝服务", message: "将蜂窝网络服务排除在隧道之外，避免影响系统电话和运营商服务。", systemImage: "antenna.radiowaves.left.and.right", isOn: $settings.excludeCellularServices)
@@ -870,12 +923,12 @@ private struct TunnelRouteSettingsView: View {
                     InfoToggleRow(title: "排除设备间通信", message: "将本地设备间通信排除在隧道之外，保留 AirDrop 和附近设备连接。", systemImage: "person.2", isOn: $settings.excludeDeviceCommunication)
                 }
             }
-            .listRowBackground(AppListRowBackground())
+            .settingsSectionStyle()
 
             Section("隐私防护") {
                 InfoToggleRow(title: "防止 WebRTC 泄露", message: "仅阻止常见公网 STUN 探测端点以降低 WebRTC 泄露风险，不封锁普通 DIRECT 的语音、视频和 P2P 流量。", systemImage: "lock.shield", isOn: $settings.blockDirectSTUN)
             }
-            .listRowBackground(AppListRowBackground())
+            .settingsSectionStyle()
 
             Section("自动连接") {
                 InfoToggleRow(
@@ -885,7 +938,7 @@ private struct TunnelRouteSettingsView: View {
                     isOn: alwaysOnBinding)
                     .disabled(isUpdatingAutoConnect)
             }
-            .listRowBackground(AppListRowBackground())
+            .settingsSectionStyle()
         }
         .scrollContentBackground(.hidden)
         .background(AppAmbientBackground())
@@ -925,41 +978,52 @@ struct SettingsNavigationRow<Destination: View>: View {
     let title: String
     let systemImage: String
     let message: String
+    var category: SettingsCategory = .configuration
     let destination: Destination
+    @ScaledMetric(relativeTo: .body) private var iconSize: CGFloat = 30
 
     var body: some View {
         HStack(spacing: 8) {
             NavigationLink {
-                destination
+                destination.environment(\.settingsCategory, category)
             } label: {
                 HStack(spacing: 12) {
-                    SettingsSymbol(systemImage: systemImage)
+                    SettingsSymbol(systemImage: systemImage, category: category)
                     Text(title)
-                        .font(.body.weight(.medium))
+                        .font(.body)
+                        .foregroundStyle(.primary)
+                        .fixedSize(horizontal: false, vertical: true)
                     Spacer(minLength: 4)
                 }
+                .frame(minHeight: 44)
+                .contentShape(Rectangle())
             }
+            .buttonStyle(SettingsPressStyle())
             InfoButton(message: message, accessibilityLabel: "查看\(title)说明")
         }
-        .padding(.vertical, 2)
+        .alignmentGuide(.listRowSeparatorLeading) { _ in iconSize + 12 }
     }
 }
 
 struct SettingsSymbol: View {
     let systemImage: String
+    var category: SettingsCategory? = nil
+    @Environment(\.settingsCategory) private var inheritedCategory
+    @Environment(\.settingsIconPressed) private var isPressed
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @ScaledMetric(relativeTo: .body) private var size: CGFloat = 30
 
     var body: some View {
         Image(systemName: systemImage)
-            .font(.system(size: 15, weight: .semibold))
-            .symbolRenderingMode(.hierarchical)
-            .foregroundStyle(Color.accentColor)
-            .frame(width: 30, height: 30)
-            .background(.thinMaterial,
-                        in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .stroke(Color.accentColor.opacity(0.16), lineWidth: 0.6)
-            }
+            .font(.body.weight(.semibold))
+            .symbolRenderingMode(.monochrome)
+            .foregroundStyle((category ?? inheritedCategory).iconForeground)
+            .frame(width: size, height: size)
+            .background((category ?? inheritedCategory).color,
+                        in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .scaleEffect(isPressed && !reduceMotion ? 0.94 : 1)
+            .animation(reduceMotion ? nil : .spring(response: 0.24, dampingFraction: 0.8), value: isPressed)
+            .accessibilityHidden(true)
     }
 }
 
@@ -967,6 +1031,7 @@ private struct GeoSettingsContent: View {
     @EnvironmentObject private var settings: SettingsStore
     @EnvironmentObject private var geoDatabase: GeoDatabaseManager
     let installedInfo: GeoInstalledInfo?
+    @State private var refreshToken = 0
 
     var body: some View {
         Section("启用与状态") {
@@ -994,7 +1059,7 @@ private struct GeoSettingsContent: View {
                     .foregroundStyle(.secondary)
             }
         }
-        .listRowBackground(AppListRowBackground())
+        .settingsSectionStyle()
 
         if settings.geoEnabled {
             Section("加载格式") {
@@ -1015,7 +1080,7 @@ private struct GeoSettingsContent: View {
                     message: "忽略配置中以 GEO 规则取反的匹配条件。",
                     isOn: $settings.ignoreGeoNegation)
             }
-            .listRowBackground(AppListRowBackground())
+            .settingsSectionStyle()
 
             Section("本地数据") {
                 if let installedInfo {
@@ -1044,7 +1109,7 @@ private struct GeoSettingsContent: View {
                     HStack {
                         Label("立即更新规则数据", systemImage: "arrow.down.circle")
                         Spacer()
-                        if geoDatabase.isUpdating { ProgressView() }
+                        SettingsActivityIndicator(isRunning: geoDatabase.isUpdating, successToken: refreshToken)
                     }
                 }
                 .disabled(geoDatabase.isUpdating)
@@ -1054,7 +1119,7 @@ private struct GeoSettingsContent: View {
                         .foregroundStyle(geoDatabase.statusIsError ? Color.red : Color.secondary)
                 }
             }
-            .listRowBackground(AppListRowBackground())
+            .settingsSectionStyle()
 
             Section("更新策略") {
                 InfoToggleRow(
@@ -1073,7 +1138,7 @@ private struct GeoSettingsContent: View {
                     }
                 }
             }
-            .listRowBackground(AppListRowBackground())
+            .settingsSectionStyle()
 
             Section("下载来源") {
                 if settings.geodataMode {
@@ -1083,13 +1148,14 @@ private struct GeoSettingsContent: View {
                 }
                 GeoURLField(title: "GeoSite 下载地址", defaultValue: SettingsStore.defaultGeoSiteURL, text: $settings.geoSiteURL)
             }
-            .listRowBackground(AppListRowBackground())
+            .settingsSectionStyle()
         }
     }
 
     private func updateGeo() async {
         do {
             try await geoDatabase.updateManually()
+            refreshToken += 1
         } catch {
             // 具体错误由 GeoDatabaseManager 发布到设置页。
         }
@@ -1162,7 +1228,7 @@ struct InfoButton: View {
                 .frame(width: 44, height: 44)
                 .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(SettingsPressStyle())
         .accessibilityLabel(accessibilityLabel)
         .popover(isPresented: $showingInfo, attachmentAnchor: .rect(.bounds), arrowEdge: .top) {
             Text(message)
@@ -1215,7 +1281,10 @@ struct InfoToggleRow: View {
             Spacer(minLength: 8)
             Toggle("", isOn: $isOn)
                 .labelsHidden()
+                .tint(Color(uiColor: .systemGreen))
+                .accessibilityLabel(title)
         }
+        .frame(minHeight: 44)
     }
 }
 

@@ -4,8 +4,22 @@ import SwiftUI
 /// 采用静态径向色场，避免滚动时持续触发高成本模糊动画。
 struct AppAmbientBackground: View {
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.coraSettingsAppearance) private var settingsAppearance
 
     var body: some View {
+        Group {
+            if settingsAppearance {
+                Color(uiColor: .systemGroupedBackground)
+            } else {
+                ambientFields
+            }
+        }
+        .ignoresSafeArea()
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+
+    private var ambientFields: some View {
         GeometryReader { proxy in
             let extent = max(proxy.size.width, proxy.size.height)
             ZStack {
@@ -82,8 +96,14 @@ struct AppAmbientBackground: View {
 
 /// Form/List 行使用的统一半透明材质，避免透明滚动底色削弱内容层级。
 struct AppListRowBackground: View {
+    @Environment(\.coraSettingsAppearance) private var settingsAppearance
+
     var body: some View {
-        Rectangle().fill(.regularMaterial)
+        if settingsAppearance {
+            Color(uiColor: .secondarySystemGroupedBackground)
+        } else {
+            Rectangle().fill(.regularMaterial)
+        }
     }
 }
 
