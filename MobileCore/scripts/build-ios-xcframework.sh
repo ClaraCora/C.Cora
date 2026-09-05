@@ -35,6 +35,23 @@ esac
 mkdir -p "$(dirname "$OUTPUT")"
 rm -rf "$OUTPUT"
 
+# gomobile builds the device and simulator archives concurrently. Go may race
+# with a late cgo/toolchain writer while removing its default work directory,
+# which surfaces as "unlinkat ...: directory not empty" after a successful
+# compile. Keep all temporary build state in an isolated directory, ask Go to
+# leave its work trees alone, and remove them only after gomobile has exited.
+readonly TEMP_BASE="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
+mkdir -p "$TEMP_BASE"
+readonly BUILD_TEMP_ROOT="$(mktemp -d "$TEMP_BASE/cora-gomobile-${build_kind}.XXXXXX")"
+readonly GO_BUILD_TEMP="$BUILD_TEMP_ROOT/go"
+mkdir -p "$GO_BUILD_TEMP"
+cleanup_build_temp() {
+  rm -rf "$BUILD_TEMP_ROOT"
+}
+trap cleanup_build_temp EXIT
+export TMPDIR="$BUILD_TEMP_ROOT"
+export GOTMPDIR="$GO_BUILD_TEMP"
+
 cd "$MOBILE_ROOT"
 MIHOMO_VERSION="$(go list -m -f '{{.Version}}' github.com/metacubex/mihomo)"
 echo "Building $build_kind Mihomo.xcframework (iOS $IOS_VERSION) with mihomo $MIHOMO_VERSION"
@@ -43,6 +60,7 @@ gomobile bind \
   -iosversion="$IOS_VERSION" \
   -tags "with_gvisor,with_low_memory" \
   -ldflags="-X github.com/metacubex/mihomo/constant.Version=${MIHOMO_VERSION}" \
+  -work \
   -target=ios \
   -o "$OUTPUT" \
   .
