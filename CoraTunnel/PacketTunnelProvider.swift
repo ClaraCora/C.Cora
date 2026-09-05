@@ -30,6 +30,10 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private let ipcQueue = DispatchQueue(label: "com.cora.tunnel.ipc",
                                          qos: .userInitiated,
                                          attributes: .concurrent)
+    // Control-plane requests can carry provider payloads, delay-test results,
+    // or connection snapshots. A concurrent queue without admission control
+    // lets repeated App requests retain an unbounded backlog in the NE.
+    private let ipcWorkSlots = DispatchSemaphore(value: 2)
     private struct StoredIPCResponse {
         let data: Data
         let expiresAt: Date
@@ -145,7 +149,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
         // App 主动连接始终带 config：非空=订阅，空串=明确 DIRECT；系统重连无此 key，复用缓存。
         let hasConfigOption = options?["config"] != nil
-        let incomingConfig = options?["config"] as? String
+        var incomingConfig = options?["config"] as? String
         let settingsJSON = (options?["settings"] as? String) ?? ""
         let configSource = hasConfigOption
             ? ((incomingConfig?.isEmpty == false) ? "来自 options(\(incomingConfig!.count) 字节)" : "App 明确 DIRECT")
@@ -160,8 +164,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         MihomoSetup(home)
         startTrollStoreIPCIfNeeded()
 
-        let configYAML = resolveConfig(incoming: incomingConfig,
+        var configYAML = resolveConfig(incoming: incomingConfig,
                                        hasOption: hasConfigOption, home: home)
+        incomingConfig = nil
         var resolvedSettings = injectingSystemDNS(into:
             resolveCached(incoming: settingsJSON.isEmpty ? nil : settingsJSON,
                           home: home, file: "settings.json") ?? "")
@@ -258,6 +263,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 }
                 return ok
             }
+            // The Go parser has completed before the result is returned. Drop
+            // the Swift-side copies immediately so a large subscription is not
+            // retained alongside the live mihomo/gVisor runtime.
+            configYAML = ""
+            resolvedSettings = ""
             guard let startResult else {
                 self.runtimeQueue.sync {
                     self.memoryDiagnostics?.stop(event: "startCancelled")
@@ -740,16 +750,16 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         case "hello":
             reply(Data(MihomoControlInfo().utf8))
         case "queryProxies":
-            ipcQueue.async {
+            enqueueIPCWork(generation: sessionGeneration, reply: reply) {
                 reply(Data(MihomoQueryProxies().utf8))
             }
         case "remoteResourceStatus":
-            ipcQueue.async {
+            enqueueIPCWork(generation: sessionGeneration, reply: reply) {
                 reply(Data(MihomoRemoteResourceStatus().utf8))
             }
         case "updateProxyProviders":
             recordMemoryDiagnostic("providerUpdateStart")
-            ipcQueue.async {
+            enqueueIPCWork(generation: sessionGeneration, reply: reply) {
                 let response = MihomoUpdateProxyProviders()
                 self.recordMemoryDiagnostic("providerUpdateEnd")
                 reply(Data(response.utf8))
@@ -757,14 +767,14 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         case "updateProxyProvider":
             let name = (obj?["name"] as? String) ?? ""
             recordMemoryDiagnostic("providerUpdateStart")
-            ipcQueue.async {
+            enqueueIPCWork(generation: sessionGeneration, reply: reply) {
                 let response = MihomoUpdateProxyProvider(name)
                 self.recordMemoryDiagnostic("providerUpdateEnd")
                 reply(Data(response.utf8))
             }
         case "updateRuleProviders":
             recordMemoryDiagnostic("ruleProviderUpdateStart")
-            ipcQueue.async {
+            enqueueIPCWork(generation: sessionGeneration, reply: reply) {
                 let response = MihomoUpdateRuleProviders()
                 self.recordMemoryDiagnostic("ruleProviderUpdateEnd")
                 reply(Data(response.utf8))
@@ -772,7 +782,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         case "updateRuleProvider":
             let name = (obj?["name"] as? String) ?? ""
             recordMemoryDiagnostic("ruleProviderUpdateStart")
-            ipcQueue.async {
+            enqueueIPCWork(generation: sessionGeneration, reply: reply) {
                 let response = MihomoUpdateRuleProvider(name)
                 self.recordMemoryDiagnostic("ruleProviderUpdateEnd")
                 reply(Data(response.utf8))
@@ -791,7 +801,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             let directURL = (obj?["directURL"] as? String) ?? ""
             let timeout = (obj?["timeout"] as? NSNumber)?.intValue ?? 5000
             recordMemoryDiagnostic("groupDelayStart")
-            ipcQueue.async {
+            enqueueIPCWork(generation: sessionGeneration, reply: reply) {
                 let response = MihomoGroupDelay(group, url, directURL, timeout)
                 self.recordMemoryDiagnostic("groupDelayEnd")
                 reply(Self.validatedCoreJSONData(response, command: "groupDelay"))
@@ -803,7 +813,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             let directURL = (obj?["directURL"] as? String) ?? ""
             let timeout = (obj?["timeout"] as? NSNumber)?.intValue ?? 5000
             recordMemoryDiagnostic("proxyDelayStart")
-            ipcQueue.async {
+            enqueueIPCWork(generation: sessionGeneration, reply: reply) {
                 let response = MihomoProxyDelay(name, group, url, directURL, timeout)
                 self.recordMemoryDiagnostic("proxyDelayEnd")
                 reply(Self.validatedCoreJSONData(response, command: "proxyDelay"))
@@ -820,7 +830,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             let directURL = (obj?["directURL"] as? String) ?? ""
             let timeout = (obj?["timeout"] as? NSNumber)?.intValue ?? 5000
             recordMemoryDiagnostic("proxyDelaysStart")
-            ipcQueue.async {
+            enqueueIPCWork(generation: sessionGeneration, reply: reply) {
                 let response = MihomoProxyDelays(targetsJSON, url, directURL, timeout)
                 self.recordMemoryDiagnostic("proxyDelaysEnd")
                 reply(Self.validatedCoreJSONData(response, command: "proxyDelays"))
@@ -828,7 +838,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         case "readRuleProvider":
             let name = (obj?["name"] as? String) ?? ""
             let maxBytes = (obj?["maxBytes"] as? NSNumber)?.intValue ?? (1 * 1024 * 1024)
-            ipcQueue.async {
+            enqueueIPCWork(generation: sessionGeneration, reply: reply) {
                 reply(Data(MihomoRuleProviderContent(name, maxBytes).utf8))
             }
         case "scriptFetch":
@@ -838,22 +848,22 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 reply(Self.jsonData(["ok": false, "error": "脚本请求参数无效"]))
                 return
             }
-            ipcQueue.async {
+            enqueueIPCWork(generation: sessionGeneration, reply: reply) {
                 reply(Data(MihomoScriptFetch(requestJSON).utf8))
             }
         case "scriptTargetInfo":
             let name = (obj?["name"] as? String) ?? ""
             let group = (obj?["group"] as? String) ?? ""
-            ipcQueue.async {
+            enqueueIPCWork(generation: sessionGeneration, reply: reply) {
                 reply(Data(MihomoScriptTargetInfo(name, group).utf8))
             }
         case "directNetworkInfo":
-            ipcQueue.async {
+            enqueueIPCWork(generation: sessionGeneration, reply: reply) {
                 reply(Data(MihomoDirectNetworkInfo().utf8))
             }
         case "connections":
             let limit = (obj?["limit"] as? NSNumber)?.intValue ?? 200
-            ipcQueue.async {
+            enqueueIPCWork(generation: sessionGeneration, reply: reply) {
                 reply(Data(MihomoConnectionsSnapshot(limit).utf8))
             }
         case "closeConnection":
@@ -879,7 +889,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 ? ["ok": true, "enabled": result.enabled]
                 : ["ok": false, "error": result.error ?? "开发者诊断不可用"]))
         case "memoryDiagnostics":
-            ipcQueue.async {
+            enqueueIPCWork(generation: sessionGeneration, reply: reply) {
                 let enabled = self.runtimeQueue.sync { self.developerModeEnabled }
                 guard enabled else {
                     reply(Data("开发者模式未开启".utf8))
@@ -899,7 +909,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 ? ["ok": true]
                 : ["ok": false, "error": result.error ?? "清理诊断失败"]))
         case "proxyDetails":
-            reply(Data(MihomoProxyDetails().utf8))
+            enqueueIPCWork(generation: sessionGeneration, reply: reply) {
+                reply(Data(MihomoProxyDetails().utf8))
+            }
         case "configNotices":
             reply(Data(MihomoConfigNotices().utf8))
         case "getMode":
@@ -910,7 +922,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         case "runLogChunk":
             let offset = (obj?["offset"] as? NSNumber)?.intValue ?? -1
             let generation = (obj?["generation"] as? NSNumber)?.intValue ?? 0
-            ipcQueue.async {
+            enqueueIPCWork(generation: sessionGeneration, reply: reply) {
                 reply(Data(MihomoRunLogChunk(offset, generation).utf8))
             }
         case "readResponseChunk":
@@ -919,18 +931,50 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                                               generation: sessionGeneration))
         case "getLogs":
             // 日志可能很大，IPC 响应有体积上限 → 只回传末尾约 24KB，取最新内容。
-            let body = "[cmd=\(cmd)]\n" + collectLogs()
-            reply(Self.tailData(body, maxBytes: 24 * 1024))
+            enqueueIPCWork(generation: sessionGeneration, reply: reply) {
+                let body = "[cmd=\(cmd)]\n" + self.collectLogs()
+                reply(Self.tailData(body, maxBytes: 24 * 1024))
+            }
         case "exportNELog":
             // 只导出有界的 NE 专用日志；不包含完整 run.log，避免事故备份本身
             // 在 NE 内制造不必要的内存峰值。
-            reply(Data(FileLog.export().utf8))
+            enqueueIPCWork(generation: sessionGeneration, reply: reply) {
+                reply(Data(FileLog.export().utf8))
+            }
         default:
             reply(Self.jsonData([
                 "ok": false,
                 "error": "未知控制命令：\(cmd)",
             ]))
         }
+    }
+
+    /// Admit at most two control-plane operations at a time. The non-blocking
+    /// admission check keeps the Network Extension callback thread free and
+    /// prevents an abandoned caller from leaving a large queued backlog.
+    private func enqueueIPCWork(generation: UInt64,
+                                reply: @escaping (Data?) -> Void,
+                                operation: @escaping () -> Void) {
+        guard ipcWorkSlots.wait(timeout: .now()) == .success else {
+            reply(Self.jsonData(["ok": false, "error": "控制请求繁忙，请稍后重试"]))
+            return
+        }
+        ipcQueue.async { [self] in
+            defer { ipcWorkSlots.signal() }
+            guard isCurrentIPCSession(generation) else {
+                reply(Self.jsonData(["ok": false, "error": "控制请求已过期"]))
+                return
+            }
+            autoreleasepool {
+                operation()
+            }
+        }
+    }
+
+    private func isCurrentIPCSession(_ generation: UInt64) -> Bool {
+        ipcResponseLock.lock()
+        defer { ipcResponseLock.unlock() }
+        return ipcResponseCachingEnabled && generation == ipcSessionGeneration
     }
 
     /// NetworkExtension may turn an oversized provider reply into nil. Large

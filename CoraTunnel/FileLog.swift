@@ -14,6 +14,8 @@ enum FileLog {
     private static let queue = DispatchQueue(label: "com.cora.tunnel.filelog")
     private static let maxBufferedLines = 512
     private static let trimBufferedLinesAt = 640
+    private static let maxBufferedBytes: UInt64 = 128 * 1024
+    private static let maxLineBytes = 64 * 1024
     private static let maxFileBytes: UInt64 = 512 * 1024
     private static let currentFileName = "ne.log"
     private static let previousFileName = "ne.previous.log"
@@ -56,16 +58,23 @@ enum FileLog {
     /// 追加一行（带时间戳）。
     static func write(_ message: String) {
         queue.sync {
-            let line = "\(formatter.string(from: Date())) [NE] \(message)"
+            let boundedMessage = boundedText(message, maxBytes: maxLineBytes)
+            let line = "\(formatter.string(from: Date())) [NE] \(boundedMessage)"
             buffer.append(line)
             bufferedBytes += UInt64(line.utf8.count)
-            if buffer.count >= trimBufferedLinesAt {
-                let removeCount = buffer.count - maxBufferedLines
-                for removed in buffer.prefix(removeCount) {
+            if buffer.count >= trimBufferedLinesAt || bufferedBytes > maxBufferedBytes {
+                var removeCount = 0
+                while removeCount < buffer.count &&
+                        (buffer.count - removeCount > maxBufferedLines ||
+                         bufferedBytes > maxBufferedBytes) {
+                    let removed = buffer[removeCount]
                     bufferedBytes = bufferedBytes >= UInt64(removed.utf8.count)
                         ? bufferedBytes - UInt64(removed.utf8.count) : 0
+                    removeCount += 1
                 }
-                buffer.removeFirst(removeCount)
+                if removeCount > 0 {
+                    buffer.removeFirst(removeCount)
+                }
             }
 
             // best-effort：App Group 可用时也落一份有界文件，便于将来排查。
@@ -214,6 +223,12 @@ enum FileLog {
         } catch {
             return nil
         }
+    }
+
+    private static func boundedText(_ value: String, maxBytes: Int) -> String {
+        guard maxBytes > 0, value.utf8.count > maxBytes else { return value }
+        let prefix = String(decoding: value.utf8.prefix(maxBytes), as: UTF8.self)
+        return prefix + "... (truncated)"
     }
 
     /// 导出当前缓冲全部内容（供 handleAppMessage 回传主 App）。

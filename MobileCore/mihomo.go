@@ -533,8 +533,12 @@ func startLogCapture() {
 				if elm.LogLevel < log.Level() {
 					continue
 				}
+				// A provider/config error can contain the original payload. Bound it
+				// before fmt.Sprintf so one pathological event cannot allocate an
+				// unbounded temporary string in the Network Extension.
+				payload := boundedLogText(elm.Payload, maxRunLogLineBytes/2)
 				line := fmt.Sprintf("%s [%s] %s\n",
-					logTimestamp(), elm.Type(), elm.Payload)
+					logTimestamp(), elm.Type(), payload)
 				logFileMu.Lock()
 				writeRunLogLine(f, line)
 				logFileMu.Unlock()
@@ -543,6 +547,17 @@ func startLogCapture() {
 			}
 		}()
 	})
+}
+
+func boundedLogText(value string, maximum int) string {
+	if maximum <= 0 || len(value) <= maximum {
+		return value
+	}
+	end := maximum
+	for end > 0 && !utf8.RuneStart(value[end]) {
+		end--
+	}
+	return value[:end] + "... (truncated)"
 }
 
 // appSettings 是主 App 下发的设置（JSON）。零值即各项默认。
@@ -867,6 +882,10 @@ func applyRuntimeConfig(fd int, tunnelMTU int, configYAML string, st appSettings
 	rawCfg.Tun.Enable = true
 	rawCfg.Tun.FileDescriptor = fd
 	merged = nil
+	// The raw parser no longer needs the caller's YAML string. Release this
+	// reference before ParseRawConfig, whose low-memory path may briefly hold
+	// parsed proxy/rule structures while the runtime builds them.
+	configYAML = ""
 
 	// 主 App 可能已替换 GEO 文件；清掉上次连接遗留的 matcher/MMDB 缓存后再解析。
 	geodata.ClearGeoSiteCache()
@@ -884,7 +903,6 @@ func applyRuntimeConfig(fd int, tunnelMTU int, configYAML string, st appSettings
 	// a large subscription is not held alongside its parsed representation.
 	rawCfg = nil
 	merged = nil
-	configYAML = ""
 	runtime.GC()
 	dnsSystemTemplate := captureDNSSystemTemplate(cfg.DNS)
 	if resolvedDNS, replacements := materializeSystemDNSConfig(
@@ -1985,7 +2003,7 @@ func updateRuntimeProviders(names []string, update func(string) error) string {
 	// the parsed provider. Reclaim the old payload before returning to Swift;
 	// this runs only after an explicit refresh, never on the packet path.
 	if len(updated) > 0 {
-		runtime.GC()
+		debug.FreeOSMemory()
 	}
 	return result
 }
@@ -4118,8 +4136,8 @@ func Stop() {
 	executor.Shutdown()
 	tunnel.SetReservedSyntheticIPPrefixes(nil)
 	// 旧运行时必须在下一次 StartWithConfig 前尽量归还 Go 堆页，
-	// 避免完整 stop/start 重载在 NE 中形成短暂的内存峰值。
-	runtime.GC()
+	// 避免完整 stop/start 重载在 NE 中形成短暂的内存峰值。FreeOSMemory
+	// 已包含一次完整 GC，不再额外扫描一遍堆。
 	debug.FreeOSMemory()
 }
 
@@ -4147,6 +4165,10 @@ func appendRunLog(msg string) {
 	}
 	logFileMu.Lock()
 	defer logFileMu.Unlock()
+	// Keep wrapper-generated errors bounded too. Panic stacks and provider
+	// errors can otherwise be formatted into a multi-megabyte temporary string
+	// before writeRunLogLine gets a chance to rotate/truncate it.
+	msg = boundedLogText(msg, maxRunLogLineBytes/2)
 	line := fmt.Sprintf("%s [WRAP] %s\n", logTimestamp(), msg)
 	if runLogFile != nil {
 		writeRunLogLine(runLogFile, line)

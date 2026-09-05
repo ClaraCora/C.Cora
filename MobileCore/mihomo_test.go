@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/fakeip"
@@ -19,6 +20,22 @@ import (
 	mdns "github.com/metacubex/mihomo/dns"
 	"gopkg.in/yaml.v3"
 )
+
+func TestBoundedLogText(t *testing.T) {
+	if got := boundedLogText("short", 16); got != "short" {
+		t.Fatalf("short log changed: %q", got)
+	}
+	got := boundedLogText(strings.Repeat("界", 32), 17)
+	if !strings.HasSuffix(got, "... (truncated)") {
+		t.Fatalf("truncated log missing suffix: %q", got)
+	}
+	if len(got) > 17+len("... (truncated)") {
+		t.Fatalf("truncated log too large: %d bytes", len(got))
+	}
+	if !utf8.ValidString(got) {
+		t.Fatalf("truncated log is not valid UTF-8: %q", got)
+	}
+}
 
 func BenchmarkMergeConfigLarge(b *testing.B) {
 	input := largeBenchmarkConfig(1_000, 4_000)
