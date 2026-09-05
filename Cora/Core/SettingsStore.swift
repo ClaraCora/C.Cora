@@ -249,8 +249,11 @@ final class SettingsStore: ObservableObject {
         ipv6 = d.object(forKey: K.ipv6) as? Bool ?? false
         geoEnabled = d.object(forKey: K.geoEnabled) as? Bool ?? true
         let storedGeoLoader = d.string(forKey: K.geoLoader) ?? "memconservative"
-        geoLoader = Self.geoLoaderOptions.contains(storedGeoLoader) ? storedGeoLoader : "memconservative"
-        if storedGeoLoader != geoLoader { d.set(geoLoader, forKey: K.geoLoader) }
+        let normalizedGeoLoader = Self.geoLoaderOptions.contains(storedGeoLoader)
+            ? storedGeoLoader
+            : "memconservative"
+        geoLoader = normalizedGeoLoader
+        if storedGeoLoader != normalizedGeoLoader { d.set(normalizedGeoLoader, forKey: K.geoLoader) }
         geodataMode = d.object(forKey: K.geodataMode) as? Bool ?? true
         geoIPDatURL = d.string(forKey: K.geoIPDatURL) ?? Self.defaultGeoIPDatURL
         geoMMDBURL = d.string(forKey: K.geoMMDBURL) ?? Self.defaultGeoMMDBURL
@@ -268,8 +271,11 @@ final class SettingsStore: ObservableObject {
             ? 24
             : min(max(remoteInterval, 1), 168)
         let storedLogLevel = d.string(forKey: K.logLevel) ?? "info"
-        logLevel = Self.logLevelOptions.contains(storedLogLevel) ? storedLogLevel : "info"
-        if storedLogLevel != logLevel { d.set(logLevel, forKey: K.logLevel) }
+        let normalizedLogLevel = Self.logLevelOptions.contains(storedLogLevel)
+            ? storedLogLevel
+            : "info"
+        logLevel = normalizedLogLevel
+        if storedLogLevel != normalizedLogLevel { d.set(normalizedLogLevel, forKey: K.logLevel) }
         developerMode = d.object(forKey: K.developerMode) as? Bool ?? false
         delayTestURL = d.string(forKey: K.delayTestURL) ?? Self.defaultDelayTestURL
         directDelayTestURL = d.string(forKey: K.directDelayTestURL)
