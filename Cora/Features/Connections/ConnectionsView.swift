@@ -170,7 +170,7 @@ private struct ConnectionCountCard: View {
                 .lineLimit(1)
                 .minimumScaleFactor(0.70)
         }
-        .frame(maxWidth: .infinity, minHeight: 116, alignment: .leading)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(14)
         .coraGlassSurface(tint: tint)
         .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))

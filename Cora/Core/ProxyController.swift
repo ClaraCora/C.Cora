@@ -495,15 +495,13 @@ final class ProxyController: ObservableObject {
     }
 
     private var delayTestURL: String {
-        let configured = SettingsStore.shared.delayTestURL
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return configured.isEmpty ? SettingsStore.defaultDelayTestURL : configured
+        SettingsStore.effectiveHTTPURL(SettingsStore.shared.delayTestURL,
+                                       fallback: SettingsStore.defaultDelayTestURL)
     }
 
     private var directDelayTestURL: String {
-        let configured = SettingsStore.shared.directDelayTestURL
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return configured.isEmpty ? SettingsStore.defaultDirectDelayTestURL : configured
+        SettingsStore.effectiveHTTPURL(SettingsStore.shared.directDelayTestURL,
+                                       fallback: SettingsStore.defaultDirectDelayTestURL)
     }
 
     private var delayTestTimeoutMilliseconds: Int {

@@ -643,19 +643,25 @@ func parseSettings(settingsJSON string) appSettings {
 	if strings.TrimSpace(settingsJSON) != "" {
 		_ = json.Unmarshal([]byte(settingsJSON), &s)
 	}
-	if s.Stack == "" {
+	// iOS Packet Tunnel has only been validated with gVisor. Older app
+	// versions exposed experimental system/mixed values, so normalize any
+	// persisted or malformed value before it reaches the mihomo config.
+	if s.Stack != "gvisor" {
 		s.Stack = "gvisor"
 	}
-	if s.LogLevel == "" {
+	switch strings.ToLower(strings.TrimSpace(s.LogLevel)) {
+	case "silent", "error", "warning", "info", "debug":
+		s.LogLevel = strings.ToLower(strings.TrimSpace(s.LogLevel))
+	default:
 		s.LogLevel = "info"
 	}
 	if s.MixedPort < 0 || s.MixedPort > 65535 {
 		s.MixedPort = 0
 	}
-	if s.GeoLoader == "" {
+	if s.GeoLoader != "standard" && s.GeoLoader != "memconservative" {
 		s.GeoLoader = "memconservative"
 	}
-	if s.GeoUpdateInterval <= 0 {
+	if s.GeoUpdateInterval < 1 || s.GeoUpdateInterval > 168 {
 		s.GeoUpdateInterval = 24
 	}
 	s.RemoteResourceUpdatePolicy = normalizedRemoteResourceUpdatePolicy(s.RemoteResourceUpdatePolicy)

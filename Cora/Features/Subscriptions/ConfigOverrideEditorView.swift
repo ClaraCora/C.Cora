@@ -2,10 +2,52 @@ import SwiftUI
 
 struct ConfigOverrideSettingsView: View {
     @EnvironmentObject private var overrides: ConfigOverrideStore
+    @EnvironmentObject private var core: CoreStateManager
     @State private var showRestoreConfirmation = false
+    @State private var applyError: String?
 
     var body: some View {
         Form {
+            if overrides.pendingConnectionApply {
+                Section {
+                    Label("配置覆写将在下次连接时生效。", systemImage: "arrow.triangle.2.circlepath")
+                        .font(.subheadline)
+                    if core.isActive {
+                        Button {
+                            Task {
+                                let applied = await core.applyPendingSettings()
+                                if !applied { applyError = core.lastError ?? "VPN 重连失败，请稍后重试" }
+                            }
+                        } label: {
+                            HStack {
+                                Label("应用并重连", systemImage: "arrow.clockwise")
+                                Spacer()
+                                if core.isBusy { ProgressView().controlSize(.small) }
+                            }
+                        }
+                        .disabled(core.isBusy || !overrides.validationWarnings.isEmpty)
+                    }
+                } footer: {
+                    Text(core.isActive ? "应用过程中会先停止旧隧道，再启动当前配置。" : "设置已保存，下一次连接 VPN 时会自动应用。")
+                }
+                .listRowBackground(AppListRowBackground())
+            }
+
+            if !overrides.validationWarnings.isEmpty {
+                Section {
+                    Label("配置覆写存在待修正的输入。", systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.orange)
+                    ForEach(overrides.validationWarnings, id: \.self) { warning in
+                        Text(warning)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                } footer: {
+                    Text("修正后才能应用到下一次 VPN 连接。")
+                }
+                .listRowBackground(AppListRowBackground())
+            }
+
             Section {
                 NavigationLink {
                     DNSOverrideSettingsView()
@@ -39,6 +81,14 @@ struct ConfigOverrideSettingsView: View {
         .background(AppAmbientBackground())
         .navigationTitle("配置覆写")
         .navigationBarTitleDisplayMode(.inline)
+        .alert("设置应用失败", isPresented: Binding(
+            get: { applyError != nil },
+            set: { if !$0 { applyError = nil } }
+        )) {
+            Button("好") { applyError = nil }
+        } message: {
+            Text(applyError ?? "")
+        }
         .confirmationDialog("恢复所有默认配置？", isPresented: $showRestoreConfirmation) {
             Button("恢复默认配置", role: .destructive) {
                 overrides.restoreDefaults()
@@ -210,7 +260,7 @@ private struct TunOverrideSettingsView: View {
     var body: some View {
         Form {
             Section {
-                Toggle("使用隧道设置", isOn: $overrides.overwriteTun)
+                Toggle("覆写 TUN 设置", isOn: $overrides.overwriteTun)
             }
             .listRowBackground(AppListRowBackground())
             Section {

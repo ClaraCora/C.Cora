@@ -355,6 +355,11 @@ struct EditSubscriptionView: View {
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .keyboardType(.URL)
+                    if let message = SettingsStore.httpURLValidationMessage(url, allowEmpty: false) {
+                        Text(message)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                    }
                 }
                 .listRowBackground(AppListRowBackground())
                 if urlChanged {
@@ -379,7 +384,7 @@ struct EditSubscriptionView: View {
                         dismiss()
                         Task { await store.updateRemote(sub.id, name: n, url: u) }
                     }
-                    .disabled(!isDirty || url.trimmingCharacters(in: .whitespaces).isEmpty)
+                    .disabled(!isDirty || !SettingsStore.isValidHTTPURL(url, allowEmpty: false))
                 }
             }
         }

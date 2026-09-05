@@ -4,21 +4,52 @@ import UIKit
 /// 设置页：按功能类型组织现有设置，详细说明通过名称后的信息按钮按需查看。
 struct SettingsView: View {
     @EnvironmentObject private var core: CoreStateManager
+    @EnvironmentObject private var settings: SettingsStore
+    @EnvironmentObject private var configOverrides: ConfigOverrideStore
+    @State private var pendingApplyError: String?
+
     var body: some View {
         NavigationStack {
             ZStack {
                 AppAmbientBackground()
                 Form {
-                    Section {
+                    if settings.pendingConnectionApply || configOverrides.pendingConnectionApply {
+                        Section {
+                            Label("部分设置将在下次连接时生效。", systemImage: "arrow.triangle.2.circlepath")
+                                .font(.subheadline)
+                            if core.isActive {
+                                Button {
+                                    Task {
+                                        let applied = await core.applyPendingSettings()
+                                        if !applied {
+                                            pendingApplyError = core.lastError ?? "VPN 重连失败，请稍后重试"
+                                        }
+                                    }
+                                } label: {
+                                    HStack {
+                                        Label("应用并重连", systemImage: "arrow.clockwise")
+                                        Spacer()
+                                        if core.isBusy { ProgressView().controlSize(.small) }
+                                    }
+                                }
+                                .disabled(core.isBusy)
+                            } else {
+                                Text("设置已保存，下一次连接 VPN 时会自动应用。")
+                                    .font(.footnote)
+                                    .foregroundStyle(.secondary)
+                            }
+                        } footer: {
+                            Text("应用过程中会先完整停止旧的隧道，再启动新配置，以避免内存峰值叠加。")
+                        }
+                        .listRowBackground(AppListRowBackground())
+                    }
+
+                    Section("配置") {
                         SettingsNavigationRow(
                             title: "配置与订阅",
                             systemImage: "doc.text.magnifyingglass",
                             message: "管理远程订阅、本地配置和配置覆写。",
                             destination: SubscriptionsView())
-                    }
-                    .listRowBackground(AppListRowBackground())
-
-                    Section {
                         SettingsNavigationRow(
                             title: "远程资源",
                             systemImage: "externaldrive.connected.to.line.below",
@@ -27,7 +58,7 @@ struct SettingsView: View {
                     }
                     .listRowBackground(AppListRowBackground())
 
-                    Section {
+                    Section("运行") {
                         SettingsNavigationRow(
                             title: "内核运行",
                             systemImage: "gearshape.2",
@@ -56,16 +87,12 @@ struct SettingsView: View {
                     }
                     .listRowBackground(AppListRowBackground())
 
-                    Section {
+                    Section("维护") {
                         SettingsNavigationRow(
                             title: "检测脚本",
                             systemImage: "play.tv",
                             message: "管理节点解锁检测脚本。脚本在 Cora 外部仓库维护，更新前会校验签名和摘要。",
                             destination: UnlockScriptSettingsView())
-                    }
-                    .listRowBackground(AppListRowBackground())
-
-                    Section {
                         HStack(spacing: 12) {
                             SettingsSymbol(systemImage: "info.circle")
                             Text("App 版本").font(.body.weight(.medium))
@@ -85,6 +112,14 @@ struct SettingsView: View {
             }
             .navigationTitle("设置")
             .task { await core.refreshStatus() }
+            .alert("设置应用失败", isPresented: Binding(
+                get: { pendingApplyError != nil },
+                set: { if !$0 { pendingApplyError = nil } }
+            )) {
+                Button("好") { pendingApplyError = nil }
+            } message: {
+                Text(pendingApplyError ?? "")
+            }
         }
     }
 
@@ -610,11 +645,13 @@ private struct DelayTestSettingsView: View {
                     title: "代理测速地址",
                     message: "普通代理节点的策略组与单节点测速使用此 HTTP 或 HTTPS 地址。留空时使用默认地址；修改后立即用于下一次测速。",
                     placeholder: SettingsStore.defaultDelayTestURL,
+                    defaultValue: SettingsStore.defaultDelayTestURL,
                     text: $settings.delayTestURL)
                 DelayTestURLField(
                     title: "直连测速地址",
                     message: "DIRECT 或最终落到 DIRECT 的国内直连策略使用此地址。留空时使用默认地址；不会改变普通代理节点的测速地址。",
                     placeholder: SettingsStore.defaultDirectDelayTestURL,
+                    defaultValue: SettingsStore.defaultDirectDelayTestURL,
                     text: $settings.directDelayTestURL)
             }
             .listRowBackground(AppListRowBackground())
@@ -633,20 +670,40 @@ private struct DelayTestURLField: View {
     let title: String
     let message: String
     let placeholder: String
+    let defaultValue: String
     @Binding var text: String
 
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
             InfoLabel(title: title, message: message)
                 .font(.body.weight(.medium))
-            TextField(placeholder, text: $text, axis: .vertical)
-                .font(.footnote.monospaced())
-                .keyboardType(.URL)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                .lineLimit(1...3)
+            HStack(alignment: .top, spacing: 8) {
+                TextField(placeholder, text: $text, axis: .vertical)
+                    .font(.footnote.monospaced())
+                    .keyboardType(.URL)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .lineLimit(1...3)
+                Button {
+                    text = defaultValue
+                } label: {
+                    Image(systemName: "arrow.counterclockwise")
+                        .frame(width: 44, height: 44)
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel("恢复默认地址")
+            }
+            if let validationMessage {
+                Text(validationMessage)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
         }
         .padding(.vertical, 4)
+    }
+
+    private var validationMessage: String? {
+        SettingsStore.httpURLValidationMessage(text)
     }
 }
 
@@ -660,9 +717,19 @@ private struct KernelSettingsView: View {
         Form {
             Section {
                 Picker(selection: $settings.logLevel) {
-                    ForEach(SettingsStore.logLevelOptions, id: \.self) { Text($0).tag($0) }
+                    Text("静默").tag("silent")
+                    Text("仅错误").tag("error")
+                    Text("警告").tag("warning")
+                    Text("信息").tag("info")
+                    Text("调试").tag("debug")
                 } label: {
                     InfoLabel(title: "日志级别", message: "控制内核输出的日志详细程度。修改后重新连接 VPN 生效。")
+                }
+                HStack {
+                    InfoLabel(title: "TCP 栈", message: "iOS Network Extension 仅使用经过验证的 gVisor 栈。system 和 mixed 在本项目中可能导致连接后无网络，因此不提供切换。")
+                    Spacer()
+                    Text("gVisor")
+                        .foregroundStyle(.secondary)
                 }
                 InfoToggleRow(title: "IPv6", message: "允许隧道处理 IPv6 流量。部分网络或配置不支持 IPv6 时可以关闭。", systemImage: "network", isOn: $settings.ipv6)
                 HStack {
@@ -769,12 +836,22 @@ private struct GeoSettingsView: View {
 private struct TunnelRouteSettingsView: View {
     @EnvironmentObject private var settings: SettingsStore
     @EnvironmentObject private var core: CoreStateManager
+    @State private var isUpdatingAutoConnect = false
+    @State private var autoConnectError: String?
 
     var body: some View {
         Form {
             Section("流量接管") {
                 InfoToggleRow(title: "接管全部流量", message: "将系统默认排除的流量也纳入隧道。只有需要完整 VPN 覆盖时才建议开启。", systemImage: "network", isOn: $settings.includeAllNetworks)
                 InfoToggleRow(title: "强制路由", message: "即使未接管全部流量，也强制按规则路由隧道流量。", systemImage: "arrow.triangle.branch", isOn: $settings.enforceRoutes)
+            } footer: {
+                if settings.includeAllNetworks {
+                    Text("完整接管可能影响局域网、系统服务和电池消耗；系统服务排除项仍按下方设置处理。")
+                } else if settings.enforceRoutes {
+                    Text("强制路由只影响进入隧道的流量，不会把系统默认排除的流量纳入隧道。")
+                } else {
+                    Text("修改后需要重新连接 VPN 才会更新系统路由。")
+                }
             }
             .listRowBackground(AppListRowBackground())
 
@@ -797,11 +874,8 @@ private struct TunnelRouteSettingsView: View {
                     title: "自动连接 VPN",
                     message: "使用 iOS Connect On Demand，在重启或网络变化后自动连接。通过 Cora 控制中心按钮关闭时会暂停自动连接；苹果受监管设备的真正 Always-On VPN 仍需 MDM。",
                     systemImage: "bolt.shield",
-                    isOn: Binding(
-                        get: { settings.alwaysOnVPN },
-                        set: { value in
-                            Task { await core.setAlwaysOnVPN(value) }
-                        }))
+                    isOn: alwaysOnBinding)
+                    .disabled(isUpdatingAutoConnect)
             }
             .listRowBackground(AppListRowBackground())
         }
@@ -809,6 +883,30 @@ private struct TunnelRouteSettingsView: View {
         .background(AppAmbientBackground())
         .navigationTitle("隧道与隐私")
         .navigationBarTitleDisplayMode(.inline)
+        .alert("自动连接设置失败", isPresented: Binding(
+            get: { autoConnectError != nil },
+            set: { if !$0 { autoConnectError = nil } }
+        )) {
+            Button("好") { autoConnectError = nil }
+        } message: {
+            Text(autoConnectError ?? "")
+        }
+    }
+
+    private var alwaysOnBinding: Binding<Bool> {
+        Binding(
+            get: { settings.alwaysOnVPN },
+            set: { value in
+                guard !isUpdatingAutoConnect else { return }
+                isUpdatingAutoConnect = true
+                Task {
+                    let applied = await core.setAlwaysOnVPN(value)
+                    if !applied {
+                        autoConnectError = core.lastError ?? "请先连接一次 VPN，再启用自动连接"
+                    }
+                    isUpdatingAutoConnect = false
+                }
+            })
     }
 }
 
@@ -819,17 +917,20 @@ struct SettingsNavigationRow<Destination: View>: View {
     let destination: Destination
 
     var body: some View {
-        NavigationLink {
-            destination
-        } label: {
-            HStack(spacing: 12) {
-                SettingsSymbol(systemImage: systemImage)
-                Text(title)
-                    .font(.body.weight(.medium))
-                InfoButton(message: message, accessibilityLabel: "查看\(title)说明")
+        HStack(spacing: 8) {
+            NavigationLink {
+                destination
+            } label: {
+                HStack(spacing: 12) {
+                    SettingsSymbol(systemImage: systemImage)
+                    Text(title)
+                        .font(.body.weight(.medium))
+                    Spacer(minLength: 4)
+                }
             }
-            .padding(.vertical, 4)
+            InfoButton(message: message, accessibilityLabel: "查看\(title)说明")
         }
+        .padding(.vertical, 4)
     }
 }
 
@@ -887,14 +988,17 @@ private struct GeoSettingsContent: View {
         if settings.geoEnabled {
             Section("加载格式") {
                 Picker(selection: $settings.geoLoader) {
-                    ForEach(SettingsStore.geoLoaderOptions, id: \.self) { Text($0).tag($0) }
+                    Text("内存保守").tag("memconservative")
+                    Text("标准").tag("standard")
                 } label: {
                     InfoLabel(title: "加载方式", message: "控制规则数据被内核读取的方式。更改后在下一次连接时生效。")
                 }
-                InfoToggleRow(
-                    title: "GeoIP 数据格式",
-                    message: "开启时使用 GeoIP.dat；关闭时使用 MMDB。下载地址会随格式切换。",
-                    isOn: $settings.geodataMode)
+                Picker(selection: $settings.geodataMode) {
+                    Text("GeoIP.dat").tag(true)
+                    Text("MMDB").tag(false)
+                } label: {
+                    InfoLabel(title: "GeoIP 数据格式", message: "选择内核读取的 GeoIP 数据格式。切换后需要重新连接，下载地址也会随格式切换。")
+                }
                 InfoToggleRow(
                     title: "忽略 GEO 取反规则",
                     message: "忽略配置中以 GEO 规则取反的匹配条件。",
@@ -944,7 +1048,7 @@ private struct GeoSettingsContent: View {
             Section("更新策略") {
                 InfoToggleRow(
                     title: "自动更新",
-                    message: "按照设定间隔检查并下载规则数据。",
+                    message: "App 启动时和下一次连接 VPN 前按设定间隔检查并下载规则数据。App 被划掉且 VPN 持续运行时不会单独启动后台下载。",
                     isOn: $settings.geoAutoUpdate)
                 if settings.geoAutoUpdate {
                     Stepper(value: $settings.geoUpdateInterval, in: 1...168) {
@@ -962,11 +1066,11 @@ private struct GeoSettingsContent: View {
 
             Section("下载来源") {
                 if settings.geodataMode {
-                    GeoURLField(title: "GeoIP 下载地址", text: $settings.geoIPDatURL)
+                    GeoURLField(title: "GeoIP 下载地址", defaultValue: SettingsStore.defaultGeoIPDatURL, text: $settings.geoIPDatURL)
                 } else {
-                    GeoURLField(title: "MMDB 下载地址", text: $settings.geoMMDBURL)
+                    GeoURLField(title: "MMDB 下载地址", defaultValue: SettingsStore.defaultGeoMMDBURL, text: $settings.geoMMDBURL)
                 }
-                GeoURLField(title: "GeoSite 下载地址", text: $settings.geoSiteURL)
+                GeoURLField(title: "GeoSite 下载地址", defaultValue: SettingsStore.defaultGeoSiteURL, text: $settings.geoSiteURL)
             }
             .listRowBackground(AppListRowBackground())
         }
@@ -983,27 +1087,46 @@ private struct GeoSettingsContent: View {
 
 private struct GeoURLField: View {
     let title: String
+    let defaultValue: String
     @Binding var text: String
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(title)
                 .font(.body.weight(.medium))
-            TextField(title, text: $text, axis: .vertical)
-                .font(.footnote.monospaced())
-                .keyboardType(.URL)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                .lineLimit(1...3)
+            HStack(alignment: .top, spacing: 8) {
+                TextField(title, text: $text, axis: .vertical)
+                    .font(.footnote.monospaced())
+                    .keyboardType(.URL)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .lineLimit(1...3)
+                Button {
+                    text = defaultValue
+                } label: {
+                    Image(systemName: "arrow.counterclockwise")
+                        .frame(width: 44, height: 44)
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel("恢复默认地址")
+            }
+            if let validationMessage {
+                Text(validationMessage)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
         }
         .padding(.vertical, 2)
+    }
+
+    private var validationMessage: String? {
+        SettingsStore.httpURLValidationMessage(text)
     }
 }
 
 struct InfoLabel: View {
     let title: String
     let message: String
-    @State private var showingInfo = false
 
     var body: some View {
         HStack(spacing: 6) {
@@ -1025,7 +1148,7 @@ struct InfoButton: View {
             Image(systemName: "info.circle")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
-                .frame(width: 28, height: 28)
+                .frame(width: 44, height: 44)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)

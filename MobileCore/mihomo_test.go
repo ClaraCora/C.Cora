@@ -1512,6 +1512,27 @@ func TestParseSettingsNormalizesMixedPort(t *testing.T) {
 	}
 }
 
+func TestParseSettingsKeepsIOSRuntimeValuesSafe(t *testing.T) {
+	settings := parseSettings(`{
+  "stack": "system",
+  "logLevel": "not-a-level",
+  "geoLoader": "not-a-loader",
+  "geoUpdateInterval": 999
+}`)
+	if settings.Stack != "gvisor" {
+		t.Fatalf("stack = %q, want gvisor", settings.Stack)
+	}
+	if settings.LogLevel != "info" {
+		t.Fatalf("log level = %q, want info", settings.LogLevel)
+	}
+	if settings.GeoLoader != "memconservative" {
+		t.Fatalf("geo loader = %q, want memconservative", settings.GeoLoader)
+	}
+	if settings.GeoUpdateInterval != 24 {
+		t.Fatalf("geo update interval = %d, want 24", settings.GeoUpdateInterval)
+	}
+}
+
 func TestParseSettingsIncludesOfflineProxySelections(t *testing.T) {
 	settings := parseSettings(`{"proxySelections":{"Proxy":"HK One"}}`)
 	if got := settings.ProxySelections["Proxy"]; got != "HK One" {

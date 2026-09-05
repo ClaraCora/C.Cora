@@ -181,6 +181,8 @@ final class CoreStateManager: ObservableObject {
             excludeDeviceCommunication: s.excludeDeviceCommunication,
             enforceRoutes: s.enforceRoutes)
         try await tunnel.start(configYAML: yaml, settingsJSON: settings, protocolOptions: opts)
+        SettingsStore.shared.markConnectionSettingsApplied()
+        ConfigOverrideStore.shared.markConnectionSettingsApplied()
     }
 
     /// 在运行中的 VPN 上应用刚刚成功下载的当前订阅。
@@ -226,6 +228,24 @@ final class CoreStateManager: ObservableObject {
                 && allSucceeded
         }
         return allSucceeded
+    }
+
+    /// 应用设置页中等待连接的变更。沿用订阅重载的停止确认流程，避免新旧
+    /// mihomo 运行时重叠；失败时保留待应用标记，便于用户修正后重试。
+    @discardableResult
+    func applyPendingSettings() async -> Bool {
+        guard !isBusy,
+              status == .connected || status == .reasserting else { return false }
+
+        isReloadingConfiguration = true
+        isBusy = true
+        defer {
+            isReloadingConfiguration = false
+            isBusy = false
+        }
+
+        let currentYAML = SubscriptionStore.shared.activeYAML
+        return await performConfigurationReload(previousYAML: currentYAML)
     }
 
     private func performConfigurationReload(previousYAML: String?) async -> Bool {
@@ -313,7 +333,9 @@ final class CoreStateManager: ObservableObject {
     }
 
     /// 设置页切换自动连接时调用。关闭只撤销自动连接，不强制断开当前 VPN。
-    func setAlwaysOnVPN(_ enabled: Bool) async {
+    @discardableResult
+    func setAlwaysOnVPN(_ enabled: Bool) async -> Bool {
+        let previous = SettingsStore.shared.alwaysOnVPN
         do {
             if enabled {
                 AppGroupState.vpnAutoConnectSuspended = false
@@ -323,11 +345,11 @@ final class CoreStateManager: ObservableObject {
                 try await tunnel.setOnDemandEnabled(false)
             }
             SettingsStore.shared.alwaysOnVPN = enabled
+            return true
         } catch {
             lastError = error.localizedDescription
-            if enabled {
-                SettingsStore.shared.alwaysOnVPN = false
-            }
+            SettingsStore.shared.alwaysOnVPN = previous
+            return false
         }
     }
 

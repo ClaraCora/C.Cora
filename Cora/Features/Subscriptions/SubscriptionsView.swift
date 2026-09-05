@@ -314,6 +314,11 @@ private struct AddSubscriptionView: View {
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .keyboardType(.URL)
+                    if let message = SettingsStore.httpURLValidationMessage(url, allowEmpty: false) {
+                        Text(message)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                    }
                 }
                 .listRowBackground(AppListRowBackground())
                 Text("订阅内容需为 Clash/mihomo YAML。")
@@ -335,7 +340,7 @@ private struct AddSubscriptionView: View {
                         dismiss()
                         Task { await store.add(name: n, url: u) }
                     }
-                    .disabled(url.trimmingCharacters(in: .whitespaces).isEmpty)
+                    .disabled(!SettingsStore.isValidHTTPURL(url, allowEmpty: false))
                 }
             }
         }

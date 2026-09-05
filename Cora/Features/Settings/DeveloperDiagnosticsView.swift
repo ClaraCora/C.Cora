@@ -10,11 +10,15 @@ struct DeveloperDiagnosticsView: View {
     @State private var isLoading = false
     @State private var statusMessage: String?
     @State private var copied = false
+    @State private var isUpdatingMode = false
+    @State private var showClearConfirmation = false
 
     private var developerModeBinding: Binding<Bool> {
         Binding(
             get: { settings.developerMode },
             set: { enabled in
+                guard !isUpdatingMode else { return }
+                let previous = settings.developerMode
                 settings.developerMode = enabled
                 if !enabled {
                     rawDiagnostics = ""
@@ -22,11 +26,14 @@ struct DeveloperDiagnosticsView: View {
                     statusMessage = nil
                 }
                 guard core.isActive else { return }
+                isUpdatingMode = true
                 Task {
                     let ok = await core.setMemoryDiagnostics(enabled)
                     if !ok {
+                        settings.developerMode = previous
                         statusMessage = "当前隧道未接受开发者诊断切换，请重新连接 VPN。"
                     }
+                    isUpdatingMode = false
                 }
             })
     }
@@ -48,6 +55,7 @@ struct DeveloperDiagnosticsView: View {
                     }
                 }
                 .tint(.accentColor)
+                .disabled(isUpdatingMode)
             } footer: {
                 Text("开启后每 5 秒记录一次物理内存、VM、Go 堆、连接和 goroutine 快照，并保留当前/上一会话的数字摘要。关闭后不会持续采样；诊断数据可能包含连接数量等运行态信息。")
             }
@@ -85,11 +93,11 @@ struct DeveloperDiagnosticsView: View {
                     .disabled(rawDiagnostics.isEmpty || isLoading)
 
                     Button(role: .destructive) {
-                        Task { await clearDiagnostics() }
+                        showClearConfirmation = true
                     } label: {
                         Label("清理诊断文件", systemImage: "trash")
                     }
-                    .disabled(isLoading || !core.isActive)
+                    .disabled(isLoading)
                 }
                 .listRowBackground(AppListRowBackground())
 
@@ -119,6 +127,13 @@ struct DeveloperDiagnosticsView: View {
         .listRowSeparatorTint(Color.primary.opacity(0.08))
         .navigationTitle("开发者模式")
         .navigationBarTitleDisplayMode(.inline)
+        .confirmationDialog("清理已保存的诊断文件？", isPresented: $showClearConfirmation) {
+            Button("清理诊断文件", role: .destructive) {
+                Task { await clearDiagnostics() }
+            }
+        } message: {
+            Text("VPN 未运行时也可以清理 App Group 中已经落盘的诊断数据。")
+        }
         .task {
             guard settings.developerMode else { return }
             await loadDiagnostics()

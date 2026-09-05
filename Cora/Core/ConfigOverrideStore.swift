@@ -17,6 +17,9 @@ struct HostOverride: Identifiable, Codable, Equatable, Sendable {
 final class ConfigOverrideStore: ObservableObject {
     static let shared = ConfigOverrideStore()
 
+    /// 覆写参数通过下一次 mihomo 启动应用，设置页据此显示待应用状态。
+    @Published private(set) var pendingConnectionApply = false
+
     @Published var overwriteDNS: Bool { didSet { save(overwriteDNS, Key.overwriteDNS) } }
     @Published var dnsListen: String { didSet { save(dnsListen, Key.dnsListen) } }
     @Published var dnsPreferH3: Bool { didSet { save(dnsPreferH3, Key.dnsPreferH3) } }
@@ -76,6 +79,34 @@ final class ConfigOverrideStore: ObservableObject {
         "*.n.n.srv.nintendo.net",
         "+.xboxlive.com",
     ]
+
+    var validationWarnings: [String] {
+        var warnings: [String] = []
+        if overwriteDNS {
+            if !Self.isValidListenAddress(dnsListen) {
+                warnings.append("DNS 监听地址无效，应为 host:port，例如 0.0.0.0:1053")
+            }
+            for (title, values) in [
+                ("默认域名解析服务器", defaultNameservers),
+                ("域名解析服务器", nameservers),
+                ("代理域名解析服务器", proxyNameservers),
+                ("直连域名解析服务器", directNameservers),
+                ("Fallback 域名解析服务器", fallbackNameservers)
+            ] where values.contains(where: { !Self.isValidResolver($0) }) {
+                warnings.append("\(title)中存在无法识别的地址")
+            }
+            if dnsUseHosts && hosts.contains(where: {
+                $0.domain.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+                !Self.isValidIP($0.address)
+            }) {
+                warnings.append("Hosts 中存在空域名或无效 IP 地址")
+            }
+        }
+        if overwriteTun && tunDNSHijack.contains(where: { !Self.isValidHijackRule($0) }) {
+            warnings.append("DNS 接管规则中存在无效的端口")
+        }
+        return warnings
+    }
 
     private let defaults = UserDefaults.standard
 
@@ -238,6 +269,10 @@ final class ConfigOverrideStore: ObservableObject {
         tunICMPForwarding = true
     }
 
+    func markConnectionSettingsApplied() {
+        pendingConnectionApply = false
+    }
+
     private func cleaned(_ values: [String]) -> [String] {
         values.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
@@ -245,14 +280,53 @@ final class ConfigOverrideStore: ObservableObject {
 
     private func save(_ value: Any, _ key: String) {
         defaults.set(value, forKey: key)
+        pendingConnectionApply = true
     }
 
     private func saveHosts() {
         guard let data = try? JSONEncoder().encode(hosts) else { return }
         defaults.set(data, forKey: Key.hosts)
+        pendingConnectionApply = true
     }
 
     private static func bool(_ defaults: UserDefaults, _ key: String, default value: Bool) -> Bool {
         defaults.object(forKey: key) as? Bool ?? value
+    }
+
+    private static func isValidListenAddress(_ value: String) -> Bool {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let separator = trimmed.lastIndex(of: ":") else { return false }
+        let host = String(trimmed[..<separator]).trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        let port = Int(trimmed[trimmed.index(after: separator)...]) ?? 0
+        return !host.isEmpty && port > 0 && port <= 65_535 && !host.contains(" ")
+    }
+
+    private static func isValidResolver(_ value: String) -> Bool {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        if trimmed == "system" || isValidIP(trimmed) { return true }
+        if SettingsStore.isValidHTTPURL(trimmed, allowEmpty: false) { return true }
+        return !trimmed.contains(where: { $0.isWhitespace }) && !trimmed.contains(",")
+    }
+
+    private static func isValidIP(_ value: String) -> Bool {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let ipv4Parts = trimmed.split(separator: ".", omittingEmptySubsequences: false)
+        if ipv4Parts.count == 4,
+           ipv4Parts.allSatisfy({ part in
+               guard let number = Int(part) else { return false }
+               return (0...255).contains(number)
+           }) {
+            return true
+        }
+        guard trimmed.contains(":"), !trimmed.contains(where: { $0.isWhitespace }) else { return false }
+        return trimmed.allSatisfy { $0.isNumber || "abcdefABCDEF:".contains($0) }
+    }
+
+    private static func isValidHijackRule(_ value: String) -> Bool {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let separator = trimmed.lastIndex(of: ":") else { return false }
+        let port = Int(trimmed[trimmed.index(after: separator)...]) ?? 0
+        return !trimmed[..<separator].isEmpty && port > 0 && port <= 65_535
     }
 }

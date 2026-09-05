@@ -595,6 +595,20 @@ final class TunnelManager {
 
     /// 清理 NE 侧诊断文件；普通模式下不会创建这些文件。
     func clearMemoryDiagnostics() async -> Result<Void, Error> {
+        // 诊断文件位于 App Group。VPN 已停止或 NE 被 Jetsam 回收时没有可用
+        // 的 IPC server，此时由主 App 直接清理；运行中的 NE 仍通过命令暂停
+        // 采样器后再删除，避免与采样写入并发。
+        if let mgr = try? await loadSavedManager(),
+           let connection = mgr?.connection,
+           connection.status == .connected ||
+           connection.status == .connecting ||
+           connection.status == .reasserting {
+            return await clearMemoryDiagnosticsThroughIPC()
+        }
+        return Self.clearPersistedMemoryDiagnostics()
+    }
+
+    private func clearMemoryDiagnosticsThroughIPC() async -> Result<Void, Error> {
         let payload = (try? JSONSerialization.data(withJSONObject: [
             "v": 1, "cmd": "clearMemoryDiagnostics"
         ])) ?? Data(#"{"cmd":"clearMemoryDiagnostics"}"#.utf8)
@@ -612,5 +626,18 @@ final class TunnelManager {
             return .failure(NSError(domain: "Cora.MemoryDiagnostics", code: 2,
                                     userInfo: [NSLocalizedDescriptionKey: reason]))
         }
+    }
+
+    private static func clearPersistedMemoryDiagnostics() -> Result<Void, Error> {
+        guard let directory = AppGroup.containerURL else {
+            return .failure(NSError(domain: "Cora.MemoryDiagnostics", code: 3,
+                                    userInfo: [NSLocalizedDescriptionKey: "共享目录不可用"]))
+        }
+        let manager = FileManager.default
+        for name in ["memory-diagnostic.ndjson", "memory-diagnostic.previous.ndjson",
+                     "memory-diagnostic.summary.json", "memory-diagnostic.summary.previous.json"] {
+            try? manager.removeItem(at: directory.appendingPathComponent(name))
+        }
+        return .success(())
     }
 }
