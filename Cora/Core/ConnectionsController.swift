@@ -313,6 +313,7 @@ final class ConnectionsController: ObservableObject {
     private static let maximumRememberedConnectionIDs = 20_000
     private static let maximumStrategyStatistics = 256
     private static let maximumHostStatistics = 4_096
+    private static let maximumCachedHistorySummaries = 8
     private static let persistenceKey = "connectionSession.v1"
     private static let persistenceInterval: TimeInterval = 5
     private static let pollIntervalNanoseconds: UInt64 = 3_000_000_000
@@ -341,9 +342,11 @@ final class ConnectionsController: ObservableObject {
     private var historyOffset = 0
     private var lastHistoryRefreshDate = Date.distantPast
     private var lastHistoryCountRefreshDate = Date.distantPast
+    private var lastHistoryDataVersion: Int64 = -1
     private var nodeRankingCache: CachedNodeRanking?
     private var nodeRankingTask: Task<ConnectionTrafficRankingSnapshot, Never>?
     private var nodeRankingRequestID: UInt64 = 0
+    private var historySummaryCache: [ConnectionHistoryQuery: CachedHistorySummary] = [:]
     // The overview only needs totals. A full connection array is requested
     // while the record screen is visible, avoiding a large JSON allocation in
     // the App every second when the user is on another tab.
@@ -383,6 +386,21 @@ final class ConnectionsController: ObservableObject {
         let value: ConnectionTrafficRankingSnapshot
     }
 
+    private struct CachedHistorySummary {
+        let key: HistorySummaryCacheKey
+        let value: ConnectionHistorySummary
+    }
+
+    private struct HistorySummaryCacheKey: Equatable {
+        let query: ConnectionHistoryQuery
+        let counts: ConnectionHistoryCountSummary
+    }
+
+    private struct HistoryStoreRead: Sendable {
+        let persisted: [ConnectionHistoryRecord]
+        let counts: ConnectionHistoryCountSummary
+    }
+
     /// A compact snapshot of the current VPN session. It stays in the App's own
     /// storage, never in the Network Extension, so restoring the record screen
     /// cannot increase the extension's memory footprint.
@@ -402,7 +420,9 @@ final class ConnectionsController: ObservableObject {
         // The root view starts with a totals-only IPC poll. Load only the
         // counts needed by the overview here; the record page fetches its
         // first detail page when it becomes visible.
-        reloadHistoryCountsFromStore(force: true)
+        Task { [weak self] in
+            await self?.reloadHistoryCountsFromStore(force: true)
+        }
     }
 
     /// 由页面 `.task` 持有生命周期；离开页面后 SwiftUI 会取消轮询。
@@ -451,11 +471,13 @@ final class ConnectionsController: ObservableObject {
         nodeRankingTask?.cancel()
         nodeRankingTask = nil
         nodeRankingCache = nil
+        historySummaryCache.removeAll(keepingCapacity: true)
         snapshot = nil
         historyStore?.clearAll()
         history = []
         historySummary = .empty
         historyOffset = 0
+        lastHistoryDataVersion = -1
         hasMoreHistory = false
         lastHistoryRefreshDate = .distantPast
         lastHistoryCountRefreshDate = .distantPast
@@ -520,12 +542,12 @@ final class ConnectionsController: ObservableObject {
                     reconcileSessionTotals(uploadTotal: latest.uploadTotal,
                                            downloadTotal: latest.downloadTotal)
                     persistSession()
-                    reloadHistoryFromStore(activeConnections: latest.connections,
-                                           force: showLoading)
+                    await reloadHistoryFromStore(activeConnections: latest.connections,
+                                                 force: showLoading)
                 } else {
                     // The overview only needs counts and totals. Avoid loading
                     // a page and running strategy/host GROUP BY on every poll.
-                    reloadHistoryCountsFromStore(force: false)
+                    await reloadHistoryCountsFromStore(force: false)
                 }
                 error = nil
             } catch {
@@ -559,7 +581,7 @@ final class ConnectionsController: ObservableObject {
                     total: max(0, current.total - 1))
                 mergeSessionStatistics(with: snapshot?.connections ?? [])
                 persistSession(force: true)
-                reloadHistoryFromStore(activeConnections: snapshot?.connections ?? [])
+                await reloadHistoryFromStore(activeConnections: snapshot?.connections ?? [])
             }
             error = nil
         case .some(let reason):
@@ -585,7 +607,7 @@ final class ConnectionsController: ObservableObject {
                     total: 0)
                 mergeSessionStatistics(with: [])
                 persistSession(force: true)
-                reloadHistoryFromStore(activeConnections: [])
+                await reloadHistoryFromStore(activeConnections: [])
             }
             error = nil
         case .some(let reason):
@@ -609,7 +631,7 @@ final class ConnectionsController: ObservableObject {
     }
 
     func reloadHistoryFromStore(activeConnections: [ActiveConnection]? = nil,
-                                force: Bool = true) {
+                                force: Bool = true) async {
         guard let historyStore else {
             if let activeConnections { history = activeEntries(activeConnections) }
             return
@@ -625,18 +647,28 @@ final class ConnectionsController: ObservableObject {
         }
         lastHistoryRefreshDate = now
         historyOffset = 0
-        let persisted = historyStore.fetchPage(offset: 0)
-        history = mergedHistory(activeConnections: active, persisted: persisted)
-        historyOffset = persisted.count
-        hasMoreHistory = persisted.count == ConnectionHistoryStore.defaultFetchPageSize
-        historySummary = historyStore.summary()
+        let currentGeneration = generation
+        let read = await Task.detached(priority: .utility) {
+            HistoryStoreRead(persisted: historyStore.fetchPage(offset: 0),
+                             counts: historyStore.countSummary())
+        }.value
+        guard !Task.isCancelled, generation == currentGeneration else { return }
+        lastHistoryDataVersion = read.counts.dataVersion
+
+        history = mergedHistory(activeConnections: active, persisted: read.persisted)
+        historyOffset = read.persisted.count
+        hasMoreHistory = read.persisted.count == ConnectionHistoryStore.defaultFetchPageSize
+
+        let summary = await loadHistorySummary(for: .all, counts: read.counts, store: historyStore)
+        guard !Task.isCancelled, generation == currentGeneration else { return }
+        historySummary = summary
     }
 
     /// Refreshes only the values shown by the overview connection cards.
     /// Keeping this path separate from `reloadHistoryFromStore` avoids
     /// materializing connection details and aggregate dictionaries during the
     /// normal three-second totals poll.
-    private func reloadHistoryCountsFromStore(force: Bool = false) {
+    private func reloadHistoryCountsFromStore(force: Bool = false) async {
         guard let historyStore else {
             let activeCount = snapshot?.total ?? snapshot?.connections.count ?? 0
             let recordCount = max(history.count, activeCount)
@@ -658,14 +690,21 @@ final class ConnectionsController: ObservableObject {
             return
         }
         lastHistoryCountRefreshDate = now
-        let counts = historyStore.countSummary()
+        let currentGeneration = generation
+        let counts = await Task.detached(priority: .utility) {
+            historyStore.countSummary()
+        }.value
+        guard !Task.isCancelled, generation == currentGeneration else { return }
         let current = historySummary
+        let dataChanged = lastHistoryDataVersion != counts.dataVersion
+        lastHistoryDataVersion = counts.dataVersion
         guard current.recordCount != counts.recordCount ||
                 current.activeCount != counts.activeCount ||
                 current.uploadTotal != counts.uploadTotal ||
-                current.downloadTotal != counts.downloadTotal else {
+                current.downloadTotal != counts.downloadTotal || dataChanged else {
             return
         }
+        historySummaryCache.removeAll(keepingCapacity: true)
         historySummary = ConnectionHistorySummary(
             recordCount: counts.recordCount,
             activeCount: counts.activeCount,
@@ -694,8 +733,34 @@ final class ConnectionsController: ObservableObject {
         return Array(filtered.dropFirst(max(0, offset)).prefix(max(1, limit)))
     }
 
-    func historySummary(for query: ConnectionHistoryQuery) -> ConnectionHistorySummary {
-        historyStore?.summary(for: query) ?? .empty
+    func loadHistorySummary(for query: ConnectionHistoryQuery) async -> ConnectionHistorySummary {
+        guard let historyStore else { return .empty }
+        let counts = await Task.detached(priority: .utility) {
+            historyStore.countSummary()
+        }.value
+        return await loadHistorySummary(for: query, counts: counts, store: historyStore)
+    }
+
+    private func loadHistorySummary(for query: ConnectionHistoryQuery,
+                                    counts: ConnectionHistoryCountSummary,
+                                    store: ConnectionHistoryStore) async
+        -> ConnectionHistorySummary {
+        let key = HistorySummaryCacheKey(query: query, counts: counts)
+        if let cached = historySummaryCache[query], cached.key == key {
+            return cached.value
+        }
+
+        let value = await Task.detached(priority: .utility) {
+            store.summary(for: query)
+        }.value
+        guard !Task.isCancelled else { return value }
+        historySummaryCache[query] = CachedHistorySummary(key: key, value: value)
+        if historySummaryCache.count > Self.maximumCachedHistorySummaries,
+           let evictedQuery = historySummaryCache.keys.first,
+           evictedQuery != query {
+            historySummaryCache.removeValue(forKey: evictedQuery)
+        }
+        return value
     }
 
     /// Loads all node metrics in one App-side SQLite scan. The task is lazy,
@@ -855,6 +920,7 @@ final class ConnectionsController: ObservableObject {
         nodeRankingTask?.cancel()
         nodeRankingTask = nil
         nodeRankingCache = nil
+        historySummaryCache.removeAll(keepingCapacity: true)
         sessionSummary = ConnectionSessionSummary()
         activeSamples = [:]
         rememberedConnectionIDs.removeAll(keepingCapacity: true)

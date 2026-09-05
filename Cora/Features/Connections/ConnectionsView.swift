@@ -393,9 +393,9 @@ private struct HostTrafficDetailView: View {
         .navigationTitle("主机名")
         .navigationBarTitleDisplayMode(.inline)
         .task {
-            strategyTotals = trafficTotals(
-                from: controller.historySummary(for: historyQuery).strategyVolumes,
-                role: .strategy)
+            let summary = await controller.loadHistorySummary(for: historyQuery)
+            guard !Task.isCancelled else { return }
+            strategyTotals = trafficTotals(from: summary.strategyVolumes, role: .strategy)
             loadMoreHistory(reset: true)
         }
     }

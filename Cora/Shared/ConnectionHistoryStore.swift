@@ -314,6 +314,9 @@ struct ConnectionHistoryCountSummary: Sendable, Equatable {
     let activeCount: Int
     let uploadTotal: Int64
     let downloadTotal: Int64
+    /// SQLite increments this value when the other shared handle commits.
+    /// It lets App-side aggregate caches notice distribution-only changes.
+    let dataVersion: Int64
 }
 
 /// Shared, bounded connection history. Both the App and Network Extension use
@@ -621,7 +624,10 @@ final class ConnectionHistoryStore: @unchecked Sendable {
 
     func summary(for query: ConnectionHistoryQuery = .all) -> ConnectionHistorySummary {
         queue.sync {
-            guard database != nil else { return .empty }
+            // Aggregation is an App-only UI query. The Network Extension keeps
+            // this path disabled so a future caller cannot accidentally create
+            // GROUP BY temp data in the packet-tunnel process.
+            guard allowsAppOnlyQueries, database != nil else { return .empty }
             let predicate = query.sqlPredicate
             let totalsSQL = "SELECT COUNT(*), COALESCE(SUM(is_active), 0), "
                 + "COALESCE(SUM(upload), 0), COALESCE(SUM(download), 0) "
@@ -647,21 +653,24 @@ final class ConnectionHistoryStore: @unchecked Sendable {
                 return ConnectionHistoryCountSummary(recordCount: 0,
                                                       activeCount: 0,
                                                       uploadTotal: 0,
-                                                      downloadTotal: 0)
+                                                      downloadTotal: 0,
+                                                      dataVersion: 0)
             }
             let sql = "SELECT COUNT(*), COALESCE(SUM(is_active), 0), "
                 + "COALESCE(SUM(upload), 0), COALESCE(SUM(download), 0) "
                 + "FROM connection_history"
-            guard let row = row(for: sql) else {
+            guard let totalsRow = row(for: sql) else {
                 return ConnectionHistoryCountSummary(recordCount: 0,
                                                       activeCount: 0,
                                                       uploadTotal: 0,
-                                                      downloadTotal: 0)
+                                                      downloadTotal: 0,
+                                                      dataVersion: 0)
             }
-            return ConnectionHistoryCountSummary(recordCount: Int(row.int(0)),
-                                                  activeCount: Int(row.int(1)),
-                                                  uploadTotal: row.int(2),
-                                                  downloadTotal: row.int(3))
+            return ConnectionHistoryCountSummary(recordCount: Int(totalsRow.int(0)),
+                                                  activeCount: Int(totalsRow.int(1)),
+                                                  uploadTotal: totalsRow.int(2),
+                                                  downloadTotal: totalsRow.int(3),
+                                                  dataVersion: row(for: "PRAGMA data_version")?.int(0) ?? 0)
         }
     }
 
