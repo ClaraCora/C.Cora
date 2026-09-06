@@ -49,7 +49,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     // A chunked response is only a short-lived hand-off to the App. Keep the
     // aggregate budget bounded when a caller disappears before fetching it.
     private static let ipcMaximumStoredResponseBytes = 8 * 1_024 * 1_024
-    private static let ipcMaximumStoredResponses = 2
+    // Script checks may issue several HTTP requests concurrently. Keep enough
+    // response slots for that burst while retaining the aggregate 8 MB cap.
+    private static let ipcMaximumStoredResponses = 12
     private static let ipcResponseLifetime: TimeInterval = 30
     private var trollStoreIPCServer: TrollStoreFileIPCServer?
     /// 仅在开发者模式开启时创建，普通 VPN 会话不持有诊断定时器、压力监听或文件句柄。
@@ -878,6 +880,12 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             reply(Data(MihomoTrafficNow().utf8))
         case "memory":
             reply(Self.memoryFootprintData())
+        case "runtime":
+            // RuntimeStats is a compact, on-demand snapshot. It does not start
+            // a sampler or retain any connection details in the NE.
+            reply(Data(MihomoRuntimeStats().utf8))
+        case "networkInfo":
+            reply(networkDiagnosticData())
         case "setMemoryDiagnostics":
             let enabled = (obj?["enabled"] as? NSNumber)?.boolValue ?? false
             let result = setMemoryDiagnosticsEnabled(enabled)
@@ -1170,6 +1178,47 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         let payload: [String: NSNumber] = ["physFootprint": NSNumber(value: footprint)]
         return (try? JSONSerialization.data(withJSONObject: payload))
             ?? Data(#"{"physFootprint":0}"#.utf8)
+    }
+
+    /// Returns the latest physical path observation and tunnel interface data
+    /// without starting a new monitor or walking connection payloads.
+    private func networkDiagnosticData() -> Data {
+        let pathData: [String: Any] = pathMonitorQueue.sync {
+            guard let path = latestObservedPath else {
+                return ["status": "unknown", "availableInterfaces": []]
+            }
+            let status: String
+            switch path.status {
+            case .satisfied: status = "satisfied"
+            case .unsatisfied: status = "unsatisfied"
+            case .requiresConnection: status = "requiresConnection"
+            @unknown default: status = "unknown"
+            }
+            let available = path.availableInterfaces.map { interface in
+                ["name": interface.name,
+                 "type": Self.interfaceTypeName(interface.type)]
+            }
+            let used = [
+                path.usesInterfaceType(.wifi) ? "wifi" : nil,
+                path.usesInterfaceType(.cellular) ? "cellular" : nil,
+                path.usesInterfaceType(.wiredEthernet) ? "wired" : nil,
+            ].compactMap { $0 }
+            return [
+                "status": status,
+                "usedInterfaces": used,
+                "availableInterfaces": available,
+                "supportsIPv4": path.supportsIPv4,
+                "supportsIPv6": path.supportsIPv6,
+                "expensive": path.isExpensive,
+                "constrained": path.isConstrained,
+            ]
+        }
+        let tunnelInfo = runtimeQueue.sync { (tunnelFileDescriptor.map(Int.init) ?? -1, tunnelInterfaceInfo()?.mtu ?? 0) }
+        var result = pathData
+        result["systemDNS"] = systemDNSServers
+        result["utunFD"] = tunnelInfo.0
+        result["utunMTU"] = tunnelInfo.1
+        return Self.jsonData(result)
     }
 
     /// 只在设置 JSON 明确开启时启动 NE 诊断。旧缓存或系统重连同样经过这里，

@@ -1288,48 +1288,313 @@ struct InfoToggleRow: View {
     }
 }
 
-/// 内核状态页：验证 App 与 Tunnel 之间的主控制通道。
+/// 内核状态页：按需读取一份有界运行快照，便于定位 VPN、IPC 和内存问题。
 private struct KernelStatusView: View {
-    @State private var text = "探测中…"
+    @EnvironmentObject private var core: CoreStateManager
+    @State private var snapshot = KernelDiagnosticSnapshot.empty
+    @State private var isLoading = false
+    @State private var expanded: Set<String> = ["core", "network", "traffic"]
 
     var body: some View {
-        ScrollView {
-            Text(text)
-                .font(.system(.footnote, design: .monospaced))
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .textSelection(.enabled)
-                .padding()
+        List {
+            diagnosticSection("core", title: "连接状态", icon: "point.3.connected.trianglepath.dotted", tint: .blue) {
+                DiagnosticValueRow(title: "VPN 状态", value: core.statusText,
+                                   valueColor: snapshot.isReachable ? .green : .secondary)
+                DiagnosticValueRow(title: "控制通道", value: snapshot.transport)
+                DiagnosticValueRow(title: "最近刷新", value: snapshot.updatedText)
+                DiagnosticValueRow(title: "协议", value: snapshot.protocolText)
+                DiagnosticValueRow(title: "内核版本", value: snapshot.coreVersion)
+                DiagnosticValueRow(title: "代理模式", value: snapshot.mode)
+            }
+
+            diagnosticSection("network", title: "网络接口", icon: "network", tint: .teal) {
+                DiagnosticValueRow(title: "NWPath", value: snapshot.pathStatus,
+                                   valueColor: snapshot.pathStatus == "satisfied" ? .green : .orange)
+                DiagnosticValueRow(title: "当前接口", value: snapshot.usedInterfaces)
+                DiagnosticValueRow(title: "可用接口", value: snapshot.availableInterfaces)
+                DiagnosticValueRow(title: "IP 能力", value: snapshot.ipSupport)
+                DiagnosticValueRow(title: "网络属性", value: snapshot.pathFlags)
+                DiagnosticValueRow(title: "系统 DNS", value: snapshot.systemDNS)
+                DiagnosticValueRow(title: "utun", value: snapshot.utunText)
+            }
+
+            diagnosticSection("traffic", title: "流量与连接", icon: "arrow.up.arrow.down", tint: .green) {
+                DiagnosticValueRow(title: "实时下行", value: ByteFormat.rate(snapshot.down))
+                DiagnosticValueRow(title: "实时上行", value: ByteFormat.rate(snapshot.up))
+                DiagnosticValueRow(title: "累计下行", value: ByteFormat.size(snapshot.downloadTotal))
+                DiagnosticValueRow(title: "累计上行", value: ByteFormat.size(snapshot.uploadTotal))
+                DiagnosticValueRow(title: "活动连接", value: "\(snapshot.activeCount)（TCP \(snapshot.tcpCount) / UDP \(snapshot.udpCount)）")
+                DiagnosticValueRow(title: "返回详情", value: "\(snapshot.connections.count) 条（最多 20 条）")
+            }
+
+            diagnosticSection("runtime", title: "内核资源", icon: "memorychip", tint: .orange) {
+                DiagnosticValueRow(title: "NE 物理内存", value: snapshot.physFootprint)
+                DiagnosticValueRow(title: "Go 堆已用", value: snapshot.heapAlloc)
+                DiagnosticValueRow(title: "Go 运行时内存", value: snapshot.goSys)
+                DiagnosticValueRow(title: "Goroutines", value: snapshot.goroutines)
+                DiagnosticValueRow(title: "Provider / 规则", value: "\(snapshot.proxyProviders) / \(snapshot.ruleProviders)")
+                DiagnosticValueRow(title: "策略组", value: snapshot.proxyGroups)
+                DiagnosticValueRow(title: "待处理关闭连接", value: snapshot.closedQueuePending)
+            }
+
+            if !snapshot.connections.isEmpty {
+                diagnosticSection("connections", title: "活动连接明细", icon: "list.bullet.rectangle", tint: .indigo) {
+                    ForEach(snapshot.connections) { connection in
+                        ConnectionDiagnosticRow(connection: connection)
+                    }
+                }
+            }
+
+            if !snapshot.notices.isEmpty {
+                diagnosticSection("config", title: "配置提示", icon: "exclamationmark.triangle", tint: .yellow) {
+                    ForEach(snapshot.notices, id: \.self) { notice in
+                        Label(notice, systemImage: "info.circle")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+
+            if !snapshot.errors.isEmpty {
+                Section("读取失败") {
+                    ForEach(snapshot.errors, id: \.self) { error in
+                        Label(error, systemImage: "xmark.octagon.fill")
+                            .font(.footnote)
+                            .foregroundStyle(.red)
+                    }
+                }
+                .settingsSectionStyle()
+            }
         }
+        .listStyle(.insetGrouped)
+        .scrollContentBackground(.hidden)
         .background(AppAmbientBackground())
         .navigationTitle("内核状态")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbar { Button("刷新") { Task { await reload() } } }
+        .toolbar {
+            ToolbarItem(placement: .navigationBarTrailing) {
+                Button { Task { await reload() } } label: {
+                    Image(systemName: isLoading ? "progress.indicator" : "arrow.clockwise")
+                }
+                .disabled(isLoading)
+                .accessibilityLabel("刷新诊断")
+            }
+        }
         .task { await reload() }
     }
 
-    private func reload() async {
-        text = "探测中…"
-        let transport = TrollStoreIPC.isEnabled
-            ? "TrollStore 文件 IPC"
-            : "sendProviderMessage IPC"
-        var out = "（请在 VPN 已连接时探测）\n\n【\(transport)】\n"
-        let hello = await CoreStateManager.shared.sendMessage(["cmd": "hello"])
-        if case .ok(let data) = hello,
-           let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
-            out += "协议 v\((object["protocolVersion"] as? NSNumber)?.intValue ?? 0)，"
-                + "内核 \(object["coreVersion"] as? String ?? "?")\n"
+    @ViewBuilder
+    private func diagnosticSection<Content: View>(_ id: String,
+                                                   title: String,
+                                                   icon: String,
+                                                   tint: Color,
+                                                   @ViewBuilder content: () -> Content) -> some View {
+        Section {
+            if expanded.contains(id) { content() }
+        } header: {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    if expanded.contains(id) { expanded.remove(id) } else { expanded.insert(id) }
+                }
+            } label: {
+                HStack {
+                    Image(systemName: icon).foregroundStyle(tint)
+                    Text(title).font(.subheadline.weight(.semibold))
+                    Spacer()
+                    Image(systemName: expanded.contains(id) ? "chevron.up" : "chevron.down")
+                        .font(.caption.weight(.bold)).foregroundStyle(.secondary)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
         }
-        let ipc = await CoreStateManager.shared.sendMessage(["cmd": "queryProxies"])
-        switch ipc {
-        case .ok(let data):
-            let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-            let proxies = (obj?["proxies"] as? [String: Any]) ?? [:]
-            let groupCount = proxies.values.compactMap { ($0 as? [String: Any])?["all"] }.count
-            out += "✅ 可用，queryProxies 回 \(data.count) 字节，策略组 \(groupCount)\n"
-        case .failure(let reason):
-            out += "❌ \(reason)\n"
-        }
-
-        text = out
+        .settingsSectionStyle()
     }
+
+    private func reload() async {
+        guard !isLoading else { return }
+        isLoading = true
+        defer { isLoading = false }
+        snapshot = await KernelDiagnosticSnapshot.load()
+    }
+}
+
+private struct DiagnosticValueRow: View {
+    let title: String
+    let value: String
+    var valueColor: Color = .secondary
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            Text(title).font(.footnote).foregroundStyle(.secondary)
+            Spacer(minLength: 8)
+            Text(value).font(.footnote.monospaced()).foregroundStyle(valueColor)
+                .multilineTextAlignment(.trailing).lineLimit(3).minimumScaleFactor(0.75)
+        }
+        .textSelection(.enabled)
+    }
+}
+
+private struct ConnectionDiagnosticRow: View {
+    let connection: ActiveConnection
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(connection.destinationTitle).font(.footnote.weight(.semibold)).lineLimit(1)
+                Spacer()
+                Text(connection.networkLabel).font(.caption2.monospaced()).foregroundStyle(.secondary)
+            }
+            Text(connection.endpointText).font(.caption2.monospaced()).foregroundStyle(.secondary).lineLimit(1)
+            HStack(spacing: 10) {
+                Text(connection.routeText).lineLimit(1)
+                Spacer()
+                Text("↓ \(ByteFormat.size(connection.download))  ↑ \(ByteFormat.size(connection.upload))")
+            }
+            .font(.caption2).foregroundStyle(.secondary)
+        }
+        .textSelection(.enabled)
+    }
+}
+
+private struct KernelDiagnosticSnapshot {
+    var updatedAt = Date()
+    var transport = "未知"
+    var protocolText = "未知"
+    var coreVersion = "未知"
+    var mode = "未知"
+    var isReachable = false
+    var up: Int64 = 0
+    var down: Int64 = 0
+    var uploadTotal: Int64 = 0
+    var downloadTotal: Int64 = 0
+    var activeCount = 0
+    var tcpCount = 0
+    var udpCount = 0
+    var connections: [ActiveConnection] = []
+    var pathStatus = "未知"
+    var usedInterfaces = "未知"
+    var availableInterfaces = "未知"
+    var ipSupport = "未知"
+    var pathFlags = "未知"
+    var systemDNS = "未知"
+    var utunText = "未知"
+    var physFootprint = "不可用"
+    var heapAlloc = "不可用"
+    var goSys = "不可用"
+    var goroutines = "不可用"
+    var proxyProviders = "不可用"
+    var ruleProviders = "不可用"
+    var proxyGroups = "不可用"
+    var closedQueuePending = "不可用"
+    var notices: [String] = []
+    var errors: [String] = []
+
+    static let empty = Self()
+    var updatedText: String { updatedAt.formatted(date: .omitted, time: .shortened) }
+
+    static func load() async -> Self {
+        var result = Self()
+        result.updatedAt = Date()
+        result.transport = TrollStoreIPC.isEnabled ? "TrollStore 文件 IPC" : "sendProviderMessage IPC"
+        async let hello = CoreStateManager.shared.sendMessage(["cmd": "hello"])
+        async let traffic = CoreStateManager.shared.sendMessage(["cmd": "traffic"])
+        async let connections = CoreStateManager.shared.sendMessage(["cmd": "connections", "limit": 20])
+        async let memory = CoreStateManager.shared.sendMessage(["cmd": "memory"])
+        async let runtime = CoreStateManager.shared.sendMessage(["cmd": "runtime"])
+        async let network = CoreStateManager.shared.sendMessage(["cmd": "networkInfo"])
+        async let notices = CoreStateManager.shared.sendMessage(["cmd": "configNotices"])
+        async let mode = CoreStateManager.shared.sendMessage(["cmd": "getMode"])
+        let responses = await (hello, traffic, connections, memory, runtime, network, notices, mode)
+        result.consumeHello(responses.0)
+        result.consumeTraffic(responses.1)
+        result.consumeConnections(responses.2)
+        result.consumeMemory(responses.3)
+        result.consumeRuntime(responses.4)
+        result.consumeNetwork(responses.5)
+        result.consumeNotices(responses.6)
+        result.consumeMode(responses.7)
+        return result
+    }
+
+    private mutating func consumeHello(_ response: TunnelManager.IPCResult) {
+        guard case .ok(let data) = response,
+              let object = Self.object(data) else { errors.append("hello：\(Self.reason(response))"); return }
+        isReachable = true
+        protocolText = "v\((object["protocolVersion"] as? NSNumber)?.intValue ?? 0)"
+        coreVersion = object["coreVersion"] as? String ?? "未知"
+    }
+
+    private mutating func consumeTraffic(_ response: TunnelManager.IPCResult) {
+        guard case .ok(let data) = response, let object = Self.object(data) else { errors.append("traffic：\(Self.reason(response))"); return }
+        up = (object["up"] as? NSNumber)?.int64Value ?? 0
+        down = (object["down"] as? NSNumber)?.int64Value ?? 0
+    }
+
+    private mutating func consumeConnections(_ response: TunnelManager.IPCResult) {
+        guard case .ok(let data) = response,
+              let object = Self.object(data) else { errors.append("connections：\(Self.reason(response))"); return }
+        uploadTotal = (object["uploadTotal"] as? NSNumber)?.int64Value ?? 0
+        downloadTotal = (object["downloadTotal"] as? NSNumber)?.int64Value ?? 0
+        activeCount = (object["total"] as? NSNumber)?.intValue ?? 0
+        if let values = try? JSONDecoder().decode(ConnectionsSnapshot.self, from: data) {
+            connections = values.connections
+            tcpCount = values.connections.filter { $0.networkKey == "tcp" }.count
+            udpCount = values.connections.filter { $0.networkKey == "udp" }.count
+        }
+    }
+
+    private mutating func consumeMemory(_ response: TunnelManager.IPCResult) {
+        guard case .ok(let data) = response, let object = Self.object(data),
+              let value = (object["physFootprint"] as? NSNumber)?.int64Value else { return }
+        physFootprint = ByteFormat.size(value)
+    }
+
+    private mutating func consumeRuntime(_ response: TunnelManager.IPCResult) {
+        guard case .ok(let data) = response, let object = Self.object(data) else { errors.append("runtime：\(Self.reason(response))"); return }
+        heapAlloc = Self.bytes(object["heapAlloc"])
+        goSys = Self.bytes(object["sys"])
+        goroutines = Self.integer(object["goroutines"])
+        proxyProviders = Self.integer(object["proxyProviders"])
+        ruleProviders = Self.integer(object["ruleProviders"])
+        proxyGroups = Self.integer(object["proxyGroups"])
+        closedQueuePending = Self.integer(object["closedQueuePending"])
+    }
+
+    private mutating func consumeNetwork(_ response: TunnelManager.IPCResult) {
+        guard case .ok(let data) = response, let object = Self.object(data) else { errors.append("networkInfo：\(Self.reason(response))"); return }
+        pathStatus = object["status"] as? String ?? "未知"
+        usedInterfaces = (object["usedInterfaces"] as? [String])?.joined(separator: ", ") ?? "无"
+        availableInterfaces = ((object["availableInterfaces"] as? [[String: Any]]) ?? []).map {
+            "\($0["name"] as? String ?? "?")/\($0["type"] as? String ?? "?")"
+        }.joined(separator: ", ")
+        ipSupport = "IPv4 \((object["supportsIPv4"] as? Bool) == true ? "✓" : "×") · IPv6 \((object["supportsIPv6"] as? Bool) == true ? "✓" : "×")"
+        pathFlags = "计费 \((object["expensive"] as? Bool) == true ? "是" : "否") · 受限 \((object["constrained"] as? Bool) == true ? "是" : "否")"
+        systemDNS = (object["systemDNS"] as? [String])?.joined(separator: ", ") ?? "未获取"
+        let fd = (object["utunFD"] as? NSNumber)?.intValue ?? -1
+        let mtu = (object["utunMTU"] as? NSNumber)?.intValue ?? 0
+        utunText = fd >= 0 ? "fd \(fd) · MTU \(mtu > 0 ? String(mtu) : "系统")" : "未创建"
+    }
+
+    private mutating func consumeNotices(_ response: TunnelManager.IPCResult) {
+        guard case .ok(let data) = response,
+              let values = try? JSONSerialization.jsonObject(with: data) as? [String] else { return }
+        notices = values
+    }
+
+    private mutating func consumeMode(_ response: TunnelManager.IPCResult) {
+        guard case .ok(let data) = response,
+              let value = String(data: data, encoding: .utf8),
+              !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        switch value.trimmingCharacters(in: .whitespacesAndNewlines) {
+        case "global": mode = "全局"
+        case "direct": mode = "直连"
+        default: mode = "规则"
+        }
+    }
+
+    private static func object(_ data: Data) -> [String: Any]? { try? JSONSerialization.jsonObject(with: data) as? [String: Any] }
+    private static func reason(_ response: TunnelManager.IPCResult) -> String { if case .failure(let value) = response { return value }; return "无效响应" }
+    private static func integer(_ value: Any?) -> String { (value as? NSNumber)?.stringValue ?? "0" }
+    private static func bytes(_ value: Any?) -> String { guard let n = (value as? NSNumber)?.int64Value else { return "0 B" }; return ByteFormat.size(n) }
 }
