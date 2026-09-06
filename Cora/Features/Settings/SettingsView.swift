@@ -764,6 +764,7 @@ private struct KernelSettingsView: View {
     @EnvironmentObject private var core: CoreStateManager
     @State private var isKernelAvailable = false
     @State private var isCheckingKernel = true
+    @State private var diagnosticSnapshot = KernelDiagnosticSnapshot.empty
 
     var body: some View {
         Form {
@@ -801,28 +802,51 @@ private struct KernelSettingsView: View {
             .settingsSectionStyle()
 
             Section {
+                HStack {
+                    InfoLabel(title: "VPN 状态", message: "当前 Network Extension 隧道状态。")
+                    Spacer()
+                    Text(core.statusText)
+                        .foregroundStyle(isKernelAvailable ? Color.green : Color.secondary)
+                }
+                HStack {
+                    InfoLabel(title: "代理模式", message: "运行中的 mihomo 当前代理模式。")
+                    Spacer()
+                    Text(diagnosticSnapshot.mode).foregroundStyle(.secondary)
+                }
+                HStack {
+                    InfoLabel(title: "实时速率", message: "内核当前每秒上下行速率。")
+                    Spacer()
+                    Text("↓ \(ByteFormat.rate(diagnosticSnapshot.down))  ↑ \(ByteFormat.rate(diagnosticSnapshot.up))")
+                        .font(.footnote.monospacedDigit()).foregroundStyle(.secondary)
+                }
+                HStack {
+                    InfoLabel(title: "活动连接", message: "当前内核维护的 TCP 与 UDP 连接数量。")
+                    Spacer()
+                    Text("\(diagnosticSnapshot.activeCount)（TCP \(diagnosticSnapshot.tcpCount) / UDP \(diagnosticSnapshot.udpCount)）")
+                        .font(.footnote.monospacedDigit()).foregroundStyle(.secondary)
+                }
+                HStack {
+                    InfoLabel(title: "NE 物理内存", message: "Network Extension 当前 phys_footprint，占用口径与系统 Jetsam 接近。")
+                    Spacer()
+                    Text(diagnosticSnapshot.physFootprint).font(.footnote.monospacedDigit()).foregroundStyle(.secondary)
+                }
+                HStack {
+                    InfoLabel(title: "诊断刷新", message: "按需读取一份有界运行快照，不会启动常驻采样。")
+                    Spacer()
+                    if isCheckingKernel {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Button("刷新") { Task { await refreshKernelAvailability() } }
+                            .buttonStyle(.borderless)
+                    }
+                }
                 NavigationLink {
                     KernelStatusView()
                 } label: {
-                    HStack {
-                        InfoLabel(title: "连接诊断", message: "检查 App 与隧道扩展之间的控制通道和当前内核响应。")
-                        Spacer()
-                        if isCheckingKernel {
-                            ProgressView().controlSize(.small)
-                        } else {
-                            Image(systemName: isKernelAvailable ? "checkmark.circle.fill" : "xmark.circle.fill")
-                                .foregroundStyle(isKernelAvailable ? Color.green : Color.secondary)
-                                .accessibilityLabel(isKernelAvailable ? "内核可用" : "内核不可用")
-                        }
-                    }
+                    Label("查看完整连接诊断", systemImage: "list.bullet.rectangle.portrait")
                 }
-                HStack {
-                    InfoLabel(title: "内核版本", message: "当前由隧道扩展运行的 mihomo 内核版本。")
-                    Spacer()
-                    Text(core.coreVersion)
-                        .foregroundStyle(.secondary)
-                        .monospaced()
-                }
+            } header: {
+                Text("运行概览")
             }
             .settingsSectionStyle()
         }
@@ -843,13 +867,10 @@ private struct KernelSettingsView: View {
             return
         }
         isCheckingKernel = true
-        let result = await CoreStateManager.shared.sendMessage(["cmd": "hello"])
+        let snapshot = await KernelDiagnosticSnapshot.load()
         guard !Task.isCancelled else { return }
-        if case .ok = result {
-            isKernelAvailable = true
-        } else {
-            isKernelAvailable = false
-        }
+        diagnosticSnapshot = snapshot
+        isKernelAvailable = snapshot.isReachable
         isCheckingKernel = false
     }
 }
