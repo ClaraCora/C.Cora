@@ -93,6 +93,46 @@ struct PO0WhitelistSettingsView: View {
             }
 
             Section {
+                HStack {
+                    Text("当前状态")
+                    Spacer()
+                    Text(store.summary).foregroundStyle(.secondary)
+                }
+                if let snapshot = store.snapshot, snapshot.configurationID == store.configuration.id {
+                    if snapshot.lastCheckedAt > 0 {
+                        dateRow("最近检测", timestamp: snapshot.lastCheckedAt)
+                    }
+                    if core.isActive, snapshot.enabled, snapshot.nextCheckAt > 0 {
+                        dateRow("下次检测", timestamp: snapshot.nextCheckAt)
+                    }
+                }
+                Button {
+                    Task { await store.checkNow() }
+                } label: {
+                    HStack {
+                        Label("立即检测并加白", systemImage: "plus.shield")
+                        Spacer()
+                        SettingsActivityIndicator(isRunning: core.isActive && store.snapshot?.isWorking == true)
+                    }
+                }
+                .disabled(!core.isActive || !store.configuration.enabled || store.isSaving ||
+                          hasChanges || store.snapshot?.isWorking == true)
+            } header: {
+                Text("检测状态")
+            } footer: {
+                if hasChanges {
+                    Text("有尚未保存的修改，请点击右上角“保存”。")
+                } else if !core.isActive {
+                    Text("VPN 未连接。下次从 App 连接 VPN 后应用设置；已有结果仅代表上次检测。")
+                } else if didSave, store.message == nil {
+                    Text("设置已保存并应用。")
+                } else {
+                    Text("检测调用 PO0 加白接口，同一出口重复请求不会重复占用白名单名额。")
+                }
+            }
+            .settingsSectionStyle()
+
+            Section {
                 Toggle(isOn: $draft.enabled) {
                     Label("自动检测并加白", systemImage: "checkmark.shield")
                 }
@@ -139,46 +179,6 @@ struct PO0WhitelistSettingsView: View {
             }
             .settingsSectionStyle()
             .disabled(store.isSaving)
-
-            Section {
-                HStack {
-                    Text("当前状态")
-                    Spacer()
-                    Text(store.summary).foregroundStyle(.secondary)
-                }
-                if let snapshot = store.snapshot, snapshot.configurationID == store.configuration.id {
-                    if snapshot.lastCheckedAt > 0 {
-                        dateRow("最近检测", timestamp: snapshot.lastCheckedAt)
-                    }
-                    if core.isActive, snapshot.enabled, snapshot.nextCheckAt > 0 {
-                        dateRow("下次检测", timestamp: snapshot.nextCheckAt)
-                    }
-                }
-                Button {
-                    Task { await store.checkNow() }
-                } label: {
-                    HStack {
-                        Label("立即检测并加白", systemImage: "plus.shield")
-                        Spacer()
-                        SettingsActivityIndicator(isRunning: core.isActive && store.snapshot?.isWorking == true)
-                    }
-                }
-                .disabled(!core.isActive || !store.configuration.enabled || store.isSaving ||
-                          hasChanges || store.snapshot?.isWorking == true)
-            } header: {
-                Text("检测状态")
-            } footer: {
-                if hasChanges {
-                    Text("有尚未保存的修改，请点击右上角“保存”。")
-                } else if !core.isActive {
-                    Text("VPN 未连接。下次从 App 连接 VPN 后应用设置；已有结果仅代表上次检测。")
-                } else if didSave, store.message == nil {
-                    Text("设置已保存并应用。")
-                } else {
-                    Text("检测调用 PO0 加白接口，同一出口重复请求不会重复占用白名单名额。")
-                }
-            }
-            .settingsSectionStyle()
 
             if let message = store.validationMessage ?? store.message {
                 Section {
