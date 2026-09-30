@@ -18,7 +18,7 @@ import (
 	"github.com/metacubex/mihomo/config"
 	C "github.com/metacubex/mihomo/constant"
 	mdns "github.com/metacubex/mihomo/dns"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 func TestBoundedLogText(t *testing.T) {

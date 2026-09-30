@@ -1,8 +1,7 @@
 diff --git a/internal/fdbased_darwin/processors.go b/internal/fdbased_darwin/processors.go
-index ea863cd..e43cd37 100644
 --- a/internal/fdbased_darwin/processors.go
 +++ b/internal/fdbased_darwin/processors.go
-@@ -28,17 +28,40 @@ import (
+@@ -28,17 +28,40 @@
  	"github.com/metacubex/gvisor/pkg/tcpip/stack/gro"
  )
  
@@ -48,7 +47,7 @@ index ea863cd..e43cd37 100644
  }
  
  func (p *processor) start(wg *sync.WaitGroup) {
-@@ -102,6 +125,7 @@ func newProcessorManager(opts *Options, e *endpoint) *processorManager {
+@@ -102,6 +125,7 @@
  	m.wg.Add(opts.ProcessorsPerChannel)
  
  	for i := range m.processors {
@@ -56,7 +55,7 @@ index ea863cd..e43cd37 100644
  		p := &m.processors[i]
  		p.sleeper.AddWaker(&p.packetWaker)
  		p.sleeper.AddWaker(&p.closeWaker)
-@@ -127,6 +151,9 @@ func (m *processorManager) start() {
+@@ -127,6 +151,9 @@
  // afterLoad is invoked by stateify.
  func (m *processorManager) afterLoad(context.Context) {
  	m.wg.Add(len(m.processors))
@@ -66,7 +65,7 @@ index ea863cd..e43cd37 100644
  	m.start()
  }
  
-@@ -162,10 +189,9 @@ func (m *processorManager) queuePacket(pkt *stack.PacketBuffer, hasEthHeader boo
+@@ -162,10 +189,9 @@
  		pIdx = m.connectionHash(&cid) % uint32(len(m.processors))
  	}
  	p := &m.processors[pIdx]
@@ -82,7 +81,6 @@ index ea863cd..e43cd37 100644
  type connectionID struct {
 diff --git a/internal/fdbased_darwin/processors_test.go b/internal/fdbased_darwin/processors_test.go
 new file mode 100644
-index 0000000..115c82f
 --- /dev/null
 +++ b/internal/fdbased_darwin/processors_test.go
 @@ -0,0 +1,37 @@
@@ -124,49 +122,39 @@ index 0000000..115c82f
 +	}
 +}
 diff --git a/tun_darwin_gvisor.go b/tun_darwin_gvisor.go
-index c036861..6ff01a8 100644
 --- a/tun_darwin_gvisor.go
 +++ b/tun_darwin_gvisor.go
-@@ -15 +15,6 @@
+@@ -10,6 +10,11 @@
+ 	"github.com/metacubex/sing-tun/internal/rawfile_darwin"
+ 
+ 	"golang.org/x/sys/unix"
++)
++
 +const (
 +	darwinGVisorProcessorsPerChannel = 1
 +	darwinGVisorQDiscQueueLen        = 128
-+)
-+
+ )
+ 
  var _ GVisorTun = (*NativeTun)(nil)
-@@ -51,15 +56,16 @@
+@@ -50,7 +55,7 @@
+ 
  func (t *NativeTun) NewEndpoint() (stack.LinkEndpoint, stack.NICOptions, error) {
--	ep, err := fdbased.New(&fdbased.Options{
--		FDs:               []int{t.tunFd},
--		MTU:               t.options.MTU,
--		RXChecksumOffload: true,
--		RecvMsgX:          t.options.EXP_RecvMsgX,
--		SendMsgX:          t.options.EXP_SendMsgX,
--	})
--	if err != nil {
--		return nil, stack.NICOptions{}, err
--	}
--	return ep, stack.NICOptions{
--		QDisc: fifo.New(ep, 1, 1000),
--	}, nil
-+	ep, err := fdbased.New(&fdbased.Options{
-+		FDs:                  []int{t.tunFd},
-+		MTU:                  t.options.MTU,
-+		RXChecksumOffload:    true,
-+		RecvMsgX:             t.options.EXP_RecvMsgX,
-+		SendMsgX:             t.options.EXP_SendMsgX,
+ 	ep, err := fdbased.New(&fdbased.Options{
+-		ProcessorsPerChannel: t.options.EXP_ProcessorsPerChannel,
 +		ProcessorsPerChannel: darwinGVisorProcessorsPerChannel,
-+	})
-+	if err != nil {
-+		return nil, stack.NICOptions{}, err
-+	}
-+	return ep, stack.NICOptions{
+ 		FDs:                  []int{t.tunFd},
+ 		MTU:                  t.options.MTU,
+ 		RXChecksumOffload:    true,
+@@ -61,6 +66,6 @@
+ 		return nil, stack.NICOptions{}, err
+ 	}
+ 	return ep, stack.NICOptions{
+-		QDisc: fifo.New(ep, 1, 1000),
 +		QDisc: fifo.New(ep, 1, darwinGVisorQDiscQueueLen),
-+	}, nil
+ 	}, nil
  }
 diff --git a/tun_darwin_gvisor_test.go b/tun_darwin_gvisor_test.go
 new file mode 100644
-index 0000000..6e3a6d2
 --- /dev/null
 +++ b/tun_darwin_gvisor_test.go
 @@ -0,0 +1,20 @@

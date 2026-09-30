@@ -33,6 +33,8 @@ struct MemoryDiagnosticSample: Decodable {
     struct CoraDiagnostic: Decodable {
         let ipcResponseCount: Int?
         let ipcResponseBytes: UInt64?
+        let ipcResponseMemoryBytes: UInt64?
+        let ipcResponseFileBytes: UInt64?
         let logBufferedLines: Int?
         let logBufferedBytes: UInt64?
         let logPersistedBytes: UInt64?
@@ -237,6 +239,10 @@ enum MemoryDiagnosticAnalyzer {
 
         let ipcBytes = latest("ipcResponseBytes", summary: summary,
                               fallback: last?.cora?.ipcResponseBytes)
+        let ipcMemoryBytes = latest("ipcResponseMemoryBytes", summary: summary,
+                                    fallback: last?.cora?.ipcResponseMemoryBytes) ?? ipcBytes
+        let ipcFileBytes = latest("ipcResponseFileBytes", summary: summary,
+                                  fallback: last?.cora?.ipcResponseFileBytes)
         let ipcCount = latestInt("ipcResponseCount", summary: summary,
                                  fallback: last?.cora?.ipcResponseCount)
         let logBufferedBytes = latest("logBufferedBytes", summary: summary,
@@ -301,7 +307,7 @@ enum MemoryDiagnosticAnalyzer {
            providers > initial {
             findings.append("规则 Provider 数量在采样期间增加，规则数据加载可能推动 Go 堆增长。")
         }
-        if let ipcBytes, ipcBytes > 512 * 1024 {
+        if let ipcBytes = ipcMemoryBytes, ipcBytes > 512 * 1024 {
             findings.append("IPC 分块响应缓存仍有 \(formatBytes(ipcBytes))，检查大响应是否按时消费或过期。")
         }
         if let logBufferedBytes, logBufferedBytes > 64 * 1024 {
@@ -345,7 +351,7 @@ enum MemoryDiagnosticAnalyzer {
             "强制 GC \(formatCount(forcedGC))",
         ].joined(separator: " / ")
         let coraLine = [
-            "IPC \(formatCount(ipcCount)) / \(formatBytes(ipcBytes))",
+            "IPC \(formatCount(ipcCount)) / \(formatBytes(ipcBytes))（内存 \(formatBytes(ipcMemoryBytes))，临时文件 \(formatBytes(ipcFileBytes))）",
             "日志缓冲 \(formatCount(logBufferedLines)) 行 / \(formatBytes(logBufferedBytes))",
             "持久化日志 \(formatBytes(logPersistedBytes))",
         ].joined(separator: "；")

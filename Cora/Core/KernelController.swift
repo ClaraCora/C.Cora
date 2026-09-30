@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 
 /// 连接页用的内核运行态：当前模式 + 实时上下行速率 + NE 进程 phys_footprint。
 /// 经统一控制通道：模式 getMode/setMode、速率 traffic、内存 memory。
@@ -41,6 +42,7 @@ final class KernelController: ObservableObject {
     @Published private(set) var reachable = false
     /// Packet Tunnel Extension 进程的物理内存占用（task_vm_info.phys_footprint，字节）。
     @Published private(set) var memoryFootprint: Int64?
+    @Published private(set) var isReleasingMemory = false
     @Published private(set) var totalDownload: Int64 = 0
     @Published private(set) var totalUpload: Int64 = 0
     /// 最近若干秒的速率采样（曲线图数据）。
@@ -53,6 +55,7 @@ final class KernelController: ObservableObject {
     private var memoryTask: Task<Void, Never>?
     private var memoryRefreshTask: Task<Int64?, Never>?
     private var memoryRefreshGeneration = 0
+    private var memoryReleaseGeneration = 0
     private var modeTask: Task<Void, Never>?
     private var sampleIndex = 0
     private let maxSamples = 60
@@ -89,6 +92,8 @@ final class KernelController: ObservableObject {
 
     /// 断开后调用：停止采样。
     func stop() {
+        memoryReleaseGeneration &+= 1
+        isReleasingMemory = false
         modeTask?.cancel()
         modeTask = nil
         stopTraffic()
@@ -185,6 +190,52 @@ final class KernelController: ObservableObject {
         guard let footprint else { return false }
         if memoryFootprint != footprint { memoryFootprint = footprint }
         return true
+    }
+
+    enum MemoryReleaseResult: Equatable {
+        case released(before: Int64, after: Int64)
+        case failure(String)
+        case superseded
+    }
+
+    /// User-triggered only. The NE collects unused Go pages without closing
+    /// connections, clearing rankings, or changing DNS/forwarding parameters.
+    func releaseMemory() async -> MemoryReleaseResult {
+        guard CoreStateManager.shared.status == .connected else {
+            return .failure("VPN 尚未连接，请稍后重试")
+        }
+        guard !isReleasingMemory else { return .failure("正在释放，请稍候") }
+        memoryReleaseGeneration &+= 1
+        let generation = memoryReleaseGeneration
+        isReleasingMemory = true
+        defer {
+            if generation == memoryReleaseGeneration { isReleasingMemory = false }
+        }
+        let result = await CoreStateManager.shared.sendMessage(["cmd": "releaseMemory"])
+        guard !Task.isCancelled, generation == memoryReleaseGeneration,
+              CoreStateManager.shared.status == .connected else { return .superseded }
+        switch result {
+        case .failure(let reason):
+            return .failure(reason)
+        case .ok(let data):
+            guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+                return .failure("释放结果读取失败，请稍后重试")
+            }
+            guard object["ok"] as? Bool == true else {
+                return .failure(object["error"] as? String ?? "释放失败，请稍后重试")
+            }
+            guard let before = (object["before"] as? NSNumber)?.int64Value, before > 0,
+                  let after = (object["physFootprint"] as? NSNumber)?.int64Value, after > 0 else {
+                return .failure("已完成回收，内存数值暂时不可用")
+            }
+            // A memory poll issued before collection must not overwrite this
+            // newer value when its delayed response arrives.
+            memoryRefreshGeneration &+= 1
+            memoryRefreshTask?.cancel()
+            memoryRefreshTask = nil
+            memoryFootprint = after
+            return .released(before: before, after: after)
+        }
     }
 
     /// phys_footprint 正常每 5 秒查询；首次失败时每秒重试，直到拿到第一个数值。

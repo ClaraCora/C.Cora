@@ -2,7 +2,7 @@
 set -euo pipefail
 
 readonly MODULE="github.com/metacubex/sing-shadowsocks2"
-readonly EXPECTED_VERSION="v0.2.7"
+readonly EXPECTED_VERSION="v0.2.8"
 readonly SING_MODULE="github.com/metacubex/sing"
 readonly EXPECTED_SING_VERSION="v0.5.7"
 readonly PATCHED_SING_DIR="${PATCHED_SING_DIR:?Run prepare-ios-sing.sh first and pass its output as PATCHED_SING_DIR}"
@@ -11,8 +11,8 @@ readonly TEST_REL="internal/shadowio/reader_reuse_test.go"
 readonly EXPECTED_SOURCE_SHA="3611b8ea3960d70c2aecbf6ddf2be0dbac2358720f973429d0f36dade35f4a1d"
 readonly EXPECTED_PATCHED_SHA="aa2018624b29e7f004451bc763e17cd86cd36388333f32b414a3f446844f232e"
 readonly EXPECTED_TEST_SHA="ecadb6f5ffa69d5e8510ca4c4e185b23520e3033b3c223efc6cca638e6f26cc4"
-readonly PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/sing-shadowsocks2-v0.2.7-length-buffer.patch"
-readonly PATCHED_DIR="${RUNNER_TEMP:?}/sing-shadowsocks2-v0.2.7-ios-memory-v2"
+readonly PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/sing-shadowsocks2-v0.2.8-length-buffer.patch"
+readonly PATCHED_DIR="${RUNNER_TEMP:?}/sing-shadowsocks2-v0.2.8-ios-memory-v1"
 
 check_sha256() {
   local expected="$1"

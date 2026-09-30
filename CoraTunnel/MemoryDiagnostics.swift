@@ -11,12 +11,16 @@ final class MemoryDiagnostics: @unchecked Sendable {
     struct SupplementalStats {
         let ipcResponseCount: Int
         let ipcResponseBytes: UInt64
+        let ipcResponseMemoryBytes: UInt64
+        let ipcResponseFileBytes: UInt64
         let logBufferedLines: Int
         let logBufferedBytes: UInt64
         let logPersistedBytes: UInt64
 
         static let empty = SupplementalStats(ipcResponseCount: 0,
                                              ipcResponseBytes: 0,
+                                             ipcResponseMemoryBytes: 0,
+                                             ipcResponseFileBytes: 0,
                                              logBufferedLines: 0,
                                              logBufferedBytes: 0,
                                              logPersistedBytes: 0)
@@ -275,6 +279,8 @@ final class MemoryDiagnostics: @unchecked Sendable {
                 + "\"reusableSize\":\(vm.reusableSize)},"
                 + "\"cora\":{\"ipcResponseCount\":\(supplemental.ipcResponseCount),"
                 + "\"ipcResponseBytes\":\(supplemental.ipcResponseBytes),"
+                + "\"ipcResponseMemoryBytes\":\(supplemental.ipcResponseMemoryBytes),"
+                + "\"ipcResponseFileBytes\":\(supplemental.ipcResponseFileBytes),"
                 + "\"logBufferedLines\":\(supplemental.logBufferedLines),"
                 + "\"logBufferedBytes\":\(supplemental.logBufferedBytes),"
                 + "\"logPersistedBytes\":\(supplemental.logPersistedBytes)},"
@@ -325,6 +331,10 @@ final class MemoryDiagnostics: @unchecked Sendable {
         updateMetricLocked("ipcResponseCount", value: UInt64(max(0, supplemental.ipcResponseCount)),
                            timestampMs: timestampMs)
         updateMetricLocked("ipcResponseBytes", value: supplemental.ipcResponseBytes,
+                           timestampMs: timestampMs)
+        updateMetricLocked("ipcResponseMemoryBytes", value: supplemental.ipcResponseMemoryBytes,
+                           timestampMs: timestampMs)
+        updateMetricLocked("ipcResponseFileBytes", value: supplemental.ipcResponseFileBytes,
                            timestampMs: timestampMs)
         updateMetricLocked("logBufferedLines", value: UInt64(max(0, supplemental.logBufferedLines)),
                            timestampMs: timestampMs)

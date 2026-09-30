@@ -52,7 +52,7 @@ import (
 	"github.com/metacubex/mihomo/tunnel"
 	"github.com/metacubex/mihomo/tunnel/statistic"
 	"github.com/oschwald/maxminddb-golang"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 const defaultASNURL = "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/GeoLite2-ASN.mmdb"
@@ -495,7 +495,7 @@ func ForceGC() {
 // <home>/run.log。用户在 Windows 无 Mac/Console，靠这个文件 + 主 App 读取，
 // 才能看到内核内部输出（如出站接口选择、bind 失败、DNS 等），不靠猜。
 //
-// 依据：metacubex/mihomo v1.19.30 log/log.go ——
+// 依据：metacubex/mihomo v1.19.31 log/log.go ——
 //
 //	func Subscribe() observable.Subscription[Event]（即 <-chan Event）
 //	type Event struct { LogLevel LogLevel; Payload string }
@@ -1631,13 +1631,19 @@ func ConfigNotices() string {
 
 // ProxyDetails 返回 {节点名: 协议摘要} 的 JSON。对应 Swift 侧 `MihomoProxyDetails()`。
 func ProxyDetails() string {
+	return string(ProxyDetailsData())
+}
+
+// ProxyDetailsData returns the same JSON directly as NSData through gomobile.
+// The legacy string entry point shares this encoder.
+func ProxyDetailsData() []byte {
 	configApplyMu.RLock()
 	defer configApplyMu.RUnlock()
 	out, err := json.Marshal(proxyDetailsMap)
 	if err != nil {
-		return "{}"
+		return []byte(`{}`)
 	}
-	return string(out)
+	return out
 }
 
 // filterGeoNegationRules 仅在 geo **开启**时用：保留普通 geo 规则，只剔除「取反」的——
@@ -1788,12 +1794,22 @@ func filterGeoRules(rules []any) ([]any, int) {
 // It traverses group interfaces directly so a large subscription is never
 // fully serialized and decoded again inside the extension.
 func QueryProxies() string {
+	return string(QueryProxiesData())
+}
+
+// QueryProxiesData returns the same JSON directly as NSData through gomobile.
+// The legacy string entry point shares this encoder.
+func QueryProxiesData() []byte {
 	configApplyMu.RLock()
 	defer configApplyMu.RUnlock()
-	return queryProxyCatalog(tunnel.Proxies(), tunnel.Mode().String())
+	return queryProxyCatalogData(tunnel.Proxies(), tunnel.Mode().String())
 }
 
 func queryProxyCatalog(proxies map[string]C.Proxy, mode string) string {
+	return string(queryProxyCatalogData(proxies, mode))
+}
+
+func queryProxyCatalogData(proxies map[string]C.Proxy, mode string) []byte {
 	groups := map[string]any{}
 	nodeTypes := map[string]string{}
 	for name, proxy := range proxies {
@@ -1835,9 +1851,9 @@ func queryProxyCatalog(proxies map[string]C.Proxy, mode string) string {
 		"mode":      mode,
 	})
 	if err != nil {
-		return `{"proxies":{},"error":"marshal: ` + err.Error() + `"}`
+		return marshalJSONData(map[string]any{"proxies": map[string]any{}, "error": "marshal: " + err.Error()})
 	}
-	return string(out)
+	return out
 }
 
 type remoteProxyProvider struct {
@@ -2419,11 +2435,15 @@ func offlineGroupType(value string) string {
 }
 
 func marshalJSON(value any) string {
+	return string(marshalJSONData(value))
+}
+
+func marshalJSONData(value any) []byte {
 	out, err := json.Marshal(value)
 	if err != nil {
-		return `{}`
+		return []byte(`{}`)
 	}
-	return string(out)
+	return out
 }
 
 // SelectProxy 在指定策略组里选定某节点（等价 REST PUT /proxies/{name}）。
@@ -2833,17 +2853,23 @@ type scriptFetchRequest struct {
 // runner. It is intentionally HTTPS-only and always dials the named mihomo
 // proxy; it never uses the system URLSession or the currently selected group.
 func ScriptFetch(requestJSON string) string {
+	return string(ScriptFetchData(requestJSON))
+}
+
+// ScriptFetchData returns the same JSON directly as NSData through gomobile.
+// The legacy string entry point shares this encoder.
+func ScriptFetchData(requestJSON string) []byte {
 	var request scriptFetchRequest
 	if err := json.Unmarshal([]byte(requestJSON), &request); err != nil {
-		return marshalJSON(map[string]any{"ok": false, "error": "请求参数无效"})
+		return marshalJSONData(map[string]any{"ok": false, "error": "请求参数无效"})
 	}
 	if len(request.Body) > maxScriptRequestBodyBytes {
-		return marshalJSON(map[string]any{"ok": false, "error": "脚本请求体超过大小限制"})
+		return marshalJSONData(map[string]any{"ok": false, "error": "脚本请求体超过大小限制"})
 	}
 	rawURL := strings.TrimSpace(request.URL)
 	u, err := url.Parse(rawURL)
 	if err != nil || !strings.EqualFold(u.Scheme, "https") || u.Hostname() == "" || u.User != nil {
-		return marshalJSON(map[string]any{"ok": false, "error": "脚本只允许 HTTPS 请求"})
+		return marshalJSONData(map[string]any{"ok": false, "error": "脚本只允许 HTTPS 请求"})
 	}
 	method := strings.ToUpper(strings.TrimSpace(request.Method))
 	if method == "" {
@@ -2852,15 +2878,15 @@ func ScriptFetch(requestJSON string) string {
 	switch method {
 	case stdHTTP.MethodGet, stdHTTP.MethodPost, stdHTTP.MethodHead:
 	default:
-		return marshalJSON(map[string]any{"ok": false, "error": "脚本只允许 GET、POST、HEAD"})
+		return marshalJSONData(map[string]any{"ok": false, "error": "脚本只允许 GET、POST、HEAD"})
 	}
 	proxies := tunnel.Proxies()
 	proxy, err := resolveScriptProxy(request.Name, request.Group, proxies)
 	if err != nil {
-		return marshalJSON(map[string]any{"ok": false, "error": err.Error()})
+		return marshalJSONData(map[string]any{"ok": false, "error": err.Error()})
 	}
 	if proxy.Type() == C.Direct || proxy.Type() == C.Reject || proxy.Type() == C.RejectDrop {
-		return marshalJSON(map[string]any{"ok": false, "error": "目标不是可用于解锁测试的代理节点"})
+		return marshalJSONData(map[string]any{"ok": false, "error": "目标不是可用于解锁测试的代理节点"})
 	}
 	if request.TimeoutMs <= 0 || request.TimeoutMs > maxScriptRequestTimeoutMs {
 		request.TimeoutMs = maxScriptRequestTimeoutMs
@@ -2873,7 +2899,7 @@ func ScriptFetch(requestJSON string) string {
 	}
 	tlsConfig, err := ca.GetTLSConfig(ca.Option{})
 	if err != nil {
-		return marshalJSON(map[string]any{"ok": false, "error": "TLS 配置失败"})
+		return marshalJSONData(map[string]any{"ok": false, "error": "TLS 配置失败"})
 	}
 	transport := &stdHTTP.Transport{
 		DialContext: func(dialCtx context.Context, _, address string) (net.Conn, error) {
@@ -2908,7 +2934,7 @@ func ScriptFetch(requestJSON string) string {
 	}
 	req, err := stdHTTP.NewRequest(method, rawURL, body)
 	if err != nil {
-		return marshalJSON(map[string]any{"ok": false, "error": "请求构造失败"})
+		return marshalJSONData(map[string]any{"ok": false, "error": "请求构造失败"})
 	}
 	req = req.WithContext(ctx)
 	for key, value := range request.Headers {
@@ -2918,12 +2944,12 @@ func ScriptFetch(requestJSON string) string {
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return marshalJSON(map[string]any{"ok": false, "error": "节点请求超时或失败"})
+		return marshalJSONData(map[string]any{"ok": false, "error": "节点请求超时或失败"})
 	}
 	defer resp.Body.Close()
 	data, readErr := io.ReadAll(io.LimitReader(resp.Body, maxScriptResponseBodyBytes+1))
 	if readErr != nil {
-		return marshalJSON(map[string]any{"ok": false, "error": "读取响应失败"})
+		return marshalJSONData(map[string]any{"ok": false, "error": "读取响应失败"})
 	}
 	truncated := len(data) > maxScriptResponseBodyBytes
 	if truncated {
@@ -2942,7 +2968,7 @@ func ScriptFetch(requestJSON string) string {
 		headers[key] = value
 		headerBytes += len(key) + len(value)
 	}
-	return marshalJSON(map[string]any{
+	return marshalJSONData(map[string]any{
 		"ok":        true,
 		"status":    resp.StatusCode,
 		"headers":   headers,
@@ -3441,6 +3467,12 @@ func TrafficNow() string {
 // Bounding the list avoids large REST-style snapshots creating avoidable
 // encode/decode peaks in the Network Extension process.
 func ConnectionsSnapshot(limit int) string {
+	return string(ConnectionsSnapshotData(limit))
+}
+
+// ConnectionsSnapshotData returns the same JSON directly as NSData through gomobile.
+// The legacy string entry point shares this encoder.
+func ConnectionsSnapshotData(limit int) []byte {
 	uploadTotal, downloadTotal := statistic.DefaultManager.Total()
 	if limit == 0 {
 		// Keep the response detail-free, but still expose the live count used by
@@ -3464,10 +3496,10 @@ func ConnectionsSnapshot(limit int) string {
 			Total:         liveCount,
 		})
 		if err != nil {
-			return `{"downloadTotal":0,"uploadTotal":0,"connections":[],"total":0,"truncated":false}`
+			return []byte(`{"downloadTotal":0,"uploadTotal":0,"connections":[],"total":0,"truncated":false}`)
 		}
 		atomic.StoreInt64(&lastConnectionSnapshotBytes, int64(len(out)))
-		return string(out)
+		return out
 	}
 	if limit < 0 {
 		limit = defaultConnectionSnapshotLimit
@@ -3490,10 +3522,10 @@ func ConnectionsSnapshot(limit int) string {
 		Truncated:     total > len(connections),
 	})
 	if err != nil {
-		return `{"downloadTotal":0,"uploadTotal":0,"connections":[],"total":0,"truncated":false}`
+		return []byte(`{"downloadTotal":0,"uploadTotal":0,"connections":[],"total":0,"truncated":false}`)
 	}
 	atomic.StoreInt64(&lastConnectionSnapshotBytes, int64(len(out)))
-	return string(out)
+	return out
 }
 
 // newestConnectionSnapshot shares the same bounded selection between the App

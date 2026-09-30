@@ -1,10 +1,13 @@
 import SwiftUI
 import Charts
+import UIKit
 
 /// 总览：以连接控制为中心，运行状态与流量指标围绕主操作展开。
 struct ConnectView: View {
     @EnvironmentObject private var core: CoreStateManager
     @ObservedObject var connections: ConnectionsController
+    @State private var memoryReleaseFeedback: String?
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     var body: some View {
         NavigationStack {
@@ -13,7 +16,7 @@ struct ConnectView: View {
 
                 ScrollView {
                     VStack(spacing: 18) {
-                        ConnectionHero()
+                        ConnectionHero(onMemoryRelease: { memoryReleaseFeedback = $0 })
 
                         if core.isActive {
                             // Keep the high-frequency traffic publisher scoped to
@@ -33,8 +36,38 @@ struct ConnectView: View {
                 .scrollIndicators(.hidden)
                 .background(Color.clear)
             }
+            .overlay(alignment: .bottom) {
+                if let message = memoryReleaseFeedback {
+                    Text(message)
+                        .font(.subheadline)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(14)
+                        .frame(maxWidth: .infinity)
+                        .background {
+                            if reduceTransparency {
+                                RoundedRectangle(cornerRadius: 14)
+                                    .fill(Color(uiColor: .secondarySystemBackground))
+                            } else {
+                                RoundedRectangle(cornerRadius: 14).fill(.regularMaterial)
+                            }
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.bottom, 12)
+                        .allowsHitTesting(false)
+                }
+            }
             .navigationBarTitleDisplayMode(.inline)
             .task { await core.refreshStatus() }
+            .task(id: memoryReleaseFeedback) {
+                guard memoryReleaseFeedback != nil else { return }
+                do { try await Task.sleep(nanoseconds: 4_000_000_000) }
+                catch { return }
+                memoryReleaseFeedback = nil
+            }
+            .onChange(of: core.status) { status in
+                if status != .connected { memoryReleaseFeedback = nil }
+            }
         }
     }
 }
@@ -108,6 +141,7 @@ private struct OverviewConnectionCard: View {
 }
 
 private struct ConnectionHero: View {
+    let onMemoryRelease: (String) -> Void
     @EnvironmentObject private var core: CoreStateManager
     @EnvironmentObject private var kernel: KernelController
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -174,14 +208,29 @@ private struct ConnectionHero: View {
             .accessibilityLabel(core.isActive ? "断开 VPN" : "连接 VPN")
 
             VStack(spacing: 10) {
-                Label(kernel.memoryFootprint.map(ByteFormat.size) ?? "—",
-                      systemImage: "memorychip")
+                HStack(spacing: 6) {
+                    if kernel.isReleasingMemory {
+                        ProgressView().controlSize(.mini)
+                    } else {
+                        Image(systemName: "memorychip")
+                    }
+                    Text(kernel.isReleasingMemory ? "释放中…"
+                         : kernel.memoryFootprint.map(ByteFormat.size) ?? "—")
+                }
                     .font(.footnote.monospacedDigit().weight(.medium))
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 12)
                     .frame(minHeight: 32)
                     .background(Capsule().fill(.thinMaterial))
-                    .accessibilityLabel("内存 \(kernel.memoryFootprint.map(ByteFormat.size) ?? "未知")")
+                    .frame(minHeight: 44)
+                    .contentShape(Rectangle())
+                    .onLongPressGesture(minimumDuration: 0.6) { releaseMemory() }
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(kernel.isReleasingMemory ? "正在释放空闲内存"
+                                        : "NE 内存 \(kernel.memoryFootprint.map(ByteFormat.size) ?? "未知")")
+                    .accessibilityHint(core.status == .connected ? "长按释放空闲内存" : "连接 VPN 后可释放空闲内存")
+                    .accessibilityAddTraits(.isButton)
+                    .accessibilityAction(named: Text("释放空闲内存")) { releaseMemory() }
 
                 HStack(spacing: 10) {
                     OverviewModeMenu()
@@ -214,6 +263,27 @@ private struct ConnectionHero: View {
         .onAppear { updateRipple() }
         .onChange(of: core.status) { _ in updateRipple() }
         .onChange(of: reduceMotion) { _ in updateRipple() }
+    }
+
+    private func releaseMemory() {
+        guard core.status == .connected, !kernel.isReleasingMemory else { return }
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        Task {
+            let result = await kernel.releaseMemory()
+            let message: String
+            switch result {
+            case .released(let before, let after):
+                message = before > after
+                    ? "已释放 \(ByteFormat.size(before - after))，当前 \(ByteFormat.size(after))"
+                    : "已完成回收，当前 \(ByteFormat.size(after))；使用中的内存会保留"
+            case .failure(let reason): message = reason
+            case .superseded: return
+            }
+            onMemoryRelease(message)
+            if UIAccessibility.isVoiceOverRunning {
+                UIAccessibility.post(notification: .announcement, argument: message)
+            }
+        }
     }
 
     private var rippleRings: some View {

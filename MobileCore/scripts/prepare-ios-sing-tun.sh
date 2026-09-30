@@ -2,17 +2,17 @@
 set -euo pipefail
 
 readonly MODULE="github.com/metacubex/sing-tun"
-readonly EXPECTED_VERSION="v0.4.22"
+readonly EXPECTED_VERSION="v0.4.24"
 readonly PROCESSOR_SOURCE_REL="internal/fdbased_darwin/processors.go"
 readonly DARWIN_STACK_SOURCE_REL="tun_darwin_gvisor.go"
 readonly DARWIN_STACK_TEST_REL="tun_darwin_gvisor_test.go"
 readonly EXPECTED_PROCESSOR_SOURCE_SHA="64c92b86efd20d4bc9eebd32acefd77051ceb84ab2879e701c2241a181970088"
-readonly EXPECTED_DARWIN_STACK_SOURCE_SHA="232842a816568665b6739b4b9165aecea229c2d7549c8f584f8de8adc8a274a1"
+readonly EXPECTED_DARWIN_STACK_SOURCE_SHA="fe5b186250b55e4d661cd93f92a91c11737bc145b269808cd26becd82dc423eb"
 readonly EXPECTED_PROCESSOR_PATCHED_SHA="ef063b883d4fff7c146044b5db31f73b74e497664645b4a786d326505b047051"
-readonly EXPECTED_DARWIN_STACK_PATCHED_SHA="3d4bc2e32d4eeb99298b62310b0f126da1ce8ead3ef757a03bfc17cad426cf52"
+readonly EXPECTED_DARWIN_STACK_PATCHED_SHA="7eb5b393a808964f501cf9d51b5e763705a3f2f074dc9829ff5c21efd71e1b05"
 readonly EXPECTED_DARWIN_STACK_TEST_SHA="6d7a62d602fedd3aba86093dbdbfcb4e102d515908c4b10fb10ade3153dbe910"
-readonly PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/sing-tun-v0.4.22-darwin-queue.patch"
-readonly PATCHED_DIR="${RUNNER_TEMP:?}/sing-tun-v0.4.22-ios-memory-v2"
+readonly PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/sing-tun-v0.4.24-darwin-queue.patch"
+readonly PATCHED_DIR="${RUNNER_TEMP:?}/sing-tun-v0.4.24-ios-memory-v1"
 
 check_sha256() {
   local expected="$1"

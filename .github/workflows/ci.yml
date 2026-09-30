@@ -33,6 +33,12 @@ jobs:
       - name: Test connection history persistence
         run: bash scripts/test-connection-history.sh
 
+      - name: Test bounded IPC response storage
+        run: bash scripts/test-ipc-response-cache.sh
+
+      - name: Test manual NE memory release
+        run: bash scripts/test-kernel-memory.sh
+
       - name: Test single-node delay feedback
         run: bash scripts/test-proxy-controller.sh
 
