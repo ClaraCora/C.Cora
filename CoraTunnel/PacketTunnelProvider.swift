@@ -762,7 +762,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         switch cmd {
         case "po0WhitelistStatus":
             reply(Data(MihomoPO0WhitelistStatus().utf8))
-        case "setPO0Whitelist", "checkPO0Whitelist":
+        case "setPO0Whitelist", "checkPO0Whitelist", "refreshPO0Whitelist":
             self.runtimeQueue.async {
                 guard !self.isStopping, self.tunnelFileDescriptor != nil,
                       self.currentIPCSessionGeneration() == sessionGeneration else {
@@ -780,6 +780,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                     return
                 }
                 do {
+                    if cmd == "refreshPO0Whitelist" {
+                        // A query must not configure/restart the automatic adder.
+                        reply(Data(MihomoRefreshPO0Whitelist(try validated.json()).utf8))
+                        return
+                    }
                     if AppGroup.containerURL != nil {
                         guard PO0WhitelistStorage.load().id == validated.id else {
                             reply(Self.jsonData(["error": "设置已更新，请重试同步最新设置"]))

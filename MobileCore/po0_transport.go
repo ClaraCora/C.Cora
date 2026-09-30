@@ -20,6 +20,14 @@ const po0APIBase = "https://124.221.69.228/api/firewall/"
 const po0MaximumResponseBytes = 32 << 10
 
 func fetchPO0Whitelist(ctx context.Context, token po0Token) po0Result {
+	return fetchPO0(ctx, token, false)
+}
+
+func fetchPO0WhitelistReadOnly(ctx context.Context, token po0Token) po0Result {
+	return fetchPO0(ctx, token, true)
+}
+
+func fetchPO0(ctx context.Context, token po0Token, readOnly bool) po0Result {
 	tlsConfig, err := ca.GetTLSConfig(ca.Option{})
 	if err != nil {
 		return po0Result{Error: "无法初始化安全连接"}
@@ -35,7 +43,7 @@ func fetchPO0Whitelist(ctx context.Context, token po0Token) po0Result {
 		MaxResponseHeaderBytes: 16 << 10,
 	}
 	defer transport.CloseIdleConnections()
-	return requestPO0Whitelist(ctx, newPO0HTTPClient(transport), po0APIBase, token, 1500*time.Millisecond)
+	return requestPO0(ctx, newPO0HTTPClient(transport), po0APIBase, token, 1500*time.Millisecond, readOnly)
 }
 
 func newPO0HTTPClient(transport http.RoundTripper) *http.Client {
@@ -47,9 +55,19 @@ func newPO0HTTPClient(transport http.RoundTripper) *http.Client {
 
 func requestPO0Whitelist(ctx context.Context, client *http.Client, base string,
 	token po0Token, backoff time.Duration) po0Result {
-	endpoint := base + url.PathEscape(token.value) + "/add"
-	if token.slot != nil {
-		endpoint += "?slot=" + strconv.Itoa(*token.slot)
+	return requestPO0(ctx, client, base, token, backoff, false)
+}
+
+func requestPO0(ctx context.Context, client *http.Client, base string,
+	token po0Token, backoff time.Duration, readOnly bool) po0Result {
+	endpoint := base + url.PathEscape(token.value)
+	method := http.MethodGet
+	if !readOnly {
+		method = http.MethodPost
+		endpoint += "/add"
+		if token.slot != nil {
+			endpoint += "?slot=" + strconv.Itoa(*token.slot)
+		}
 	}
 	var result po0Result
 	for attempt := 0; attempt < 3; attempt++ {
@@ -65,7 +83,7 @@ func requestPO0Whitelist(ctx context.Context, client *http.Client, base string,
 			case <-timer.C:
 			}
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, nil)
+		req, err := http.NewRequestWithContext(ctx, method, endpoint, nil)
 		if err != nil {
 			return po0Result{Error: "请求地址无效"}
 		}

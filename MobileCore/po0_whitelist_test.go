@@ -237,3 +237,143 @@ func TestPO0NetworkChangeDuringRequestGetsOneFollowup(t *testing.T) {
 		t.Fatal("network flaps created duplicate checks")
 	}
 }
+
+func TestPO0ReadOnlyHTTPNeverAddsOrPins(t *testing.T) {
+	for _, status := range []int{200, 503} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			var count atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				count.Add(1)
+				if r.Method != http.MethodGet || r.URL.Path != "/pgnfw_private" || r.URL.RawQuery != "" {
+					t.Errorf("read-only refresh attempted a write: %s %s", r.Method, r.URL.Path)
+				}
+				w.WriteHeader(status)
+				fmt.Fprint(w, `{"enabled":true,"currentIp":"1.2.3.4","whitelist":["1.2.3.0/24"],"limit":5}`)
+			}))
+			defer server.Close()
+			slot := 3
+			result := requestPO0(context.Background(), newPO0HTTPClient(http.DefaultTransport),
+				server.URL+"/", po0Token{value: "pgnfw_private", slot: &slot}, time.Millisecond, true)
+			if status == 200 && (!result.Applied || count.Load() != 1) {
+				t.Fatalf("query failed: %+v", result)
+			}
+			if status == 503 && (result.Error == "" || count.Load() != 3) {
+				t.Fatal("GET retry behavior changed")
+			}
+		})
+	}
+}
+
+func TestPO0ReadOnlyDoesNotConfigureOrReschedule(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprint(enabled), func(t *testing.T) {
+			var writes, reads atomic.Int32
+			s := newPO0Service(func(context.Context, po0Token) po0Result { writes.Add(1); return po0Result{} })
+			s.lookup = func(context.Context, po0Token) po0Result { reads.Add(1); return po0Result{CurrentIP: "1.2.3.4"} }
+			s.initialDelay = time.Hour
+			defer s.stop()
+			cfg := po0TestConfig("readonly", "pgnfw_x@0", enabled)
+			if err := s.configure(cfg); err != nil {
+				t.Fatal(err)
+			}
+			var before, after po0Snapshot
+			json.Unmarshal([]byte(s.snapshotJSON()), &before)
+			if err := s.refreshReadOnly(cfg); err != nil {
+				t.Fatal(err)
+			}
+			po0Wait(t, func() bool {
+				json.Unmarshal([]byte(s.snapshotJSON()), &after)
+				return after.LastRefreshedAt > 0 && !after.Refreshing
+			})
+			if writes.Load() != 0 || reads.Load() != 1 || after.NextCheckAt != before.NextCheckAt ||
+				after.Pending != before.Pending || after.LastCheckedAt != before.LastCheckedAt || after.Enabled != enabled ||
+				len(after.Results) != 1 || !after.Results[0].ReadOnly {
+				t.Fatalf("read changed automatic state: before=%+v, after=%+v", before, after)
+			}
+			if err := s.refreshReadOnly(po0TestConfig("stale", "pgnfw_x", enabled)); err == nil {
+				t.Fatal("stale configuration accepted")
+			}
+			if reads.Load() != 1 || writes.Load() != 0 {
+				t.Fatal("stale query scheduled network work")
+			}
+		})
+	}
+}
+
+func TestPO0ReadAndAutomaticWriteShareOneBatch(t *testing.T) {
+	var active, writes atomic.Int32
+	var overlap atomic.Bool
+	entered, release := make(chan struct{}), make(chan struct{})
+	s := newPO0Service(func(context.Context, po0Token) po0Result {
+		if active.Add(1) != 1 {
+			overlap.Store(true)
+		}
+		defer active.Add(-1)
+		writes.Add(1)
+		return po0Result{}
+	})
+	s.lookup = func(ctx context.Context, _ po0Token) po0Result {
+		if active.Add(1) != 1 {
+			overlap.Store(true)
+		}
+		defer active.Add(-1)
+		close(entered)
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		return po0Result{}
+	}
+	s.initialDelay = 20 * time.Millisecond
+	defer s.stop()
+	cfg := po0TestConfig("serial", "pgnfw_x", true)
+	if err := s.configure(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.refreshReadOnly(cfg); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("read did not start")
+	}
+	po0Wait(t, func() bool { var st po0Snapshot; json.Unmarshal([]byte(s.snapshotJSON()), &st); return st.Checking })
+	if writes.Load() != 0 {
+		t.Fatal("write bypassed the shared gate")
+	}
+	close(release)
+	po0Wait(t, func() bool { return writes.Load() == 1 })
+	if overlap.Load() {
+		t.Fatal("GET and POST ran concurrently")
+	}
+}
+
+func TestPO0StopCancelsReadAndDropsStaleResults(t *testing.T) {
+	entered := make(chan struct{})
+	s := newPO0Service(func(context.Context, po0Token) po0Result { t.Error("unexpected POST"); return po0Result{} })
+	s.lookup = func(ctx context.Context, _ po0Token) po0Result {
+		close(entered)
+		<-ctx.Done()
+		return po0Result{Applied: true}
+	}
+	defer s.stop()
+	cfg := po0TestConfig("cancel", "pgnfw_x", false)
+	if err := s.configure(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.refreshReadOnly(cfg); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("read did not start")
+	}
+	s.stop()
+	var state po0Snapshot
+	json.Unmarshal([]byte(s.snapshotJSON()), &state)
+	if state.Refreshing || len(state.Results) != 0 || state.LastRefreshedAt != 0 {
+		t.Fatal("read outlived VPN stop")
+	}
+}

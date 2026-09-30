@@ -47,6 +47,52 @@ struct PO0WhitelistSettingsView: View {
     var body: some View {
         Form {
             Section {
+                Button {
+                    Task { await store.refreshReadOnly() }
+                } label: {
+                    HStack {
+                        Label("刷新查看", systemImage: "arrow.clockwise")
+                        Spacer()
+                        SettingsActivityIndicator(isRunning: core.isActive && (store.isRequestingRefresh || store.snapshot?.refreshing == true))
+                    }
+                }
+                .disabled(!core.isActive || store.configuration.tokens.isEmpty || store.isSaving ||
+                          hasChanges || store.isRequestingRefresh || store.snapshot?.refreshing == true)
+                if let snapshot = store.snapshot, snapshot.configurationID == store.configuration.id,
+                   let time = snapshot.lastRefreshedAt, time > 0 {
+                    dateRow("最近刷新", timestamp: time)
+                }
+                if let error = store.readOnlyMessage {
+                    Label(error, systemImage: "exclamationmark.triangle")
+                        .font(.footnote)
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if store.snapshot?.results.isEmpty != false {
+                    Text(store.configuration.tokens.isEmpty ? "填写并保存 Token 后，可在这里查看白名单。" : "暂无白名单结果，点击“刷新查看”获取。")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+            } header: {
+                Text("白名单")
+            } footer: {
+                if hasChanges {
+                    Text("请先保存修改，再刷新对应 Token 的白名单。")
+                } else if !core.isActive {
+                    Text("连接 VPN 后可刷新查看。已有结果仅代表上次查询。")
+                } else {
+                    Text("刷新只查询，不添加白名单或写入槽位。已开启的自动加白仍按原计划运行。")
+                }
+            }
+            .settingsSectionStyle()
+
+            if let snapshot = store.snapshot, snapshot.configurationID == store.configuration.id {
+                ForEach(snapshot.results) { result in
+                    resultSection(result)
+                }
+            }
+
+            Section {
                 Toggle(isOn: $draft.enabled) {
                     Label("自动检测并加白", systemImage: "checkmark.shield")
                 }
@@ -112,7 +158,7 @@ struct PO0WhitelistSettingsView: View {
                     Task { await store.checkNow() }
                 } label: {
                     HStack {
-                        Label("立即检测并加白", systemImage: "arrow.clockwise")
+                        Label("立即检测并加白", systemImage: "plus.shield")
                         Spacer()
                         SettingsActivityIndicator(isRunning: core.isActive && store.snapshot?.isWorking == true)
                     }
@@ -148,11 +194,6 @@ struct PO0WhitelistSettingsView: View {
                 .settingsSectionStyle()
             }
 
-            if let snapshot = store.snapshot, snapshot.configurationID == store.configuration.id {
-                ForEach(snapshot.results) { result in
-                    resultSection(result)
-                }
-            }
         }
         .scrollContentBackground(.hidden)
         .background(AppAmbientBackground())
@@ -188,6 +229,9 @@ struct PO0WhitelistSettingsView: View {
                 do { try await Task.sleep(nanoseconds: 3_000_000_000) } catch { return }
             }
         }
+        .environment(\.coraSettingsAppearance, true)
+        .environment(\.defaultMinListRowHeight, 44)
+        .tint(Color(uiColor: .systemBlue))
     }
 
     private func dateRow(_ title: String, timestamp: Double) -> some View {
@@ -212,15 +256,23 @@ struct PO0WhitelistSettingsView: View {
                 LabeledContent("白名单占用", value: "\(result.whitelist.count)\(result.truncated ? "+" : "") / \(result.limit)")
             }
             ForEach(Array(result.whitelist.enumerated()), id: \.offset) { _, entry in
-                HStack {
+                HStack(alignment: .top) {
                     Text(entry.ip).textSelection(.enabled)
                     Spacer(minLength: 8)
-                    if let slot = entry.slot {
-                        Label("槽位 \(slot)", systemImage: "pin")
-                            .font(.caption).foregroundStyle(.secondary)
+                    VStack(alignment: .trailing, spacing: 4) {
+                        if result.isCurrentExit(entry) {
+                            Label("当前出口", systemImage: "location.fill")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.green)
+                        }
+                        if let slot = entry.slot {
+                            Label("槽位 \(slot)", systemImage: "pin")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
                     }
                 }
                 .font(.subheadline)
+                .accessibilityElement(children: .combine)
             }
             if result.truncated {
                 Text("仅显示前 64 条，完整白名单可在 PO0 网站查看。")

@@ -40,6 +40,7 @@ type po0Result struct {
 	Limit     int        `json:"limit"`
 	Truncated bool       `json:"truncated"`
 	Error     string     `json:"error,omitempty"`
+	ReadOnly  bool       `json:"readOnly"`
 }
 
 type po0Snapshot struct {
@@ -49,6 +50,8 @@ type po0Snapshot struct {
 	Pending         bool        `json:"pending"`
 	LastCheckedAt   int64       `json:"lastCheckedAt"`
 	NextCheckAt     int64       `json:"nextCheckAt"`
+	Refreshing      bool        `json:"refreshing"`
+	LastRefreshedAt int64       `json:"lastRefreshedAt"`
 	Results         []po0Result `json:"results"`
 }
 
@@ -107,8 +110,11 @@ type po0Service struct {
 	control sync.Mutex
 	mu      sync.Mutex
 	run     *po0Run
+	query   *po0Run
 	state   po0Snapshot
 	fetch   func(context.Context, po0Token) po0Result
+	lookup  func(context.Context, po0Token) po0Result
+	gate    chan struct{}
 	// Kept configurable internally for deterministic, fast lifecycle tests.
 	initialDelay time.Duration
 	minimumGap   time.Duration
@@ -116,7 +122,7 @@ type po0Service struct {
 }
 
 func newPO0Service(fetch func(context.Context, po0Token) po0Result) *po0Service {
-	return &po0Service{fetch: fetch, initialDelay: 2 * time.Second,
+	return &po0Service{fetch: fetch, lookup: fetchPO0WhitelistReadOnly, gate: make(chan struct{}, 1), initialDelay: 2 * time.Second,
 		minimumGap: 10 * time.Second, intervalUnit: time.Minute}
 }
 
@@ -151,11 +157,19 @@ func (s *po0Service) configure(raw string) error {
 func (s *po0Service) stopWorker() {
 	s.mu.Lock()
 	run := s.run
+	query := s.query
 	s.run = nil
+	s.query = nil
 	s.mu.Unlock()
+	if query != nil {
+		query.cancel()
+	}
 	if run != nil {
 		run.cancel()
 		<-run.done
+	}
+	if query != nil {
+		<-query.done
 	}
 }
 
@@ -186,6 +200,84 @@ func (s *po0Service) snapshotJSON() string {
 	defer s.mu.Unlock()
 	data, _ := json.Marshal(s.state)
 	return string(data)
+}
+
+// A read request never configures the service or touches the automatic timer.
+// It is allowed with automatic registration off, and shares a gate with writes
+// so only one bounded HTTP batch can run at a time in NE.
+func (s *po0Service) refreshReadOnly(raw string) error {
+	cfg, tokens, err := parsePO0Configuration(raw)
+	if err != nil {
+		return err
+	}
+	if len(tokens) == 0 {
+		return errors.New("请先填写并保存 PO0 Token")
+	}
+	s.control.Lock()
+	defer s.control.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if cfg.ID != s.state.ConfigurationID {
+		return errors.New("PO0 设置尚未同步，请先保存设置后重试")
+	}
+	if s.query != nil {
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	query := &po0Run{cancel: cancel, done: make(chan struct{})}
+	s.query = query
+	s.state.Refreshing = true
+	go func() {
+		defer close(query.done)
+		defer cancel()
+		s.fetchBatch(ctx, tokens, true)
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.query != query {
+			return
+		}
+		s.query = nil
+		s.state.Refreshing = false
+	}()
+	return nil
+}
+
+func (s *po0Service) fetchBatch(ctx context.Context, tokens []po0Token, readOnly bool) {
+	select {
+	case <-ctx.Done():
+		return
+	case s.gate <- struct{}{}:
+	}
+	defer func() { <-s.gate }()
+	results := make([]po0Result, 0, len(tokens))
+	for i, token := range tokens {
+		if ctx.Err() != nil {
+			return
+		}
+		var result po0Result
+		if readOnly {
+			result = s.lookup(ctx, token)
+		} else {
+			result = s.fetch(ctx, token)
+		}
+		result.Index, result.Slot, result.ReadOnly = i+1, token.slot, readOnly
+		if result.Whitelist == nil {
+			result.Whitelist = []po0Entry{}
+		}
+		results = append(results, result)
+	}
+	// Publish before releasing the gate: an older GET must never overwrite
+	// the results of a newer automatic POST that acquired the gate after it.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ctx.Err() == nil {
+		s.state.Results = results
+		if readOnly {
+			s.state.LastRefreshedAt = time.Now().Unix()
+		} else {
+			s.state.LastCheckedAt = time.Now().Unix()
+		}
+	}
 }
 
 func (s *po0Service) work(ctx context.Context, run *po0Run, cfg po0Configuration, tokens []po0Token) {
@@ -220,26 +312,13 @@ func (s *po0Service) work(ctx context.Context, run *po0Run, cfg po0Configuration
 			s.state.Checking, s.state.Pending = true, false
 			s.state.NextCheckAt = 0
 			s.mu.Unlock()
-			results := make([]po0Result, 0, len(tokens))
-			for i, token := range tokens {
-				if ctx.Err() != nil {
-					return
-				}
-				result := s.fetch(ctx, token)
-				result.Index, result.Slot = i+1, token.slot
-				if result.Whitelist == nil {
-					result.Whitelist = []po0Entry{}
-				}
-				results = append(results, result)
-			}
+			s.fetchBatch(ctx, tokens, false)
 			if ctx.Err() != nil {
 				return
 			}
 			delay := time.Duration(cfg.IntervalMinutes) * s.intervalUnit
 			s.mu.Lock()
 			s.state.Checking = false
-			s.state.Results = results
-			s.state.LastCheckedAt = time.Now().Unix()
 			s.state.NextCheckAt = time.Now().Add(delay).Unix()
 			s.mu.Unlock()
 			timer.Reset(delay)
@@ -261,5 +340,13 @@ func PO0WhitelistStatus() string { return po0Whitelist.snapshotJSON() }
 
 func CheckPO0WhitelistNow() string {
 	po0Whitelist.request(false)
+	return PO0WhitelistStatus()
+}
+
+func RefreshPO0Whitelist(configurationJSON string) string {
+	if err := po0Whitelist.refreshReadOnly(configurationJSON); err != nil {
+		data, _ := json.Marshal(map[string]string{"error": err.Error()})
+		return string(data)
+	}
 	return PO0WhitelistStatus()
 }

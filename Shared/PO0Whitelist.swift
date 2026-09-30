@@ -93,8 +93,10 @@ struct PO0WhitelistSnapshot: Codable {
     let lastCheckedAt: Double
     let nextCheckAt: Double
     let results: [PO0WhitelistResult]
+    var refreshing: Bool? = nil
+    var lastRefreshedAt: Double? = nil
 
-    var isWorking: Bool { checking || pending }
+    var isWorking: Bool { checking || pending || refreshing == true }
     var successfulCount: Int { results.filter(\.applied).count }
 }
 
@@ -108,6 +110,7 @@ struct PO0WhitelistResult: Codable, Identifiable {
     let limit: Int
     let truncated: Bool
     let error: String?
+    var readOnly: Bool? = nil
     var id: Int { index }
 
     struct Entry: Codable {
@@ -116,8 +119,28 @@ struct PO0WhitelistResult: Codable, Identifiable {
     }
 
     var title: String {
-        if let error, !error.isEmpty { return "检测失败" }
+        if let error, !error.isEmpty { return readOnly == true ? "查询失败" : "检测失败" }
         if !enabled { return "防火墙未启用" }
-        return applied ? "已加入白名单" : "加白未生效"
+        if applied { return "当前出口已在白名单" }
+        return readOnly == true ? "当前出口未在白名单" : "加白未生效"
+    }
+
+    func isCurrentExit(_ entry: Entry) -> Bool {
+        guard let current = Self.ipv4(currentIp), let candidate = Self.ipv4(entry.ip) else { return false }
+        if !current.isSubnet && !candidate.isSubnet { return current.address == candidate.address }
+        return (current.address & 0xFFFF_FF00) == (candidate.address & 0xFFFF_FF00)
+    }
+
+    private static func ipv4(_ value: String) -> (address: UInt32, isSubnet: Bool)? {
+        let parts = value.components(separatedBy: "/")
+        guard parts.count == 1 || (parts.count == 2 && parts[1] == "24") else { return nil }
+        let octets = parts[0].components(separatedBy: ".")
+        guard octets.count == 4 else { return nil }
+        var address: UInt32 = 0
+        for octet in octets {
+            guard let byte = UInt8(octet), String(byte) == octet else { return nil }
+            address = (address << 8) | UInt32(byte)
+        }
+        return (address, parts.count == 2)
     }
 }

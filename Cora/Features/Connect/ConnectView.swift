@@ -183,7 +183,22 @@ private struct ConnectionHero: View {
                     .background(Capsule().fill(.thinMaterial))
                     .accessibilityLabel("内存 \(kernel.memoryFootprint.map(ByteFormat.size) ?? "未知")")
 
-                OverviewModeMenu()
+                HStack(spacing: 10) {
+                    OverviewModeMenu()
+                    NavigationLink {
+                        PO0WhitelistSettingsView()
+                    } label: {
+                        Image(systemName: "checkmark.shield")
+                            .font(.body.weight(.semibold))
+                            .foregroundStyle(.teal)
+                            .frame(width: 44, height: 44)
+                            .background(Circle().fill(.regularMaterial))
+                            .contentShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("PO0 白名单设置")
+                    .accessibilityHint("查看白名单并设置自动检测")
+                }
             }
 
             if let error = core.lastError {
