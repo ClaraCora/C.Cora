@@ -377,6 +377,7 @@ struct ProxiesView: View {
             group: group,
             groupIndex: controller.resolutionIndex,
             visibleNodes: result.nodes,
+            nodeTypeLabels: controller.nodeTypeLabels,
             isExpanded: result.isExpanded,
             isInteractionLocked: activeGroupName != nil && activeGroupName != group.name,
             isTesting: controller.testing.contains(group.name),
@@ -602,6 +603,7 @@ struct ProxiesView: View {
         let panel = GroupExpandedPanel(
             group: result.group,
             groupIndex: controller.resolutionIndex,
+            nodeTypeLabels: controller.nodeTypeLabels,
             isTesting: controller.testing.contains(result.group.name),
             canTest: controller.isRuntimeAvailable &&
                 controller.testingCurrentSelectionKeys.isEmpty,
@@ -1221,6 +1223,7 @@ private struct StrategyGroupListPanel: View {
     let group: ProxyGroup
     let groupIndex: ProxyGroupIndex
     let visibleNodes: [ProxyGroupNode]
+    let nodeTypeLabels: [String: String]
     let isExpanded: Bool
     let isInteractionLocked: Bool
     let isTesting: Bool
@@ -1289,6 +1292,7 @@ private struct StrategyGroupListPanel: View {
                             referencedGroup: item.name == group.name
                                 ? nil
                                 : groupIndex.group(named: item.name),
+                            protocolLabel: nodeTypeLabels[item.name],
                             isCurrent: item.name == group.now,
                             isSelecting: selecting == item.name,
                             isSelectionBlocked: selecting != nil,
@@ -1434,6 +1438,7 @@ private struct GroupIcon: View {
 private struct ProxyNodeListRow: View {
     let node: String
     let referencedGroup: ProxyGroup?
+    let protocolLabel: String?
     let isCurrent: Bool
     let isSelecting: Bool
     let isSelectionBlocked: Bool
@@ -1486,6 +1491,7 @@ private struct ProxyNodeListRow: View {
             subtitle: referencedGroup.map {
                 $0.now.isEmpty ? "未选择" : $0.now
             },
+            protocolLabel: referencedGroup == nil ? protocolLabel : nil,
             delay: delay)
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(node)
@@ -1505,6 +1511,7 @@ private struct ProxyNodeListRow: View {
     private var accessibilityValue: String {
         [
             isCurrent ? "当前节点" : nil,
+            referencedGroup == nil ? protocolLabel.map { "协议 \($0)" } : nil,
             DelayBadge.accessibilityText(delay),
             isReadOnly ? "离线只读" : (selectable ? nil : "由策略组自动选择"),
         ]
@@ -1557,6 +1564,7 @@ private struct GroupGridCard: View {
 private struct GroupExpandedPanel: View {
     let group: ProxyGroup
     let groupIndex: ProxyGroupIndex
+    let nodeTypeLabels: [String: String]
     let isTesting: Bool
     let canTest: Bool
     let selecting: String?
@@ -1597,6 +1605,7 @@ private struct GroupExpandedPanel: View {
                                       referencedGroup: item.name == group.name
                                           ? nil
                                           : groupIndex.group(named: item.name),
+                                      protocolLabel: nodeTypeLabels[item.name],
                                       isCurrent: item.name == group.now,
                                       isSelecting: selecting == item.name,
                                       isSelectionBlocked: selecting != nil,
@@ -1805,6 +1814,7 @@ private struct GroupExpandedHeader: View {
 private struct GroupNodeGridCell: View {
     let node: ProxyGroupNode
     let referencedGroup: ProxyGroup?
+    let protocolLabel: String?
     let isCurrent: Bool
     let isSelecting: Bool
     let isSelectionBlocked: Bool
@@ -1871,14 +1881,10 @@ private struct GroupNodeGridCell: View {
                     Image(systemName: "checkmark.circle.fill").foregroundStyle(Color.accentColor)
                 }
             }
-            HStack {
-                Spacer()
-                if isTestingDelay {
-                    ProgressView().controlSize(.mini)
-                } else {
-                    DelayBadge(delay: delay, compact: true)
-                }
-            }
+            ProxyNodeFooter(protocolLabel: referencedGroup == nil ? protocolLabel : nil,
+                            delay: delay,
+                            isTestingDelay: isTestingDelay,
+                            compact: true)
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
@@ -1898,7 +1904,11 @@ private struct GroupNodeGridCell: View {
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(node.name)
-        .accessibilityValue(isCurrent ? "当前节点，\(DelayBadge.accessibilityText(delay))" : DelayBadge.accessibilityText(delay))
+        .accessibilityValue([
+            isCurrent ? "当前节点" : nil,
+            referencedGroup == nil ? protocolLabel.map { "协议 \($0)" } : nil,
+            isTestingDelay ? "正在测试延迟" : DelayBadge.accessibilityText(delay),
+        ].compactMap { $0 }.joined(separator: "，"))
     }
 }
 
@@ -2158,6 +2168,7 @@ private struct ProxyNodeRow: View {
     let isCurrent: Bool
     let isSelecting: Bool
     let subtitle: String?
+    let protocolLabel: String?
     let delay: Int?
 
     @ViewBuilder
@@ -2215,13 +2226,67 @@ private struct ProxyNodeRow: View {
                     DelayBadge(delay: delay)
                 }
             } else {
-                HStack(spacing: 8) {
-                    Spacer(minLength: 4)
-                    DelayBadge(delay: delay)
+                ProxyNodeFooter(protocolLabel: protocolLabel, delay: delay)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// Reuses the existing delay line without making normal-sized cards taller.
+/// Large text and narrow widths can move the delay onto a trailing second line.
+private struct ProxyNodeFooter: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
+    let protocolLabel: String?
+    let delay: Int?
+    var isTestingDelay = false
+    var compact = false
+
+    var body: some View {
+        Group {
+            if dynamicTypeSize.isAccessibilitySize, protocolLabel != nil {
+                stackedContent
+            } else {
+                ViewThatFits(in: .horizontal) {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        typeLabel(wrapping: false)
+                        Spacer(minLength: 4)
+                        delayContent
+                    }
+                    stackedContent
                 }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var stackedContent: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            typeLabel(wrapping: true)
+            HStack {
+                Spacer(minLength: 4)
+                delayContent
+            }
+        }
+    }
+
+    @ViewBuilder private func typeLabel(wrapping: Bool) -> some View {
+        if let protocolLabel {
+            Text(protocolLabel)
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(.secondary)
+                .lineLimit(wrapping ? nil : 1)
+                .fixedSize(horizontal: !wrapping, vertical: wrapping)
+        }
+    }
+
+    @ViewBuilder private var delayContent: some View {
+        if isTestingDelay {
+            ProgressView().controlSize(.mini)
+        } else {
+            DelayBadge(delay: delay, compact: compact)
+        }
     }
 }
 

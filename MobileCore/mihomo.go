@@ -1784,22 +1784,40 @@ func filterGeoRules(rules []any) ([]any, int) {
 	return out, dropped
 }
 
-// QueryProxies returns only the group fields used by the app. It traverses the
-// group interfaces directly so a large subscription is never fully serialized
-// and decoded again inside the extension.
+// QueryProxies returns only the group fields and node types used by the app.
+// It traverses group interfaces directly so a large subscription is never
+// fully serialized and decoded again inside the extension.
 func QueryProxies() string {
 	configApplyMu.RLock()
 	defer configApplyMu.RUnlock()
+	return queryProxyCatalog(tunnel.Proxies(), tunnel.Mode().String())
+}
+
+func queryProxyCatalog(proxies map[string]C.Proxy, mode string) string {
 	groups := map[string]any{}
-	for name, proxy := range tunnel.Proxies() {
+	nodeTypes := map[string]string{}
+	for name, proxy := range proxies {
 		group, isGroup := proxy.Adapter().(outboundgroup.ProxyGroup)
 		if !isGroup {
 			continue
 		}
 		members := group.Proxies()
+		// Reuse the first group's existing member count as a capacity hint. This
+		// avoids repeated map growth for large provider groups without a second
+		// traversal or reserving space for every repeated appearance in all groups.
+		if len(groups) == 0 {
+			nodeTypes = make(map[string]string, len(members))
+		}
 		all := make([]string, 0, len(members))
 		for _, member := range members {
-			all = append(all, member.Name())
+			memberName := member.Name()
+			all = append(all, memberName)
+			if _, exists := nodeTypes[memberName]; exists {
+				continue
+			}
+			if _, isGroup := member.Adapter().(outboundgroup.ProxyGroup); !isGroup {
+				nodeTypes[memberName] = member.Type().String()
+			}
 		}
 		groups[name] = map[string]any{
 			"type":   proxy.Type().String(),
@@ -1812,8 +1830,9 @@ func QueryProxies() string {
 
 	// 顺带带上当前模式，UI 一次 IPC 即可拿到「组 + 模式」，省一次往返。
 	out, err := json.Marshal(map[string]any{
-		"proxies": groups,
-		"mode":    tunnel.Mode().String(),
+		"proxies":   groups,
+		"nodeTypes": nodeTypes,
+		"mode":      mode,
 	})
 	if err != nil {
 		return `{"proxies":{},"error":"marshal: ` + err.Error() + `"}`
@@ -2225,7 +2244,12 @@ func OfflineProxySnapshot(configYAML, providerPayloadsJSON, selectionsJSON strin
 	if mode == "" {
 		mode = "rule"
 	}
-	nodeTypes := make(map[string]string, len(inlineTypes)+len(providerNodeTypes))
+	// Exact reserved names, matching mihomo's built-in adapters. The App cannot
+	// infer these from YAML because they have no proxies[] definition.
+	nodeTypes := map[string]string{
+		"DIRECT": "direct", "REJECT": "reject", "REJECT-DROP": "reject-drop",
+		"COMPATIBLE": "compatible", "PASS": "pass", "PASS-RULE": "pass-rule",
+	}
 	for name, nodeType := range inlineTypes {
 		if normalizedType := strings.ToLower(strings.TrimSpace(nodeType)); normalizedType != "" {
 			nodeTypes[name] = normalizedType

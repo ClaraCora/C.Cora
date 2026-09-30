@@ -104,6 +104,47 @@ struct ProxyGroupIndex {
     }
 }
 
+/// Online adapter names and offline YAML aliases share one compact UI label.
+/// Unknown values and strategy-group types are deliberately not protocols.
+enum ProxyProtocolLabel {
+    static func displayName(for rawType: String) -> String? {
+        switch rawType.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "ss", "shadowsocks": return "SS"
+        case "ssr", "shadowsocksr": return "SSR"
+        case "snell": return "SNELL"
+        case "socks5": return "SOCKS5"
+        case "http": return "HTTP"
+        case "vmess": return "VMESS"
+        case "vless": return "VLESS"
+        case "trojan": return "TROJAN"
+        case "hysteria": return "HYSTERIA"
+        case "hysteria2", "hy2": return "HYSTERIA2"
+        case "wireguard": return "WIREGUARD"
+        case "tuic": return "TUIC"
+        case "ssh": return "SSH"
+        case "mieru": return "MIERU"
+        case "anytls": return "ANYTLS"
+        case "sudoku": return "SUDOKU"
+        case "masque": return "MASQUE"
+        case "trusttunnel": return "TRUSTTUNNEL"
+        case "shadowquic": return "SHADOWQUIC"
+        case "openvpn": return "OPENVPN"
+        case "tailscale": return "TAILSCALE"
+        case "zerotier": return "ZEROTIER"
+        case "gostrelay", "gost-relay": return "GOSTRELAY"
+        case "direct": return "DIRECT"
+        case "reject": return "REJECT"
+        case "rejectdrop", "reject-drop": return "REJECT-DROP"
+        case "compatible": return "COMPATIBLE"
+        case "pass": return "PASS"
+        case "passrule", "pass-rule": return "PASS-RULE"
+        case "rematch": return "REMATCH"
+        case "dns": return "DNS"
+        default: return nil
+        }
+    }
+}
+
 /// 沿策略组当前选择递归找到最终出口。精确匹配组名，并对循环、空引用和过深引用安全降级。
 enum ProxySelectionResolver {
     private static let maximumDepth = 64
@@ -226,6 +267,8 @@ enum ProxyDelayResolver {
 final class ProxyController: ObservableObject {
 
     @Published private(set) var groups: [ProxyGroup] = []
+    /// One App-owned label per unique node, shared by all group appearances.
+    @Published private(set) var nodeTypeLabels: [String: String] = [:]
     /// 完整分组图用于递归解析引用；`groups` 仍只包含当前模式需要展示的分组。
     @Published private(set) var resolutionGroups: [ProxyGroup] = [] {
         didSet {
@@ -305,12 +348,14 @@ final class ProxyController: ObservableObject {
             mode = "rule"
             groups = []
             resolutionGroups = []
+            nodeTypeLabels = [:]
             return
         case .ok(let data):
             guard let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
                 error = "解析失败（IPC 响应非 JSON）"
                 groups = []
                 resolutionGroups = []
+                nodeTypeLabels = [:]
                 return
             }
             mode = ((obj["mode"] as? String) ?? "rule").lowercased()
@@ -324,6 +369,7 @@ final class ProxyController: ObservableObject {
             if runtimeAvailable && mode == "direct" {
                 groups = []
                 resolutionGroups = []
+                nodeTypeLabels = [:]
                 return
             }
 
@@ -331,6 +377,7 @@ final class ProxyController: ObservableObject {
                 error = "解析代理列表失败"
                 groups = []
                 resolutionGroups = []
+                nodeTypeLabels = [:]
                 return
             }
 
@@ -352,6 +399,17 @@ final class ProxyController: ObservableObject {
             let groupLookup = Dictionary(uniqueKeysWithValues: proxies.keys.compactMap { name in
                 makeGroup(name).map { (name, $0) }
             })
+            var labels: [String: String] = [:]
+            if let rawTypes = obj["nodeTypes"] as? [String: Any] {
+                labels.reserveCapacity(rawTypes.count)
+                for (name, value) in rawTypes where groupLookup[name] == nil {
+                    if let rawType = value as? String,
+                       let label = ProxyProtocolLabel.displayName(for: rawType) {
+                        labels[name] = label
+                    }
+                }
+            }
+            nodeTypeLabels = labels
             resolutionGroups = Array(groupLookup.values)
 
             switch mode {
@@ -389,6 +447,7 @@ final class ProxyController: ObservableObject {
         sessionGeneration &+= 1
         groups = []
         resolutionGroups = []
+        nodeTypeLabels = [:]
         mode = "rule"
         isLoading = false
         hasLoaded = false
