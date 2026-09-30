@@ -65,7 +65,6 @@ struct SettingsView: View {
                     .settingsSectionStyle()
 
                     Section("运行") {
-                        PO0WhitelistSettingsEntry()
                         SettingsNavigationRow(
                             title: "内核运行",
                             systemImage: "gearshape.2",
@@ -96,45 +95,16 @@ struct SettingsView: View {
                             message: "设置测速地址和测速超时时间。",
                             category: .speed,
                             destination: DelayTestSettingsView())
-                    }
-                    .settingsSectionStyle()
-
-                    Section {
-                        Picker(selection: $settings.overviewDownloadRanking) {
-                            ForEach(ConnectionTrafficRankingMetric.allCases) { metric in
-                                Text(metric.title).tag(metric)
-                            }
-                        } label: {
-                            HStack(spacing: 12) {
-                                SettingsSymbol(systemImage: "arrow.down.circle", category: .configuration)
-                                Text("点击累计下行")
-                            }
-                        }
-                        .pickerStyle(.menu)
-                        .frame(minHeight: 44)
-                        .alignmentGuide(.listRowSeparatorLeading) { _ in 42 }
-
-                        Picker(selection: $settings.overviewUploadRanking) {
-                            ForEach(ConnectionTrafficRankingMetric.allCases) { metric in
-                                Text(metric.title).tag(metric)
-                            }
-                        } label: {
-                            HStack(spacing: 12) {
-                                SettingsSymbol(systemImage: "arrow.up.circle", category: .speed)
-                                Text("点击累计上行")
-                            }
-                        }
-                        .pickerStyle(.menu)
-                        .frame(minHeight: 44)
-                        .alignmentGuide(.listRowSeparatorLeading) { _ in 42 }
-                    } header: {
-                        Text("总览")
-                    } footer: {
-                        Text("选择点击总览累计流量卡片时打开的节点用量排行，修改后立即生效。")
+                        PO0WhitelistSettingsEntry()
                     }
                     .settingsSectionStyle()
 
                     Section("维护") {
+                        SettingsNavigationRow(
+                            title: "总览",
+                            systemImage: "gauge.with.dots.needle.67percent",
+                            message: "设置点击总览累计下行、累计上行时打开的节点用量排行，修改后立即生效。",
+                            destination: OverviewSettingsView())
                         SettingsNavigationRow(
                             title: "检测脚本",
                             systemImage: "play.tv",
@@ -183,6 +153,56 @@ struct SettingsView: View {
         let version = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0.6"
         let build = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1"
         return "\(version) (\(build))"
+    }
+}
+
+private struct OverviewSettingsView: View {
+    @EnvironmentObject private var settings: SettingsStore
+
+    var body: some View {
+        Form {
+            Section {
+                Picker(selection: $settings.overviewDownloadRanking) {
+                    ForEach(ConnectionTrafficRankingMetric.allCases) { metric in
+                        Text(metric.title).tag(metric)
+                    }
+                } label: {
+                    HStack(spacing: 12) {
+                        SettingsSymbol(systemImage: "arrow.down.circle", category: .configuration)
+                        Text("点击累计下行")
+                    }
+                }
+                .pickerStyle(.menu)
+                .frame(minHeight: 44)
+                .alignmentGuide(.listRowSeparatorLeading) { _ in 42 }
+
+                Picker(selection: $settings.overviewUploadRanking) {
+                    ForEach(ConnectionTrafficRankingMetric.allCases) { metric in
+                        Text(metric.title).tag(metric)
+                    }
+                } label: {
+                    HStack(spacing: 12) {
+                        SettingsSymbol(systemImage: "arrow.up.circle", category: .speed)
+                        Text("点击累计上行")
+                    }
+                }
+                .pickerStyle(.menu)
+                .frame(minHeight: 44)
+                .alignmentGuide(.listRowSeparatorLeading) { _ in 42 }
+            } header: {
+                Text("累计流量跳转")
+            } footer: {
+                Text("选择点击总览累计流量卡片时打开的节点用量排行，修改后立即生效。")
+            }
+            .settingsSectionStyle()
+        }
+        .scrollContentBackground(.hidden)
+        .background(AppAmbientBackground())
+        .listStyle(.insetGrouped)
+        .coraListSectionSpacing(12)
+        .listRowSeparatorTint(Color.primary.opacity(0.08))
+        .navigationTitle("总览")
+        .navigationBarTitleDisplayMode(.inline)
     }
 }
 
