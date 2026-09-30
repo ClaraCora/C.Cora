@@ -130,9 +130,9 @@ final class ConnectionHistoryRecorder {
     private func sampleActiveLocked() {
         guard let store else { return }
         autoreleasepool {
-            let payload = Data(MihomoConnectionsSnapshot(Self.snapshotLimit).utf8)
-            if let snapshot = ConnectionHistoryRecord.coreSnapshot(from: payload) {
-                store.upsertActive(snapshot.records)
+            if let payload = MihomoConnectionHistorySnapshot(Self.snapshotLimit),
+               let snapshot = ConnectionHistoryRecord.coreSnapshot(from: payload),
+               store.upsertActive(snapshot.records) {
                 // The IPC snapshot is normally complete. When it is capped, a
                 // missing ID might still be live, so rely on Mihomo's bounded
                 // close queue instead of falsely ending it.
@@ -147,18 +147,15 @@ final class ConnectionHistoryRecorder {
     private func drainClosedQueueLocked() {
         guard let store else { return }
         autoreleasepool {
-            let closedPayload = Data(MihomoClosedConnectionsSnapshot(
-                closedCursor, Self.closedBatchLimit).utf8)
-            if let snapshot = ConnectionHistoryRecord.coreSnapshot(from: closedPayload) {
+            if let closedPayload = MihomoClosedConnectionHistorySnapshot(
+                closedCursor, Self.closedBatchLimit),
+               let snapshot = ConnectionHistoryRecord.coreSnapshot(from: closedPayload),
+               store.upsertClosed(snapshot.records) {
+                // Acknowledge only a committed batch. If SQLite is temporarily
+                // busy/full, the next tick retries the same bounded close queue.
                 closedCursor = snapshot.cursor ?? closedCursor
                 if snapshot.dropped {
                     FileLog.write("连接历史关闭队列溢出：极高短连接负载下可能漏记少量详情，VPN 转发未受影响")
-                }
-                if !snapshot.records.isEmpty {
-                    // The close queue contains final tracker counters, so update
-                    // the row before marking it inactive.
-                    store.upsertActive(snapshot.records)
-                    store.finish(ids: snapshot.records.map { $0.id })
                 }
             }
             runMaintenanceIfNeededLocked(store: store)

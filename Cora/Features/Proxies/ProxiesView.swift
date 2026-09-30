@@ -29,6 +29,19 @@ struct ProxiesView: View {
             ZStack {
                 AppAmbientBackground()
                 navigationContent
+                    .overlay(alignment: .bottom) {
+                        if let failure = controller.nodeTestFailure {
+                            ProxyNodeFailureToast(failure: failure) {
+                                controller.dismissNodeTestFailure(id: failure.id)
+                            }
+                            .id(failure.id)
+                            .padding(.horizontal, 16)
+                            .padding(.bottom, 12)
+                            .transition(.opacity)
+                        }
+                    }
+                    .animation(reduceMotion ? nil : .easeOut(duration: 0.18),
+                               value: controller.nodeTestFailure?.id)
 
                 if unlockTests.isRunning || unlockTests.result != nil {
                     UnlockTestOverlay(
@@ -2248,6 +2261,7 @@ private struct DelayBadge: View {
 
     static func shortText(_ delay: Int?) -> String {
         guard let delay else { return "未测" }
+        if delay < 0 { return "失败" }
         return delay > 0 ? "\(delay) ms" : "超时"
     }
 
@@ -2259,6 +2273,7 @@ private struct DelayBadge: View {
 
     static func accessibilityText(_ delay: Int?) -> String {
         guard let delay else { return "未测速" }
+        if delay < 0 { return "延迟测试失败" }
         return delay > 0 ? "延迟 \(delay) 毫秒" : "延迟测试超时"
     }
 

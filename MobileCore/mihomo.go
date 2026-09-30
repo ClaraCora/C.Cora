@@ -3451,6 +3451,30 @@ func ConnectionsSnapshot(limit int) string {
 		limit = maxConnectionSnapshotLimit
 	}
 
+	connections, total := newestConnectionSnapshot(limit)
+	out, err := json.Marshal(struct {
+		DownloadTotal int64                    `json:"downloadTotal"`
+		UploadTotal   int64                    `json:"uploadTotal"`
+		Connections   []*statistic.TrackerInfo `json:"connections"`
+		Total         int                      `json:"total"`
+		Truncated     bool                     `json:"truncated"`
+	}{
+		DownloadTotal: downloadTotal,
+		UploadTotal:   uploadTotal,
+		Connections:   connections,
+		Total:         total,
+		Truncated:     total > len(connections),
+	})
+	if err != nil {
+		return `{"downloadTotal":0,"uploadTotal":0,"connections":[],"total":0,"truncated":false}`
+	}
+	atomic.StoreInt64(&lastConnectionSnapshotBytes, int64(len(out)))
+	return string(out)
+}
+
+// newestConnectionSnapshot shares the same bounded selection between the App
+// IPC response and the NE's compact history payload. Callers pass a positive limit.
+func newestConnectionSnapshot(limit int) (connectionSnapshotHeap, int) {
 	connections := make(connectionSnapshotHeap, 0, limit)
 	heap.Init(&connections)
 	total := 0
@@ -3471,24 +3495,7 @@ func ConnectionsSnapshot(limit int) string {
 	sort.Slice(connections, func(left, right int) bool {
 		return connections[left].Start.After(connections[right].Start)
 	})
-	out, err := json.Marshal(struct {
-		DownloadTotal int64                    `json:"downloadTotal"`
-		UploadTotal   int64                    `json:"uploadTotal"`
-		Connections   []*statistic.TrackerInfo `json:"connections"`
-		Total         int                      `json:"total"`
-		Truncated     bool                     `json:"truncated"`
-	}{
-		DownloadTotal: downloadTotal,
-		UploadTotal:   uploadTotal,
-		Connections:   connections,
-		Total:         total,
-		Truncated:     total > len(connections),
-	})
-	if err != nil {
-		return `{"downloadTotal":0,"uploadTotal":0,"connections":[],"total":0,"truncated":false}`
-	}
-	atomic.StoreInt64(&lastConnectionSnapshotBytes, int64(len(out)))
-	return string(out)
+	return connections, total
 }
 
 // ClosedConnectionsSnapshot returns a small batch of connection snapshots that

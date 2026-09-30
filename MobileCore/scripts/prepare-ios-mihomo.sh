@@ -24,6 +24,9 @@ readonly DNS_SERVER_REL="dns/server.go"
 readonly DNS_EXECUTOR_REL="hub/executor/executor.go"
 readonly DNS_ROUTE_REL="hub/route/dns.go"
 readonly DOH_ROUTE_REL="hub/route/doh.go"
+readonly MRS_READER_REL="rules/provider/mrs_reader.go"
+readonly MRS_DECODER_REL="rules/provider/mrs_decoder.go"
+readonly MRS_DECODER_TEST_REL="rules/provider/mrs_decoder_test.go"
 readonly EXPECTED_SOURCE_SHA="acfdffbbd6050aa0481fe4ea60f0f73a10bca6ed7a6cfbca108e2c1acb0a78f5"
 readonly EXPECTED_PATCHED_SHA="d104df749066eb7c687728409b22670bc322e5b34bc539efe4df736afecaaf5e"
 readonly EXPECTED_TEST_SHA="1bbc3234327ae86b295d5eb386a5384678047191c2a60e0fdfa870986ef08b63"
@@ -54,13 +57,18 @@ readonly EXPECTED_DNS_ROUTE_SOURCE_SHA="764f108e722683aa97af8e147f8847d6d4fe8147
 readonly EXPECTED_DNS_ROUTE_PATCHED_SHA="3bc6213dfd04066f4f6542973989abb40a9a7776da9a0eac33b31698e29093e2"
 readonly EXPECTED_DOH_ROUTE_SOURCE_SHA="f10191ed7fa4e7cb07e9ed771f015df69d49451317e959ee8be0a14af272a3ad"
 readonly EXPECTED_DOH_ROUTE_PATCHED_SHA="24c775b534e1ecca13e6f0d82954f04cf1e2cc1bbf85227c6900298609a17ca7"
+readonly EXPECTED_MRS_READER_SOURCE_SHA="fc264f4f0b5acff30a88d860d721eaae750ea63d9d2b706abd8a797a30626213"
+readonly EXPECTED_MRS_READER_PATCHED_SHA="81f2fdf0e71e02fd8df58af2a9036a138ebd64f1db10f2692e01d8a5c6721156"
+readonly EXPECTED_MRS_DECODER_SHA="f58a0179708ef843ea7ea91a6e3e78c8e0e3187e66276b9e88db1699259345de"
+readonly EXPECTED_MRS_DECODER_TEST_SHA="9743a88016ae679566eb25cd23aa0613260c6361313b650d89381a9d8724368b"
 readonly PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/mihomo-v1.19.30-oversize-buffer-pool.patch"
 readonly CONFIG_PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/mihomo-v1.19.30-progressive-config-parse.patch"
 readonly HISTORY_PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/mihomo-v1.19.30-connection-close-queue.patch"
 readonly HISTORY_TEST_PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/mihomo-v1.19.30-connection-close-queue-test.patch"
 readonly RESERVED_SYNTHETIC_IP_PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/mihomo-v1.19.30-reserved-synthetic-ip-guard.patch"
 readonly ATOMIC_DNS_RUNTIME_PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/mihomo-v1.19.30-atomic-dns-runtime.patch"
-readonly PATCHED_DIR="${RUNNER_TEMP:?}/mihomo-v1.19.30-ios-cora-v7"
+readonly MRS_DECODE_PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/mihomo-v1.19.30-bounded-mrs-decode.patch"
+readonly PATCHED_DIR="${RUNNER_TEMP:?}/mihomo-v1.19.30-ios-cora-v8"
 
 check_sha256() {
   local expected="$1"
@@ -115,6 +123,7 @@ check_sha256 "$EXPECTED_DNS_SERVER_SOURCE_SHA" "$SOURCE_DIR/$DNS_SERVER_REL"
 check_sha256 "$EXPECTED_DNS_EXECUTOR_SOURCE_SHA" "$SOURCE_DIR/$DNS_EXECUTOR_REL"
 check_sha256 "$EXPECTED_DNS_ROUTE_SOURCE_SHA" "$SOURCE_DIR/$DNS_ROUTE_REL"
 check_sha256 "$EXPECTED_DOH_ROUTE_SOURCE_SHA" "$SOURCE_DIR/$DOH_ROUTE_REL"
+check_sha256 "$EXPECTED_MRS_READER_SOURCE_SHA" "$SOURCE_DIR/$MRS_READER_REL"
 for added_rel in "$RESERVED_SYNTHETIC_IP_REL" "$RESERVED_SYNTHETIC_IP_TEST_REL"; do
   if [[ -e "$SOURCE_DIR/$added_rel" ]]; then
     echo "Unexpected upstream reserved synthetic IP file: $SOURCE_DIR/$added_rel" >&2
@@ -124,6 +133,12 @@ done
 for added_rel in "$DNS_RUNTIME_REL" "$DNS_RUNTIME_TEST_REL"; do
   if [[ -e "$SOURCE_DIR/$added_rel" ]]; then
     echo "Unexpected upstream atomic DNS runtime file: $SOURCE_DIR/$added_rel" >&2
+    exit 1
+  fi
+done
+for added_rel in "$MRS_DECODER_REL" "$MRS_DECODER_TEST_REL"; do
+  if [[ -e "$SOURCE_DIR/$added_rel" ]]; then
+    echo "Unexpected upstream MRS decoder file: $SOURCE_DIR/$added_rel" >&2
     exit 1
   fi
 done
@@ -163,6 +178,10 @@ git -c core.autocrlf=false -C "$PATCHED_DIR" \
   apply --check --whitespace=error-all "$ATOMIC_DNS_RUNTIME_PATCH_FILE"
 git -c core.autocrlf=false -C "$PATCHED_DIR" \
   apply --whitespace=error-all "$ATOMIC_DNS_RUNTIME_PATCH_FILE"
+git -c core.autocrlf=false -C "$PATCHED_DIR" \
+  apply --check --whitespace=error-all "$MRS_DECODE_PATCH_FILE"
+git -c core.autocrlf=false -C "$PATCHED_DIR" \
+  apply --whitespace=error-all "$MRS_DECODE_PATCH_FILE"
 check_sha256 "$EXPECTED_PATCHED_SHA" "$PATCHED_DIR/$SOURCE_REL"
 check_sha256 "$EXPECTED_TEST_SHA" "$PATCHED_DIR/$TEST_REL"
 check_sha256 "$EXPECTED_CONFIG_PATCHED_SHA" "$PATCHED_DIR/$CONFIG_REL"
@@ -181,6 +200,9 @@ check_sha256 "$EXPECTED_DNS_SERVER_PATCHED_SHA" "$PATCHED_DIR/$DNS_SERVER_REL"
 check_sha256 "$EXPECTED_DNS_EXECUTOR_PATCHED_SHA" "$PATCHED_DIR/$DNS_EXECUTOR_REL"
 check_sha256 "$EXPECTED_DNS_ROUTE_PATCHED_SHA" "$PATCHED_DIR/$DNS_ROUTE_REL"
 check_sha256 "$EXPECTED_DOH_ROUTE_PATCHED_SHA" "$PATCHED_DIR/$DOH_ROUTE_REL"
+check_sha256 "$EXPECTED_MRS_READER_PATCHED_SHA" "$PATCHED_DIR/$MRS_READER_REL"
+check_sha256 "$EXPECTED_MRS_DECODER_SHA" "$PATCHED_DIR/$MRS_DECODER_REL"
+check_sha256 "$EXPECTED_MRS_DECODER_TEST_SHA" "$PATCHED_DIR/$MRS_DECODER_TEST_REL"
 
 go -C "$PATCHED_DIR" mod edit -require="$SING_MODULE@$EXPECTED_SING_VERSION"
 go -C "$PATCHED_DIR" mod edit -replace="$SING_MODULE@$EXPECTED_SING_VERSION=$PATCHED_SING_DIR"

@@ -98,6 +98,41 @@ struct SettingsView: View {
                     }
                     .settingsSectionStyle()
 
+                    Section {
+                        Picker(selection: $settings.overviewDownloadRanking) {
+                            ForEach(ConnectionTrafficRankingMetric.allCases) { metric in
+                                Text(metric.title).tag(metric)
+                            }
+                        } label: {
+                            HStack(spacing: 12) {
+                                SettingsSymbol(systemImage: "arrow.down.circle", category: .configuration)
+                                Text("点击累计下行")
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        .frame(minHeight: 44)
+                        .alignmentGuide(.listRowSeparatorLeading) { _ in 42 }
+
+                        Picker(selection: $settings.overviewUploadRanking) {
+                            ForEach(ConnectionTrafficRankingMetric.allCases) { metric in
+                                Text(metric.title).tag(metric)
+                            }
+                        } label: {
+                            HStack(spacing: 12) {
+                                SettingsSymbol(systemImage: "arrow.up.circle", category: .speed)
+                                Text("点击累计上行")
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        .frame(minHeight: 44)
+                        .alignmentGuide(.listRowSeparatorLeading) { _ in 42 }
+                    } header: {
+                        Text("总览")
+                    } footer: {
+                        Text("选择点击总览累计流量卡片时打开的节点用量排行，修改后立即生效。")
+                    }
+                    .settingsSectionStyle()
+
                     Section("维护") {
                         SettingsNavigationRow(
                             title: "检测脚本",

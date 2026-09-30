@@ -271,14 +271,6 @@ private enum NodeTrafficPalette {
 }
 
 private extension ConnectionTrafficRankingMetric {
-    var title: String {
-        switch self {
-        case .total: return "总计"
-        case .download: return "下行"
-        case .upload: return "上行"
-        }
-    }
-
     var summaryTitle: String {
         switch self {
         case .total: return "本次连接累计流量"

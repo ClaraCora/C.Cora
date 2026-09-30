@@ -1,10 +1,11 @@
 import Foundation
+import Combine
 
-/// 内核相关设置（持久化到 UserDefaults）。
+/// 应用与内核设置（持久化到 UserDefaults）。
 ///
-/// 这些影响 NE 内 mihomo 的启动配置：连接时序列化为 JSON 经 startVPNTunnel(options) 下发，
+/// 内核运行项影响 NE 内 mihomo 的启动配置：连接时序列化为 JSON 经 startVPNTunnel(options) 下发，
 /// Go 侧 StartWithConfig 据此覆盖 tun.stack / ipv6 / geo / log-level 等运行设置。
-/// 因此**修改后需重新连接才生效**。
+/// 这些运行项修改后需重新连接；App 导航与手动测速偏好即时生效。
 @MainActor
 final class SettingsStore: ObservableObject {
 
@@ -13,6 +14,14 @@ final class SettingsStore: ObservableObject {
     /// iOS Packet Tunnel 只支持经过验证的 gVisor 栈。保留字段用于兼容旧版本，
     /// 但不向用户暴露 system/mixed，避免保存不可用的网络配置。
     static let fixedStack = "gvisor"
+
+    /// App-only navigation preferences; saved immediately without changing NE settings.
+    @Published var overviewDownloadRanking: ConnectionTrafficRankingMetric {
+        didSet { d.set(overviewDownloadRanking.rawValue, forKey: K.overviewDownloadRanking) }
+    }
+    @Published var overviewUploadRanking: ConnectionTrafficRankingMetric {
+        didSet { d.set(overviewUploadRanking.rawValue, forKey: K.overviewUploadRanking) }
+    }
 
     /// 当前连接尚未应用的运行设置。设置页用它显示“下次连接生效”。
     @Published private(set) var pendingConnectionApply = false
@@ -219,6 +228,8 @@ final class SettingsStore: ObservableObject {
 
     private let d = UserDefaults.standard
     private enum K {
+        static let overviewDownloadRanking = "set.overviewDownloadRanking"
+        static let overviewUploadRanking = "set.overviewUploadRanking"
         static let stack = "set.stack", ipv6 = "set.ipv6"
         static let geoEnabled = "set.geoEnabled", geoLoader = "set.geoLoader"
         static let geodataMode = "set.geodataMode"
@@ -243,6 +254,10 @@ final class SettingsStore: ObservableObject {
     }
 
     private init() {
+        overviewDownloadRanking = ConnectionTrafficRankingMetric(
+            rawValue: d.string(forKey: K.overviewDownloadRanking) ?? "") ?? .download
+        overviewUploadRanking = ConnectionTrafficRankingMetric(
+            rawValue: d.string(forKey: K.overviewUploadRanking) ?? "") ?? .upload
         let storedStack = d.string(forKey: K.stack)
         stack = Self.fixedStack
         if storedStack != Self.fixedStack { d.set(Self.fixedStack, forKey: K.stack) }

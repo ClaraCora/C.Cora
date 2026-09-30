@@ -30,6 +30,12 @@ jobs:
           echo "--- installed iphoneos SDKs ---"
           xcodebuild -showsdks | grep -i iphoneos || true
 
+      - name: Test connection history persistence
+        run: bash scripts/test-connection-history.sh
+
+      - name: Test single-node delay feedback
+        run: bash scripts/test-proxy-controller.sh
+
       # ───────────── Phase 1：gomobile 编 mihomo 内核 ─────────────
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -118,10 +124,10 @@ jobs:
       - name: Verify patched Mihomo
         run: |
           set -euxo pipefail
-          go -C "$PATCHED_MIHOMO" test ./common/pool ./config ./tunnel ./tunnel/statistic ./component/dialer ./component/resolver ./dns ./adapter/outbound ./hub/executor ./hub/route
-          go -C "$PATCHED_MIHOMO" test -tags "with_low_memory" ./common/pool ./config ./tunnel ./tunnel/statistic ./component/dialer ./component/resolver ./dns ./adapter/outbound ./hub/executor ./hub/route
-          go -C "$PATCHED_MIHOMO" vet ./tunnel ./component/dialer ./component/resolver ./dns ./adapter/outbound ./hub/executor ./hub/route
-          go -C "$PATCHED_MIHOMO" vet -tags "with_low_memory" ./tunnel ./component/dialer ./component/resolver ./dns ./adapter/outbound ./hub/executor ./hub/route
+          go -C "$PATCHED_MIHOMO" test ./common/pool ./config ./tunnel ./tunnel/statistic ./component/dialer ./component/resolver ./dns ./adapter/outbound ./hub/executor ./hub/route ./rules/provider
+          go -C "$PATCHED_MIHOMO" test -tags "with_low_memory" ./common/pool ./config ./tunnel ./tunnel/statistic ./component/dialer ./component/resolver ./dns ./adapter/outbound ./hub/executor ./hub/route ./rules/provider
+          go -C "$PATCHED_MIHOMO" vet ./tunnel ./component/dialer ./component/resolver ./dns ./adapter/outbound ./hub/executor ./hub/route ./rules/provider
+          go -C "$PATCHED_MIHOMO" vet -tags "with_low_memory" ./tunnel ./component/dialer ./component/resolver ./dns ./adapter/outbound ./hub/executor ./hub/route ./rules/provider
 
       - name: Verify patched gVisor TCP
         run: |

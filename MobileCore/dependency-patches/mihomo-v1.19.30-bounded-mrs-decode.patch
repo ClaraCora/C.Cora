@@ -1,0 +1,486 @@
+diff --git a/rules/provider/mrs_decoder.go b/rules/provider/mrs_decoder.go
+new file mode 100644
+index 0000000..5466cd0
+--- /dev/null
++++ b/rules/provider/mrs_decoder.go
+@@ -0,0 +1,110 @@
++package provider
++
++import (
++	"bytes"
++	"io"
++
++	"github.com/klauspost/compress/zstd"
++)
++
++// This bounds the temporary decoded payload, not the accepted MRS file size.
++// Large or unusual streams continue to use the upstream streaming decoder.
++const mrsDecodeBufferLimit = 2 << 20
++
++func newMrsReader(buf []byte) (io.ReadCloser, error) {
++	if capacity, ok := mrsDecodedCapacity(buf); ok {
++		// DecodeAll uses the output as history instead of allocating the entire
++		// advertised window (often 8 MiB for sub-MiB MRS payloads). One decoder
++		// suffices for this one-shot call; no provider or connection is serialized.
++		decoder, err := zstd.NewReader(nil,
++			zstd.WithDecoderConcurrency(1), zstd.WithDecodeAllCapLimit(true))
++		if err != nil {
++			return nil, err
++		}
++		defer decoder.Close()
++		decoded, err := decoder.DecodeAll(buf, make([]byte, 0, capacity))
++		if err != nil {
++			return nil, err
++		}
++		return io.NopCloser(bytes.NewReader(decoded)), nil
++	}
++
++	decoder, err := zstd.NewReader(bytes.NewReader(buf))
++	if err != nil {
++		return nil, err
++	}
++	return decoder.IOReadCloser(), nil
++}
++
++// mrsDecodedCapacity finds a conservative output bound for a single complete
++// Zstandard frame. Streaming encoders often omit the content size, so inspecting
++// only that field would miss the MRS files that need this optimization most.
++// Per the Zstandard format, each compressed block produces at most 128 KiB;
++// raw and RLE block headers state their exact output sizes. This probe does not
++// decode or validate content: zstd still checks blocks, offsets and checksums.
++// Concatenated/skippable frames and anything outside the bound use streaming,
++// without first allocating an output buffer or attempting a second decode.
++func mrsDecodedCapacity(buf []byte) (int, bool) {
++	var header zstd.Header
++	if err := header.Decode(buf); err != nil || header.Skippable {
++		return 0, false
++	}
++	if header.HasFCS && header.FrameContentSize > mrsDecodeBufferLimit {
++		return 0, false
++	}
++
++	const maxBlockSize = 128 << 10
++	blockLimit := maxBlockSize
++	if !header.SingleSegment && header.WindowSize < maxBlockSize {
++		blockLimit = int(header.WindowSize)
++	}
++	remaining := buf[header.HeaderSize:]
++	capacity := 0
++	for {
++		if len(remaining) < 3 {
++			return 0, false
++		}
++		block := uint32(remaining[0]) | uint32(remaining[1])<<8 | uint32(remaining[2])<<16
++		remaining = remaining[3:]
++		blockSize := int(block >> 3)
++		if blockSize > blockLimit {
++			return 0, false
++		}
++		storedSize, outputBound := blockSize, blockSize
++		switch (block >> 1) & 3 {
++		case 0: // raw
++		case 1: // RLE: one stored byte expands to blockSize bytes
++			storedSize = 1
++		case 2: // compressed
++			outputBound = blockLimit
++		default: // reserved
++			return 0, false
++		}
++		if storedSize > len(remaining) {
++			return 0, false
++		}
++		remaining = remaining[storedSize:]
++		if !header.HasFCS {
++			capacity += outputBound
++			if capacity > mrsDecodeBufferLimit {
++				return 0, false
++			}
++		}
++		if block&1 != 0 {
++			break
++		}
++	}
++	if header.HasCheckSum {
++		if len(remaining) < 4 {
++			return 0, false
++		}
++		remaining = remaining[4:]
++	}
++	if len(remaining) != 0 {
++		return 0, false
++	}
++	if header.HasFCS {
++		capacity = int(header.FrameContentSize)
++	}
++	return capacity, true
++}
+diff --git a/rules/provider/mrs_decoder_test.go b/rules/provider/mrs_decoder_test.go
+new file mode 100644
+index 0000000..d84a4f0
+--- /dev/null
++++ b/rules/provider/mrs_decoder_test.go
+@@ -0,0 +1,328 @@
++package provider
++
++import (
++	"bytes"
++	"encoding/binary"
++	"fmt"
++	"io"
++	"net/netip"
++	"testing"
++
++	"github.com/klauspost/compress/zstd"
++	C "github.com/metacubex/mihomo/constant"
++	P "github.com/metacubex/mihomo/constant/provider"
++)
++
++func encodeMrsTestFrame(t testing.TB, payload []byte, unknownSize bool) []byte {
++	t.Helper()
++	encoder, err := zstd.NewWriter(nil, zstd.WithEncoderConcurrency(1), zstd.WithWindowSize(8<<20))
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer encoder.Close()
++	encoded := encoder.EncodeAll(payload, nil)
++	if unknownSize {
++		var header zstd.Header
++		if err := header.Decode(encoded); err != nil {
++			t.Fatal(err)
++		}
++		// Preserve blocks and checksum but omit the content size and advertise
++		// an 8 MiB window, as upstream's streaming MRS encoder does.
++		flags := byte(0)
++		if header.HasCheckSum {
++			flags = 4
++		}
++		encoded = append([]byte{0x28, 0xb5, 0x2f, 0xfd, flags, 0x68}, encoded[header.HeaderSize:]...)
++	}
++	return encoded
++}
++
++func mrsTestPayload(t testing.TB, strategy mrsRuleStrategy, extra []byte) []byte {
++	t.Helper()
++	var payload bytes.Buffer
++	payload.Write(MrsMagicBytes[:])
++	payload.WriteByte(strategy.Behavior().Byte())
++	for _, value := range []int64{int64(strategy.Count()), int64(len(extra))} {
++		if err := binary.Write(&payload, binary.BigEndian, value); err != nil {
++			t.Fatal(err)
++		}
++	}
++	payload.Write(extra)
++	if err := strategy.WriteMrs(&payload); err != nil {
++		t.Fatal(err)
++	}
++	return payload.Bytes()
++}
++
++func readMrsTestFrame(t testing.TB, encoded []byte) ([]byte, error) {
++	t.Helper()
++	reader, err := newMrsReader(encoded)
++	if err != nil {
++		return nil, err
++	}
++	defer reader.Close()
++	return io.ReadAll(reader)
++}
++
++func TestMrsRuleRoundTrip(t *testing.T) {
++	for _, behavior := range []P.RuleBehavior{P.Domain, P.IPCIDR} {
++		t.Run(behavior.String(), func(t *testing.T) {
++			original := newStrategy(behavior, nil).(mrsRuleStrategy)
++			original.Reset()
++			rules := []string{"example.org", "+.example.com", "*.example.net"}
++			checks := []struct {
++				value string
++				want  bool
++			}{{"example.org", true}, {"example.com", true}, {"a.example.com", true},
++				{"a.example.net", true}, {"example.net", false}, {"other.org", false}}
++			if behavior == P.IPCIDR {
++				rules = []string{"192.0.2.0/24", "2001:db8::/32"}
++				checks = []struct {
++					value string
++					want  bool
++				}{{"192.0.2.0", true}, {"192.0.2.255", true}, {"192.0.3.0", false},
++					{"2001:db8::1", true}, {"2001:db9::1", false}}
++			}
++			for _, rule := range rules {
++				original.Insert(rule)
++			}
++			original.FinishInsert()
++			for _, extraSize := range []int{0, 8192, mrsDecodeBufferLimit + 1} {
++				for _, unknownSize := range []bool{false, true} {
++					t.Run(fmt.Sprintf("extra=%d/unknown=%t", extraSize, unknownSize), func(t *testing.T) {
++						payload := mrsTestPayload(t, original, make([]byte, extraSize))
++						encoded := encodeMrsTestFrame(t, payload, unknownSize)
++						_, fast := mrsDecodedCapacity(encoded)
++						if fast != (extraSize < mrsDecodeBufferLimit) {
++							t.Fatalf("unexpected fast path: %t", fast)
++						}
++						parsed, err := rulesMrsParse(encoded, newStrategy(behavior, nil))
++						if err != nil {
++							t.Fatal(err)
++						}
++						if parsed.Count() != original.Count() {
++							t.Fatalf("count: got %d want %d", parsed.Count(), original.Count())
++						}
++						var before, after bytes.Buffer
++						if err := original.WriteMrs(&before); err != nil {
++							t.Fatal(err)
++						}
++						if err := parsed.(mrsRuleStrategy).WriteMrs(&after); err != nil {
++							t.Fatal(err)
++						}
++						if !bytes.Equal(before.Bytes(), after.Bytes()) {
++							t.Fatal("rule data changed")
++						}
++						for _, check := range checks {
++							metadata := &C.Metadata{Host: check.value}
++							if behavior == P.IPCIDR {
++								metadata.DstIP = netip.MustParseAddr(check.value)
++							}
++							if got := parsed.Match(metadata, C.RuleMatchHelper{}); got != check.want {
++								t.Errorf("match %q: got %t want %t", check.value, got, check.want)
++							}
++						}
++					})
++				}
++			}
++		})
++	}
++}
++
++func TestMrsDecodedCapacityBoundary(t *testing.T) {
++	for _, size := range []int{1, 255, 1024, 128 << 10, 700 << 10, mrsDecodeBufferLimit, mrsDecodeBufferLimit + 1} {
++		payload := bytes.Repeat([]byte("abc"), (size+2)/3)[:size]
++		for _, unknownSize := range []bool{false, true} {
++			t.Run(fmt.Sprintf("size=%d/unknown=%t", size, unknownSize), func(t *testing.T) {
++				encoded := encodeMrsTestFrame(t, payload, unknownSize)
++				capacity, fast := mrsDecodedCapacity(encoded)
++				if fast != (size <= mrsDecodeBufferLimit) {
++					t.Fatalf("unexpected fast path: %t", fast)
++				}
++				if fast && (capacity < size || capacity > mrsDecodeBufferLimit) {
++					t.Fatalf("output %d is not bounded by capacity %d", size, capacity)
++				}
++				decoded, err := readMrsTestFrame(t, encoded)
++				if err != nil || !bytes.Equal(decoded, payload) {
++					t.Fatalf("decode mismatch: %v", err)
++				}
++			})
++		}
++	}
++}
++
++func TestMrsRawAndRLECapacity(t *testing.T) {
++	// Unknown content size, 1 KiB window, one raw and one RLE block.
++	encoded := []byte{0x28, 0xb5, 0x2f, 0xfd, 0, 0, 24, 0, 0, 'a', 'b', 'c', 35, 0, 0, 'x'}
++	capacity, fast := mrsDecodedCapacity(encoded)
++	if !fast || capacity != 7 {
++		t.Fatalf("capacity = %d, fast = %t", capacity, fast)
++	}
++	decoded, err := readMrsTestFrame(t, encoded)
++	if err != nil || string(decoded) != "abcxxxx" {
++		t.Fatalf("raw/RLE decode: %q, %v", decoded, err)
++	}
++}
++
++func TestMrsSmallWindowCapacity(t *testing.T) {
++	payload := bytes.Repeat([]byte("abc"), 300)
++	encoded := encodeMrsTestFrame(t, payload, true)
++	encoded[5] = 0 // 1 KiB window; the payload needs no larger history.
++	capacity, fast := mrsDecodedCapacity(encoded)
++	if !fast || capacity > 1024 {
++		t.Fatalf("small window capacity = %d, fast = %t", capacity, fast)
++	}
++	decoded, err := readMrsTestFrame(t, encoded)
++	if err != nil || !bytes.Equal(decoded, payload) {
++		t.Fatalf("small window decode: %v", err)
++	}
++}
++
++func TestMrsMultipleFrames(t *testing.T) {
++	first, second := []byte("first payload"), []byte("second payload")
++	encoded := append(encodeMrsTestFrame(t, first, false), encodeMrsTestFrame(t, second, true)...)
++	for _, skip := range []bool{false, true} {
++		input := encoded
++		if skip {
++			input = append([]byte{0x50, 0x2a, 0x4d, 0x18, 3, 0, 0, 0, 's', 'k', 'p'}, input...)
++		}
++		if _, fast := mrsDecodedCapacity(input); fast {
++			t.Fatal("multi/skippable frame must stream")
++		}
++		decoded, err := readMrsTestFrame(t, input)
++		if err != nil || !bytes.Equal(decoded, append(first, second...)) {
++			t.Fatalf("streaming compatibility: %v", err)
++		}
++	}
++}
++
++func TestMrsMalformedFrames(t *testing.T) {
++	encoded := encodeMrsTestFrame(t, bytes.Repeat([]byte("abc"), 1000), true)
++	for length := 0; length < len(encoded); length++ {
++		input := encoded[:length]
++		if _, fast := mrsDecodedCapacity(input); fast {
++			t.Fatalf("truncated input of length %d entered fast path", length)
++		}
++		if length > 0 {
++			if _, err := readMrsTestFrame(t, input); err == nil {
++				t.Fatalf("truncated input of length %d accepted", length)
++			}
++		}
++	}
++	badCRC := append([]byte(nil), encoded...)
++	badCRC[len(badCRC)-1] ^= 0xff
++	if _, err := readMrsTestFrame(t, badCRC); err == nil {
++		t.Fatal("corrupt checksum accepted")
++	}
++	badBlock := append([]byte(nil), encoded...)
++	badBlock[6] = badBlock[6]&^6 | 6
++	if _, fast := mrsDecodedCapacity(badBlock); fast {
++		t.Fatal("reserved block type accepted")
++	}
++	if _, err := readMrsTestFrame(t, badBlock); err == nil {
++		t.Fatal("reserved block decoded")
++	}
++	// A declared content size of one byte cannot grow the output allocation
++	// to accommodate blocks whose actual output is larger.
++	undersized := append([]byte{0x28, 0xb5, 0x2f, 0xfd, 0x24, 1}, encoded[6:]...)
++	if _, err := readMrsTestFrame(t, undersized); err == nil {
++		t.Fatal("false content size accepted")
++	}
++}
++
++func TestMrsMalformedPayloads(t *testing.T) {
++	strategy := NewDomainStrategy()
++	strategy.Reset()
++	strategy.Insert("example.org")
++	strategy.FinishInsert()
++	payload := mrsTestPayload(t, strategy, nil)
++	for _, offset := range []int{0, 4, 13, 21} { // magic, behavior, extra length, set version
++		invalid := append([]byte(nil), payload...)
++		invalid[offset] = 0xff
++		if _, err := rulesMrsParse(encodeMrsTestFrame(t, invalid, true), NewDomainStrategy()); err == nil {
++			t.Errorf("invalid MRS field at %d accepted", offset)
++		}
++	}
++	for _, length := range []int{0, 4, 5, 13, 20, len(payload) - 1} {
++		if _, err := rulesMrsParse(encodeMrsTestFrame(t, payload[:length], false), NewDomainStrategy()); err == nil {
++			t.Errorf("truncated MRS of length %d accepted", length)
++		}
++	}
++	// Reserved data must be skipped without allocating its advertised length.
++	invalid := append([]byte(nil), payload[:21]...)
++	binary.BigEndian.PutUint64(invalid[13:], 1<<40)
++	if _, err := rulesMrsParse(encodeMrsTestFrame(t, invalid, true), NewDomainStrategy()); err == nil {
++		t.Fatal("truncated reserved data accepted")
++	}
++	if _, err := rulesMrsParse(encodeMrsTestFrame(t, payload, false), NewIPCidrStrategy()); err == nil {
++		t.Fatal("wrong behavior accepted")
++	}
++}
++
++func BenchmarkMrsLargeWindow(b *testing.B) {
++	strategy := NewDomainStrategy()
++	strategy.Reset()
++	for i := 0; i < 40000; i++ {
++		strategy.Insert(fmt.Sprintf("host-%d.example.org", i))
++	}
++	strategy.FinishInsert()
++	encoded := encodeMrsTestFrame(b, mrsTestPayload(b, strategy, nil), true)
++	for _, fast := range []bool{false, true} {
++		b.Run(fmt.Sprintf("bounded=%t", fast), func(b *testing.B) {
++			b.ReportAllocs()
++			for i := 0; i < b.N; i++ {
++				var reader io.ReadCloser
++				var err error
++				if fast {
++					reader, err = newMrsReader(encoded)
++				} else {
++					var decoder *zstd.Decoder
++					decoder, err = zstd.NewReader(bytes.NewReader(encoded))
++					if err == nil {
++						reader = decoder.IOReadCloser()
++					}
++				}
++				if err != nil {
++					b.Fatal(err)
++				}
++				_, err = io.Copy(io.Discard, reader)
++				reader.Close()
++				if err != nil {
++					b.Fatal(err)
++				}
++			}
++		})
++	}
++}
++
++func FuzzMrsDecodedCapacity(f *testing.F) {
++	f.Add([]byte{})
++	f.Add([]byte{0x28, 0xb5, 0x2f, 0xfd, 0, 0, 35, 0, 0, 'x'})
++	for _, unknownSize := range []bool{false, true} {
++		f.Add(encodeMrsTestFrame(f, bytes.Repeat([]byte("test payload"), 20000), unknownSize))
++	}
++	f.Fuzz(func(t *testing.T, encoded []byte) {
++		capacity, fast := mrsDecodedCapacity(encoded)
++		if !fast {
++			return
++		}
++		if capacity < 0 || capacity > mrsDecodeBufferLimit {
++			t.Fatalf("unbounded capacity %d", capacity)
++		}
++		decoder, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1), zstd.WithDecodeAllCapLimit(true))
++		if err != nil {
++			t.Fatal(err)
++		}
++		defer decoder.Close()
++		// An independent decode with the full allowance verifies that the
++		// probe did not underestimate a valid frame. Both decodes stay bounded.
++		want, err := decoder.DecodeAll(encoded, make([]byte, 0, mrsDecodeBufferLimit))
++		if err != nil {
++			return
++		}
++		got, err := decoder.DecodeAll(encoded, make([]byte, 0, capacity))
++		if err != nil || !bytes.Equal(got, want) {
++			t.Fatalf("capacity %d underestimated output %d: %v", capacity, len(want), err)
++		}
++	})
++}
+diff --git a/rules/provider/mrs_reader.go b/rules/provider/mrs_reader.go
+index 66f6212..2cee210 100644
+--- a/rules/provider/mrs_reader.go
++++ b/rules/provider/mrs_reader.go
+@@ -1,20 +1,17 @@
+ package provider
+ 
+ import (
+-	"bytes"
+ 	"encoding/binary"
+ 	"errors"
+ 	"fmt"
+ 	"io"
+-
+-	"github.com/klauspost/compress/zstd"
+ )
+ 
+ var MrsMagicBytes = [4]byte{'M', 'R', 'S', 1} // MRSv1
+ 
+ func rulesMrsParse(buf []byte, strategy ruleStrategy) (ruleStrategy, error) {
+ 	if _strategy, ok := strategy.(mrsRuleStrategy); ok {
+-		reader, err := zstd.NewReader(bytes.NewReader(buf))
++		reader, err := newMrsReader(buf)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+@@ -57,8 +54,7 @@ func rulesMrsParse(buf []byte, strategy ruleStrategy) (ruleStrategy, error) {
+ 			return nil, errors.New("length is invalid")
+ 		}
+ 		if length > 0 {
+-			extra := make([]byte, length)
+-			_, err = io.ReadFull(reader, extra)
++			_, err = io.CopyN(io.Discard, reader, length)
+ 			if err != nil {
+ 				return nil, err
+ 			}

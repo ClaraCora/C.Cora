@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 
 struct ProxyGroupNode: Identifiable {
     struct ID: Hashable {
@@ -16,6 +17,15 @@ struct ProxyGroupNode: Identifiable {
 struct ProxyNodeTestKey: Hashable {
     let group: String
     let node: String
+}
+
+/// One transient failure notice, shared by the strategy and node tabs.
+struct ProxyNodeTestFailure: Identifiable {
+    static let delayValue = -1
+
+    let id = UUID()
+    let node: String
+    let message: String
 }
 
 /// One concrete current-selection target for the toolbar batch delay test.
@@ -233,13 +243,15 @@ final class ProxyController: ObservableObject {
     @Published private(set) var isRuntimeAvailable = false
     @Published var error: String?
 
-    /// 节点延迟（毫秒），node 名 → ms。0 表示本次测速超时，缺失表示本次连接尚未测速。
+    /// 节点延迟（毫秒），node 名 → ms。0 表示超时，-1 表示失败，缺失表示尚未测速。
     /// 结果属于当前 VPN 会话，App 重启时从 App Group 快照恢复。
     @Published private(set) var delays: [String: Int]
     /// 正在测速的策略组名。
     @Published private(set) var testing: Set<String> = []
     /// 正在单独测速的节点，以策略组和节点名共同标识。
     @Published private(set) var testingNodes: Set<ProxyNodeTestKey> = []
+    @Published private(set) var nodeTestFailure: ProxyNodeTestFailure?
+    private var nodeFailureDismissTask: Task<Void, Never>?
     /// 顶部批量测速当前覆盖的最终节点 key。卡片据此显示独立加载状态。
     @Published private(set) var testingCurrentSelectionKeys: Set<String> = []
     /// 正在切换的策略组与目标节点，避免重复点击并给节点行显示进度。
@@ -372,6 +384,7 @@ final class ProxyController: ObservableObject {
 
     /// 结束当前界面测速任务并清除内存结果。NE 负责创建/删除持久化会话快照。
     func resetSession() {
+        dismissNodeTestFailure()
         loadGeneration &+= 1
         sessionGeneration &+= 1
         groups = []
@@ -399,6 +412,7 @@ final class ProxyController: ObservableObject {
     private func reconcileDelaySession() {
         let snapshot = ProxyDelayStore.load()
         guard snapshot?.sessionID != delaySessionID else { return }
+        dismissNodeTestFailure()
         delaySessionID = snapshot?.sessionID
         delays = snapshot?.delays ?? [:]
         testing = []
@@ -571,7 +585,7 @@ final class ProxyController: ObservableObject {
               testingCurrentSelectionKeys.isEmpty,
               !testingNodes.contains(testingKey) else { return }
         let session = sessionGeneration
-        error = nil
+        dismissNodeTestFailure()
         testingNodes.insert(testingKey)
         let delayKey = ProxyDelayResolver.storageKey(for: name, index: resolutionIndex)
         clearDelayValues(for: [delayKey])
@@ -588,21 +602,49 @@ final class ProxyController: ObservableObject {
         switch result {
         case .ok(let data):
             guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
-                self.error = "测速失败：响应非 JSON"
+                failNodeTest(name, delayKey: delayKey, reason: "响应格式不正确，请重试")
                 return
             }
             if let message = object["error"] as? String {
-                self.error = "测速失败：\(message)"
+                failNodeTest(name, delayKey: delayKey, reason: message)
                 return
             }
             guard let delay = (object["delay"] as? NSNumber)?.intValue else {
-                self.error = "测速失败：响应缺少延迟"
+                failNodeTest(name, delayKey: delayKey, reason: "响应缺少延迟，请重试")
+                return
+            }
+            guard delay > 0 else {
+                failNodeTest(name, delayKey: delayKey, reason: "未能获取有效延迟，请重试")
                 return
             }
             mergeDelayValues([delayKey: delay])
         case .failure(let reason):
-            self.error = "测速失败：\(reason)"
+            failNodeTest(name, delayKey: delayKey, reason: reason)
         }
+    }
+
+    private func failNodeTest(_ name: String, delayKey: String, reason: String) {
+        mergeDelayValues([delayKey: ProxyNodeTestFailure.delayValue])
+        dismissNodeTestFailure()
+        let message = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        let failure = ProxyNodeTestFailure(node: name,
+                                           message: message.isEmpty ? "请求失败，请稍后重试" : message)
+        nodeTestFailure = failure
+        nodeFailureDismissTask = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: 4_000_000_000)
+            } catch {
+                return
+            }
+            self?.dismissNodeTestFailure(id: failure.id)
+        }
+    }
+
+    func dismissNodeTestFailure(id: UUID? = nil) {
+        if let id, nodeTestFailure?.id != id { return }
+        nodeFailureDismissTask?.cancel()
+        nodeFailureDismissTask = nil
+        nodeTestFailure = nil
     }
 
     /// 测试当前页面每张卡片已选中的最终节点。目标按共享延迟 key 去重，

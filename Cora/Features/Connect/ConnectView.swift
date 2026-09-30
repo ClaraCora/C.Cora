@@ -312,6 +312,7 @@ private extension KernelController.Mode {
 
 private struct RuntimeMetricsGrid: View {
     @EnvironmentObject private var kernel: KernelController
+    @EnvironmentObject private var settings: SettingsStore
     @ObservedObject var connections: ConnectionsController
 
     var body: some View {
@@ -327,21 +328,25 @@ private struct RuntimeMetricsGrid: View {
                              samples: kernel.samples, direction: .up)
             NavigationLink {
                 NodeTrafficRankingView(controller: connections,
-                                       initialMetric: .download)
+                                       initialMetric: settings.overviewDownloadRanking)
+                    .id(settings.overviewDownloadRanking)
             } label: {
                 MetricWidget(title: "累计下行", value: ByteFormat.size(kernel.totalDownload),
                              systemImage: "arrow.down.circle", tint: .blue)
             }
             .buttonStyle(.plain)
+            .accessibilityHint("打开\(settings.overviewDownloadRanking.title)节点用量排行")
 
             NavigationLink {
                 NodeTrafficRankingView(controller: connections,
-                                       initialMetric: .upload)
+                                       initialMetric: settings.overviewUploadRanking)
+                    .id(settings.overviewUploadRanking)
             } label: {
                 MetricWidget(title: "累计上行", value: ByteFormat.size(kernel.totalUpload),
                              systemImage: "arrow.up.circle", tint: .orange)
             }
             .buttonStyle(.plain)
+            .accessibilityHint("打开\(settings.overviewUploadRanking.title)节点用量排行")
         }
     }
 

@@ -1,5 +1,101 @@
 # Third-party patches
 
+## mihomo-v1.19.30-bounded-mrs-decode
+
+- Added: 2026-09-30
+- Upstream module: `github.com/metacubex/mihomo v1.19.30`
+- Patched file: `rules/provider/mrs_reader.go`; added
+  `rules/provider/mrs_decoder.go` and its regression tests
+- Build tags: default and `with_low_memory`
+
+### Reason
+
+The upstream MRS reader feeds a `bytes.Reader` into the streaming decoder in
+`github.com/klauspost/compress/zstd v1.17.9`. An MRS frame can advertise an
+8 MiB history window even when its decoded rule data occupies less than 1 MiB.
+Streaming decoding reserves that window plus scratch space. Provider loading
+and refresh can therefore create substantial temporary allocation pressure in
+the Network Extension. Decoder low-memory mode is already enabled upstream;
+enabling it again, or only reducing decoder concurrency, does not remove that
+window allocation.
+
+### Local behavior
+
+A small, allocation-free frame probe determines a conservative decoded output
+bound before selecting a decoder. It uses the frame content size when present,
+or walks block headers when the streaming encoder omitted it. Compressed blocks
+are bounded by `min(window size, 128 KiB)`; raw and RLE blocks state their output
+size. Only a complete, single frame whose bound is at most 2 MiB takes the new
+path. Zstandard remains responsible for validating compressed data and checksums.
+
+That path uses `DecodeAll` with an explicitly sized output buffer and
+`WithDecodeAllCapLimit(true)`. The output doubles as decompression history, and
+the decoder is closed before rule parsing. There is no persistent decoder pool
+or retained decompressed-file cache. One decoder handles each one-shot call;
+this does not serialize providers or change network connection concurrency.
+
+Large, concatenated, skippable, or unrecognized frames use the original streaming
+decoder immediately, without a speculative output allocation or a second decode.
+The 2 MiB threshold is an optimization boundary, not a new MRS file-size limit
+or a bound on total NE memory. Domain/IP rule structures and matching are
+unchanged. Reserved MRS extension data is discarded through a bounded copy
+instead of allocating its entire declared length. Eligible frames are fully
+decoded and checksum-validated before parsing, so a corrupt checksum cannot be
+missed when the rule parser stops reading at the end of its own data.
+
+### Verification
+
+- All existing patches plus this patch apply to a clean v1.19.30 module.
+  Preparation checks all touched source and output hashes and refuses unexpected
+  upstream files with the new names.
+- `go test` and `go vet ./rules/provider` pass with default and `with_low_memory`
+  builds. CI now includes this package in both test/vet lists.
+- Tests cover domain/IP round trips and matching, known/unknown content size,
+  small/large windows, the exact buffer boundary and streaming fallback, raw/RLE
+  blocks, concatenated/skippable frames, truncated input, corrupt checksums,
+  invalid MRS fields, and oversized reserved-data declarations.
+- A 30-second `FuzzMrsDecodedCapacity` run completed 1,237,273 inputs without a
+  failure. The fuzz oracle independently checks the inferred capacity against
+  a bounded reference decode.
+- All 51 public MRS resources referenced by the test configuration produce
+  byte-identical decoded payloads and serialized rule sets, with identical
+  counts. All 51 use the bounded path. Private subscription content is not
+  included in the patch or tests.
+- `GOOS=ios GOARCH=arm64 CGO_ENABLED=0 go build -tags with_low_memory
+  ./rules/provider` passes. This verifies the Go package, not the complete
+  gomobile/Xcode build or behavior on an iPhone.
+
+Full rule-parse benchmark on Windows/amd64, Go 1.25.4, GOMAXPROCS=4,
+`with_low_memory`, default Go GC settings, three 500 ms runs (medians):
+
+| Public rule set | Before MiB/op | After MiB/op | Before ms/op | After ms/op |
+| --- | ---: | ---: | ---: | ---: |
+| proxy_domain | 10.62 | 1.19 | 1.37 | 1.16 |
+| kelee_ChinaMax_domain | 12.91 | 2.73 | 3.21 | 3.64 |
+| kelee_Global_domain | 11.15 | 1.48 | 1.71 | 1.47 |
+| kelee_SpeedtestInternational_domain | 10.88 | 1.20 | 1.40 | 1.15 |
+| kelee_ChinaMax_ipcidr | 10.67 | 1.28 | 2.41 | 1.81 |
+| All 51, one sequential load | 57.52 | 9.19 | 11.49 | 10.69 |
+
+MiB/op means cumulative bytes allocated during each complete parse, including
+rule construction. It is neither simultaneous live memory nor measured iOS
+physical footprint. The batch allocates about 84% less and finishes about 7%
+faster in this experiment. The largest domain set takes about 0.43 ms longer;
+the change does not promise faster loading for every file. Network forwarding
+is outside this code path. Device measurements and termination logs are still
+needed to assess the reported iOS VPN exits.
+
+The committed synthetic decoder benchmark is reproducible with
+`go test ./rules/provider -run '^$' -bench BenchmarkMrsLargeWindow -benchmem`.
+It compares the original streaming reader with the bounded decoder; its numbers
+are decoder-only and should not be substituted for the full-parse table above.
+
+### Rollback
+
+Remove the bounded MRS patch, its preparation-script paths/hashes/apply wiring,
+and `./rules/provider` from the Mihomo CI test/vet lists as one change. No rule
+file conversion, configuration change, or stored-data migration is involved.
+
 ## mihomo-v1.19.30-atomic-dns-runtime
 
 - Added: 2026-08-23

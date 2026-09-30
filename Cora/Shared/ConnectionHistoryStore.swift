@@ -269,6 +269,14 @@ enum ConnectionTrafficRankingMetric: String, CaseIterable, Hashable, Identifiabl
     case upload
 
     var id: Self { self }
+
+    var title: String {
+        switch self {
+        case .total: return "总计"
+        case .download: return "下行"
+        case .upload: return "上行"
+        }
+    }
 }
 
 /// All three node rankings produced by one App-side history scan.
@@ -410,12 +418,28 @@ final class ConnectionHistoryStore: @unchecked Sendable {
 
     /// Persists the current active sample. Records are upserted in one short
     /// transaction; no full history is ever retained by the Network Extension.
-    func upsertActive(_ records: [ConnectionHistoryRecord]) {
-        guard !records.isEmpty else { return }
-        queue.sync {
-            guard database != nil else { return }
+    @discardableResult
+    func upsertActive(_ records: [ConnectionHistoryRecord]) -> Bool {
+        upsert(records, closedAt: nil)
+    }
+
+    /// Final counters and the closed state are committed together. This avoids
+    /// inserting each closed row as active and then updating the same row again.
+    @discardableResult
+    func upsertClosed(_ records: [ConnectionHistoryRecord], at date: Date = Date()) -> Bool {
+        upsert(records, closedAt: date)
+    }
+
+    private func upsert(_ records: [ConnectionHistoryRecord], closedAt: Date?) -> Bool {
+        guard !records.isEmpty else { return true }
+        return queue.sync {
+            guard database != nil else { return false }
             do {
                 try execute("BEGIN IMMEDIATE TRANSACTION")
+                var statement: OpaquePointer?
+                try prepare(Self.upsertSQL, into: &statement)
+                defer { sqlite3_finalize(statement) }
+                let chainEncoder = JSONEncoder()
                 var recordCount = try totalRecordCountLocked()
                 var knownIDs = try existingIDsLocked(for: records)
                 for record in records {
@@ -429,13 +453,19 @@ final class ConnectionHistoryStore: @unchecked Sendable {
                         recordCount -= removed
                         guard recordCount < Self.maximumRecordCount else { continue }
                     }
-                    try upsertLocked(record)
+                    // Release each row's Foundation temporaries before the next
+                    // row, even when a full 512-record close batch is written.
+                    try autoreleasepool {
+                        try upsertLocked(record, statement: statement,
+                                         closedAt: closedAt, chainEncoder: chainEncoder)
+                    }
                     if !exists {
                         knownIDs.insert(record.id)
                         recordCount += 1
                     }
                 }
                 try execute("COMMIT")
+                return true
             } catch StoreError.sqlite(let code) where code == SQLITE_FULL {
                 try? execute("ROLLBACK")
                 // A capped database may still need pages while a WAL reader is
@@ -448,6 +478,7 @@ final class ConnectionHistoryStore: @unchecked Sendable {
                 // History is observability only. Never make a DB issue affect
                 // packet forwarding or tunnel startup.
             }
+            return false
         }
     }
 
@@ -778,19 +809,18 @@ final class ConnectionHistoryStore: @unchecked Sendable {
         }
     }
 
-    private func upsertLocked(_ record: ConnectionHistoryRecord) throws {
-        let sql = """
+    private static let upsertSQL = """
             INSERT INTO connection_history (
                 id, started_at, ended_at, is_active, upload, download, network,
                 connection_type, source_ip, source_port, destination_ip,
                 destination_port, host, sniff_host, process, process_path, chains,
                 strategy_name, host_name, rule, rule_payload
-            ) VALUES (?, ?, NULL, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 upload = excluded.upload,
                 download = excluded.download,
-                is_active = 1,
-                ended_at = NULL,
+                is_active = excluded.is_active,
+                ended_at = excluded.ended_at,
                 network = excluded.network,
                 connection_type = excluded.connection_type,
                 source_ip = excluded.source_ip,
@@ -807,22 +837,36 @@ final class ConnectionHistoryStore: @unchecked Sendable {
                 rule = excluded.rule,
                 rule_payload = excluded.rule_payload
             """
-        var statement: OpaquePointer?
-        try prepare(sql, into: &statement)
-        defer { sqlite3_finalize(statement) }
+
+    private func upsertLocked(_ record: ConnectionHistoryRecord,
+                              statement: OpaquePointer?,
+                              closedAt: Date?,
+                              chainEncoder: JSONEncoder) throws {
+        // Reuse one statement per batch without retaining the previous row's
+        // bound strings or native SQLite allocations between rows.
+        defer {
+            sqlite3_reset(statement)
+            sqlite3_clear_bindings(statement)
+        }
         let values: [String] = [
             record.network, record.connectionType, record.sourceIP,
             record.sourcePort, record.destinationIP, record.destinationPort, record.host,
             record.sniffHost, record.process, record.processPath,
-            (try? String(data: JSONEncoder().encode(record.chains), encoding: .utf8)) ?? "[]",
+            (try? String(data: chainEncoder.encode(record.chains), encoding: .utf8)) ?? "[]",
             record.strategyName, record.hostName, record.rule, record.rulePayload,
         ]
         bindText(record.id, to: statement, index: 1)
         sqlite3_bind_double(statement, 2, record.startedAt.timeIntervalSince1970)
-        sqlite3_bind_int64(statement, 3, record.upload)
-        sqlite3_bind_int64(statement, 4, record.download)
+        if let closedAt {
+            sqlite3_bind_double(statement, 3, closedAt.timeIntervalSince1970)
+        } else {
+            sqlite3_bind_null(statement, 3)
+        }
+        sqlite3_bind_int(statement, 4, closedAt == nil ? 1 : 0)
+        sqlite3_bind_int64(statement, 5, record.upload)
+        sqlite3_bind_int64(statement, 6, record.download)
         for (index, value) in values.enumerated() {
-            bindText(value, to: statement, index: Int32(index + 5))
+            bindText(value, to: statement, index: Int32(index + 7))
         }
         try stepDone(statement)
     }
