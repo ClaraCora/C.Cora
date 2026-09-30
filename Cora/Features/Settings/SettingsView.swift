@@ -65,6 +65,7 @@ struct SettingsView: View {
                     .settingsSectionStyle()
 
                     Section("运行") {
+                        PO0WhitelistSettingsEntry()
                         SettingsNavigationRow(
                             title: "内核运行",
                             systemImage: "gearshape.2",

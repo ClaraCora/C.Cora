@@ -106,6 +106,9 @@ final class TunnelManager {
     func start(configYAML: String?, settingsJSON: String, protocolOptions: ProtocolOptions) async throws {
         let mgr = try await loadOrCreateManager(options: protocolOptions)
         var options: [String: NSObject] = ["config": (configYAML ?? "") as NSString]
+        if let po0 = try? PO0WhitelistStorage.load().json() {
+            options["po0Whitelist"] = po0 as NSString
+        }
         if !settingsJSON.isEmpty { options["settings"] = settingsJSON as NSString }
         let startupAttemptID = UUID().uuidString
         options["startupAttemptID"] = startupAttemptID as NSString

@@ -149,6 +149,16 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         let hasConfigOption = options?["config"] != nil
         var incomingConfig = options?["config"] as? String
         let settingsJSON = (options?["settings"] as? String) ?? ""
+        // Credential-bearing options are never included in logs or diagnostics.
+        var po0Configuration = PO0WhitelistStorage.load()
+        if let po0JSON = options?["po0Whitelist"] as? String,
+           po0JSON.utf8.count <= 4096,
+           let po0 = try? JSONDecoder().decode(PO0WhitelistConfiguration.self, from: Data(po0JSON.utf8)),
+           let validated = try? po0.validated(),
+           AppGroup.containerURL == nil {
+            po0Configuration = validated
+            try? PO0WhitelistStorage.save(validated)
+        }
         let configSource = hasConfigOption
             ? ((incomingConfig?.isEmpty == false) ? "来自 options(\(incomingConfig!.count) 字节)" : "App 明确 DIRECT")
             : "无 options（系统重连，将用缓存/DIRECT 兜底）"
@@ -252,6 +262,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                     }
                     self.connectionHistoryRecorder.start()
                     self.startPathMonitor() // 开始把真实出站接口喂给内核
+                    // Shared settings may have changed while the kernel started.
+                    let currentPO0 = AppGroup.containerURL == nil ? po0Configuration : PO0WhitelistStorage.load()
+                    if let po0JSON = try? currentPO0.json() {
+                        _ = MihomoConfigurePO0Whitelist(po0JSON)
+                    }
                     if !developerMode, self.memoryPressureGuard == nil {
                         let guarder = MemoryPressureGuard()
                         guarder.start()
@@ -740,11 +755,46 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             ]))
             return
         }
-        if cmd != "traffic" && cmd != "memory" {
+        if cmd != "traffic" && cmd != "memory" && cmd != "po0WhitelistStatus" {
             FileLog.write("handleAppMessage：cmd=\(cmd)")
         }
 
         switch cmd {
+        case "po0WhitelistStatus":
+            reply(Data(MihomoPO0WhitelistStatus().utf8))
+        case "setPO0Whitelist", "checkPO0Whitelist":
+            self.runtimeQueue.async {
+                guard !self.isStopping, self.tunnelFileDescriptor != nil,
+                      self.currentIPCSessionGeneration() == sessionGeneration else {
+                    reply(Self.jsonData(["error": "VPN 尚未连接，请稍后重试"]))
+                    return
+                }
+                if cmd == "checkPO0Whitelist" {
+                    reply(Data(MihomoCheckPO0WhitelistNow().utf8))
+                    return
+                }
+                guard let json = obj?["configuration"] as? String, json.utf8.count <= 4096,
+                      let value = try? JSONDecoder().decode(PO0WhitelistConfiguration.self, from: Data(json.utf8)),
+                      let validated = try? value.validated() else {
+                    reply(Self.jsonData(["error": "PO0 设置格式不正确，请重新保存"]))
+                    return
+                }
+                do {
+                    if AppGroup.containerURL != nil {
+                        guard PO0WhitelistStorage.load().id == validated.id else {
+                            reply(Self.jsonData(["error": "设置已更新，请重试同步最新设置"]))
+                            return
+                        }
+                        // App owns the shared file. An older IPC must never
+                        // overwrite a newer save made while this request waited.
+                    } else {
+                        try PO0WhitelistStorage.save(validated)
+                    }
+                    reply(Data(MihomoConfigurePO0Whitelist(try validated.json()).utf8))
+                } catch {
+                    reply(Self.jsonData(["error": "VPN 无法保存 PO0 设置，请重新连接后重试"]))
+                }
+            }
         case "hello":
             reply(Data(MihomoControlInfo().utf8))
         case "queryProxies":

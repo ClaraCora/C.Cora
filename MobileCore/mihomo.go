@@ -3784,6 +3784,9 @@ func NotifyNetworkChange(name string, systemDNSJSON string, reason string,
 	if dnsErr != nil {
 		appendRunLog("忽略无效的 scoped system DNS: " + dnsErr.Error())
 	}
+	if resetConnections {
+		po0Whitelist.request(true)
+	}
 	return errors.Join(dnsErr, resolverErr)
 }
 
@@ -4128,6 +4131,7 @@ func resetDNSResolverTransport(oldResolver resolver.Resolver) {
 
 // Stop 关闭内核与所有监听器。对应 Swift 侧 `MihomoStop()`。
 func Stop() {
+	po0Whitelist.stop()
 	lockConfigApplyForWrite()
 	defer unlockConfigApplyForWrite()
 	appendRunLog("Stop: 关闭内核")

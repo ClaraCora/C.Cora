@@ -36,6 +36,9 @@ jobs:
       - name: Test single-node delay feedback
         run: bash scripts/test-proxy-controller.sh
 
+      - name: Test PO0 whitelist settings
+        run: bash scripts/test-po0-whitelist.sh
+
       # ───────────── Phase 1：gomobile 编 mihomo 内核 ─────────────
       - name: Set up Go
         uses: actions/setup-go@v5
