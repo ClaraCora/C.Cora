@@ -12,6 +12,7 @@ readonly EXPECTED_ALLOC_PATCHED_SHA="8ad6d58e0007d8a6db9ab6fcc37da00482e2e18e86d
 readonly EXPECTED_BUFFER_PATCHED_SHA="5c63a04120be7924e4a6277638e4e04609a0292536772f31cd3977fcbf773148"
 readonly EXPECTED_TEST_SHA="fbf73ae2ae4e08b11451eb13dd9f1d4005f4ede94f7e4b5e067feb9fbb56226f"
 readonly PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/sing-v0.5.7-oversize-buffer-pool.patch"
+readonly MEMORY_DIAGNOSTICS_PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/sing-v0.5.7-memory-diagnostics.patch"
 readonly PATCHED_DIR="${RUNNER_TEMP:?}/sing-v0.5.7-ios-oversize-pool-v1"
 
 check_sha256() {
@@ -62,6 +63,13 @@ git -c core.autocrlf=false -C "$PATCHED_DIR" \
 check_sha256 "$EXPECTED_ALLOC_PATCHED_SHA" "$PATCHED_DIR/$ALLOC_SOURCE_REL"
 check_sha256 "$EXPECTED_BUFFER_PATCHED_SHA" "$PATCHED_DIR/$BUFFER_SOURCE_REL"
 check_sha256 "$EXPECTED_TEST_SHA" "$PATCHED_DIR/$TEST_REL"
+
+# Apply the optional diagnostics API after the allocator patch SHA checks so
+# those checks continue to validate the exact functional patch output.
+git -c core.autocrlf=false -C "$PATCHED_DIR" \
+  apply --check --whitespace=error-all "$MEMORY_DIAGNOSTICS_PATCH_FILE"
+git -c core.autocrlf=false -C "$PATCHED_DIR" \
+  apply --whitespace=error-all "$MEMORY_DIAGNOSTICS_PATCH_FILE"
 
 go mod edit -replace="$MODULE@$EXPECTED_VERSION=$PATCHED_DIR"
 readonly RESOLUTION="$(go list -m -f '{{.Version}}|{{if .Replace}}{{.Replace.Dir}}{{end}}' "$MODULE")"

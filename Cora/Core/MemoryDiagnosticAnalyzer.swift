@@ -40,6 +40,11 @@ struct MemoryDiagnosticSample: Decodable {
         let logPersistedBytes: UInt64?
     }
 
+    struct FakeIPDiagnostic: Decodable {
+        let storage: String?
+        let entries: Int?
+    }
+
     struct GoRuntimeDiagnostic: Decodable {
         let heapAlloc: UInt64?
         let heapObjects: UInt64?
@@ -80,6 +85,36 @@ struct MemoryDiagnosticSample: Decodable {
         let connectionSnapshotBytes: Int64?
         let closedSnapshotBytes: Int64?
         let closedQueuePending: Int?
+        let mihomoBufferPoolBuffers: Int?
+        let mihomoBufferPoolBytes: UInt64?
+        let mihomoBufferPoolMaxBytes: UInt64?
+        let singBufferPoolBuffers: Int?
+        let singBufferPoolBytes: UInt64?
+        let singBufferPoolMaxBytes: UInt64?
+        let bufferPoolRetainedBytes: UInt64?
+        let bufferPoolLastTrimBytes: UInt64?
+        let bufferPoolTrimmedBytes: UInt64?
+        let proxyCount: Int?
+        let policyGroupCount: Int?
+        let proxyProviderNodes: Int?
+        let ruleProviderRules: Int?
+        let dnsCacheEntries: Int?
+        let dnsCacheCount: Int?
+        let dnsMappingEntries: Int?
+        let fakeIP4: FakeIPDiagnostic?
+        let fakeIP6: FakeIPDiagnostic?
+        let tunRXQueuedPackets: Int?
+        let tunRXQueuedBytes: UInt64?
+        let tunTXQueuedPackets: Int?
+        let tunTXQueuedBytes: UInt64?
+        let geoMode: String?
+        let geoLoader: String?
+        let geoSiteMatcher: String?
+        let geoIPFileBytes: UInt64?
+        let geoSiteFileBytes: UInt64?
+        let mmdbFileBytes: UInt64?
+        let asnFileBytes: UInt64?
+        let forceGCSuppressed: UInt64?
         let upTotal: Int64?
         let downTotal: Int64?
     }
@@ -95,6 +130,14 @@ private struct MemoryDiagnosticSummary: Decodable {
     let updatedAtMs: Int64?
     let sampleCount: UInt64?
     let metrics: [String: Metric]?
+    let lastRelease: ReleaseComparison?
+
+    struct ReleaseComparison: Decodable {
+        let event: String?
+        let t: Int64?
+        let before: [String: UInt64]?
+        let after: [String: UInt64]?
+    }
 
     struct Metric: Decodable {
         let first: UInt64?
@@ -163,94 +206,136 @@ enum MemoryDiagnosticAnalyzer {
             }
             return summaries.max { summaryTimestamp($0) < summaryTimestamp($1) }
         }()
-        let sampleCount = summary?.sampleCount ?? UInt64(samplesForAnalysis.count)
+        let sampleCount = max(summary?.sampleCount ?? 0,
+                              last?.sampleCount ?? UInt64(samplesForAnalysis.count))
         let duration = durationText(
             from: summary?.startedAtMs ?? first?.t,
-            to: summary?.updatedAtMs ?? last?.t)
+            to: [summary?.updatedAtMs, last?.t].compactMap { $0 }.max())
 
-        let footprint = latest("physFootprint", summary: summary, fallback: last?.physFootprint)
+        let footprint = latest("physFootprint", summary: summary, fallback: last?.physFootprint, sampleTime: last?.t)
         let footprintDelta = delta("physFootprint", summary: summary,
-                                   start: first?.physFootprint, end: last?.physFootprint)
+                                   start: first?.physFootprint, end: last?.physFootprint, endTime: last?.t)
         let footprintPeak = peak("physFootprintPeak", summary: summary,
                                  fallback: samplesForAnalysis.compactMap { $0.physFootprintPeak }.max()
                                      ?? samplesForAnalysis.compactMap(\.physFootprint).max())
         let available = latest("availableMemory", summary: summary,
-                               fallback: last?.availableMemory)
+                               fallback: last?.availableMemory, sampleTime: last?.t)
 
-        let heapAlloc = latest("heapAlloc", summary: summary, fallback: last?.go?.heapAlloc)
+        let heapAlloc = latest("heapAlloc", summary: summary, fallback: last?.go?.heapAlloc, sampleTime: last?.t)
         let heapAllocDelta = delta("heapAlloc", summary: summary,
-                                   start: first?.go?.heapAlloc, end: last?.go?.heapAlloc)
+                                   start: first?.go?.heapAlloc, end: last?.go?.heapAlloc, endTime: last?.t)
         let heapAllocPeak = peak("heapAlloc", summary: summary,
                                  fallback: samplesForAnalysis.compactMap { $0.go?.heapAlloc }.max())
-        let heapInuse = latest("heapInuse", summary: summary, fallback: last?.go?.heapInuse)
+        let heapInuse = latest("heapInuse", summary: summary, fallback: last?.go?.heapInuse, sampleTime: last?.t)
         let heapInuseDelta = delta("heapInuse", summary: summary,
-                                   start: first?.go?.heapInuse, end: last?.go?.heapInuse)
-        let heapSys = latest("heapSys", summary: summary, fallback: last?.go?.heapSys)
-        let heapIdle = latest("heapIdle", summary: summary, fallback: last?.go?.heapIdle)
+                                   start: first?.go?.heapInuse, end: last?.go?.heapInuse, endTime: last?.t)
+        let heapSys = latest("heapSys", summary: summary, fallback: last?.go?.heapSys, sampleTime: last?.t)
+        let heapIdle = latest("heapIdle", summary: summary, fallback: last?.go?.heapIdle, sampleTime: last?.t)
         let heapReleased = latest("heapReleased", summary: summary,
-                                  fallback: last?.go?.heapReleased)
+                                  fallback: last?.go?.heapReleased, sampleTime: last?.t)
         let heapObjects = latest("heapObjects", summary: summary,
-                                 fallback: last?.go?.heapObjects)
+                                 fallback: last?.go?.heapObjects, sampleTime: last?.t)
         let heapObjectsDelta = delta("heapObjects", summary: summary,
-                                     start: first?.go?.heapObjects, end: last?.go?.heapObjects)
-        let stackInuse = latest("stackInuse", summary: summary, fallback: last?.go?.stackInuse)
-        let stackSys = latest("stackSys", summary: summary, fallback: last?.go?.stackSys)
-        let sys = latest("sys", summary: summary, fallback: last?.go?.sys)
-        let totalAlloc = latest("totalAlloc", summary: summary, fallback: last?.go?.totalAlloc)
-        let mallocs = latest("mallocs", summary: summary, fallback: last?.go?.mallocs)
-        let frees = latest("frees", summary: summary, fallback: last?.go?.frees)
-        let numGC = latest("numGC", summary: summary, fallback: last?.go?.numGC)
-        let forcedGC = latest("numForcedGC", summary: summary, fallback: last?.go?.numForcedGC)
+                                     start: first?.go?.heapObjects, end: last?.go?.heapObjects, endTime: last?.t)
+        let stackInuse = latest("stackInuse", summary: summary, fallback: last?.go?.stackInuse, sampleTime: last?.t)
+        let stackSys = latest("stackSys", summary: summary, fallback: last?.go?.stackSys, sampleTime: last?.t)
+        let gcSys = latest("gcSys", summary: summary, fallback: last?.go?.gcSys, sampleTime: last?.t)
+        let sys = latest("sys", summary: summary, fallback: last?.go?.sys, sampleTime: last?.t)
+        let totalAlloc = latest("totalAlloc", summary: summary, fallback: last?.go?.totalAlloc, sampleTime: last?.t)
+        let mallocs = latest("mallocs", summary: summary, fallback: last?.go?.mallocs, sampleTime: last?.t)
+        let frees = latest("frees", summary: summary, fallback: last?.go?.frees, sampleTime: last?.t)
+        let numGC = latest("numGC", summary: summary, fallback: last?.go?.numGC, sampleTime: last?.t)
+        let forcedGC = latest("numForcedGC", summary: summary, fallback: last?.go?.numForcedGC, sampleTime: last?.t)
 
-        let resident = latest("residentSize", summary: summary, fallback: last?.vm?.residentSize)
+        let resident = latest("residentSize", summary: summary, fallback: last?.vm?.residentSize, sampleTime: last?.t)
         let residentPeak = latest("residentSizePeak", summary: summary,
-                                  fallback: last?.vm?.residentSizePeak)
+                                  fallback: last?.vm?.residentSizePeak, sampleTime: last?.t)
         let internalSize = latest("internalSize", summary: summary,
-                                  fallback: last?.vm?.internalSize)
+                                  fallback: last?.vm?.internalSize, sampleTime: last?.t)
         let compressed = latest("compressedSize", summary: summary,
-                                fallback: last?.vm?.compressedSize)
+                                fallback: last?.vm?.compressedSize, sampleTime: last?.t)
         let compressedPeak = latest("compressedSizePeak", summary: summary,
-                                    fallback: last?.vm?.compressedSizePeak)
-        let reusable = latest("reusableSize", summary: summary, fallback: last?.vm?.reusableSize)
-        let virtual = latest("virtualSize", summary: summary, fallback: last?.vm?.virtualSize)
+                                    fallback: last?.vm?.compressedSizePeak, sampleTime: last?.t)
+        let reusable = latest("reusableSize", summary: summary, fallback: last?.vm?.reusableSize, sampleTime: last?.t)
+        let virtual = latest("virtualSize", summary: summary, fallback: last?.vm?.virtualSize, sampleTime: last?.t)
 
-        let connections = latestInt("connections", summary: summary, fallback: last?.go?.connections)
-        let tcp = latestInt("tcpConnections", summary: summary, fallback: last?.go?.tcpConnections)
-        let udp = latestInt("udpConnections", summary: summary, fallback: last?.go?.udpConnections)
-        let goroutines = latestInt("goroutines", summary: summary, fallback: last?.go?.goroutines)
+        let connections = latestInt("connections", summary: summary, fallback: last?.go?.connections, sampleTime: last?.t)
+        let tcp = latestInt("tcpConnections", summary: summary, fallback: last?.go?.tcpConnections, sampleTime: last?.t)
+        let udp = latestInt("udpConnections", summary: summary, fallback: last?.go?.udpConnections, sampleTime: last?.t)
+        let goroutines = latestInt("goroutines", summary: summary, fallback: last?.go?.goroutines, sampleTime: last?.t)
         let proxyProviders = latestInt("proxyProviders", summary: summary,
-                                      fallback: last?.go?.proxyProviders)
+                                      fallback: last?.go?.proxyProviders, sampleTime: last?.t)
         let ruleProviders = latestInt("ruleProviders", summary: summary,
-                                     fallback: last?.go?.ruleProviders)
-        let proxyGroups = latestInt("proxyGroups", summary: summary,
-                                    fallback: last?.go?.proxyGroups)
+                                     fallback: last?.go?.ruleProviders, sampleTime: last?.t)
+        // Older NE used proxyGroups for all proxies; do not call that a
+        // measured policy-group count when the new accurate field is absent.
+        let policyGroups = latestInt("policyGroupCount", summary: summary,
+                                     fallback: last?.go?.policyGroupCount, sampleTime: last?.t)
+        let proxies = latestInt("proxyCount", summary: summary,
+                                fallback: last?.go?.proxyCount ?? last?.go?.proxyGroups, sampleTime: last?.t)
+        let providerNodes = latestInt("proxyProviderNodes", summary: summary,
+                                      fallback: last?.go?.proxyProviderNodes, sampleTime: last?.t)
+        let providerRules = latestInt("ruleProviderRules", summary: summary,
+                                      fallback: last?.go?.ruleProviderRules, sampleTime: last?.t)
+        let dnsEntries = latestInt("dnsCacheEntries", summary: summary,
+                                   fallback: last?.go?.dnsCacheEntries, sampleTime: last?.t)
+        let dnsCaches = latestInt("dnsCacheCount", summary: summary,
+                                  fallback: last?.go?.dnsCacheCount, sampleTime: last?.t)
+        let mappingEntries = latestInt("dnsMappingEntries", summary: summary,
+                                       fallback: last?.go?.dnsMappingEntries, sampleTime: last?.t)
+        let rxPackets = latestInt("tunRXQueuedPackets", summary: summary,
+                                  fallback: last?.go?.tunRXQueuedPackets, sampleTime: last?.t)
+        let rxBytes = latest("tunRXQueuedBytes", summary: summary,
+                             fallback: last?.go?.tunRXQueuedBytes, sampleTime: last?.t)
+        let txPackets = latestInt("tunTXQueuedPackets", summary: summary,
+                                  fallback: last?.go?.tunTXQueuedPackets, sampleTime: last?.t)
+        let txBytes = latest("tunTXQueuedBytes", summary: summary,
+                             fallback: last?.go?.tunTXQueuedBytes, sampleTime: last?.t)
         let delaySlots = latestInt("delaySlotsInUse", summary: summary,
-                                   fallback: last?.go?.delaySlotsInUse)
+                                   fallback: last?.go?.delaySlotsInUse, sampleTime: last?.t)
         let delaySlotLimit = latestInt("delaySlotLimit", summary: summary,
-                                       fallback: last?.go?.delaySlotLimit)
+                                       fallback: last?.go?.delaySlotLimit, sampleTime: last?.t)
         let delayBatches = latestInt("activeDelayBatches", summary: summary,
-                                     fallback: last?.go?.activeDelayBatches)
+                                     fallback: last?.go?.activeDelayBatches, sampleTime: last?.t)
         let snapshotBytes = latestSigned("connectionSnapshotBytes", summary: summary,
-                                         fallback: last?.go?.connectionSnapshotBytes)
+                                         fallback: last?.go?.connectionSnapshotBytes, sampleTime: last?.t)
         let closedSnapshotBytes = latestSigned("closedSnapshotBytes", summary: summary,
-                                               fallback: last?.go?.closedSnapshotBytes)
+                                               fallback: last?.go?.closedSnapshotBytes, sampleTime: last?.t)
         let closedQueuePending = latestInt("closedQueuePending", summary: summary,
-                                           fallback: last?.go?.closedQueuePending)
+                                           fallback: last?.go?.closedQueuePending, sampleTime: last?.t)
+        let mihomoPoolBuffers = latestInt("mihomoBufferPoolBuffers", summary: summary,
+                                          fallback: last?.go?.mihomoBufferPoolBuffers, sampleTime: last?.t)
+        let mihomoPoolBytes = latest("mihomoBufferPoolBytes", summary: summary,
+                                     fallback: last?.go?.mihomoBufferPoolBytes, sampleTime: last?.t)
+        let mihomoPoolMaxBytes = latest("mihomoBufferPoolMaxBytes", summary: summary,
+                                        fallback: last?.go?.mihomoBufferPoolMaxBytes, sampleTime: last?.t)
+        let singPoolBuffers = latestInt("singBufferPoolBuffers", summary: summary,
+                                        fallback: last?.go?.singBufferPoolBuffers, sampleTime: last?.t)
+        let singPoolBytes = latest("singBufferPoolBytes", summary: summary,
+                                   fallback: last?.go?.singBufferPoolBytes, sampleTime: last?.t)
+        let singPoolMaxBytes = latest("singBufferPoolMaxBytes", summary: summary,
+                                      fallback: last?.go?.singBufferPoolMaxBytes, sampleTime: last?.t)
+        let poolRetainedBytes = latest("bufferPoolRetainedBytes", summary: summary,
+                                       fallback: last?.go?.bufferPoolRetainedBytes, sampleTime: last?.t)
+        let poolLastTrimBytes = latest("bufferPoolLastTrimBytes", summary: summary,
+                                       fallback: last?.go?.bufferPoolLastTrimBytes, sampleTime: last?.t)
+        let poolTrimmedBytes = latest("bufferPoolTrimmedBytes", summary: summary,
+                                      fallback: last?.go?.bufferPoolTrimmedBytes, sampleTime: last?.t)
 
         let ipcBytes = latest("ipcResponseBytes", summary: summary,
-                              fallback: last?.cora?.ipcResponseBytes)
+                              fallback: last?.cora?.ipcResponseBytes, sampleTime: last?.t)
         let ipcMemoryBytes = latest("ipcResponseMemoryBytes", summary: summary,
-                                    fallback: last?.cora?.ipcResponseMemoryBytes) ?? ipcBytes
+                                    fallback: last?.cora?.ipcResponseMemoryBytes, sampleTime: last?.t) ?? ipcBytes
         let ipcFileBytes = latest("ipcResponseFileBytes", summary: summary,
-                                  fallback: last?.cora?.ipcResponseFileBytes)
+                                  fallback: last?.cora?.ipcResponseFileBytes, sampleTime: last?.t)
         let ipcCount = latestInt("ipcResponseCount", summary: summary,
-                                 fallback: last?.cora?.ipcResponseCount)
+                                 fallback: last?.cora?.ipcResponseCount, sampleTime: last?.t)
         let logBufferedBytes = latest("logBufferedBytes", summary: summary,
-                                      fallback: last?.cora?.logBufferedBytes)
+                                      fallback: last?.cora?.logBufferedBytes, sampleTime: last?.t)
         let logBufferedLines = latestInt("logBufferedLines", summary: summary,
-                                         fallback: last?.cora?.logBufferedLines)
+                                         fallback: last?.cora?.logBufferedLines, sampleTime: last?.t)
         let logPersistedBytes = latest("logPersistedBytes", summary: summary,
-                                       fallback: last?.cora?.logPersistedBytes)
+                                       fallback: last?.cora?.logPersistedBytes, sampleTime: last?.t)
         let gcFraction = last?.go?.gcCPUFraction
         let fallbackMemoryLimit: UInt64? = {
             guard let value = last?.go?.goMemoryLimit, value >= 0 else { return nil }
@@ -259,10 +344,10 @@ enum MemoryDiagnosticAnalyzer {
         let memoryLimitValue = latest(
             "goMemoryLimit",
             summary: summary,
-            fallback: fallbackMemoryLimit)
+            fallback: fallbackMemoryLimit, sampleTime: last?.t)
         let memoryLimit = formatBytes(memoryLimitValue)
         let gcPercentValue = latestInt("goGCPercent", summary: summary,
-                                       fallback: last?.go?.goGCPercent)
+                                       fallback: last?.go?.goGCPercent, sampleTime: last?.t)
         let gcPercent = formatCount(gcPercentValue)
         let pressure = last?.pressureEvents.map { String($0) } ?? "未知"
         let pressureSuppressed = last?.pressureSuppressed.map { String($0) } ?? "未知"
@@ -283,7 +368,7 @@ enum MemoryDiagnosticAnalyzer {
             findings.append("Go 堆对象数量持续增加，即使字节数变化不大，也要排查对象/任务是否没有回收。")
         }
         if footprintDelta >= 8 * 1024 * 1024 && heapAllocDelta < 3 * 1024 * 1024 {
-            findings.append("物理内存增加但 Go 堆变化较小，更像 gVisor/sing 缓冲池、线程栈或其他原生内存高水位。")
+            findings.append("物理内存增加但 Go 堆变化较小，需结合 Go 空闲页、栈、VM 和 IPC 缓存进一步归因；gVisor/sing 的 Go 缓冲也包含在 Go 堆内。")
         }
         if let heapSys, let heapAlloc, heapSys > heapAlloc + 16 * 1024 * 1024,
            let released = heapReleased, released < heapSys / 4 {
@@ -309,6 +394,9 @@ enum MemoryDiagnosticAnalyzer {
         }
         if let ipcBytes = ipcMemoryBytes, ipcBytes > 512 * 1024 {
             findings.append("IPC 分块响应缓存仍有 \(formatBytes(ipcBytes))，检查大响应是否按时消费或过期。")
+        }
+        if let poolRetainedBytes, poolRetainedBytes > 512 * 1024 {
+            findings.append("Mihomo/sing 大块缓冲池保留 \(formatBytes(poolRetainedBytes))；可在内存压力或手动释放后观察是否回落。")
         }
         if let logBufferedBytes, logBufferedBytes > 64 * 1024 {
             findings.append("NE 日志内存缓冲达到 \(formatBytes(logBufferedBytes))，可能抬高短时内存峰值。")
@@ -341,6 +429,7 @@ enum MemoryDiagnosticAnalyzer {
             "对象 \(formatCount(heapObjects))",
             "栈 Inuse \(formatBytes(stackInuse))",
             "栈 Sys \(formatBytes(stackSys))",
+            "GC 元数据 \(formatBytes(gcSys))",
             "Sys 总计 \(formatBytes(sys))",
         ].joined(separator: " / ")
         let allocationLine = [
@@ -355,6 +444,27 @@ enum MemoryDiagnosticAnalyzer {
             "日志缓冲 \(formatCount(logBufferedLines)) 行 / \(formatBytes(logBufferedBytes))",
             "持久化日志 \(formatBytes(logPersistedBytes))",
         ].joined(separator: "；")
+        let bufferPoolLine = [
+            "Mihomo \(formatCount(mihomoPoolBuffers)) / \(formatBytes(mihomoPoolBytes))（最大闲置块 \(formatBytes(mihomoPoolMaxBytes))）",
+            "sing \(formatCount(singPoolBuffers)) / \(formatBytes(singPoolBytes))（最大闲置块 \(formatBytes(singPoolMaxBytes))）",
+            "保留 \(formatBytes(poolRetainedBytes))",
+            "最近释放 \(formatBytes(poolLastTrimBytes))",
+            "累计释放 \(formatBytes(poolTrimmedBytes))",
+        ].joined(separator: "；")
+
+        let fake4 = fakeIPText(last?.go?.fakeIP4,
+                               entries: latestInt("fakeIP4Entries", summary: summary,
+                                                  fallback: last?.go?.fakeIP4?.entries, sampleTime: last?.t))
+        let fake6 = fakeIPText(last?.go?.fakeIP6,
+                               entries: latestInt("fakeIP6Entries", summary: summary,
+                                                  fallback: last?.go?.fakeIP6?.entries, sampleTime: last?.t))
+        let geoFiles = [
+            "GeoIP \(formatBytes(latest("geoIPFileBytes", summary: summary, fallback: last?.go?.geoIPFileBytes, sampleTime: last?.t)))",
+            "GeoSite \(formatBytes(latest("geoSiteFileBytes", summary: summary, fallback: last?.go?.geoSiteFileBytes, sampleTime: last?.t)))",
+            "MMDB \(formatBytes(latest("mmdbFileBytes", summary: summary, fallback: last?.go?.mmdbFileBytes, sampleTime: last?.t)))",
+            "ASN \(formatBytes(latest("asnFileBytes", summary: summary, fallback: last?.go?.asnFileBytes, sampleTime: last?.t)))",
+        ].joined(separator: " / ")
+        let releaseLine = releaseComparisonText(summary: summary, samples: samplesForAnalysis)
 
         return [
             "采样 \(sampleCount) 条 · \(duration)",
@@ -368,15 +478,82 @@ enum MemoryDiagnosticAnalyzer {
             "分配与 GC：\(allocationLine)",
             "GC 目标：\(memoryLimit)，GOGC=\(gcPercent)，CPU \(formatFraction(gcFraction))",
             "连接：\(formatCount(connections))（TCP \(formatCount(tcp)) / UDP \(formatCount(udp))），goroutine \(formatCount(goroutines))",
-            "Provider：节点 \(formatCount(proxyProviders)) / 规则 \(formatCount(ruleProviders))，策略组 \(formatCount(proxyGroups))",
+            "Provider：节点 \(formatCount(proxyProviders)) 个 / 条目合计 \(formatCount(providerNodes))，规则 \(formatCount(ruleProviders)) 个 / 规则合计 \(formatCount(providerRules))",
+            "代理目录：\(formatCount(proxies)) 项，策略组 \(formatCount(policyGroups)) 个（Provider 条目可能重复）",
+            "DNS：\(formatCount(dnsEntries)) 条 / \(formatCount(dnsCaches)) 份独立缓存，域名映射 \(formatCount(mappingEntries)) 条；Fake-IP v4 \(fake4) / v6 \(fake6)",
+            "TUN 等待队列：接收 \(formatCount(rxPackets)) 包 / \(formatBytes(rxBytes))，发送 \(formatCount(txPackets)) 包 / \(formatBytes(txBytes))（包长度，不含处理中的批次）",
+            "GEO：\(last?.go?.geoMode ?? "未知") / \(last?.go?.geoLoader ?? "未知") / \(last?.go?.geoSiteMatcher ?? "未知")；磁盘资产 \(geoFiles)",
             "测速资源：并发槽位 \(formatCount(delaySlots))/\(formatCount(delaySlotLimit))，活动批次 \(formatCount(delayBatches))",
             "连接快照：活动 \(formatSignedBytes(snapshotBytes))，关闭队列 \(formatSignedBytes(closedSnapshotBytes))，待释放 \(formatCount(closedQueuePending)) 条",
+            "大块缓冲池：\(bufferPoolLine)",
             "IPC/日志缓存：\(coraLine)",
+            "来源说明：缓冲池/队列与 Go 堆重叠；DNS、Fake-IP、Provider 是条目数，GEO 是磁盘大小，不能相加为物理内存。",
+            releaseLine,
             "诊断压力事件：\(pressure)（冷却合并 \(pressureSuppressed)），最近采样耗时 \(sampleDuration)",
             "",
             "判断：",
             findings.map { "• \($0)" }.joined(separator: "\n"),
         ].joined(separator: "\n")
+    }
+
+    private static func fakeIPText(_ cache: MemoryDiagnosticSample.FakeIPDiagnostic?,
+                                   entries: Int?) -> String {
+        if cache?.storage == "persistent" { return "持久化（未扫描条目）" }
+        guard let entries else { return "未采集" }
+        return "\(entries) 条（内存映射）"
+    }
+
+    private static func releaseComparisonText(summary: MemoryDiagnosticSummary?,
+                                              samples: [MemoryDiagnosticSample]) -> String {
+        var before = summary?.lastRelease?.before
+        var after = summary?.lastRelease?.after
+        var event = summary?.lastRelease?.event
+        var pairTime = summary?.lastRelease?.t ?? summary?.updatedAtMs ?? Int64.min
+        do {
+            // Prefer a newer complete detailed pair if summary persistence failed.
+            // Do not pair across sessions or across unrelated release events.
+            var pending: MemoryDiagnosticSample?
+            for sample in samples {
+                switch sample.event {
+                case "manualMemoryReleaseStart", "memoryPressure": pending = sample
+                case "manualMemoryReleaseEnd", "memoryPressureEnd":
+                    let expected = sample.event == "memoryPressureEnd" ? "memoryPressure" : "manualMemoryReleaseStart"
+                    if let start = pending, start.event == expected, start.session == sample.session,
+                       before == nil || after == nil || (sample.t ?? Int64.min) >= pairTime {
+                        pairTime = sample.t ?? Int64.min
+                        before = releaseMetrics(start)
+                        after = releaseMetrics(sample)
+                        event = sample.event == "memoryPressureEnd" ? "memoryPressure" : "manualMemoryRelease"
+                    }
+                    pending = nil
+                default: break
+                }
+            }
+        }
+        guard let before, let after else { return "最近释放对比：暂无完整的前后采样。" }
+        let label = event == "memoryPressure" ? "内存压力" : "手动释放"
+        let parts = [("物理", "physFootprint"), ("Go Alloc", "heapAlloc"),
+                     ("Go Inuse", "heapInuse"), ("Go 已归还", "heapReleased"),
+                     ("闲置大缓冲", "bufferPoolRetainedBytes")].map { label, key in
+            guard let start = before[key], let end = after[key] else { return "\(label) 未采集" }
+            return "\(label) \(formatBytes(start)) → \(formatBytes(end))（\(signedSize(signedDelta(end, start)))）"
+        }
+        let cooldown = signedDelta(after["forceGCSuppressed"], before["forceGCSuppressed"]) > 0
+            ? "；本次处于统一冷却窗口，未重复执行 GC"
+            : ""
+        return "最近释放对比（\(label)）：" + parts.joined(separator: "；") + cooldown
+    }
+
+    private static func releaseMetrics(_ sample: MemoryDiagnosticSample) -> [String: UInt64] {
+        var metrics: [String: UInt64] = [:]
+        for (key, value) in [("physFootprint", sample.physFootprint),
+                             ("heapAlloc", sample.go?.heapAlloc), ("heapInuse", sample.go?.heapInuse),
+                             ("heapReleased", sample.go?.heapReleased),
+                             ("bufferPoolRetainedBytes", sample.go?.bufferPoolRetainedBytes),
+                             ("forceGCSuppressed", sample.go?.forceGCSuppressed)] {
+            if let value { metrics[key] = value }
+        }
+        return metrics
     }
 
     private static func summaryTimestamp(_ summary: MemoryDiagnosticSummary) -> Int64 {
@@ -390,14 +567,21 @@ enum MemoryDiagnosticAnalyzer {
 
     private static func latest(_ key: String,
                                summary: MemoryDiagnosticSummary?,
-                               fallback: UInt64?) -> UInt64? {
-        metric(key, summary: summary)?.latest ?? fallback
+                               fallback: UInt64?, sampleTime: Int64? = nil) -> UInt64? {
+        let value = metric(key, summary: summary)
+        // An omitted optional field in a newer sample means unmeasured, not
+        // the last non-zero value retained earlier in the session summary.
+        if let sampleTime, sampleTime >= (value?.latestAt ?? summary?.updatedAtMs ?? Int64.min) {
+            return fallback
+        }
+        if let value { return value.latest }
+        return fallback
     }
 
     private static func peak(_ key: String,
                              summary: MemoryDiagnosticSummary?,
                              fallback: UInt64?) -> UInt64? {
-        metric(key, summary: summary)?.peak ?? fallback
+        [metric(key, summary: summary)?.peak, fallback].compactMap { $0 }.max()
     }
 
     private static func firstValue(_ key: String,
@@ -411,18 +595,24 @@ enum MemoryDiagnosticAnalyzer {
 
     private static func latestInt(_ key: String,
                                   summary: MemoryDiagnosticSummary?,
-                                  fallback: Int?) -> Int? {
-        if let value = metric(key, summary: summary)?.latest {
-            return Int(min(value, UInt64(Int.max)))
+                                  fallback: Int?, sampleTime: Int64? = nil) -> Int? {
+        if let sampleTime, sampleTime >= (metric(key, summary: summary)?.latestAt ?? summary?.updatedAtMs ?? Int64.min) {
+            return fallback
+        }
+        if let metric = metric(key, summary: summary) {
+            return metric.latest.map { Int(min($0, UInt64(Int.max))) }
         }
         return fallback
     }
 
     private static func latestSigned(_ key: String,
                                      summary: MemoryDiagnosticSummary?,
-                                     fallback: Int64?) -> Int64? {
-        if let value = metric(key, summary: summary)?.latest {
-            return Int64(min(value, UInt64(Int64.max)))
+                                     fallback: Int64?, sampleTime: Int64? = nil) -> Int64? {
+        if let sampleTime, sampleTime >= (metric(key, summary: summary)?.latestAt ?? summary?.updatedAtMs ?? Int64.min) {
+            return fallback
+        }
+        if let metric = metric(key, summary: summary) {
+            return metric.latest.map { Int64(min($0, UInt64(Int64.max))) }
         }
         return fallback
     }
@@ -430,10 +620,12 @@ enum MemoryDiagnosticAnalyzer {
     private static func delta(_ key: String,
                               summary: MemoryDiagnosticSummary?,
                               start: UInt64?,
-                              end: UInt64?) -> Int64 {
-        if let value = metric(key, summary: summary),
-           let first = value.first, let latest = value.latest {
-            return signedDelta(latest, first)
+                              end: UInt64?, endTime: Int64? = nil) -> Int64 {
+        if let value = metric(key, summary: summary), let first = value.first {
+            if let endTime, endTime >= (value.latestAt ?? summary?.updatedAtMs ?? Int64.min) {
+                return signedDelta(end, first)
+            }
+            return signedDelta(value.latest, first)
         }
         return signedDelta(end, start)
     }

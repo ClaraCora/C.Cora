@@ -75,6 +75,13 @@ final class MemoryDiagnostics: @unchecked Sendable {
         }
     }
 
+    private struct ReleaseComparison: Codable {
+        let event: String
+        let t: Int64
+        let before: [String: UInt64]
+        let after: [String: UInt64]
+    }
+
     private struct SessionSummary: Codable {
         let v: Int
         let kind: String
@@ -83,6 +90,7 @@ final class MemoryDiagnostics: @unchecked Sendable {
         var updatedAtMs: Int64
         var sampleCount: UInt64
         var metrics: [String: MetricSummary]
+        var lastRelease: ReleaseComparison?
     }
 
     private static let maxFileBytes: UInt64 = 256 * 1024
@@ -123,6 +131,7 @@ final class MemoryDiagnostics: @unchecked Sendable {
     private var lastSummaryWriteUptime: TimeInterval?
     private var summaryWritable = true
     private var sessionPhysFootprintPeak: UInt64 = 0
+    private var lastRelease: ReleaseComparison?
 
     init(supplementalStatsProvider: @escaping () -> SupplementalStats = { .empty }) {
         self.supplementalStatsProvider = supplementalStatsProvider
@@ -153,6 +162,7 @@ final class MemoryDiagnostics: @unchecked Sendable {
             lastSummaryWriteUptime = nil
             summaryWritable = true
             sessionPhysFootprintPeak = 0
+            lastRelease = nil
             prepareFilesForNewSessionLocked()
             prepareSummaryFilesForNewSessionLocked()
             guard fileHandle != nil else { return }
@@ -183,6 +193,42 @@ final class MemoryDiagnostics: @unchecked Sendable {
             guard fileHandle != nil else { return }
             writeSampleLocked(event: event, synchronize: true)
         }
+    }
+
+    /// Serialize the entire action with periodic samples and pressure events.
+    /// Both samples refresh Go counters; the last pair also survives ring rotation.
+    func releaseMemory() -> (before: UInt64, after: UInt64) {
+        queue.sync { releaseMemoryLocked(event: "manualMemoryRelease") }
+    }
+
+    private func releaseMemoryLocked(event: String) -> (before: UInt64, after: UInt64) {
+        writeSampleLocked(event: event == "memoryPressure" ? event : event + "Start",
+                          synchronize: true)
+        let before = Self.physicalFootprint()
+        let beforeStats = releaseSnapshotLocked(footprint: before)
+        MihomoForceGC()
+        let after = Self.physicalFootprint()
+        writeSampleLocked(event: event + "End", synchronize: true)
+        lastRelease = ReleaseComparison(event: event,
+                                        t: Int64(Date().timeIntervalSince1970 * 1_000),
+                                        before: beforeStats,
+                                        after: releaseSnapshotLocked(footprint: after))
+        persistSummaryLocked()
+        return (before, after)
+    }
+
+    private func releaseSnapshotLocked(footprint: UInt64) -> [String: UInt64] {
+        var metrics = ["physFootprint": footprint]
+        if let data = lastGoStats.data(using: .utf8),
+           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            for key in ["heapAlloc", "heapInuse", "heapReleased", "bufferPoolRetainedBytes",
+                        "bufferPoolLastTrimBytes", "numForcedGC", "forceGCSuppressed"] {
+                if let value = object[key] as? NSNumber, value.int64Value >= 0 {
+                    metrics[key] = value.uint64Value
+                }
+            }
+        }
+        return metrics
     }
 
     func stop(event: String) {
@@ -348,9 +394,20 @@ final class MemoryDiagnostics: @unchecked Sendable {
         // still kept in each detailed sample for short-window inspection.
         if let data = goStats.data(using: .utf8),
            let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            for (family, key) in [("fakeIP4", "fakeIP4Entries"), ("fakeIP6", "fakeIP6Entries")] {
+                if let cache = object[family] as? [String: Any],
+                   let entries = cache["entries"] as? NSNumber, entries.int64Value >= 0 {
+                    updateMetricLocked(key, value: entries.uint64Value, timestampMs: timestampMs)
+                } else {
+                    clearLatestMetricLocked(key, timestampMs: timestampMs)
+                }
+            }
             for key in Self.summaryGoMetricKeys {
                 guard let number = object[key] as? NSNumber,
-                      number.int64Value >= 0 else { continue }
+                      number.int64Value >= 0 else {
+                    clearLatestMetricLocked(key, timestampMs: timestampMs)
+                    continue
+                }
                 updateMetricLocked(key, value: number.uint64Value, timestampMs: timestampMs)
             }
         }
@@ -371,8 +428,24 @@ final class MemoryDiagnostics: @unchecked Sendable {
         "goGCPercent", "goroutines", "connections", "tcpConnections", "udpConnections",
         "proxyProviders", "ruleProviders", "proxyGroups", "delaySlotsInUse",
         "delaySlotLimit", "activeDelayBatches", "connectionSnapshotBytes",
-        "closedSnapshotBytes", "closedQueuePending",
+        "closedSnapshotBytes", "closedQueuePending", "mihomoBufferPoolBuffers",
+        "mihomoBufferPoolBytes", "mihomoBufferPoolMaxBytes", "singBufferPoolBuffers",
+        "singBufferPoolBytes", "singBufferPoolMaxBytes", "bufferPoolRetainedBytes",
+        "bufferPoolLastTrimBytes", "bufferPoolTrimmedBytes", "forceGCSuppressed",
+        "proxyCount", "policyGroupCount", "proxyProviderNodes", "ruleProviderRules",
+        "dnsCacheEntries", "dnsCacheCount", "dnsMappingEntries",
+        "tunRXQueuedPackets", "tunRXQueuedBytes", "tunTXQueuedPackets", "tunTXQueuedBytes",
+        "geoIPFileBytes", "geoSiteFileBytes", "mmdbFileBytes", "asnFileBytes",
     ]
+
+    private func clearLatestMetricLocked(_ key: String, timestampMs: Int64) {
+        guard var metric = summaryMetrics[key] else { return }
+        // Preserve historical first/peak for trend analysis; latest is unknown
+        // after a config/stack/storage transition stops exposing the metric.
+        metric.latest = nil
+        metric.latestAt = timestampMs
+        summaryMetrics[key] = metric
+    }
 
     private func updateMetricLocked(_ key: String, value: UInt64, timestampMs: Int64) {
         var metric = summaryMetrics[key] ?? MetricSummary(first: nil,
@@ -394,9 +467,14 @@ final class MemoryDiagnostics: @unchecked Sendable {
                                      startedAtMs: summaryStartedAtMs,
                                      updatedAtMs: summaryUpdatedAtMs,
                                      sampleCount: sampleCount,
-                                     metrics: summaryMetrics)
+                                     metrics: summaryMetrics,
+                                     lastRelease: lastRelease)
         guard let data = try? JSONEncoder().encode(summary),
-              UInt64(data.count) <= Self.maxSummaryBytes else { return }
+              UInt64(data.count) <= Self.maxSummaryBytes else {
+            summaryWritable = false
+            reportFileErrorLocked("summary exceeds bounded size or could not be encoded")
+            return
+        }
         do {
             try data.write(to: summaryURL, options: .atomic)
             lastSummaryWriteUptime = uptime ?? ProcessInfo.processInfo.systemUptime
@@ -454,10 +532,8 @@ final class MemoryDiagnostics: @unchecked Sendable {
             return
         }
         lastPressureUptime = uptime
-        writeSampleLocked(event: "memoryPressure", synchronize: true)
-        // The handler runs on a utility queue. Keep one bounded recovery action
-        // for the pressure window; the cooldown above prevents re-entry bursts.
-        MihomoForceGC()
+        // The handler already owns the diagnostics queue; do not queue.sync.
+        _ = releaseMemoryLocked(event: "memoryPressure")
     }
 
     private func rotateIfNeededLocked(incomingBytes: UInt64) {

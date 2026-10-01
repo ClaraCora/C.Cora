@@ -1,0 +1,233 @@
+diff --git a/internal/fdbased_darwin/memory_diagnostics.go b/internal/fdbased_darwin/memory_diagnostics.go
+new file mode 100644
+index 0000000..90fc7e3
+--- /dev/null
++++ b/internal/fdbased_darwin/memory_diagnostics.go
+@@ -0,0 +1,30 @@
++package fdbased
++
++// QueueStats visits only waiting processor queues, not GRO or packets being
++// delivered. Processor queues are immutable in number after construction.
++func (e *endpoint) QueueStats() (int, uint64) {
++	var packets int
++	var bytes uint64
++	for _, dispatcher := range e.inboundDispatchers {
++		var manager *processorManager
++		switch d := dispatcher.(type) {
++		case *readVDispatcher:
++			manager = d.mgr
++		case *recvMMsgDispatcher:
++			manager = d.mgr
++		}
++		if manager == nil {
++			continue
++		}
++		for i := range manager.processors {
++			p := &manager.processors[i]
++			p.mu.Lock()
++			packets += p.pkts.Len()
++			for _, pkt := range p.pkts.AsSlice() {
++				bytes += uint64(pkt.Size())
++			}
++			p.mu.Unlock()
++		}
++	}
++	return packets, bytes
++}
+diff --git a/internal/fdbased_darwin/memory_diagnostics_test.go b/internal/fdbased_darwin/memory_diagnostics_test.go
+new file mode 100644
+index 0000000..b842f56
+--- /dev/null
++++ b/internal/fdbased_darwin/memory_diagnostics_test.go
+@@ -0,0 +1,29 @@
++package fdbased
++
++import (
++	"testing"
++
++	"github.com/metacubex/gvisor/pkg/buffer"
++	"github.com/metacubex/gvisor/pkg/tcpip/stack"
++)
++
++func TestDiagnosticProcessorQueues(t *testing.T) {
++	manager := &processorManager{processors: make([]processor, 1)}
++	p := &manager.processors[0]
++	p.pkts.PushBack(stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(make([]byte, 71))}))
++	p.pkts.PushBack(stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(make([]byte, 19))}))
++	ep := &endpoint{inboundDispatchers: []linkDispatcher{&readVDispatcher{mgr: manager}}}
++	if packets, bytes := ep.QueueStats(); packets != 2 || bytes != 90 {
++		t.Fatalf("queue %d/%d", packets, bytes)
++	}
++	first := p.pkts.PopFront()
++	defer first.DecRef()
++	if first.Size() != 71 {
++		t.Fatal("diagnostic reordered packets")
++	}
++	// PopFront transfers ownership; use a fresh drain for the remaining packet.
++	p.pkts.Reset()
++	if packets, bytes := ep.QueueStats(); packets != 0 || bytes != 0 {
++		t.Fatal("stale processor stats")
++	}
++}
+diff --git a/memory_diagnostics.go b/memory_diagnostics.go
+new file mode 100644
+index 0000000..a05435e
+--- /dev/null
++++ b/memory_diagnostics.go
+@@ -0,0 +1,19 @@
++package tun
++
++type QueueStats struct {
++	RXPackets int    `json:"tunRXQueuedPackets"`
++	RXBytes   uint64 `json:"tunRXQueuedBytes"`
++	TXPackets int    `json:"tunTXQueuedPackets"`
++	TXBytes   uint64 `json:"tunTXQueuedBytes"`
++}
++
++// QueueSnapshot is optional. Unsupported stacks/targets return nil, rather
++// than reporting an unmeasured queue as empty.
++func QueueSnapshot(t Tun) *QueueStats {
++	if source, ok := t.(interface{ queueSnapshot() *QueueStats }); ok {
++		return source.queueSnapshot()
++	}
++	return nil
++}
++
++type queueStatsSource interface{ QueueStats() (int, uint64) }
+diff --git a/memory_diagnostics_darwin.go b/memory_diagnostics_darwin.go
+new file mode 100644
+index 0000000..8b92b2a
+--- /dev/null
++++ b/memory_diagnostics_darwin.go
+@@ -0,0 +1,14 @@
++package tun
++
++// Sources belong to this NativeTun, and are cleared at close. No global
++// registry holds a previous endpoint alive across VPN sessions.
++func (t *NativeTun) queueSnapshot() *QueueStats {
++	t.diagnosticMu.Lock()
++	defer t.diagnosticMu.Unlock()
++	if t.diagnosticRX == nil || t.diagnosticTX == nil {
++		return nil
++	}
++	rxPackets, rxBytes := t.diagnosticRX.QueueStats()
++	txPackets, txBytes := t.diagnosticTX.QueueStats()
++	return &QueueStats{rxPackets, rxBytes, txPackets, txBytes}
++}
+diff --git a/memory_diagnostics_darwin_test.go b/memory_diagnostics_darwin_test.go
+new file mode 100644
+index 0000000..a2f5d6e
+--- /dev/null
++++ b/memory_diagnostics_darwin_test.go
+@@ -0,0 +1,29 @@
++package tun
++
++import "testing"
++
++type testQueueSource struct {
++	packets int
++	bytes   uint64
++}
++
++func (q testQueueSource) QueueStats() (int, uint64) { return q.packets, q.bytes }
++
++func TestDiagnosticNativeTunLifetime(t *testing.T) {
++	native := &NativeTun{}
++	if QueueSnapshot(native) != nil {
++		t.Fatal("unconfigured queue reported as empty")
++	}
++	native.diagnosticRX, native.diagnosticTX = testQueueSource{2, 100}, testQueueSource{3, 120}
++	snapshot := QueueSnapshot(native)
++	if snapshot == nil || snapshot.RXPackets != 2 || snapshot.RXBytes != 100 || snapshot.TXPackets != 3 || snapshot.TXBytes != 120 {
++		t.Fatalf("bad snapshot: %+v", snapshot)
++	}
++	native.diagnosticMu.Lock()
++	native.diagnosticClosed = true
++	native.diagnosticRX, native.diagnosticTX = nil, nil
++	native.diagnosticMu.Unlock()
++	if QueueSnapshot(native) != nil {
++		t.Fatal("old endpoint retained after close")
++	}
++}
+diff --git a/tun_darwin.go b/tun_darwin.go
+index 21b5db6..b83701b 100644
+--- a/tun_darwin.go
++++ b/tun_darwin.go
+@@ -5,6 +5,7 @@ import (
+ 	"net"
+ 	"net/netip"
+ 	"os"
++	"sync"
+ 	"syscall"
+ 	"unsafe"
+ 
+@@ -25,20 +26,24 @@ var _ DarwinTUN = (*NativeTun)(nil)
+ const PacketOffset = 4
+ 
+ type NativeTun struct {
+-	tunFd         int
+-	tunFile       *os.File
+-	batchSize     int
+-	iovecs        []iovecBuffer
+-	iovecsOutput  []iovecBuffer
+-	msgHdrs       []rawfile.MsgHdrX
+-	msgHdrsOutput []rawfile.MsgHdrX
+-	buffers       []*buf.Buffer
+-	stopFd        stopfd.StopFD
+-	options       Options
+-	inet4Address  [4]byte
+-	inet6Address  [16]byte
+-	routeSet      bool
+-	writeMsgX     bool
++	diagnosticMu     sync.Mutex
++	diagnosticRX     queueStatsSource
++	diagnosticTX     queueStatsSource
++	diagnosticClosed bool
++	tunFd            int
++	tunFile          *os.File
++	batchSize        int
++	iovecs           []iovecBuffer
++	iovecsOutput     []iovecBuffer
++	msgHdrs          []rawfile.MsgHdrX
++	msgHdrsOutput    []rawfile.MsgHdrX
++	buffers          []*buf.Buffer
++	stopFd           stopfd.StopFD
++	options          Options
++	inet4Address     [4]byte
++	inet6Address     [16]byte
++	routeSet         bool
++	writeMsgX        bool
+ }
+ 
+ type iovecBuffer struct {
+@@ -156,6 +161,10 @@ func init() {
+ }
+ 
+ func (t *NativeTun) Close() error {
++	t.diagnosticMu.Lock()
++	t.diagnosticClosed = true
++	t.diagnosticRX, t.diagnosticTX = nil, nil
++	t.diagnosticMu.Unlock()
+ 	defer flushDNSCache()
+ 	t.stopFd.Stop()
+ 	err := t.tunFile.Close()
+diff --git a/tun_darwin_gvisor.go b/tun_darwin_gvisor.go
+index 8e51264..d2e0599 100644
+--- a/tun_darwin_gvisor.go
++++ b/tun_darwin_gvisor.go
+@@ -65,7 +65,12 @@ func (t *NativeTun) NewEndpoint() (stack.LinkEndpoint, stack.NICOptions, error)
+ 	if err != nil {
+ 		return nil, stack.NICOptions{}, err
+ 	}
+-	return ep, stack.NICOptions{
+-		QDisc: fifo.New(ep, 1, darwinGVisorQDiscQueueLen),
+-	}, nil
++	qdisc := fifo.New(ep, 1, darwinGVisorQDiscQueueLen)
++	t.diagnosticMu.Lock()
++	if !t.diagnosticClosed {
++		t.diagnosticRX = ep.(queueStatsSource)
++		t.diagnosticTX = qdisc.(queueStatsSource)
++	}
++	t.diagnosticMu.Unlock()
++	return ep, stack.NICOptions{QDisc: qdisc}, nil
+ }

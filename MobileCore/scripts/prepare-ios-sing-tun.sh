@@ -12,6 +12,10 @@ readonly EXPECTED_PROCESSOR_PATCHED_SHA="ef063b883d4fff7c146044b5db31f73b74e4976
 readonly EXPECTED_DARWIN_STACK_PATCHED_SHA="7eb5b393a808964f501cf9d51b5e763705a3f2f074dc9829ff5c21efd71e1b05"
 readonly EXPECTED_DARWIN_STACK_TEST_SHA="6d7a62d602fedd3aba86093dbdbfcb4e102d515908c4b10fb10ade3153dbe910"
 readonly PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/sing-tun-v0.4.24-darwin-queue.patch"
+readonly MEMORY_DIAGNOSTICS_PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/sing-tun-v0.4.24-memory-diagnostics.patch"
+readonly GVISOR_MODULE="github.com/metacubex/gvisor"
+readonly EXPECTED_GVISOR_VERSION="v0.0.0-20260826100401-79317d808312"
+readonly PATCHED_GVISOR_DIR="${PATCHED_GVISOR:?}"
 readonly PATCHED_DIR="${RUNNER_TEMP:?}/sing-tun-v0.4.24-ios-memory-v1"
 
 check_sha256() {
@@ -62,6 +66,24 @@ git -c core.autocrlf=false -C "$PATCHED_DIR" \
 check_sha256 "$EXPECTED_PROCESSOR_PATCHED_SHA" "$PATCHED_DIR/$PROCESSOR_SOURCE_REL"
 check_sha256 "$EXPECTED_DARWIN_STACK_PATCHED_SHA" "$PATCHED_DIR/$DARWIN_STACK_SOURCE_REL"
 check_sha256 "$EXPECTED_DARWIN_STACK_TEST_SHA" "$PATCHED_DIR/$DARWIN_STACK_TEST_REL"
+
+git -c core.autocrlf=false -C "$PATCHED_DIR" \
+  apply --check --whitespace=error-all "$MEMORY_DIAGNOSTICS_PATCH_FILE"
+git -c core.autocrlf=false -C "$PATCHED_DIR" \
+  apply --whitespace=error-all "$MEMORY_DIAGNOSTICS_PATCH_FILE"
+
+# Standalone sing-tun tests must use the same queue API/version as MobileCore.
+if [[ ! -d "$PATCHED_GVISOR_DIR" ]]; then
+  echo "Missing patched gVisor directory: $PATCHED_GVISOR_DIR" >&2
+  exit 1
+fi
+go -C "$PATCHED_DIR" mod edit -require="$GVISOR_MODULE@$EXPECTED_GVISOR_VERSION"
+go -C "$PATCHED_DIR" mod edit -replace="$GVISOR_MODULE@$EXPECTED_GVISOR_VERSION=$PATCHED_GVISOR_DIR"
+readonly GVISOR_RESOLUTION="$(go -C "$PATCHED_DIR" list -m -f '{{.Version}}|{{if .Replace}}{{.Replace.Dir}}{{end}}' "$GVISOR_MODULE")"
+if [[ "$GVISOR_RESOLUTION" != "$EXPECTED_GVISOR_VERSION|$PATCHED_GVISOR_DIR" ]]; then
+  echo "Unexpected gVisor resolution inside patched sing-tun: $GVISOR_RESOLUTION" >&2
+  exit 1
+fi
 
 go mod edit -replace="$MODULE@$EXPECTED_VERSION=$PATCHED_DIR"
 readonly RESOLUTION="$(go list -m -f '{{.Version}}|{{if .Replace}}{{.Replace.Dir}}{{end}}' "$MODULE")"

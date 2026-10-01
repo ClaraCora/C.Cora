@@ -1,0 +1,120 @@
+diff --git a/pkg/tcpip/link/qdisc/fifo/memory_diagnostics.go b/pkg/tcpip/link/qdisc/fifo/memory_diagnostics.go
+new file mode 100644
+index 0000000..f57540d
+--- /dev/null
++++ b/pkg/tcpip/link/qdisc/fifo/memory_diagnostics.go
+@@ -0,0 +1,16 @@
++package fifo
++
++// QueueStats is an on-demand snapshot of waiting packets only. The bounded
++// queue is visited under its existing lock; the dispatch batch is excluded.
++func (d *discipline) QueueStats() (int, uint64) {
++	var packets int
++	var bytes uint64
++	for i := range d.dispatchers {
++		qd := &d.dispatchers[i]
++		qd.mu.Lock()
++		packets += qd.queue.Length()
++		bytes += qd.queue.QueuedBytes()
++		qd.mu.Unlock()
++	}
++	return packets, bytes
++}
+diff --git a/pkg/tcpip/link/qdisc/fifo/memory_diagnostics_test.go b/pkg/tcpip/link/qdisc/fifo/memory_diagnostics_test.go
+new file mode 100644
+index 0000000..fde9f9e
+--- /dev/null
++++ b/pkg/tcpip/link/qdisc/fifo/memory_diagnostics_test.go
+@@ -0,0 +1,39 @@
++package fifo
++
++import (
++	"sync"
++	"testing"
++
++	"github.com/metacubex/gvisor/pkg/buffer"
++	"github.com/metacubex/gvisor/pkg/tcpip/stack"
++)
++
++func TestDiagnosticQueueSnapshotConcurrent(t *testing.T) {
++	d := &discipline{dispatchers: make([]queueDispatcher, 1)}
++	qd := &d.dispatchers[0]
++	qd.queue.Init(128)
++	var wg sync.WaitGroup
++	wg.Add(1)
++	go func() {
++		defer wg.Done()
++		for i := 0; i < 1000; i++ {
++			pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(make([]byte, 100))})
++			qd.mu.Lock()
++			qd.queue.PushBack(pkt)
++			qd.mu.Unlock()
++			qd.mu.Lock()
++			qd.queue.RemoveFront().DecRef()
++			qd.mu.Unlock()
++		}
++	}()
++	for i := 0; i < 1000; i++ {
++		packets, bytes := d.QueueStats()
++		if packets < 0 || packets > 1 || bytes != uint64(packets)*100 {
++			t.Fatalf("incoherent snapshot %d/%d", packets, bytes)
++		}
++	}
++	wg.Wait()
++	if packets, bytes := d.QueueStats(); packets != 0 || bytes != 0 {
++		t.Fatal("queue retained packets after drain")
++	}
++}
+diff --git a/pkg/tcpip/link/qdisc/memory_diagnostics.go b/pkg/tcpip/link/qdisc/memory_diagnostics.go
+new file mode 100644
+index 0000000..63f2b58
+--- /dev/null
++++ b/pkg/tcpip/link/qdisc/memory_diagnostics.go
+@@ -0,0 +1,11 @@
++package qdisc
++
++// QueuedBytes sums packet sizes, not backing allocation capacity or packets
++// already dispatched. The caller must hold the list's external lock.
++func (pl *PacketBufferCircularList) QueuedBytes() uint64 {
++	var bytes uint64
++	for i := 0; i < pl.size; i++ {
++		bytes += uint64(pl.pbs[(pl.head+i)%len(pl.pbs)].Size())
++	}
++	return bytes
++}
+diff --git a/pkg/tcpip/link/qdisc/memory_diagnostics_test.go b/pkg/tcpip/link/qdisc/memory_diagnostics_test.go
+new file mode 100644
+index 0000000..ab95e4e
+--- /dev/null
++++ b/pkg/tcpip/link/qdisc/memory_diagnostics_test.go
+@@ -0,0 +1,30 @@
++package qdisc
++
++import (
++	"testing"
++
++	"github.com/metacubex/gvisor/pkg/buffer"
++	"github.com/metacubex/gvisor/pkg/tcpip/stack"
++)
++
++func TestDiagnosticQueuedBytesAcrossWraparound(t *testing.T) {
++	var queue PacketBufferCircularList
++	queue.Init(3)
++	for _, size := range []int{10, 20, 30} {
++		queue.PushBack(stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(make([]byte, size))}))
++	}
++	if queue.QueuedBytes() != 60 || queue.Length() != 3 {
++		t.Fatal("incorrect full queue")
++	}
++	queue.RemoveFront().DecRef()
++	queue.PushBack(stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(make([]byte, 40))}))
++	if queue.QueuedBytes() != 90 || queue.PeekFront().Size() != 20 {
++		t.Fatal("sample changed queue ordering or missed wraparound")
++	}
++	for p := queue.RemoveFront(); p != nil; p = queue.RemoveFront() {
++		p.DecRef()
++	}
++	if queue.QueuedBytes() != 0 {
++		t.Fatal("stale bytes after drain")
++	}
++}

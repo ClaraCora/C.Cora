@@ -1,0 +1,479 @@
+diff --git a/common/lru/memory_diagnostics.go b/common/lru/memory_diagnostics.go
+new file mode 100644
+index 0000000..c9e69e8
+--- /dev/null
++++ b/common/lru/memory_diagnostics.go
+@@ -0,0 +1,9 @@
++package lru
++
++// Len returns retained entries, including expired entries not yet evicted.
++// It does not refresh TTLs, access order, or invoke eviction callbacks.
++func (c *LruCache[K, V]) Len() int {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	return len(c.cache)
++}
+diff --git a/common/lru/memory_diagnostics_test.go b/common/lru/memory_diagnostics_test.go
+new file mode 100644
+index 0000000..b49a0f6
+--- /dev/null
++++ b/common/lru/memory_diagnostics_test.go
+@@ -0,0 +1,24 @@
++package lru
++
++import (
++	"testing"
++	"time"
++)
++
++func TestDiagnosticLenDoesNotEvictOrRefresh(t *testing.T) {
++	evicted := 0
++	c := New[string, int](WithSize[string, int](2), WithEvict[string, int](func(string, int) { evicted++ }))
++	c.SetWithExpire("expired", 1, time.Now().Add(-time.Hour))
++	c.SetWithExpire("live", 2, time.Now().Add(time.Hour))
++	if c.Len() != 2 || evicted != 0 {
++		t.Fatal("sampling evicted an expired entry")
++	}
++	c.Set("third", 3)
++	if c.Exist("expired") || !c.Exist("live") || c.Len() != 2 {
++		t.Fatal("sampling changed LRU ordering")
++	}
++	c.Clear()
++	if c.Len() != 0 {
++		t.Fatal("stale count after clear")
++	}
++}
+diff --git a/common/pool/alloc.go b/common/pool/alloc.go
+index 4f4e4ff..8693966 100644
+--- a/common/pool/alloc.go
++++ b/common/pool/alloc.go
+@@ -11,6 +11,52 @@ import (
+ const maxPooledSize = (1 << 16) + 16
+ const maxOversizeBuffers = 8
+ 
++// OversizeStats describes the bounded buffer pool that can retain memory
++// across requests. The normal sync.Pool buckets are intentionally omitted:
++// the runtime may discard them at any GC and they are not explicitly owned.
++type OversizeStats struct {
++	Buffers        int
++	Bytes          uint64
++	MaxBufferBytes uint64
++}
++
++// GetOversizePoolStats returns a point-in-time snapshot without forcing GC.
++func GetOversizePoolStats() OversizeStats {
++	allocator, ok := DefaultAllocator.(*defaultAllocator)
++	if !ok || allocator == nil {
++		return OversizeStats{}
++	}
++	count := len(allocator.oversize)
++	var largest uint64
++	if count != 0 {
++		largest = maxPooledSize
++	}
++	return OversizeStats{Buffers: count, Bytes: uint64(count) * maxPooledSize,
++		MaxBufferBytes: largest}
++}
++
++// TrimIdle releases idle exact-size buffers. In-flight buffers are
++// unaffected and will be returned to the pool normally after their request.
++func TrimIdle() uint64 {
++	allocator, ok := DefaultAllocator.(*defaultAllocator)
++	if !ok || allocator == nil {
++		return 0
++	}
++	var released uint64
++	// Bound work to the initial idle count. Concurrent returns may refill
++	// the channel, but must never turn a pressure action into an endless drain.
++	count := len(allocator.oversize)
++	for i := 0; i < count; i++ {
++		select {
++		case <-allocator.oversize:
++			released += maxPooledSize
++		default:
++			return released
++		}
++	}
++	return released
++}
++
+ var DefaultAllocator = NewAllocator()
+ 
+ type Allocator interface {
+diff --git a/common/pool/memory_diagnostics_test.go b/common/pool/memory_diagnostics_test.go
+new file mode 100644
+index 0000000..85bb84d
+--- /dev/null
++++ b/common/pool/memory_diagnostics_test.go
+@@ -0,0 +1,75 @@
++package pool
++
++import (
++	"sync"
++	"testing"
++)
++
++func freshDiagnosticPool(t *testing.T) {
++	original := DefaultAllocator
++	DefaultAllocator = NewAllocator()
++	t.Cleanup(func() { DefaultAllocator = original })
++}
++
++func TestTrimIdle(t *testing.T) {
++	freshDiagnosticPool(t)
++	held := DefaultAllocator.Get(maxPooledSize)
++	held[0] = 73
++	for i := 0; i < maxOversizeBuffers; i++ {
++		if err := DefaultAllocator.Put(make([]byte, maxPooledSize)); err != nil {
++			t.Fatal(err)
++		}
++	}
++	stats := GetOversizePoolStats()
++	wantBytes := uint64(maxOversizeBuffers) * maxPooledSize
++	if stats.Buffers != maxOversizeBuffers || stats.Bytes != wantBytes || stats.MaxBufferBytes != maxPooledSize {
++		t.Fatalf("incorrect occupied stats: %+v", stats)
++	}
++	if released := TrimIdle(); released != wantBytes {
++		t.Fatalf("released = %d, want %d", released, wantBytes)
++	}
++	if stats := GetOversizePoolStats(); stats != (OversizeStats{}) {
++		t.Fatalf("empty stats: %+v", stats)
++	}
++	if released := TrimIdle(); released != 0 {
++		t.Fatalf("repeated trim = %d", released)
++	}
++	if held[0] != 73 {
++		t.Fatal("trim modified an in-flight buffer")
++	}
++	if err := DefaultAllocator.Put(held); err != nil {
++		t.Fatal(err)
++	}
++	reused := DefaultAllocator.Get(maxPooledSize)
++	if &reused[0] != &held[0] {
++		t.Fatal("normal reuse was lost after trim")
++	}
++	DefaultAllocator.Put(reused)
++}
++
++func TestTrimIdleConcurrentTraffic(t *testing.T) {
++	freshDiagnosticPool(t)
++	var wg sync.WaitGroup
++	for worker := 0; worker < 8; worker++ {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			for i := 0; i < 2000; i++ {
++				b := DefaultAllocator.Get(maxPooledSize)
++				b[0] = byte(i)
++				DefaultAllocator.Put(b)
++			}
++		}()
++	}
++	for i := 0; i < 200; i++ {
++		if released := TrimIdle(); released > uint64(maxOversizeBuffers)*maxPooledSize {
++			t.Fatalf("unbounded trim: %d", released)
++		}
++		stats := GetOversizePoolStats()
++		if stats.Buffers < 0 || stats.Buffers > maxOversizeBuffers || stats.Bytes != uint64(stats.Buffers)*maxPooledSize {
++			t.Fatalf("invalid concurrent stats: %+v", stats)
++		}
++	}
++	wg.Wait()
++	TrimIdle()
++}
+diff --git a/component/fakeip/memory_diagnostics.go b/component/fakeip/memory_diagnostics.go
+new file mode 100644
+index 0000000..951fb6b
+--- /dev/null
++++ b/component/fakeip/memory_diagnostics.go
+@@ -0,0 +1,18 @@
++package fakeip
++
++// CacheStats reports logical reverse mappings, not both direction indexes.
++// Persistent storage is deliberately not scanned during a diagnostic sample.
++type CacheStats struct {
++	Storage string `json:"storage"`
++	Entries *int   `json:"entries,omitempty"`
++}
++
++func (p *Pool) CacheStats() CacheStats {
++	p.mux.Lock()
++	defer p.mux.Unlock()
++	if memory, ok := p.store.(*memoryStore); ok {
++		entries := memory.cacheHost.Len()
++		return CacheStats{Storage: "memory", Entries: &entries}
++	}
++	return CacheStats{Storage: "persistent"}
++}
+diff --git a/component/fakeip/memory_diagnostics_test.go b/component/fakeip/memory_diagnostics_test.go
+new file mode 100644
+index 0000000..c55e85e
+--- /dev/null
++++ b/component/fakeip/memory_diagnostics_test.go
+@@ -0,0 +1,26 @@
++package fakeip
++
++import (
++	"net/netip"
++	"testing"
++)
++
++func TestDiagnosticCacheStats(t *testing.T) {
++	p, err := New(Options{IPNet: netip.MustParsePrefix("198.18.0.0/24"), Size: 16})
++	if err != nil {
++		t.Fatal(err)
++	}
++	address := p.Lookup("example.com")
++	p.Lookup("example.com")
++	stats := p.CacheStats()
++	if stats.Storage != "memory" || stats.Entries == nil || *stats.Entries != 1 {
++		t.Fatalf("double counted mapping: %+v", stats)
++	}
++	if host, ok := p.LookBack(address); !ok || host != "example.com" {
++		t.Fatal("sample affected mapping")
++	}
++	disk := &Pool{store: &cachefileStore{}}
++	if stats := disk.CacheStats(); stats.Storage != "persistent" || stats.Entries != nil {
++		t.Fatalf("persistent count invented: %+v", stats)
++	}
++}
+diff --git a/dns/memory_diagnostics.go b/dns/memory_diagnostics.go
+new file mode 100644
+index 0000000..94bdcec
+--- /dev/null
++++ b/dns/memory_diagnostics.go
+@@ -0,0 +1,51 @@
++package dns
++
++import "github.com/metacubex/mihomo/component/fakeip"
++
++// CacheEntries sums only distinct resolver caches, including shared bootstrap
++// resolvers once. No DNS lookup, eviction, or TTL refresh is performed.
++func CacheEntries(resolvers ...*Resolver) (int, int) {
++	seen := make(map[*Resolver]struct{}, len(resolvers)+1)
++	entries, caches := 0, 0
++	var visit func(*Resolver)
++	visit = func(r *Resolver) {
++		if r == nil {
++			return
++		}
++		if _, exists := seen[r]; exists {
++			return
++		}
++		seen[r] = struct{}{}
++		if cache, ok := r.cache.(interface{ Len() int }); ok {
++			entries += cache.Len()
++			caches++
++		}
++		visit(r.defaultResolver)
++	}
++	for _, r := range resolvers {
++		visit(r)
++	}
++	return entries, caches
++}
++
++type EnhancerCacheStats struct {
++	MappingEntries int                `json:"dnsMappingEntries"`
++	FakeIP4        *fakeip.CacheStats `json:"fakeIP4,omitempty"`
++	FakeIP6        *fakeip.CacheStats `json:"fakeIP6,omitempty"`
++}
++
++func (h *ResolverEnhancer) CacheStats() EnhancerCacheStats {
++	var stats EnhancerCacheStats
++	if h.mapping != nil {
++		stats.MappingEntries = h.mapping.Len()
++	}
++	if h.fakeIPPool != nil {
++		snapshot := h.fakeIPPool.CacheStats()
++		stats.FakeIP4 = &snapshot
++	}
++	if h.fakeIPPool6 != nil {
++		snapshot := h.fakeIPPool6.CacheStats()
++		stats.FakeIP6 = &snapshot
++	}
++	return stats
++}
+diff --git a/dns/memory_diagnostics_test.go b/dns/memory_diagnostics_test.go
+new file mode 100644
+index 0000000..c75c1c3
+--- /dev/null
++++ b/dns/memory_diagnostics_test.go
+@@ -0,0 +1,31 @@
++package dns
++
++import (
++	"testing"
++	"time"
++
++	"github.com/metacubex/mihomo/common/arc"
++	"github.com/metacubex/mihomo/common/lru"
++	D "github.com/miekg/dns"
++)
++
++func TestDiagnosticResolverCachesDeduplicateBootstrap(t *testing.T) {
++	bootstrap := &Resolver{cache: lru.New[string, *D.Msg]()}
++	primary := &Resolver{cache: lru.New[string, *D.Msg](), defaultResolver: bootstrap}
++	direct := &Resolver{cache: arc.New[string, *D.Msg](arc.WithSize[string, *D.Msg](1)), defaultResolver: bootstrap}
++	primary.cache.SetWithExpire("primary", new(D.Msg), time.Now().Add(time.Hour))
++	bootstrap.cache.SetWithExpire("bootstrap", new(D.Msg), time.Now().Add(time.Hour))
++	direct.cache.SetWithExpire("ghost", new(D.Msg), time.Now().Add(time.Hour))
++	direct.cache.SetWithExpire("live", new(D.Msg), time.Now().Add(time.Hour))
++	if entries, caches := CacheEntries(primary, primary, direct, bootstrap, nil); entries != 3 || caches != 3 {
++		t.Fatalf("entries=%d caches=%d, want 3/3 (exclude duplicates/ARC ghosts)", entries, caches)
++	}
++	// Even a malformed diagnostic resolver cycle must terminate.
++	bootstrap.defaultResolver = primary
++	if entries, caches := CacheEntries(primary); entries != 2 || caches != 2 {
++		t.Fatalf("cycle: %d/%d", entries, caches)
++	}
++	if entries, caches := CacheEntries(); entries != 0 || caches != 0 {
++		t.Fatal("empty resolver stats")
++	}
++}
+diff --git a/listener/listener.go b/listener/listener.go
+index 3a0a8aa..433e3dd 100644
+--- a/listener/listener.go
++++ b/listener/listener.go
+@@ -725,5 +725,7 @@ func closeTunListener() {
+ }
+ 
+ func Cleanup() {
++	tunMux.Lock()
++	defer tunMux.Unlock()
+ 	closeTunListener()
+ }
+diff --git a/listener/memory_diagnostics.go b/listener/memory_diagnostics.go
+new file mode 100644
+index 0000000..1ef55a6
+--- /dev/null
++++ b/listener/memory_diagnostics.go
+@@ -0,0 +1,14 @@
++package listener
++
++import "github.com/metacubex/sing-tun"
++
++// TunQueueSnapshot serializes against TUN replacement. It never captures the
++// endpoint in a global registry, nor changes queue sizes or packet processing.
++func TunQueueSnapshot() *tun.QueueStats {
++	tunMux.Lock()
++	defer tunMux.Unlock()
++	if tunLister == nil {
++		return nil
++	}
++	return tunLister.QueueSnapshot()
++}
+diff --git a/listener/sing_tun/memory_diagnostics.go b/listener/sing_tun/memory_diagnostics.go
+new file mode 100644
+index 0000000..af3068e
+--- /dev/null
++++ b/listener/sing_tun/memory_diagnostics.go
+@@ -0,0 +1,7 @@
++package sing_tun
++
++import "github.com/metacubex/sing-tun"
++
++func (l *Listener) QueueSnapshot() *tun.QueueStats {
++	return tun.QueueSnapshot(l.tunIf)
++}
+diff --git a/rules/provider/memory_diagnostics.go b/rules/provider/memory_diagnostics.go
+new file mode 100644
+index 0000000..8694b49
+--- /dev/null
++++ b/rules/provider/memory_diagnostics.go
+@@ -0,0 +1,7 @@
++package provider
++
++// DiagnosticRuleCount is safe during asynchronous provider updates. It reads
++// only a publication-time counter and never traverses rules or locks matching.
++func (bp *baseProvider) DiagnosticRuleCount() int {
++	return int(bp.diagnosticCount.Load())
++}
+diff --git a/rules/provider/memory_diagnostics_test.go b/rules/provider/memory_diagnostics_test.go
+new file mode 100644
+index 0000000..fc86782
+--- /dev/null
++++ b/rules/provider/memory_diagnostics_test.go
+@@ -0,0 +1,34 @@
++package provider
++
++import (
++	"sync"
++	"testing"
++
++	P "github.com/metacubex/mihomo/constant/provider"
++)
++
++func TestDiagnosticProviderCount(t *testing.T) {
++	provider := NewInlineProvider("diagnostic", P.Domain, []string{"example.com", "example.org"}, nil)
++	count, ok := provider.(interface{ DiagnosticRuleCount() int })
++	if !ok || count.DiagnosticRuleCount() != provider.Count() || count.DiagnosticRuleCount() != 2 {
++		t.Fatal("inline count not published")
++	}
++	var bp baseProvider
++	var wg sync.WaitGroup
++	wg.Add(1)
++	go func() {
++		defer wg.Done()
++		for i := 0; i < 10000; i++ {
++			// The updater owns strategy publication. Diagnostic readers never
++			// access this interface while a provider update swaps it.
++			bp.strategy = NewDomainStrategy()
++			bp.diagnosticCount.Store(int64(i))
++		}
++	}()
++	for i := 0; i < 10000; i++ {
++		if value := bp.DiagnosticRuleCount(); value < 0 || value > 9999 {
++			t.Fatalf("invalid count %d", value)
++		}
++	}
++	wg.Wait()
++}
+diff --git a/rules/provider/provider.go b/rules/provider/provider.go
+index 2e7829a..3800d5d 100644
+--- a/rules/provider/provider.go
++++ b/rules/provider/provider.go
+@@ -7,6 +7,7 @@ import (
+ 	"io"
+ 	"runtime"
+ 	"strings"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/metacubex/mihomo/common/pool"
+@@ -60,8 +61,9 @@ type mrsRuleStrategy interface {
+ }
+ 
+ type baseProvider struct {
+-	behavior P.RuleBehavior
+-	strategy ruleStrategy
++	behavior        P.RuleBehavior
++	strategy        ruleStrategy
++	diagnosticCount atomic.Int64
+ }
+ 
+ func (bp *baseProvider) Type() P.ProviderType {
+@@ -132,6 +134,7 @@ func NewRuleSetProvider(name string, behavior P.RuleBehavior, format P.RuleForma
+ 
+ 	onUpdate := func(strategy ruleStrategy) {
+ 		rp.strategy = strategy
++		rp.diagnosticCount.Store(int64(strategy.Count()))
+ 		tunnel.RuleUpdateCallback().Emit(rp)
+ 	}
+ 
+@@ -139,6 +142,7 @@ func NewRuleSetProvider(name string, behavior P.RuleBehavior, format P.RuleForma
+ 	if len(payload) > 0 { // using as fallback rules
+ 		rp.strategy = rulesParseInline(payload, rp.strategy)
+ 	}
++	rp.diagnosticCount.Store(int64(rp.strategy.Count()))
+ 	rp.Fetcher = resource.NewFetcher(name, interval, vehicle, bundleFile, func(bytes []byte) (ruleStrategy, error) {
+ 		return rulesParse(bytes, newStrategy(behavior, parse), format)
+ 	}, onUpdate)
+@@ -330,6 +334,7 @@ func NewInlineProvider(name string, behavior P.RuleBehavior, payload []string, p
+ 		updateAt: time.Now(),
+ 	}
+ 	ip.strategy = rulesParseInline(payload, ip.strategy)
++	ip.diagnosticCount.Store(int64(ip.strategy.Count()))
+ 
+ 	wrapper := &InlineProvider{
+ 		ip,

@@ -7,6 +7,7 @@ readonly SOURCE_REL="pkg/tcpip/transport/tcp/segment_queue.go"
 readonly EXPECTED_SOURCE_SHA="1f1f3c893472009f0f566c7dd783c014d684493bf48750783a2064685db91e7e"
 readonly EXPECTED_PATCHED_SHA="4a4a5566d456d9411a70710824ad4c7f396aec22fcf83ffdf380cd121a8c40f5"
 readonly PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/gvisor-79317d808312-tcp-ack-queue.patch"
+readonly MEMORY_DIAGNOSTICS_PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/gvisor-79317d808312-memory-diagnostics.patch"
 readonly PATCHED_DIR="${RUNNER_TEMP:?}/gvisor-79317d808312-ios-memory-v1"
 
 check_sha256() {
@@ -54,6 +55,12 @@ git -c core.autocrlf=false -C "$PATCHED_DIR" \
 git -c core.autocrlf=false -C "$PATCHED_DIR" \
   apply --whitespace=error-all "$PATCH_FILE"
 check_sha256 "$EXPECTED_PATCHED_SHA" "$PATCHED_DIR/$SOURCE_REL"
+
+# The diagnostic patch reads existing queues only, after functional SHA checks.
+git -c core.autocrlf=false -C "$PATCHED_DIR" \
+  apply --check --whitespace=error-all "$MEMORY_DIAGNOSTICS_PATCH_FILE"
+git -c core.autocrlf=false -C "$PATCHED_DIR" \
+  apply --whitespace=error-all "$MEMORY_DIAGNOSTICS_PATCH_FILE"
 
 go mod edit -replace="$MODULE@$EXPECTED_VERSION=$PATCHED_DIR"
 readonly RESOLUTION="$(go list -m -f '{{.Version}}|{{if .Replace}}{{.Replace.Dir}}{{end}}' "$MODULE")"

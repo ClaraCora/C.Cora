@@ -116,6 +116,8 @@ jobs:
           cd MobileCore
           PATCHED_SING_TUN="$(bash scripts/prepare-ios-sing-tun.sh)"
           printf 'PATCHED_SING_TUN=%s\n' "$PATCHED_SING_TUN" >> "$GITHUB_ENV"
+          go -C "$PATCHED_MIHOMO" mod edit -replace="github.com/metacubex/sing-tun@v0.4.24=$PATCHED_SING_TUN"
+          go -C "$PATCHED_MIHOMO" mod edit -replace="github.com/metacubex/gvisor@v0.0.0-20260826100401-79317d808312=$PATCHED_GVISOR"
 
       - name: Prepare patched Shadowsocks reader
         run: |
@@ -129,19 +131,22 @@ jobs:
           set -euxo pipefail
           go -C "$PATCHED_SING" test ./common/buf
           go -C "$PATCHED_SING" test -tags "with_low_memory" ./common/buf
+          go -C "$PATCHED_SING" test -race -run 'TestTrimIdle' ./common/buf
 
       - name: Verify patched Mihomo
         run: |
           set -euxo pipefail
-          go -C "$PATCHED_MIHOMO" test ./common/pool ./config ./tunnel ./tunnel/statistic ./component/dialer ./component/resolver ./dns ./adapter/outbound ./hub/executor ./hub/route ./rules/provider
-          go -C "$PATCHED_MIHOMO" test -tags "with_low_memory" ./common/pool ./config ./tunnel ./tunnel/statistic ./component/dialer ./component/resolver ./dns ./adapter/outbound ./hub/executor ./hub/route ./rules/provider
+          go -C "$PATCHED_MIHOMO" test ./common/pool ./common/lru ./component/fakeip ./config ./tunnel ./tunnel/statistic ./component/dialer ./component/resolver ./dns ./adapter/outbound ./hub/executor ./hub/route ./rules/provider
+          go -C "$PATCHED_MIHOMO" test -tags "with_low_memory" ./common/pool ./common/lru ./component/fakeip ./config ./tunnel ./tunnel/statistic ./component/dialer ./component/resolver ./dns ./adapter/outbound ./hub/executor ./hub/route ./rules/provider
+          go -C "$PATCHED_MIHOMO" test -race -run 'TestTrimIdle|TestDiagnostic' ./common/pool ./common/lru ./component/fakeip ./dns ./rules/provider
           go -C "$PATCHED_MIHOMO" vet ./tunnel ./component/dialer ./component/resolver ./dns ./adapter/outbound ./hub/executor ./hub/route ./rules/provider
           go -C "$PATCHED_MIHOMO" vet -tags "with_low_memory" ./tunnel ./component/dialer ./component/resolver ./dns ./adapter/outbound ./hub/executor ./hub/route ./rules/provider
 
       - name: Verify patched gVisor TCP
         run: |
           set -euxo pipefail
-          go -C "$PATCHED_GVISOR" test ./pkg/tcpip/transport/tcp
+          go -C "$PATCHED_GVISOR" test ./pkg/tcpip/transport/tcp ./pkg/tcpip/link/qdisc ./pkg/tcpip/link/qdisc/fifo
+          go -C "$PATCHED_GVISOR" test -race -run 'TestDiagnostic' ./pkg/tcpip/link/qdisc/fifo
 
       - name: Verify patched sing-tun Darwin transport
         run: |
@@ -160,6 +165,13 @@ jobs:
           set -euxo pipefail
           cd MobileCore
           go test -tags "with_gvisor,with_low_memory" ./...
+
+      - name: Verify memory diagnostic analysis compatibility
+        run: |
+          set -euxo pipefail
+          swiftc Cora/Core/ByteFormat.swift Cora/Core/MemoryDiagnosticAnalyzer.swift \
+            Tests/MemoryDiagnosticAnalyzerTests.swift -o "$RUNNER_TEMP/memory-diagnostic-analyzer-tests"
+          "$RUNNER_TEMP/memory-diagnostic-analyzer-tests"
 
       - name: Build standard and Legacy Mihomo.xcframeworks (gomobile bind)
         run: |

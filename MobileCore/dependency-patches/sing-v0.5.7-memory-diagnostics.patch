@@ -1,0 +1,138 @@
+diff --git a/common/buf/alloc.go b/common/buf/alloc.go
+index 534f991..66a24a3 100644
+--- a/common/buf/alloc.go
++++ b/common/buf/alloc.go
+@@ -11,6 +11,52 @@ import (
+ const maxPooledSize = (1 << 16) + 16
+ const maxOversizeBuffers = 8
+ 
++// OversizeStats describes the bounded buffer pool that can retain memory
++// across requests. The normal sync.Pool buckets are intentionally omitted:
++// the runtime may discard them at any GC and they are not explicitly owned.
++type OversizeStats struct {
++	Buffers        int
++	Bytes          uint64
++	MaxBufferBytes uint64
++}
++
++// GetOversizePoolStats returns a point-in-time snapshot without forcing GC.
++func GetOversizePoolStats() OversizeStats {
++	allocator, ok := DefaultAllocator.(*defaultAllocator)
++	if !ok || allocator == nil {
++		return OversizeStats{}
++	}
++	count := len(allocator.oversize)
++	var largest uint64
++	if count != 0 {
++		largest = maxPooledSize
++	}
++	return OversizeStats{Buffers: count, Bytes: uint64(count) * maxPooledSize,
++		MaxBufferBytes: largest}
++}
++
++// TrimIdle releases idle exact-size buffers. In-flight buffers are
++// unaffected and will be returned to the pool normally after their request.
++func TrimIdle() uint64 {
++	allocator, ok := DefaultAllocator.(*defaultAllocator)
++	if !ok || allocator == nil {
++		return 0
++	}
++	var released uint64
++	// Bound work to the initial idle count. Concurrent returns may refill
++	// the channel, but must never turn a pressure action into an endless drain.
++	count := len(allocator.oversize)
++	for i := 0; i < count; i++ {
++		select {
++		case <-allocator.oversize:
++			released += maxPooledSize
++		default:
++			return released
++		}
++	}
++	return released
++}
++
+ var DefaultAllocator = newDefaultAllocator()
+ 
+ type Allocator interface {
+diff --git a/common/buf/memory_diagnostics_test.go b/common/buf/memory_diagnostics_test.go
+new file mode 100644
+index 0000000..d2b6f38
+--- /dev/null
++++ b/common/buf/memory_diagnostics_test.go
+@@ -0,0 +1,75 @@
++package buf
++
++import (
++	"sync"
++	"testing"
++)
++
++func freshDiagnosticPool(t *testing.T) {
++	original := DefaultAllocator
++	DefaultAllocator = newDefaultAllocator()
++	t.Cleanup(func() { DefaultAllocator = original })
++}
++
++func TestTrimIdle(t *testing.T) {
++	freshDiagnosticPool(t)
++	held := DefaultAllocator.Get(maxPooledSize)
++	held[0] = 73
++	for i := 0; i < maxOversizeBuffers; i++ {
++		if err := DefaultAllocator.Put(make([]byte, maxPooledSize)); err != nil {
++			t.Fatal(err)
++		}
++	}
++	stats := GetOversizePoolStats()
++	wantBytes := uint64(maxOversizeBuffers) * maxPooledSize
++	if stats.Buffers != maxOversizeBuffers || stats.Bytes != wantBytes || stats.MaxBufferBytes != maxPooledSize {
++		t.Fatalf("incorrect occupied stats: %+v", stats)
++	}
++	if released := TrimIdle(); released != wantBytes {
++		t.Fatalf("released = %d, want %d", released, wantBytes)
++	}
++	if stats := GetOversizePoolStats(); stats != (OversizeStats{}) {
++		t.Fatalf("empty stats: %+v", stats)
++	}
++	if released := TrimIdle(); released != 0 {
++		t.Fatalf("repeated trim = %d", released)
++	}
++	if held[0] != 73 {
++		t.Fatal("trim modified an in-flight buffer")
++	}
++	if err := DefaultAllocator.Put(held); err != nil {
++		t.Fatal(err)
++	}
++	reused := DefaultAllocator.Get(maxPooledSize)
++	if &reused[0] != &held[0] {
++		t.Fatal("normal reuse was lost after trim")
++	}
++	DefaultAllocator.Put(reused)
++}
++
++func TestTrimIdleConcurrentTraffic(t *testing.T) {
++	freshDiagnosticPool(t)
++	var wg sync.WaitGroup
++	for worker := 0; worker < 8; worker++ {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			for i := 0; i < 2000; i++ {
++				b := DefaultAllocator.Get(maxPooledSize)
++				b[0] = byte(i)
++				DefaultAllocator.Put(b)
++			}
++		}()
++	}
++	for i := 0; i < 200; i++ {
++		if released := TrimIdle(); released > uint64(maxOversizeBuffers)*maxPooledSize {
++			t.Fatalf("unbounded trim: %d", released)
++		}
++		stats := GetOversizePoolStats()
++		if stats.Buffers < 0 || stats.Buffers > maxOversizeBuffers || stats.Bytes != uint64(stats.Buffers)*maxPooledSize {
++			t.Fatalf("invalid concurrent stats: %+v", stats)
++		}
++	}
++	wg.Wait()
++	TrimIdle()
++}

@@ -62,6 +62,7 @@ readonly EXPECTED_MRS_READER_PATCHED_SHA="81f2fdf0e71e02fd8df58af2a9036a138ebd64
 readonly EXPECTED_MRS_DECODER_SHA="f58a0179708ef843ea7ea91a6e3e78c8e0e3187e66276b9e88db1699259345de"
 readonly EXPECTED_MRS_DECODER_TEST_SHA="9743a88016ae679566eb25cd23aa0613260c6361313b650d89381a9d8724368b"
 readonly PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/mihomo-v1.19.31-oversize-buffer-pool.patch"
+readonly MEMORY_DIAGNOSTICS_PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/mihomo-v1.19.31-memory-diagnostics.patch"
 readonly CONFIG_PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/mihomo-v1.19.31-progressive-config-parse.patch"
 readonly HISTORY_PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/mihomo-v1.19.31-connection-close-queue.patch"
 readonly HISTORY_TEST_PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/mihomo-v1.19.31-connection-close-queue-test.patch"
@@ -203,6 +204,15 @@ check_sha256 "$EXPECTED_DOH_ROUTE_PATCHED_SHA" "$PATCHED_DIR/$DOH_ROUTE_REL"
 check_sha256 "$EXPECTED_MRS_READER_PATCHED_SHA" "$PATCHED_DIR/$MRS_READER_REL"
 check_sha256 "$EXPECTED_MRS_DECODER_SHA" "$PATCHED_DIR/$MRS_DECODER_REL"
 check_sha256 "$EXPECTED_MRS_DECODER_TEST_SHA" "$PATCHED_DIR/$MRS_DECODER_TEST_REL"
+
+# Keep the upstream/functionality SHA checks above tied to the exact patched
+# source they were introduced for. The diagnostic API is intentionally applied
+# afterward, so adding diagnostic methods does not silently invalidate those
+# source-integrity checks.
+git -c core.autocrlf=false -C "$PATCHED_DIR" \
+  apply --check --whitespace=error-all "$MEMORY_DIAGNOSTICS_PATCH_FILE"
+git -c core.autocrlf=false -C "$PATCHED_DIR" \
+  apply --whitespace=error-all "$MEMORY_DIAGNOSTICS_PATCH_FILE"
 
 go -C "$PATCHED_DIR" mod edit -require="$SING_MODULE@$EXPECTED_SING_VERSION"
 go -C "$PATCHED_DIR" mod edit -replace="$SING_MODULE@$EXPECTED_SING_VERSION=$PATCHED_SING_DIR"

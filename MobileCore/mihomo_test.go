@@ -779,7 +779,10 @@ func TestRuntimeStatsReturnsDiagnosticSnapshot(t *testing.T) {
 		t.Fatalf("RuntimeStats returned invalid JSON: %v", err)
 	}
 	for _, key := range []string{"heapAlloc", "sys", "goroutines", "connections",
-		"proxyProviders", "ruleProviders", "proxyGroups", "closedQueuePending"} {
+		"proxyProviders", "ruleProviders", "proxyGroups", "closedQueuePending",
+		"mihomoBufferPoolBuffers", "mihomoBufferPoolBytes", "singBufferPoolBuffers",
+		"singBufferPoolBytes", "bufferPoolRetainedBytes", "proxyCount", "policyGroupCount",
+		"proxyProviderNodes", "ruleProviderRules", "dnsCacheEntries", "dnsCacheCount", "geoMode", "geoLoader", "forceGCSuppressed"} {
 		if _, exists := fields[key]; !exists {
 			t.Fatalf("RuntimeStats omitted %q", key)
 		}

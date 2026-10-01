@@ -984,11 +984,15 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                     return
                 }
                 self.lastManualMemoryRelease = (sessionGeneration, uptime)
-                self.memoryDiagnostics?.record(event: "manualMemoryReleaseStart")
-                let before = MemoryDiagnostics.physicalFootprint()
-                MihomoForceGC()
-                let after = MemoryDiagnostics.physicalFootprint()
-                self.memoryDiagnostics?.record(event: "manualMemoryReleaseEnd")
+                let before: UInt64
+                let after: UInt64
+                if let diagnostics = self.memoryDiagnostics {
+                    (before, after) = diagnostics.releaseMemory()
+                } else {
+                    before = MemoryDiagnostics.physicalFootprint()
+                    MihomoForceGC()
+                    after = MemoryDiagnostics.physicalFootprint()
+                }
                 FileLog.write("手动释放空闲内存：\(before) → \(after) 字节")
                 reply(Self.jsonData(["ok": true, "before": before, "physFootprint": after]))
             }

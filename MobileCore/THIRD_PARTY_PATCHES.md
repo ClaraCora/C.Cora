@@ -383,6 +383,74 @@ Revert the commit that added this patch. For a manual rollback, remove:
 
 No configuration or user-data migration is involved.
 
+## steady-memory-diagnostics-and-idle-buffer-trim
+
+- Added: 2026-10-02
+- Upstream modules: Mihomo v1.19.31, sing v0.5.7, sing-tun v0.4.24,
+  gVisor v0.0.0-20260826100401-79317d808312
+- Diagnostic patches: `mihomo-v1.19.31-memory-diagnostics.patch`,
+  `sing-v0.5.7-memory-diagnostics.patch`,
+  `sing-tun-v0.4.24-memory-diagnostics.patch`, and
+  `gvisor-79317d808312-memory-diagnostics.patch`
+- Preparation: applied after functional patches and their source-hash checks.
+  The patched sing-tun and Mihomo modules use the same patched gVisor/sing-tun
+  dependencies as MobileCore, including standalone dependency tests.
+
+### Behavior and accounting limits
+
+Both oversize pools expose `GetOversizePoolStats()` and `TrimIdle()`. Each
+retains at most eight 65552-byte buffers; the combined upper bound is 1048832
+bytes (about 1 MiB). A trim drains at most the initial idle count and does not
+modify in-flight buffers or future returns. Normal Get/Put reuse, pool limits,
+and power-of-two `sync.Pool` buckets remain unchanged. No lock or per-packet
+counter is added to buffer allocation or packet processing.
+
+MobileCore trims before the existing `debug.FreeOSMemory()` operation. A shared
+20-second cooldown covers manual release and both existing pressure listeners.
+Suppressed calls neither trim again nor force another GC. Normal GOGC,
+GOMEMLIMIT, gVisor, DNS/cache limits, concurrency and IPC budgets are unchanged.
+
+`RuntimeStats()` additionally queries retained DNS/mapping entries, in-memory
+Fake-IP mappings, proxy/rule provider counts, true policy-group counts, GEO
+mode/loader/matcher and optional disk asset sizes. DNS caches shared by roles
+are counted once; reads do not perform lookups, refresh TTLs or evict entries.
+Persistent Fake-IP databases are not scanned; their entry count is omitted.
+Rule providers publish one atomic count at load/update time, so diagnostics
+do not race against strategy replacement.
+
+Darwin TUN queues expose optional waiting packet counts and summed packet
+lengths under existing locks. These exclude dispatch batches, GRO, socket
+buffers and backing allocation capacity. Unsupported targets/stacks omit the
+fields. NativeTun owns and clears its diagnostic sources at close; no global
+registry retains an old endpoint. Listener snapshots serialize with TUN
+replacement and cleanup.
+
+Collection is on demand or uses the existing developer-mode sampler; no new
+background task runs in normal use. Pool/queue bytes overlap Go heap metrics,
+provider and DNS counts are not byte estimates, and GEO disk sizes are not
+resident memory. These values must not be summed into a physical footprint.
+Swift stores the latest release pair in the bounded summary, handles omitted
+optional metrics and old NE responses, and never pairs separate VPN sessions.
+
+### Verification and rollback
+
+Default and low-memory Go tests cover pool reuse/trim/concurrency, DNS cache
+deduplication, Fake-IP, provider publication and runtime accounting. Queue
+wraparound/concurrent snapshots pass on Windows; Darwin queue tests and the
+MobileCore binding package cross-compile for arm64. All four diagnostic patches
+apply to clean functional-patch baselines with strict whitespace checks and
+produce byte-identical Go sources; previous functional-patch SHA checks pass.
+Go vet passes for MobileCore and the affected Mihomo packages. CI includes
+macOS race checks, Darwin tests and standalone Swift analyzer regressions.
+Swift/Xcode builds, race execution and 48-hour device verification have not
+been run locally. See [the device verification guide](../docs/ne-steady-memory-diagnostics.md).
+
+Rollback MobileCore's new pool/attribution API calls together with the four
+diagnostic patches, preparation wiring and added CI checks. Keep the earlier
+functional allocator, queue, DNS, MRS and Shadowsocks patches. The Swift fields
+are optional and can remain compatible with an older NE. No configuration or
+stored-data migration is required.
+
 ## sing-shadowsocks2-v0.2.8-reusable-length-buffer
 
 - Added: 2026-07-25

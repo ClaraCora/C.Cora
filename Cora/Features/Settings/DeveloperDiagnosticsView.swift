@@ -57,7 +57,7 @@ struct DeveloperDiagnosticsView: View {
                 .tint(Color(uiColor: .systemGreen))
                 .disabled(isUpdatingMode)
             } footer: {
-                Text("开启后每 5 秒记录一次物理内存、VM、Go 堆、连接和 goroutine 快照，并保留当前/上一会话的数字摘要。关闭后不会持续采样；诊断数据可能包含连接数量等运行态信息。")
+                Text("开启后每 5 秒记录一次物理内存、VM、Go 堆、闲置缓冲池、TUN 队列、DNS 和 Provider 摘要，并保留当前/上一会话的数字摘要及最近释放前后对比。关闭后不会持续采样；诊断数据可能包含连接数量等运行态信息。")
             }
             .settingsSectionStyle()
 
