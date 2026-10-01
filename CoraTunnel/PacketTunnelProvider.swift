@@ -99,6 +99,10 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private var lastPhysicalPath: PhysicalPathSnapshot?
     private var hasAppliedPhysicalPath = false
     private var lastPathWasSatisfied: Bool?
+    /// 只在 pathMonitorQueue 读写。监控在 mihomo 启动前就开始，启动前只能
+    /// 预绑定默认物理接口；内核启动完成后再补一次完整的网络/DNS 刷新。
+    private var mihomoCoreReady = false
+    private var preCoreInterfaceName: String?
     private var systemDNSRetrySignature: String?
     private var systemDNSRetryAttempt = 0
     private static let systemDNSRetryDelays: [TimeInterval] = [2, 5, 10]
@@ -180,11 +184,15 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
         let networkSettings = makeNetworkSettings(configuredMTU: configuredMTU,
                                                   ipv6Enabled: ipv6Enabled)
+        // 在创建 utun 前启动物理路径监控。弱网切换时即使 NE 仍在等待
+        // mihomo 启动，也要先把最新的 en0/pdp_ip0 预绑定给内核。
+        self.startPathMonitor()
         setTunnelNetworkSettings(networkSettings) { [weak self] error in
             guard let self else { return }
             if let error {
                 FileLog.write("应用网络设置失败：\(error.localizedDescription)")
                 self.log.error("应用网络设置失败：\(error.localizedDescription, privacy: .public)")
+                self.stopPathMonitor()
                 completionHandler(error)
                 return
             }
@@ -195,6 +203,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                   let fd = self.findTunnelFileDescriptor(named: interface.name) else {
                 FileLog.write("未找到 utun fd（getifaddrs/getsockopt 都没命中网关 IP）")
                 self.log.error("未找到 utun 文件描述符")
+                self.stopPathMonitor()
                 completionHandler(NSError(domain: "CoraTunnel", code: -1,
                     userInfo: [NSLocalizedDescriptionKey: "未找到 utun fd"]))
                 return
@@ -205,6 +214,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 let message = "iOS 创建的 MTU（\(systemMTU)）与配置 tun.mtu（\(configuredMTU)）不一致"
                 FileLog.write("MTU 应用失败：\(message)")
                 self.log.error("MTU 应用失败：\(message, privacy: .public)")
+                self.stopPathMonitor()
                 completionHandler(NSError(
                     domain: "CoraTunnel",
                     code: -6,
@@ -242,7 +252,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                         ControlCenter.shared.reloadControls(ofKind: ControlWidgetKind.vpn)
                     }
                     self.connectionHistoryRecorder.start()
-                    self.startPathMonitor() // 开始把真实出站接口喂给内核
+                    self.markMihomoCoreReady() // 应用最新物理路径并刷新旧连接/DNS
                     // Shared settings may have changed while the kernel started.
                     let currentPO0 = AppGroup.containerURL == nil ? po0Configuration : PO0WhitelistStorage.load()
                     if let po0JSON = try? currentPO0.json() {
@@ -263,6 +273,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             configYAML = ""
             resolvedSettings = ""
             guard let startResult else {
+                self.stopPathMonitor()
                 self.runtimeQueue.sync {
                     self.memoryDiagnostics?.stop(event: "startCancelled")
                     self.memoryDiagnostics = nil
@@ -275,6 +286,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 return
             }
             guard startResult else {
+                self.stopPathMonitor()
                 self.runtimeQueue.sync {
                     self.memoryDiagnostics?.stop(event: "startFailed")
                     self.memoryDiagnostics = nil
@@ -294,6 +306,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             if stillRunning {
                 completionHandler(nil)
             } else {
+                self.stopPathMonitor()
                 completionHandler(NSError(
                     domain: "CoraTunnel",
                     code: -5,
@@ -421,13 +434,34 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         lastPhysicalPath = nil
         hasAppliedPhysicalPath = false
         lastPathWasSatisfied = nil
+        mihomoCoreReady = false
+        preCoreInterfaceName = nil
         resetSystemDNSRetryLocked()
+    }
+
+    /// mihomo 启动完成后在路径队列上立刻补应用最近一次路径。
+    /// 这样 5G→4G 切换发生在启动窗口内时，不会因为接口名未变化而沿用旧连接。
+    private func markMihomoCoreReady() {
+        pathMonitorQueue.sync {
+            mihomoCoreReady = true
+            pendingPathUpdate?.cancel()
+            pendingPathUpdate = nil
+            if let path = latestObservedPath {
+                applyInterface(from: path)
+            }
+        }
     }
 
     /// 首次立即应用（缩短启动时「出站未绑接口」的窗口）；之后变化用防抖。
     private func schedulePathUpdate(_ path: Network.NWPath) {
         latestObservedPath = path
         pendingPathUpdate?.cancel()
+        // unavailable 是连接恢复的边界，不能被 800ms 防抖吞掉；恢复时
+        // applyInterface 会强制 resetConnections，即使接口名和地址族没变。
+        if path.status != .satisfied {
+            applyInterface(from: path)
+            return
+        }
         if !hasAppliedPhysicalPath {
             applyInterface(from: path)
             return
@@ -442,10 +476,12 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private func applyInterface(from path: Network.NWPath) {
         FileLog.write(pathSummary(path))
         guard path.status == .satisfied else {
-            if lastPathWasSatisfied != false {
+            let wasPreviouslySatisfied = lastPathWasSatisfied != false
+            if wasPreviouslySatisfied {
                 FileLog.write("物理网络路径暂时不可用，等待恢复")
             }
             lastPathWasSatisfied = false
+            resetSystemDNSRetryLocked()
             return
         }
 
@@ -457,6 +493,17 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             return
         }
         FileLog.write("物理接口选择 = \(iface.name)（\(Self.interfaceTypeName(iface.type))）")
+
+        guard mihomoCoreReady else {
+            // SetDefaultInterface 只更新 mihomo 的拨号接口，不触碰 DNS 或活动连接，
+            // 因此可安全地在 MihomoStartWithConfig 返回前执行。
+            if preCoreInterfaceName != iface.name {
+                MihomoSetDefaultInterface(iface.name)
+                preCoreInterfaceName = iface.name
+                FileLog.write("内核启动前预绑定物理接口 = \(iface.name)")
+            }
+            return
+        }
 
         let previous = lastPhysicalPath
         let isInitialPath = !hasAppliedPhysicalPath
@@ -524,6 +571,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         if dnsChanged {
             reasons.append("system DNS 变化")
+        }
+
+        if wasUnavailable {
+            reasons.append("物理网络恢复")
+            resetConnections = true
         }
 
         // NWPathMonitor 也会为 expensive/constrained 等无关属性发回调。

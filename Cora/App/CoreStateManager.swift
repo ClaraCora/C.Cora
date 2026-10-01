@@ -41,6 +41,9 @@ final class CoreStateManager: ObservableObject {
     private var pendingReloadSnapshot: String?
     private var pendingReloadHasSnapshot = false
     private var lastReloadSucceeded = true
+    private var connectionWatchdogTask: Task<Void, Never>?
+    private var stalledConnectionRecoveryPending = false
+    private static let connectionWatchdogNanoseconds: UInt64 = 35_000_000_000
 
     private init() {
         // NE 会把已连接状态同步到 App Group。主 App 被系统重新拉起时先用它恢复界面和
@@ -53,6 +56,7 @@ final class CoreStateManager: ObservableObject {
     }
 
     deinit {
+        connectionWatchdogTask?.cancel()
         if let observer = statusObserver {
             NotificationCenter.default.removeObserver(observer)
         }
@@ -70,7 +74,7 @@ final class CoreStateManager: ObservableObject {
             Task { @MainActor in
                 guard let self, self.tunnel.owns(connection) else { return }
                 self.tunnel.noteStatusChange(connection.status)
-                self.status = connection.status
+                self.updateConnectionStatus(connection.status)
                 // 同步给控制中心磁贴（App 在前台时覆盖各种来源的状态变化）
                 AppGroupState.vpnConnected = self.isActive
                 // 主动请求系统刷新磁贴，否则 App 内启停不会同步到控制中心
@@ -89,13 +93,61 @@ final class CoreStateManager: ObservableObject {
     func refreshStatus() async {
         let currentStatus = await tunnel.currentStatus()
         tunnel.noteStatusChange(currentStatus)
-        status = currentStatus
+        updateConnectionStatus(currentStatus)
         AppGroupState.vpnConnected = isActive
         if status == .connected || status == .reasserting {
             await fetchNotices()
         } else {
             configNotices = []
         }
+    }
+
+    /// App 重新打开时，系统可能还保留一个已经失去物理网络的 connecting/
+    /// reasserting 会话。它不会再触发新的状态通知，因此需要一个只在 App
+    /// 进程存活期间运行的有限看门狗，超时后主动撤销该隧道。
+    private func updateConnectionStatus(_ newStatus: NEVPNStatus) {
+        status = newStatus
+        switch newStatus {
+        case .connecting, .reasserting:
+            if !stalledConnectionRecoveryPending, connectionWatchdogTask == nil {
+                scheduleConnectionWatchdog()
+            }
+        case .connected, .disconnecting, .disconnected, .invalid:
+            stalledConnectionRecoveryPending = false
+            connectionWatchdogTask?.cancel()
+            connectionWatchdogTask = nil
+        @unknown default:
+            stalledConnectionRecoveryPending = false
+            connectionWatchdogTask?.cancel()
+            connectionWatchdogTask = nil
+        }
+    }
+
+    private func scheduleConnectionWatchdog() {
+        connectionWatchdogTask?.cancel()
+        connectionWatchdogTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: Self.connectionWatchdogNanoseconds)
+            guard !Task.isCancelled, let self else { return }
+            await self.recoverStalledConnectionIfNeeded()
+        }
+    }
+
+    private func recoverStalledConnectionIfNeeded() async {
+        guard status == .connecting || status == .reasserting else { return }
+        stalledConnectionRecoveryPending = true
+        connectionWatchdogTask = nil
+        lastError = "VPN 连接超时，已停止本次连接；请检查网络后重试"
+
+        // 自动连接失败后先暂停当前 On Demand 规则，避免系统在旧会话尚未
+        // 完全退出时立即重启同一个坏会话。用户下一次手动连接会清除该标记。
+        if SettingsStore.shared.alwaysOnVPN {
+            AppGroupState.vpnAutoConnectSuspended = true
+            try? await tunnel.setOnDemandEnabled(false)
+        }
+        tunnel.stop()
+        try? await tunnel.stopAndWaitUntilDisconnected(timeout: 8)
+        syncWidget(false)
+        await refreshStatus()
     }
 
     /// 向运行中的 NE 索取日志（普通签名走系统 IPC，TrollStore 走文件 IPC）。

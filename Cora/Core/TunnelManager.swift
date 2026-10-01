@@ -12,7 +12,7 @@ final class TunnelManager {
 
     private enum StartOutcome {
         case connected
-        case stillConnecting
+        case timedOut
         case failed
     }
 
@@ -31,9 +31,12 @@ final class TunnelManager {
     private var appInitiatedStartupAttemptID: String?
 
     private static let startupPollNanoseconds: UInt64 = 250_000_000
-    private static let startupPollCount = 40
+    /// 大型订阅解析、弱网下 Network Extension 初始化都可能超过 10 秒；
+    /// 但不能无限保持系统默认路由和 DNS 后显示“连接中”。
+    private static let startupPollCount = 120 // 30 秒
     private static let initialTransitionGracePolls = 8
     private static let shutdownPollNanoseconds: UInt64 = 100_000_000
+    private static let startupTimeoutStopSeconds: TimeInterval = 8
 
     /// 加载（或创建）Cora 的 VPN 描述文件。
     /// iOS 要求 VPN 配置先 saveToPreferences 落到「设置 > VPN」里，用户授权一次后方可启动。
@@ -129,8 +132,17 @@ final class TunnelManager {
                 appInitiatedStartupAttemptID = nil
             }
             return
-        case .stillConnecting:
-            return
+        case .timedOut:
+            if appInitiatedStartupAttemptID == startupAttemptID {
+                appInitiatedStartupAttemptID = nil
+            }
+            let stopped = await stopTimedOutStartup(mgr.connection)
+            if stopped {
+                throw Self.startupError(
+                    "VPN 启动超时，已停止本次连接；请检查网络后重试")
+            }
+            throw Self.startupError(
+                "VPN 启动超时，系统仍在退出；请稍后重试或手动关闭 VPN")
         case .failed:
             if appInitiatedStartupAttemptID == startupAttemptID {
                 appInitiatedStartupAttemptID = nil
@@ -190,8 +202,26 @@ final class TunnelManager {
             try? await Task.sleep(nanoseconds: Self.startupPollNanoseconds)
         }
 
-        // 内核解析大型配置时可能较慢；仍处于 connecting 时交给状态监听继续跟踪。
-        return enteredStartup ? .stillConnecting : .failed
+        if connection.status == .connected {
+            return .connected
+        }
+        return enteredStartup ? .timedOut : .failed
+    }
+
+    /// 启动超过上限后主动撤销系统路由，避免扩展卡在 connecting 时让整机
+    /// 继续走一个尚未完成的隧道。只等待有限时间，不阻塞后续 App 状态恢复。
+    private func stopTimedOutStartup(_ connection: NEVPNConnection) async -> Bool {
+        connection.stopVPNTunnel()
+        let deadline = Date().addingTimeInterval(Self.startupTimeoutStopSeconds)
+        while Date() < deadline {
+            switch connection.status {
+            case .disconnected, .invalid:
+                return true
+            default:
+                try? await Task.sleep(nanoseconds: Self.shutdownPollNanoseconds)
+            }
+        }
+        return connection.status == .disconnected || connection.status == .invalid
     }
 
     private func lastDisconnectError(_ connection: NEVPNConnection) async -> Error? {
