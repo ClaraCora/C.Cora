@@ -12,6 +12,7 @@ import (
 	"bytes"
 	"container/heap"
 	"context"
+	"cora/mobilecore/internal/sessionclock"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -207,7 +208,7 @@ var (
 	pendingUsesSystemDNS        bool
 	pendingSourceDNSMode        string
 	activeDNSGeneration         uint64
-	coreStartedAt               time.Time
+	coreSessionClock            *sessionclock.Timer
 	scriptTargetIPCacheMu       sync.Mutex
 	scriptTargetIPCache         = make(map[string]scriptTargetIPCacheEntry)
 	activeProxyDelayBatches     int32
@@ -905,7 +906,9 @@ func StartWithConfig(fd int, tunnelMTU int, configYAML string, settingsJSON stri
 	if err := applyRuntimeConfig(fd, tunnelMTU, configYAML, st); err != nil {
 		return err
 	}
-	coreStartedAt = time.Now()
+	// Only a successfully started new tunnel gets a new clock. App lifecycle,
+	// provider updates, network recovery and memory collection do not reset it.
+	coreSessionClock = sessionclock.New()
 	return nil
 }
 
@@ -2648,7 +2651,7 @@ func ProxyDelays(targetsJSON, url, directURL string, timeoutMs int) string {
 
 	session := beginProxyDelayBatch()
 	defer finishProxyDelayBatch(session)
-	if coreStartedAt.IsZero() {
+	if coreSessionClock == nil {
 		return marshalJSON(map[string]any{"error": "内核未运行"})
 	}
 	proxies := tunnel.Proxies()
@@ -3478,10 +3481,7 @@ func TrafficNow() string {
 	configApplyMu.RLock()
 	defer configApplyMu.RUnlock()
 	up, down := statistic.DefaultManager.Now()
-	uptime := int64(0)
-	if !coreStartedAt.IsZero() {
-		uptime = int64(time.Since(coreStartedAt) / time.Second)
-	}
+	uptime := coreSessionClock.Seconds()
 	// This response is emitted once per second while the tunnel is visible.
 	// Build the three integer fields directly so the hot path does not pay the
 	// reflection and intermediate value allocations of json.Marshal.
@@ -4257,7 +4257,7 @@ func Stop() {
 	activeGeneralIPv6 = false
 	activeUsesSystemDNS = false
 	activeDNSGeneration = 0
-	coreStartedAt = time.Time{}
+	coreSessionClock = nil
 	CloseAllConnections()
 	// The recorder is stopped by the Swift host before MihomoStop runs. Do not
 	// leave the final close snapshots in the bounded ring when no consumer can

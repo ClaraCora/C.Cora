@@ -2,6 +2,7 @@ package mihomo
 
 import (
 	"bytes"
+	"cora/mobilecore/internal/sessionclock"
 	"encoding/json"
 	"fmt"
 	"net/netip"
@@ -944,9 +945,10 @@ func TestConnectionsIPCEmptySnapshotAndMissingClose(t *testing.T) {
 }
 
 func TestTrafficNowIncludesCoreUptime(t *testing.T) {
-	previousStartedAt := coreStartedAt
-	coreStartedAt = time.Now().Add(-3 * time.Second)
-	defer func() { coreStartedAt = previousStartedAt }()
+	previousClock := coreSessionClock
+	coreSessionClock = sessionclock.New()
+	defer func() { coreSessionClock = previousClock }()
+	time.Sleep(1100 * time.Millisecond)
 
 	var snapshot struct {
 		Uptime int64 `json:"uptime"`
@@ -954,8 +956,16 @@ func TestTrafficNowIncludesCoreUptime(t *testing.T) {
 	if err := json.Unmarshal([]byte(TrafficNow()), &snapshot); err != nil {
 		t.Fatalf("TrafficNow returned invalid JSON: %v", err)
 	}
-	if snapshot.Uptime < 2 {
-		t.Fatalf("TrafficNow uptime = %d, want at least 2", snapshot.Uptime)
+	if snapshot.Uptime < 1 {
+		t.Fatalf("TrafficNow uptime = %d, want at least 1", snapshot.Uptime)
+	}
+
+	coreSessionClock = nil
+	if err := json.Unmarshal([]byte(TrafficNow()), &snapshot); err != nil {
+		t.Fatalf("TrafficNow returned invalid JSON after stopping: %v", err)
+	}
+	if snapshot.Uptime != 0 {
+		t.Fatalf("TrafficNow uptime after stopping = %d, want 0", snapshot.Uptime)
 	}
 }
 
