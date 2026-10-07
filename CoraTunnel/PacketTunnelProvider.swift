@@ -27,11 +27,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private var tunnelFileDescriptor: Int32?
     private var isStopping = false
     private let runtimeQueue = DispatchQueue(label: "com.cora.tunnel.runtime", qos: .userInitiated)
-    private let ipcQueue = DispatchQueue(label: "com.cora.tunnel.ipc",
-                                         qos: .userInitiated,
-                                         attributes: .concurrent)
+    /// Bounded control-plane work queue. This never gates packet forwarding.
+    private let ipcScheduler = IPCControlScheduler()
     private let ipcResponseCache = IPCResponseCache()
     private static let ipcInlineResponseLimit = 16 * 1_024
+    private static let ipcMaximumRequestBytes = 1 * 1_024 * 1_024
     // Runtime queue serializes user-triggered collections and tunnel lifecycle.
     private var lastManualMemoryRelease: (generation: UInt64, uptime: TimeInterval)?
     private var trollStoreIPCServer: TrollStoreFileIPCServer?
@@ -109,24 +109,44 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
     override func startTunnel(options: [String: NSObject]?,
                               completionHandler: @escaping (Error?) -> Void) {
-        runtimeQueue.sync {
+        let startup = runtimeQueue.sync { () -> (UInt64, TrollStoreFileIPCServer?) in
+            let oldServer = trollStoreIPCServer
+            trollStoreIPCServer = nil
+            let generation = clearStoredIPCResponses(enableCaching: true)
+            // A replacement start can arrive without the old stop callback.
+            // End the recorder/samplers too, so their cursors and timers cannot
+            // cross the Go runtime's new session boundary.
+            let replacingCore = tunnelFileDescriptor != nil
+            connectionHistoryRecorder.stop()
+            memoryPressureGuard?.stop()
+            memoryPressureGuard = nil
+            stopPathMonitor()
+            if replacingCore {
+                MihomoStop()
+            }
+            memoryDiagnostics?.stop(event: replacingCore ? "stopCompleted" : "restart")
+            memoryDiagnostics = nil
+            developerModeEnabled = false
             isStopping = false
             tunnelFileDescriptor = nil
+            AppGroupState.vpnConnected = false
+            // Persisted session/log state follows the same serialized boundary.
+            // FileLog rotates the previous session into ne.previous.log.
+            FileLog.reset()
+            let startupAttemptID = (options?["startupAttemptID"] as? String) ?? UUID().uuidString
+            FileLog.write("startup-attempt=\(startupAttemptID)")
+            let delaySessionID = ProxyDelayStore.beginSession()
+            FileLog.write("延迟测试会话已开始：\(delaySessionID)")
+            // Capture the physical DNS before installing the tunnel DNS route.
+            let initialSystemDNS = SystemDNS.excludingTunnel(SystemDNS.currentServers())
+            replaceSystemDNSServers(initialSystemDNS)
+            FileLog.write("system DNS = \(initialSystemDNS)")
+            return (generation, oldServer)
         }
-        stopTrollStoreIPC()
-        clearStoredIPCResponses(enableCaching: true)
-        // 每次启动只清空进程内缓冲；FileLog 会把上一会话的持久化日志轮换为
-        // ne.previous.log，避免 NE 被系统停止后事故现场被新会话覆盖。
-        // 隧道建立前先抓物理网络 DNS；隧道起来后系统主解析器会变成隧道自己的 DNS。
-        FileLog.reset()
-        let startupAttemptID = (options?["startupAttemptID"] as? String) ?? UUID().uuidString
-        FileLog.write("startup-attempt=\(startupAttemptID)")
-        // 每次真正启动隧道都创建新的延迟会话；App 重新打开时可从该快照恢复。
-        let delaySessionID = ProxyDelayStore.beginSession()
-        FileLog.write("延迟测试会话已开始：\(delaySessionID)")
-        let initialSystemDNS = SystemDNS.excludingTunnel(SystemDNS.currentServers())
-        replaceSystemDNSServers(initialSystemDNS)
-        FileLog.write("system DNS = \(initialSystemDNS)")
+        // The server can synchronously invoke a handler that needs runtimeQueue.
+        // Detach under the lifecycle queue, then wait for its queue outside it.
+        startup.1?.stop()
+        let startGeneration = startup.0
         FileLog.write("startTunnel：开始配置网络设置")
         log.info("startTunnel：开始配置网络设置")
 
@@ -152,17 +172,34 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // 在创建 utun 前先解析配置，只有显式 tun.mtu 才固定接口 MTU；否则交给 iOS 计算。
         let sharedHome = appGroupContainerPath()
         let home = sharedHome ?? fallbackHomePath()
-        homeDir = home
         FileLog.write("home dir = \(home)（\(sharedHome != nil ? "App Group 共享" : "NE 沙盒回退")），调用 MihomoSetup")
-        MihomoSetup(home)
-        startTrollStoreIPCIfNeeded()
+        let didSetup = runtimeQueue.sync {
+            guard !isStopping, isCurrentIPCSession(startGeneration) else { return false }
+            homeDir = home
+            MihomoSetup(home)
+            return true
+        }
+        guard didSetup else {
+            completionHandler(NSError(domain: "CoraTunnel", code: -5,
+                userInfo: [NSLocalizedDescriptionKey: "VPN 启动已取消"]))
+            return
+        }
+        startTrollStoreIPCIfNeeded(generation: startGeneration)
 
-        var configYAML = resolveConfig(incoming: incomingConfig,
-                                       hasOption: hasConfigOption, home: home)
+        let cachedInput = runtimeQueue.sync { () -> (String, String)? in
+            guard !isStopping, isCurrentIPCSession(startGeneration) else { return nil }
+            return (resolveConfig(incoming: incomingConfig, hasOption: hasConfigOption, home: home),
+                    resolveCached(incoming: settingsJSON.isEmpty ? nil : settingsJSON,
+                                  home: home, file: "settings.json") ?? "")
+        }
+        guard let cachedInput else {
+            completionHandler(NSError(domain: "CoraTunnel", code: -5,
+                userInfo: [NSLocalizedDescriptionKey: "VPN 启动已取消"]))
+            return
+        }
+        var configYAML = cachedInput.0
         incomingConfig = nil
-        var resolvedSettings = injectingSystemDNS(into:
-            resolveCached(incoming: settingsJSON.isEmpty ? nil : settingsJSON,
-                          home: home, file: "settings.json") ?? "")
+        var resolvedSettings = injectingSystemDNS(into: cachedInput.1)
         if sharedHome == nil {
             resolvedSettings = Self.disablingGeo(in: resolvedSettings)
         }
@@ -172,6 +209,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                                                   settingsJSON: resolvedSettings,
                                                   home: home) {
             FileLog.write("GEO / ASN 数据检查失败：\(geoError.localizedDescription)")
+            cleanupFailedStart(generation: startGeneration)
             completionHandler(geoError)
             return
         }
@@ -186,13 +224,18 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                                                   ipv6Enabled: ipv6Enabled)
         // 在创建 utun 前启动物理路径监控。弱网切换时即使 NE 仍在等待
         // mihomo 启动，也要先把最新的 en0/pdp_ip0 预绑定给内核。
-        self.startPathMonitor()
+        self.startPathMonitor(generation: startGeneration)
         setTunnelNetworkSettings(networkSettings) { [weak self] error in
             guard let self else { return }
+            guard self.isCurrentIPCSession(startGeneration) else {
+                completionHandler(NSError(domain: "CoraTunnel", code: -5,
+                    userInfo: [NSLocalizedDescriptionKey: "VPN 启动已取消"]))
+                return
+            }
             if let error {
+                self.cleanupFailedStart(generation: startGeneration)
                 FileLog.write("应用网络设置失败：\(error.localizedDescription)")
                 self.log.error("应用网络设置失败：\(error.localizedDescription, privacy: .public)")
-                self.stopPathMonitor()
                 completionHandler(error)
                 return
             }
@@ -203,7 +246,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                   let fd = self.findTunnelFileDescriptor(named: interface.name) else {
                 FileLog.write("未找到 utun fd（getifaddrs/getsockopt 都没命中网关 IP）")
                 self.log.error("未找到 utun 文件描述符")
-                self.stopPathMonitor()
+                self.cleanupFailedStart(generation: startGeneration)
                 completionHandler(NSError(domain: "CoraTunnel", code: -1,
                     userInfo: [NSLocalizedDescriptionKey: "未找到 utun fd"]))
                 return
@@ -214,7 +257,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 let message = "iOS 创建的 MTU（\(systemMTU)）与配置 tun.mtu（\(configuredMTU)）不一致"
                 FileLog.write("MTU 应用失败：\(message)")
                 self.log.error("MTU 应用失败：\(message, privacy: .public)")
-                self.stopPathMonitor()
+                self.cleanupFailedStart(generation: startGeneration)
                 completionHandler(NSError(
                     domain: "CoraTunnel",
                     code: -6,
@@ -233,16 +276,18 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 settingsJSON: resolvedSettings,
                 home: home,
                 preferSettings: !settingsJSON.isEmpty)
-            self.runtimeQueue.sync {
+            var startError: NSError?
+            let startResult: Bool? = self.runtimeQueue.sync {
+                guard !self.isStopping, self.isCurrentIPCSession(startGeneration) else { return nil }
                 self.configureMemoryDiagnostics(enabled: developerMode,
                                                  home: home,
                                                  persistState: !settingsJSON.isEmpty)
-            }
-            var startError: NSError?
-            let startResult: Bool? = self.runtimeQueue.sync {
-                guard !self.isStopping else { return nil }
                 let ok = MihomoStartWithConfig(
                     Int(fd), actualMTU, configYAML, resolvedSettings, &startError)
+                guard self.isCurrentIPCSession(startGeneration) else {
+                    MihomoStop()
+                    return nil
+                }
                 if ok {
                     FileLog.write("MihomoStartWithConfig 返回成功")
                     self.log.info("mihomo 启动成功")
@@ -273,25 +318,13 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             configYAML = ""
             resolvedSettings = ""
             guard let startResult else {
-                self.stopPathMonitor()
-                self.runtimeQueue.sync {
-                    self.memoryDiagnostics?.stop(event: "startCancelled")
-                    self.memoryDiagnostics = nil
-                    self.developerModeEnabled = false
-                }
-                completionHandler(NSError(
-                    domain: "CoraTunnel",
-                    code: -5,
+                self.cleanupFailedStart(generation: startGeneration)
+                completionHandler(NSError(domain: "CoraTunnel", code: -5,
                     userInfo: [NSLocalizedDescriptionKey: "VPN 启动已取消"]))
                 return
             }
             guard startResult else {
-                self.stopPathMonitor()
-                self.runtimeQueue.sync {
-                    self.memoryDiagnostics?.stop(event: "startFailed")
-                    self.memoryDiagnostics = nil
-                    self.developerModeEnabled = false
-                }
+                self.cleanupFailedStart(generation: startGeneration)
                 let error = startError ?? NSError(domain: "CoraTunnel", code: -3,
                     userInfo: [NSLocalizedDescriptionKey: "mihomo 启动失败（未知错误）"])
                 FileLog.write("MihomoStartWithConfig 失败：\(error.localizedDescription)")
@@ -302,17 +335,40 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
             let stillRunning = self.runtimeQueue.sync {
                 !self.isStopping && self.tunnelFileDescriptor == fd
+                    && self.isCurrentIPCSession(startGeneration)
             }
             if stillRunning {
                 completionHandler(nil)
             } else {
-                self.stopPathMonitor()
+                self.cleanupFailedStart(generation: startGeneration)
                 completionHandler(NSError(
                     domain: "CoraTunnel",
                     code: -5,
                     userInfo: [NSLocalizedDescriptionKey: "VPN 启动已取消"]))
             }
         }
+    }
+
+    private func cleanupFailedStart(generation: UInt64) {
+        let oldServer = runtimeQueue.sync { () -> TrollStoreFileIPCServer? in
+            guard currentIPCSessionGeneration() == generation else { return nil }
+            let server = trollStoreIPCServer
+            trollStoreIPCServer = nil
+            clearStoredIPCResponses(enableCaching: false)
+            isStopping = true
+            tunnelFileDescriptor = nil
+            AppGroupState.vpnConnected = false
+            stopPathMonitor()
+            connectionHistoryRecorder.stop()
+            memoryPressureGuard?.stop()
+            memoryPressureGuard = nil
+            MihomoStop()
+            memoryDiagnostics?.stop(event: "startRollback")
+            memoryDiagnostics = nil
+            developerModeEnabled = false
+            return server
+        }
+        oldServer?.stop()
     }
 
     /// 配置解析：App option 非空=订阅，显式空=内建 DIRECT；无 option=系统重连复用缓存。
@@ -358,9 +414,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                             completionHandler: @escaping () -> Void) {
         FileLog.write("stopTunnel，原因 rawValue=\(reason.rawValue)")
         log.info("stopTunnel，原因：\(reason.rawValue, privacy: .public)")
-        stopTrollStoreIPC()
-        clearStoredIPCResponses(enableCaching: false)
-        runtimeQueue.sync {
+        let stoppedGeneration = clearStoredIPCResponses(enableCaching: false)
+        let oldServer = runtimeQueue.sync { () -> TrollStoreFileIPCServer? in
+            guard currentIPCSessionGeneration() == stoppedGeneration else { return nil }
+            let server = trollStoreIPCServer
+            trollStoreIPCServer = nil
             isStopping = true
             tunnelFileDescriptor = nil
             AppGroupState.vpnConnected = false // 同步给控制中心磁贴
@@ -372,49 +430,58 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             memoryPressureGuard?.stop()
             memoryPressureGuard = nil
             memoryDiagnostics?.record(event: "tunnelStopping")
-            memoryDiagnostics?.stop(event: "stop")
+            MihomoStop()
+            memoryDiagnostics?.stop(event: "stopCompleted")
             memoryDiagnostics = nil
             developerModeEnabled = false
-            MihomoStop()
             // 断开才清空延迟快照；App 进程退出或进入后台不会触发这里。
             ProxyDelayStore.clear()
+            return server
         }
+        oldServer?.stop()
         completionHandler()
     }
 
-    private func startTrollStoreIPCIfNeeded() {
+    private func startTrollStoreIPCIfNeeded(generation: UInt64) {
         guard TrollStoreIPC.isEnabled else { return }
         let server = TrollStoreFileIPCServer { [weak self] request, reply in
             guard let self else {
                 reply(nil)
                 return
             }
-            self.handleAppMessage(request, completionHandler: reply)
+            self.handleControlMessage(request, generation: generation, completionHandler: reply)
         }
-        guard server.start() else {
-            FileLog.write("TrollStore 文件 IPC 启动失败：共享控制目录不可用")
+        let installed = runtimeQueue.sync {
+            guard !isStopping, isCurrentIPCSession(generation) else { return false }
+            // start only sets up the watcher; its handlers run asynchronously.
+            // Validate and install under one lifecycle boundary so an old
+            // startup cannot clear the next session's shared request files.
+            guard server.start() else {
+                FileLog.write("TrollStore 文件 IPC 启动失败：共享控制目录不可用")
+                return false
+            }
+            trollStoreIPCServer = server
+            return true
+        }
+        guard installed else {
+            server.stop()
             return
         }
-        trollStoreIPCServer = server
         FileLog.write("TrollStore 文件 IPC 已启动")
-    }
-
-    private func stopTrollStoreIPC() {
-        trollStoreIPCServer?.stop()
-        trollStoreIPCServer = nil
     }
 
     // MARK: - 物理接口监控
 
     /// 监控网络路径，把真实出站接口名喂给 mihomo（取代其自带的 iOS 下不可靠的接口监控）。
     /// 出站绑对物理网卡才不会被默认路由兜回 tun → 这是吞吐能跑满的关键。
-    private func startPathMonitor() {
+    private func startPathMonitor(generation: UInt64) {
         pathMonitorQueue.async { [weak self] in
-            guard let self else { return }
+            guard let self, self.isCurrentIPCSession(generation) else { return }
             self.stopPathMonitorLocked()
             let monitor = NWPathMonitor()
             monitor.pathUpdateHandler = { [weak self] path in
-                self?.schedulePathUpdate(path)
+                guard let self, self.isCurrentIPCSession(generation) else { return }
+                self.schedulePathUpdate(path)
             }
             monitor.start(queue: self.pathMonitorQueue)
             self.pathMonitor = monitor
@@ -767,9 +834,24 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     /// 关键：completionHandler 必须**非 nil 回调**，否则主 App 侧 resp 为 nil。
     override func handleAppMessage(_ messageData: Data,
                                   completionHandler: ((Data?) -> Void)?) {
+        handleControlMessage(messageData, generation: currentIPCSessionGeneration(),
+                             completionHandler: completionHandler)
+    }
+
+    private func handleControlMessage(_ messageData: Data, generation sessionGeneration: UInt64,
+                                      completionHandler: ((Data?) -> Void)?) {
+        guard isCurrentIPCSession(sessionGeneration) else {
+            completionHandler?(Self.jsonData(["ok": false, "error": "控制请求已过期", "code": "cancelled"]))
+            return
+        }
+        guard messageData.count <= Self.ipcMaximumRequestBytes else {
+            completionHandler?(Self.jsonData(["ok": false,
+                                               "error": "控制请求超过 1 MB 上限",
+                                               "code": "request_too_large"]))
+            return
+        }
         let obj = (try? JSONSerialization.jsonObject(with: messageData)) as? [String: Any]
         let cmd = (obj?["cmd"] as? String) ?? String(data: messageData, encoding: .utf8) ?? ""
-        let sessionGeneration = currentIPCSessionGeneration()
         let reply: (Data?) -> Void = { [weak self] data in
             guard let self, let data else {
                 completionHandler?(data)
@@ -836,42 +918,46 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         case "hello":
             reply(Data(MihomoControlInfo().utf8))
         case "queryProxies":
-            enqueueIPCWork(generation: sessionGeneration, reply: reply) {
+            enqueueIPCWork(generation: sessionGeneration, workClass: .snapshot, reply: reply) {
                 reply(MihomoQueryProxiesData())
             }
         case "remoteResourceStatus":
-            enqueueIPCWork(generation: sessionGeneration, reply: reply) {
+            enqueueIPCWork(generation: sessionGeneration, workClass: .light, reply: reply) {
                 reply(Data(MihomoRemoteResourceStatus().utf8))
             }
         case "updateProxyProviders":
             recordMemoryDiagnostic("providerUpdateStart")
-            enqueueIPCWork(generation: sessionGeneration, reply: reply) {
-                let response = MihomoUpdateProxyProviders()
+            enqueueIPCWork(generation: sessionGeneration, workClass: .heavy,
+                           key: "proxyProviders:all", reply: reply) {
+                let response = MihomoUpdateProxyProvidersData()
                 self.recordMemoryDiagnostic("providerUpdateEnd")
-                reply(Data(response.utf8))
+                reply(response)
             }
         case "updateProxyProvider":
             let name = (obj?["name"] as? String) ?? ""
             recordMemoryDiagnostic("providerUpdateStart")
-            enqueueIPCWork(generation: sessionGeneration, reply: reply) {
-                let response = MihomoUpdateProxyProvider(name)
+            enqueueIPCWork(generation: sessionGeneration, workClass: .heavy,
+                           key: "proxyProviders:node:\(name)", reply: reply) {
+                let response = MihomoUpdateProxyProviderData(name)
                 self.recordMemoryDiagnostic("providerUpdateEnd")
-                reply(Data(response.utf8))
+                reply(response)
             }
         case "updateRuleProviders":
             recordMemoryDiagnostic("ruleProviderUpdateStart")
-            enqueueIPCWork(generation: sessionGeneration, reply: reply) {
-                let response = MihomoUpdateRuleProviders()
+            enqueueIPCWork(generation: sessionGeneration, workClass: .heavy,
+                           key: "ruleProviders:all", reply: reply) {
+                let response = MihomoUpdateRuleProvidersData()
                 self.recordMemoryDiagnostic("ruleProviderUpdateEnd")
-                reply(Data(response.utf8))
+                reply(response)
             }
         case "updateRuleProvider":
             let name = (obj?["name"] as? String) ?? ""
             recordMemoryDiagnostic("ruleProviderUpdateStart")
-            enqueueIPCWork(generation: sessionGeneration, reply: reply) {
-                let response = MihomoUpdateRuleProvider(name)
+            enqueueIPCWork(generation: sessionGeneration, workClass: .heavy,
+                           key: "ruleProviders:node:\(name)", reply: reply) {
+                let response = MihomoUpdateRuleProviderData(name)
                 self.recordMemoryDiagnostic("ruleProviderUpdateEnd")
-                reply(Data(response.utf8))
+                reply(response)
             }
         case "selectProxy":
             let group = (obj?["group"] as? String) ?? ""
@@ -887,7 +973,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             let directURL = (obj?["directURL"] as? String) ?? ""
             let timeout = (obj?["timeout"] as? NSNumber)?.intValue ?? 5000
             recordMemoryDiagnostic("groupDelayStart")
-            enqueueIPCWork(generation: sessionGeneration, reply: reply) {
+            enqueueIPCWork(generation: sessionGeneration, workClass: .heavy, reply: reply) {
                 let response = MihomoGroupDelay(group, url, directURL, timeout)
                 self.recordMemoryDiagnostic("groupDelayEnd")
                 reply(Self.validatedCoreJSONData(response, command: "groupDelay"))
@@ -899,7 +985,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             let directURL = (obj?["directURL"] as? String) ?? ""
             let timeout = (obj?["timeout"] as? NSNumber)?.intValue ?? 5000
             recordMemoryDiagnostic("proxyDelayStart")
-            enqueueIPCWork(generation: sessionGeneration, reply: reply) {
+            enqueueIPCWork(generation: sessionGeneration, workClass: .heavy, reply: reply) {
                 let response = MihomoProxyDelay(name, group, url, directURL, timeout)
                 self.recordMemoryDiagnostic("proxyDelayEnd")
                 reply(Self.validatedCoreJSONData(response, command: "proxyDelay"))
@@ -916,7 +1002,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             let directURL = (obj?["directURL"] as? String) ?? ""
             let timeout = (obj?["timeout"] as? NSNumber)?.intValue ?? 5000
             recordMemoryDiagnostic("proxyDelaysStart")
-            enqueueIPCWork(generation: sessionGeneration, reply: reply) {
+            enqueueIPCWork(generation: sessionGeneration, workClass: .heavy, reply: reply) {
                 let response = MihomoProxyDelays(targetsJSON, url, directURL, timeout)
                 self.recordMemoryDiagnostic("proxyDelaysEnd")
                 reply(Self.validatedCoreJSONData(response, command: "proxyDelays"))
@@ -924,8 +1010,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         case "readRuleProvider":
             let name = (obj?["name"] as? String) ?? ""
             let maxBytes = (obj?["maxBytes"] as? NSNumber)?.intValue ?? (1 * 1024 * 1024)
-            enqueueIPCWork(generation: sessionGeneration, reply: reply) {
-                reply(Data(MihomoRuleProviderContent(name, maxBytes).utf8))
+            enqueueIPCWork(generation: sessionGeneration, workClass: .snapshot, reply: reply) {
+                reply(MihomoRuleProviderContentData(name, maxBytes))
             }
         case "scriptFetch":
             guard let request = obj?["request"] as? [String: Any],
@@ -934,22 +1020,23 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 reply(Self.jsonData(["ok": false, "error": "脚本请求参数无效"]))
                 return
             }
-            enqueueIPCWork(generation: sessionGeneration, reply: reply) {
+            enqueueIPCWork(generation: sessionGeneration, workClass: .script,
+                           scriptID: request["scriptID"] as? String, reply: reply) {
                 reply(MihomoScriptFetchData(requestJSON))
             }
         case "scriptTargetInfo":
             let name = (obj?["name"] as? String) ?? ""
             let group = (obj?["group"] as? String) ?? ""
-            enqueueIPCWork(generation: sessionGeneration, reply: reply) {
-                reply(Data(MihomoScriptTargetInfo(name, group).utf8))
+            enqueueIPCWork(generation: sessionGeneration, workClass: .snapshot, reply: reply) {
+                reply(MihomoScriptTargetInfoData(name, group))
             }
         case "directNetworkInfo":
-            enqueueIPCWork(generation: sessionGeneration, reply: reply) {
-                reply(Data(MihomoDirectNetworkInfo().utf8))
+            enqueueIPCWork(generation: sessionGeneration, workClass: .snapshot, reply: reply) {
+                reply(MihomoDirectNetworkInfoData())
             }
         case "connections":
             let limit = (obj?["limit"] as? NSNumber)?.intValue ?? 200
-            enqueueIPCWork(generation: sessionGeneration, reply: reply) {
+            enqueueIPCWork(generation: sessionGeneration, workClass: .snapshot, reply: reply) {
                 reply(MihomoConnectionsSnapshotData(limit))
             }
         case "closeConnection":
@@ -965,7 +1052,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 "closed": Int(MihomoCloseAllConnections()),
             ]))
         case "traffic":
-            reply(Data(MihomoTrafficNow().utf8))
+            reply(MihomoTrafficNowData())
         case "memory":
             reply(Self.memoryFootprintData())
         case "releaseMemory":
@@ -999,7 +1086,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         case "runtime":
             // RuntimeStats is a compact, on-demand snapshot. It does not start
             // a sampler or retain any connection details in the NE.
-            reply(Data(MihomoRuntimeStats().utf8))
+            enqueueIPCWork(generation: sessionGeneration, workClass: .light, reply: reply) {
+                reply(MihomoRuntimeStatsData())
+            }
         case "networkInfo":
             reply(networkDiagnosticData())
         case "setMemoryDiagnostics":
@@ -1009,7 +1098,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 ? ["ok": true, "enabled": result.enabled]
                 : ["ok": false, "error": result.error ?? "开发者诊断不可用"]))
         case "memoryDiagnostics":
-            enqueueIPCWork(generation: sessionGeneration, reply: reply) {
+            enqueueIPCWork(generation: sessionGeneration, workClass: .snapshot, reply: reply) {
                 let enabled = self.runtimeQueue.sync { self.developerModeEnabled }
                 guard enabled else {
                     reply(Data("开发者模式未开启".utf8))
@@ -1029,7 +1118,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 ? ["ok": true]
                 : ["ok": false, "error": result.error ?? "清理诊断失败"]))
         case "proxyDetails":
-            enqueueIPCWork(generation: sessionGeneration, reply: reply) {
+            enqueueIPCWork(generation: sessionGeneration, workClass: .snapshot, reply: reply) {
                 reply(MihomoProxyDetailsData())
             }
         case "configNotices":
@@ -1042,8 +1131,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         case "runLogChunk":
             let offset = (obj?["offset"] as? NSNumber)?.intValue ?? -1
             let generation = (obj?["generation"] as? NSNumber)?.intValue ?? 0
-            enqueueIPCWork(generation: sessionGeneration, reply: reply) {
-                reply(Data(MihomoRunLogChunk(offset, generation).utf8))
+            enqueueIPCWork(generation: sessionGeneration, workClass: .light, reply: reply) {
+                reply(MihomoRunLogChunkData(offset, generation))
             }
         case "readResponseChunk":
             completionHandler?(responseChunk(token: obj?["token"] as? String,
@@ -1051,14 +1140,14 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                                               generation: sessionGeneration))
         case "getLogs":
             // 日志可能很大，IPC 响应有体积上限 → 只回传末尾约 24KB，取最新内容。
-            enqueueIPCWork(generation: sessionGeneration, reply: reply) {
+            enqueueIPCWork(generation: sessionGeneration, workClass: .snapshot, reply: reply) {
                 let body = "[cmd=\(cmd)]\n" + self.collectLogs()
                 reply(Self.tailData(body, maxBytes: 24 * 1024))
             }
         case "exportNELog":
             // 只导出有界的 NE 专用日志；不包含完整 run.log，避免事故备份本身
             // 在 NE 内制造不必要的内存峰值。
-            enqueueIPCWork(generation: sessionGeneration, reply: reply) {
+            enqueueIPCWork(generation: sessionGeneration, workClass: .heavy, reply: reply) {
                 reply(Data(FileLog.export().utf8))
             }
         default:
@@ -1073,17 +1162,32 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     /// callback thread remains free. Responses still carry a session
     /// generation check, so an old task cannot populate a new tunnel session.
     private func enqueueIPCWork(generation: UInt64,
+                                workClass: IPCControlScheduler.WorkClass = .snapshot,
+                                key: String? = nil,
+                                scriptID: String? = nil,
                                 reply: @escaping (Data?) -> Void,
                                 operation: @escaping () -> Void) {
-        ipcQueue.async { [self] in
-            guard isCurrentIPCSession(generation) else {
+        // Provider single-flight keys are scoped to the tunnel session. An
+        // old session may still be unwinding a cancelled network request;
+        // it must not block the same refresh in a newly started session.
+        let scopedKey = key.map { "\($0)#\(generation)" }
+        let accepted = ipcScheduler.submit(workClass, key: scopedKey, scriptID: scriptID, operation: { [weak self] in
+            guard let self else { return }
+            guard self.isCurrentIPCSession(generation) else {
                 reply(Self.jsonData(["ok": false, "error": "控制请求已过期"]))
                 return
             }
-            autoreleasepool {
-                operation()
-            }
-        }
+            operation()
+        }, onReject: {
+            reply(Self.jsonData(["ok": false, "error": "控制任务繁忙，请稍后重试", "code": "busy"]))
+        }, onCancel: {
+            reply(Self.jsonData(["ok": false, "error": "控制请求已过期", "code": "cancelled"]))
+        }, onTimeout: {
+            reply(Self.jsonData(["ok": false, "error": "控制任务排队超时", "code": "timeout"]))
+        })
+        // submit invokes onReject synchronously. Keep this explicit for
+        // readability and future scheduler implementations.
+        _ = accepted
     }
 
     private func isCurrentIPCSession(_ generation: UInt64) -> Bool {
@@ -1128,6 +1232,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private func memoryDiagnosticSupplementalStats() -> MemoryDiagnostics.SupplementalStats {
         let responseStats = ipcResponseCache.stats()
         let logStats = FileLog.stats()
+        let schedulerStats = ipcScheduler.stats()
         return MemoryDiagnostics.SupplementalStats(
             ipcResponseCount: responseStats.count,
             ipcResponseBytes: UInt64(responseStats.payloadBytes),
@@ -1135,11 +1240,24 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             ipcResponseFileBytes: UInt64(responseStats.fileBytes),
             logBufferedLines: logStats.bufferedLines,
             logBufferedBytes: logStats.bufferedBytes,
-            logPersistedBytes: logStats.persistedBytes)
+            logPersistedBytes: logStats.persistedBytes,
+            ipcInFlight: schedulerStats.inFlight,
+            ipcQueueDepth: schedulerStats.queueDepth,
+            ipcPeakInFlight: schedulerStats.peakInFlight,
+            ipcRejected: schedulerStats.rejected,
+            ipcPeakQueueDepth: schedulerStats.peakQueueDepth,
+            ipcCancelled: schedulerStats.cancelled,
+            ipcTimedOut: schedulerStats.timedOut,
+            ipcCompletedByClass: schedulerStats.completedByClass,
+            ipcDurationMsByClass: schedulerStats.durationMsByClass,
+            historyStats: connectionHistoryRecorder.stats())
     }
 
-    private func clearStoredIPCResponses(enableCaching: Bool? = nil) {
-        ipcResponseCache.reset(enableCaching: enableCaching)
+    @discardableResult
+    private func clearStoredIPCResponses(enableCaching: Bool? = nil) -> UInt64 {
+        let generation = ipcResponseCache.reset(enableCaching: enableCaching)
+        ipcScheduler.cancelPending()
+        return generation
     }
 
     private func currentIPCSessionGeneration() -> UInt64 {
@@ -1209,7 +1327,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         let tunnelInfo = runtimeQueue.sync { (tunnelFileDescriptor.map(Int.init) ?? -1, tunnelInterfaceInfo()?.mtu ?? 0) }
         var result = pathData
-        result["systemDNS"] = systemDNSServers
+        result["systemDNS"] = currentSystemDNSServers()
         result["utunFD"] = tunnelInfo.0
         result["utunMTU"] = tunnelInfo.1
         return Self.jsonData(result)

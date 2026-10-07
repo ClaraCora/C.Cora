@@ -38,6 +38,18 @@ struct MemoryDiagnosticSample: Decodable {
         let logBufferedLines: Int?
         let logBufferedBytes: UInt64?
         let logPersistedBytes: UInt64?
+        let ipcInFlight: Int?
+        let ipcQueueDepth: Int?
+        let ipcPeakInFlight: Int?
+        let ipcRejected: Int?
+        let ipcCancelled: Int?
+        let ipcTimedOut: Int?
+        let historySampleBytes: UInt64?
+        let historyClosedBytes: UInt64?
+        let historyClosedRows: Int?
+        let historyWriteDurationMs: UInt64?
+        let historyWriteFailures: Int?
+        let historyStoreRetries: Int?
     }
 
     struct FakeIPDiagnostic: Decodable {
@@ -85,6 +97,15 @@ struct MemoryDiagnosticSample: Decodable {
         let connectionSnapshotBytes: Int64?
         let closedSnapshotBytes: Int64?
         let closedQueuePending: Int?
+        let runtimeGeneration: UInt64?
+        let providerRefreshActive: Int?
+        let providerRefreshTasks: Int?
+        let closableProviders: Int?
+        let ntpActive: Bool?
+        let logCaptureActive: Bool?
+        let scriptTargetIPCacheEntries: Int?
+        let scriptTargetIPCacheBytes: UInt64?
+        let scriptTargetIPCacheStaleEntries: Int?
         let mihomoBufferPoolBuffers: Int?
         let mihomoBufferPoolBytes: UInt64?
         let mihomoBufferPoolMaxBytes: UInt64?
@@ -465,6 +486,26 @@ enum MemoryDiagnosticAnalyzer {
             "ASN \(formatBytes(latest("asnFileBytes", summary: summary, fallback: last?.go?.asnFileBytes, sampleTime: last?.t)))",
         ].joined(separator: " / ")
         let releaseLine = releaseComparisonText(summary: summary, samples: samplesForAnalysis)
+        func count(_ key: String, _ fallback: Int?) -> String {
+            formatCount(latestInt(key, summary: summary, fallback: fallback, sampleTime: last?.t))
+        }
+        func bytes(_ key: String, _ fallback: UInt64?) -> String {
+            formatBytes(latest(key, summary: summary, fallback: fallback, sampleTime: last?.t))
+        }
+        func activity(_ key: String, _ fallback: Bool?) -> String {
+            guard let active = latestInt(key, summary: summary,
+                                         fallback: fallback.map { $0 ? 1 : 0 }, sampleTime: last?.t) else {
+                return "未知"
+            }
+            return active == 0 ? "已停止" : "运行中"
+        }
+        let generation = latest("runtimeGeneration", summary: summary,
+                                fallback: last?.go?.runtimeGeneration, sampleTime: last?.t)
+            .map { String($0) } ?? "未知"
+        let lifecycleLine = "代次 \(generation)，日志订阅 \(activity("logCaptureActive", last?.go?.logCaptureActive))，NTP \(activity("ntpActive", last?.go?.ntpActive))，Provider 刷新任务 \(count("providerRefreshTasks", last?.go?.providerRefreshTasks)) / 控制请求 \(count("providerRefreshActive", last?.go?.providerRefreshActive)) / 可关闭 \(count("closableProviders", last?.go?.closableProviders))"
+        let controlLine = "执行 \(count("ipcInFlight", last?.cora?.ipcInFlight))/8，排队 \(count("ipcQueueDepth", last?.cora?.ipcQueueDepth))/24，执行峰值 \(count("ipcPeakInFlight", last?.cora?.ipcPeakInFlight))，拒绝 \(count("ipcRejected", last?.cora?.ipcRejected)) / 取消 \(count("ipcCancelled", last?.cora?.ipcCancelled)) / 排队超时 \(count("ipcTimedOut", last?.cora?.ipcTimedOut))"
+        let historyLine = "活动采样 \(bytes("historySampleBytes", last?.cora?.historySampleBytes))，关闭批次 \(count("historyClosedRows", last?.cora?.historyClosedRows)) 条 / \(bytes("historyClosedBytes", last?.cora?.historyClosedBytes))，最近写入 \(count("historyWriteDurationMs", last?.cora?.historyWriteDurationMs.map { Int(clamping: $0) }))ms，写入失败 \(count("historyWriteFailures", last?.cora?.historyWriteFailures)) / 打开重试 \(count("historyStoreRetries", last?.cora?.historyStoreRetries))"
+        let scriptCacheLine = "\(count("scriptTargetIPCacheEntries", last?.go?.scriptTargetIPCacheEntries)) 条，文本 \(bytes("scriptTargetIPCacheBytes", last?.go?.scriptTargetIPCacheBytes))，已过期 \(count("scriptTargetIPCacheStaleEntries", last?.go?.scriptTargetIPCacheStaleEntries)) 条（不含 map/对象开销）"
 
         return [
             "采样 \(sampleCount) 条 · \(duration)",
@@ -479,6 +520,7 @@ enum MemoryDiagnosticAnalyzer {
             "GC 目标：\(memoryLimit)，GOGC=\(gcPercent)，CPU \(formatFraction(gcFraction))",
             "连接：\(formatCount(connections))（TCP \(formatCount(tcp)) / UDP \(formatCount(udp))），goroutine \(formatCount(goroutines))",
             "Provider：节点 \(formatCount(proxyProviders)) 个 / 条目合计 \(formatCount(providerNodes))，规则 \(formatCount(ruleProviders)) 个 / 规则合计 \(formatCount(providerRules))",
+            "运行时生命周期：\(lifecycleLine)",
             "代理目录：\(formatCount(proxies)) 项，策略组 \(formatCount(policyGroups)) 个（Provider 条目可能重复）",
             "DNS：\(formatCount(dnsEntries)) 条 / \(formatCount(dnsCaches)) 份独立缓存，域名映射 \(formatCount(mappingEntries)) 条；Fake-IP v4 \(fake4) / v6 \(fake6)",
             "TUN 等待队列：接收 \(formatCount(rxPackets)) 包 / \(formatBytes(rxBytes))，发送 \(formatCount(txPackets)) 包 / \(formatBytes(txBytes))（包长度，不含处理中的批次）",
@@ -487,6 +529,9 @@ enum MemoryDiagnosticAnalyzer {
             "连接快照：活动 \(formatSignedBytes(snapshotBytes))，关闭队列 \(formatSignedBytes(closedSnapshotBytes))，待释放 \(formatCount(closedQueuePending)) 条",
             "大块缓冲池：\(bufferPoolLine)",
             "IPC/日志缓存：\(coraLine)",
+            "控制任务：\(controlLine)",
+            "连接历史写入：\(historyLine)",
+            "脚本入口 IP 缓存：\(scriptCacheLine)",
             "来源说明：缓冲池/队列与 Go 堆重叠；DNS、Fake-IP、Provider 是条目数，GEO 是磁盘大小，不能相加为物理内存。",
             releaseLine,
             "诊断压力事件：\(pressure)（冷却合并 \(pressureSuppressed)），最近采样耗时 \(sampleDuration)",

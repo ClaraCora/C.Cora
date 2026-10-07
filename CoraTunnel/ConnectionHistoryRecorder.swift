@@ -6,6 +6,29 @@ import Mihomo
 /// map is capped well below a Packet Tunnel's memory budget and is never sent
 /// across IPC as a history payload.
 final class ConnectionHistoryRecorder {
+    struct Stats {
+        var sampleBytes = 0
+        var closedBytes = 0
+        var closedRows = 0
+        var writeDurationMs: Double = 0
+        var writeFailures = 0
+        var storeRetries = 0
+    }
+    private let statsLock = NSLock()
+    private var diagnosticStats = Stats()
+
+    func stats() -> Stats {
+        statsLock.lock()
+        defer { statsLock.unlock() }
+        return diagnosticStats
+    }
+
+    private func updateStats(_ operation: (inout Stats) -> Void) {
+        statsLock.lock()
+        operation(&diagnosticStats)
+        statsLock.unlock()
+    }
+
     // Keep the NE-side JSON and SQLite batch bounded. Activity is sampled less
     // often than the close queue because active rows change continuously while
     // closed rows need prompt final counters for the record screen.
@@ -30,15 +53,16 @@ final class ConnectionHistoryRecorder {
     private var lastMaintenanceDate = Date.distantPast
 
     func start() {
-        queue.async { [weak self] in
-            guard let self, self.isStopped else { return }
-            self.isStopped = false
-            self.sessionGeneration &+= 1
-            let generation = self.sessionGeneration
+        queue.sync {
+            guard isStopped else { return }
+            self.updateStats { $0 = Stats() }
+            isStopped = false
+            sessionGeneration &+= 1
+            let generation = sessionGeneration
             // Mihomo's close queue cursor belongs to the current core process.
             // A restarted core begins again at zero.
-            self.closedCursor = 0
-            self.openStoreAndStartTimerLocked(generation: generation)
+            closedCursor = 0
+            openStoreAndStartTimerLocked(generation: generation)
         }
     }
 
@@ -122,6 +146,7 @@ final class ConnectionHistoryRecorder {
         let interval = Self.storeRetryIntervals[
             min(storeRetryAttempt, Self.storeRetryIntervals.count - 1)]
         storeRetryAttempt += 1
+        updateStats { $0.storeRetries += 1 }
         storeRetryWorkItem = workItem
         queue.asyncAfter(deadline: .now() + interval,
                          execute: workItem)
@@ -131,12 +156,15 @@ final class ConnectionHistoryRecorder {
         guard let store else { return }
         autoreleasepool {
             if let payload = MihomoConnectionHistorySnapshot(Self.snapshotLimit),
-               let snapshot = ConnectionHistoryRecord.coreSnapshot(from: payload),
-               store.upsertActive(snapshot.records) {
-                // The IPC snapshot is normally complete. When it is capped, a
-                // missing ID might still be live, so rely on Mihomo's bounded
-                // close queue instead of falsely ending it.
-                if !snapshot.isTruncated {
+               let snapshot = ConnectionHistoryRecord.coreSnapshot(from: payload) {
+                let started = ProcessInfo.processInfo.systemUptime
+                let committed = store.upsertActive(snapshot.records)
+                updateStats {
+                    $0.sampleBytes = payload.count
+                    $0.writeDurationMs = (ProcessInfo.processInfo.systemUptime - started) * 1_000
+                    if !committed { $0.writeFailures += 1 }
+                }
+                if committed, !snapshot.isTruncated {
                     store.finishActive(except: snapshot.records.map { $0.id })
                 }
             }
@@ -147,15 +175,22 @@ final class ConnectionHistoryRecorder {
     private func drainClosedQueueLocked() {
         guard let store else { return }
         autoreleasepool {
-            if let closedPayload = MihomoClosedConnectionHistorySnapshot(
-                closedCursor, Self.closedBatchLimit),
-               let snapshot = ConnectionHistoryRecord.coreSnapshot(from: closedPayload),
-               store.upsertClosed(snapshot.records) {
-                // Acknowledge only a committed batch. If SQLite is temporarily
-                // busy/full, the next tick retries the same bounded close queue.
-                closedCursor = snapshot.cursor ?? closedCursor
-                if snapshot.dropped {
-                    FileLog.write("连接历史关闭队列溢出：极高短连接负载下可能漏记少量详情，VPN 转发未受影响")
+            if let payload = MihomoClosedConnectionHistorySnapshot(closedCursor, Self.closedBatchLimit),
+               let snapshot = ConnectionHistoryRecord.coreSnapshot(from: payload) {
+                let started = ProcessInfo.processInfo.systemUptime
+                let committed = store.upsertClosed(snapshot.records)
+                updateStats {
+                    $0.closedBytes = payload.count
+                    $0.closedRows = snapshot.records.count
+                    $0.writeDurationMs = (ProcessInfo.processInfo.systemUptime - started) * 1_000
+                    if !committed { $0.writeFailures += 1 }
+                }
+                // Acknowledge only a committed batch; failed writes retry the same cursor.
+                if committed {
+                    closedCursor = snapshot.cursor ?? closedCursor
+                    if snapshot.dropped {
+                        FileLog.write("连接历史关闭队列溢出：极高短连接负载下可能漏记少量详情，VPN 转发未受影响")
+                    }
                 }
             }
             runMaintenanceIfNeededLocked(store: store)

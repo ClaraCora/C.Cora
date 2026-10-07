@@ -36,6 +36,12 @@ jobs:
       - name: Test bounded IPC response storage
         run: bash scripts/test-ipc-response-cache.sh
 
+      - name: Test bounded IPC control scheduling
+        run: bash scripts/test-ipc-control-scheduler.sh
+
+      - name: Test TrollStore IPC request limits
+        run: bash scripts/test-trollstore-ipc-policy.sh
+
       - name: Test manual NE memory release
         run: bash scripts/test-kernel-memory.sh
 
@@ -136,11 +142,12 @@ jobs:
       - name: Verify patched Mihomo
         run: |
           set -euxo pipefail
-          go -C "$PATCHED_MIHOMO" test ./common/pool ./common/lru ./component/fakeip ./config ./tunnel ./tunnel/statistic ./component/dialer ./component/resolver ./dns ./adapter/outbound ./hub/executor ./hub/route ./rules/provider
-          go -C "$PATCHED_MIHOMO" test -tags "with_low_memory" ./common/pool ./common/lru ./component/fakeip ./config ./tunnel ./tunnel/statistic ./component/dialer ./component/resolver ./dns ./adapter/outbound ./hub/executor ./hub/route ./rules/provider
+          go -C "$PATCHED_MIHOMO" test ./common/pool ./common/lru ./component/fakeip ./config ./tunnel ./tunnel/statistic ./component/dialer ./component/resolver ./component/resource ./dns ./adapter/outbound ./adapter/provider ./hub/executor ./hub/route ./rules/provider ./ntp/ntp
+          go -C "$PATCHED_MIHOMO" test -tags "with_low_memory" ./common/pool ./common/lru ./component/fakeip ./config ./tunnel ./tunnel/statistic ./component/dialer ./component/resolver ./component/resource ./dns ./adapter/outbound ./adapter/provider ./hub/executor ./hub/route ./rules/provider ./ntp/ntp
           go -C "$PATCHED_MIHOMO" test -race -run 'TestTrimIdle|TestDiagnostic' ./common/pool ./common/lru ./component/fakeip ./dns ./rules/provider
-          go -C "$PATCHED_MIHOMO" vet ./tunnel ./component/dialer ./component/resolver ./dns ./adapter/outbound ./hub/executor ./hub/route ./rules/provider
-          go -C "$PATCHED_MIHOMO" vet -tags "with_low_memory" ./tunnel ./component/dialer ./component/resolver ./dns ./adapter/outbound ./hub/executor ./hub/route ./rules/provider
+          go -C "$PATCHED_MIHOMO" test -race -run 'TestRuntime' ./component/resource ./adapter/provider ./hub/executor ./ntp/ntp
+          go -C "$PATCHED_MIHOMO" vet ./tunnel ./component/dialer ./component/resolver ./component/resource ./dns ./adapter/outbound ./adapter/provider ./hub/executor ./hub/route ./rules/provider ./ntp/ntp
+          go -C "$PATCHED_MIHOMO" vet -tags "with_low_memory" ./tunnel ./component/dialer ./component/resolver ./component/resource ./dns ./adapter/outbound ./adapter/provider ./hub/executor ./hub/route ./rules/provider ./ntp/ntp
 
       - name: Verify patched gVisor TCP
         run: |
@@ -164,7 +171,11 @@ jobs:
         run: |
           set -euxo pipefail
           cd MobileCore
+          go test ./...
           go test -tags "with_gvisor,with_low_memory" ./...
+          go test -race -run 'TestRuntimeControl|TestRuntimeLogHome' ./...
+          go vet ./...
+          go vet -tags "with_gvisor,with_low_memory" ./...
 
       - name: Verify memory diagnostic analysis compatibility
         run: |

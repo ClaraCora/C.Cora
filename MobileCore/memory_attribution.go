@@ -3,6 +3,7 @@ package mihomo
 import (
 	"os"
 	"sync/atomic"
+	"time"
 
 	"github.com/metacubex/mihomo/adapter/outboundgroup"
 	"github.com/metacubex/mihomo/component/geodata"
@@ -17,12 +18,14 @@ import (
 // These categories overlap with Go heap accounting. File sizes and item
 // counts must never be added to heapAlloc or called precise resident bytes.
 type memoryAttribution struct {
-	ProxyCount         int `json:"proxyCount"`
-	PolicyGroupCount   int `json:"policyGroupCount"`
-	ProxyProviderNodes int `json:"proxyProviderNodes"`
-	RuleProviderRules  int `json:"ruleProviderRules"`
-	DNSCacheEntries    int `json:"dnsCacheEntries"`
-	DNSCacheCount      int `json:"dnsCacheCount"`
+	ProxyCount           int `json:"proxyCount"`
+	PolicyGroupCount     int `json:"policyGroupCount"`
+	ProxyProviderNodes   int `json:"proxyProviderNodes"`
+	RuleProviderRules    int `json:"ruleProviderRules"`
+	ClosableProviders    int `json:"closableProviders"`
+	ProviderRefreshTasks int `json:"providerRefreshTasks"`
+	DNSCacheEntries      int `json:"dnsCacheEntries"`
+	DNSCacheCount        int `json:"dnsCacheCount"`
 	*mdns.EnhancerCacheStats
 	*tun.QueueStats
 	GeoMode           string  `json:"geoMode"`
@@ -33,6 +36,11 @@ type memoryAttribution struct {
 	MMDBFileBytes     *uint64 `json:"mmdbFileBytes,omitempty"`
 	ASNFileBytes      *uint64 `json:"asnFileBytes,omitempty"`
 	ForceGCSuppressed uint64  `json:"forceGCSuppressed"`
+	// Script target IP lookup is session-local and bounded. Reporting its
+	// footprint helps distinguish a small retained cache from Go heap growth.
+	ScriptTargetIPCacheEntries      int    `json:"scriptTargetIPCacheEntries"`
+	ScriptTargetIPCacheBytes        uint64 `json:"scriptTargetIPCacheBytes"`
+	ScriptTargetIPCacheStaleEntries int    `json:"scriptTargetIPCacheStaleEntries"`
 }
 
 // Caller holds configApplyMu.RLock. This is used only by RuntimeStats queries
@@ -40,6 +48,8 @@ type memoryAttribution struct {
 func collectMemoryAttribution() memoryAttribution {
 	stats := memoryAttribution{GeoMode: "mmdb", GeoLoader: geodata.LoaderName(),
 		GeoSiteMatcher: geodata.SiteMatcherName(), ForceGCSuppressed: atomic.LoadUint64(&forceGCSuppressed)}
+	stats.ScriptTargetIPCacheEntries, stats.ScriptTargetIPCacheBytes,
+		stats.ScriptTargetIPCacheStaleEntries = scriptTargetIPCacheStats(time.Now())
 	if geodata.GeodataMode() {
 		stats.GeoMode = "dat"
 	}
@@ -56,6 +66,15 @@ func collectMemoryAttribution() memoryAttribution {
 	for _, provider := range tunnel.RuleProviders() {
 		if count, ok := provider.(interface{ DiagnosticRuleCount() int }); ok {
 			stats.RuleProviderRules += count.DiagnosticRuleCount()
+		}
+	}
+	for _, provider := range providerObjects(tunnel.Providers(), tunnel.RuleProviders()) {
+		switch provider.(type) {
+		case interface{ Close() error }, interface{ Close() }:
+			stats.ClosableProviders++
+		}
+		if active, ok := provider.(interface{ DiagnosticRefreshActive() int }); ok {
+			stats.ProviderRefreshTasks += active.DiagnosticRefreshActive()
 		}
 	}
 	runtime := resolver.CurrentDNSRuntime()

@@ -1,0 +1,1057 @@
+diff --git a/adapter/provider/healthcheck.go b/adapter/provider/healthcheck.go
+index 822a00d..d4154fe 100644
+--- a/adapter/provider/healthcheck.go
++++ b/adapter/provider/healthcheck.go
+@@ -9,6 +9,7 @@ import (
+ 	"github.com/metacubex/mihomo/common/atomic"
+ 	"github.com/metacubex/mihomo/common/singledo"
+ 	"github.com/metacubex/mihomo/common/utils"
++	"github.com/metacubex/mihomo/component/resource"
+ 	C "github.com/metacubex/mihomo/constant"
+ 	"github.com/metacubex/mihomo/log"
+ 
+@@ -27,6 +28,7 @@ type extraOption struct {
+ }
+ 
+ type HealthCheck struct {
++	tasks          resource.RuntimeTasks
+ 	ctx            context.Context
+ 	ctxCancel      context.CancelFunc
+ 	url            string
+@@ -42,14 +44,24 @@ type HealthCheck struct {
+ }
+ 
+ func (hc *HealthCheck) process() {
+-	ticker := time.NewTicker(hc.interval)
++	if !hc.tasks.Begin(hc.ctx) {
++		return
++	}
++	defer hc.tasks.End()
++	hc.mu.Lock()
++	interval := hc.interval
++	hc.mu.Unlock()
++	if interval <= 0 {
++		return
++	}
++	ticker := time.NewTicker(interval)
+ 	go hc.check()
+ 	for {
+ 		select {
+ 		case <-ticker.C:
+ 			lastTouch := hc.lastTouch.Load()
+ 			since := time.Since(lastTouch)
+-			if !hc.lazy || since < hc.interval {
++			if !hc.lazy || since < interval {
+ 				hc.check()
+ 			} else {
+ 				log.Debugln("Skip once health check because we are lazy")
+@@ -62,6 +74,8 @@ func (hc *HealthCheck) process() {
+ }
+ 
+ func (hc *HealthCheck) setProxies(proxies []C.Proxy) {
++	hc.mu.Lock()
++	defer hc.mu.Unlock()
+ 	hc.proxies = proxies
+ }
+ 
+@@ -75,15 +89,15 @@ func (hc *HealthCheck) registerHealthCheckTask(url string, expectedStatus utils.
+ 	hc.mu.Lock()
+ 	defer hc.mu.Unlock()
+ 
+-	// if the provider has not set up health checks, then modify it to be the same as the group's interval
+-	if hc.interval == 0 {
+-		hc.interval = time.Duration(interval) * time.Second
+-	}
+-
+ 	if hc.extra == nil {
+ 		hc.extra = make(map[string]*extraOption)
+ 	}
+ 
++	// If the provider has not set up health checks, use the group's interval.
++	if hc.interval == 0 {
++		hc.interval = time.Duration(interval) * time.Second
++	}
++
+ 	// prioritize the use of previously registered configurations, especially those from provider
+ 	if _, ok := hc.extra[url]; ok {
+ 		// provider default health check does not set filter
+@@ -113,6 +127,8 @@ func splitAndAddFiltersToExtra(filter string, option *extraOption) {
+ }
+ 
+ func (hc *HealthCheck) auto() bool {
++	hc.mu.Lock()
++	defer hc.mu.Unlock()
+ 	return hc.interval != 0
+ }
+ 
+@@ -121,7 +137,12 @@ func (hc *HealthCheck) touch() {
+ }
+ 
+ func (hc *HealthCheck) check() {
+-	if len(hc.proxies) == 0 {
++	if !hc.tasks.Begin(hc.ctx) {
++		return
++	}
++	defer hc.tasks.End()
++	proxies, extra := hc.snapshot()
++	if len(proxies) == 0 {
+ 		return
+ 	}
+ 
+@@ -133,12 +154,12 @@ func (hc *HealthCheck) check() {
+ 
+ 		// execute default health check
+ 		option := &extraOption{filters: nil, expectedStatus: hc.expectedStatus}
+-		hc.execute(b, hc.url, id, option)
++		hc.execute(b, hc.url, id, option, proxies)
+ 
+ 		// execute extra health check
+-		if len(hc.extra) != 0 {
+-			for url, option := range hc.extra {
+-				hc.execute(b, url, id, option)
++		if len(extra) != 0 {
++			for url, option := range extra {
++				hc.execute(b, url, id, option, proxies)
+ 			}
+ 		}
+ 		_ = b.Wait()
+@@ -147,7 +168,7 @@ func (hc *HealthCheck) check() {
+ 	})
+ }
+ 
+-func (hc *HealthCheck) execute(b *errgroup.Group, url, uid string, option *extraOption) {
++func (hc *HealthCheck) execute(b *errgroup.Group, url, uid string, option *extraOption, proxies []C.Proxy) {
+ 	url = strings.TrimSpace(url)
+ 	if len(url) == 0 {
+ 		log.Debugln("Health Check has been skipped due to testUrl is empty, {%s}", uid)
+@@ -168,7 +189,7 @@ func (hc *HealthCheck) execute(b *errgroup.Group, url, uid string, option *extra
+ 		}
+ 	}
+ 
+-	for _, proxy := range hc.proxies {
++	for _, proxy := range proxies {
+ 		// skip proxies that do not require health check
+ 		if filterReg != nil {
+ 			if match, _ := filterReg.MatchString(proxy.Name()); !match {
+@@ -188,6 +209,25 @@ func (hc *HealthCheck) execute(b *errgroup.Group, url, uid string, option *extra
+ 	}
+ }
+ 
++func (hc *HealthCheck) snapshot() ([]C.Proxy, map[string]*extraOption) {
++	hc.mu.Lock()
++	defer hc.mu.Unlock()
++	proxies := append([]C.Proxy(nil), hc.proxies...)
++	extra := make(map[string]*extraOption, len(hc.extra))
++	for url, option := range hc.extra {
++		if option == nil {
++			extra[url] = nil
++			continue
++		}
++		filters := make(map[string]struct{}, len(option.filters))
++		for filter := range option.filters {
++			filters[filter] = struct{}{}
++		}
++		extra[url] = &extraOption{expectedStatus: option.expectedStatus, filters: filters}
++	}
++	return proxies, extra
++}
++
+ func (hc *HealthCheck) close() {
+ 	hc.ctxCancel()
+ }
+diff --git a/adapter/provider/provider.go b/adapter/provider/provider.go
+index fa7d56b..a0d05ca 100644
+--- a/adapter/provider/provider.go
++++ b/adapter/provider/provider.go
+@@ -111,6 +111,11 @@ func (bp *baseProvider) setProxies(proxies []C.Proxy) {
+ 	}
+ }
+ 
++func (bp *baseProvider) CancelRuntime() { bp.healthCheck.close() }
++func (bp *baseProvider) WaitRuntimeIdle(deadline time.Time) bool {
++	return bp.healthCheck.tasks.Wait(deadline)
++}
++
+ func (bp *baseProvider) Close() error {
+ 	bp.healthCheck.close()
+ 	return nil
+@@ -176,6 +181,15 @@ func (pp *proxySetProvider) closeAllConnections() {
+ 	})
+ }
+ 
++func (pp *proxySetProvider) CancelRuntime() {
++	pp.baseProvider.CancelRuntime()
++	pp.Fetcher.CancelRuntime()
++}
++func (pp *proxySetProvider) WaitRuntimeIdle(deadline time.Time) bool {
++	fetcherIdle := pp.Fetcher.WaitRuntimeIdle(deadline)
++	return pp.baseProvider.WaitRuntimeIdle(deadline) && fetcherIdle
++}
++
+ func (pp *proxySetProvider) Close() error {
+ 	_ = pp.baseProvider.Close()
+ 	return pp.Fetcher.Close()
+diff --git a/component/resource/fetcher.go b/component/resource/fetcher.go
+index 464af2e..04f3cdc 100644
+--- a/component/resource/fetcher.go
++++ b/component/resource/fetcher.go
+@@ -6,6 +6,7 @@ import (
+ 	"io/fs"
+ 	"os"
+ 	"sync"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/metacubex/mihomo/common/utils"
+@@ -21,20 +22,24 @@ type Parser[V any] func([]byte) (V, error)
+ type BundleFile func() (fs.File, error)
+ 
+ type Fetcher[V any] struct {
+-	ctx          context.Context
+-	ctxCancel    context.CancelFunc
+-	resourceType string
+-	name         string
+-	vehicle      P.Vehicle
+-	bundleFile   BundleFile
+-	updatedAt    time.Time
+-	hash         utils.HashType
+-	parser       Parser[V]
+-	interval     time.Duration
+-	onUpdate     func(V)
+-	watcher      *fswatch.Watcher
+-	loadBufMutex sync.Mutex
+-	backoff      slowdown.Backoff
++	ctx           context.Context
++	ctxCancel     context.CancelFunc
++	resourceType  string
++	name          string
++	vehicle       P.Vehicle
++	bundleFile    BundleFile
++	updatedAt     time.Time
++	hash          utils.HashType
++	parser        Parser[V]
++	interval      time.Duration
++	onUpdate      func(V)
++	watcher       *fswatch.Watcher
++	loadBufMutex  sync.Mutex
++	backoff       slowdown.Backoff
++	updateMu      sync.Mutex
++	watcherMu     sync.Mutex
++	tasks         RuntimeTasks
++	refreshActive atomic.Int32
+ }
+ 
+ func (f *Fetcher[V]) Name() string {
+@@ -50,16 +55,30 @@ func (f *Fetcher[V]) VehicleType() P.VehicleType {
+ }
+ 
+ func (f *Fetcher[V]) UpdatedAt() time.Time {
++	f.loadBufMutex.Lock()
++	defer f.loadBufMutex.Unlock()
+ 	return f.updatedAt
+ }
+ 
++func (f *Fetcher[V]) DiagnosticRefreshActive() int { return int(f.refreshActive.Load()) }
++
+ func (f *Fetcher[V]) Initial() (V, error) {
++	if !f.tasks.Begin(f.ctx) {
++		return lo.Empty[V](), f.ctx.Err()
++	}
++	defer f.tasks.End()
++	f.updateMu.Lock()
++	defer f.updateMu.Unlock()
++	f.refreshActive.Add(1)
++	defer f.refreshActive.Add(-1)
+ 	if stat, fErr := os.Stat(f.vehicle.Path()); fErr == nil {
+ 		// local file exists, use it first
+ 		buf, err := os.ReadFile(f.vehicle.Path())
+ 		modTime := stat.ModTime()
+ 		contents, _, err := f.loadBuf(buf, utils.MakeHash(buf), false)
++		f.loadBufMutex.Lock()
+ 		f.updatedAt = modTime // reset updatedAt to file's modTime
++		f.loadBufMutex.Unlock()
+ 
+ 		if err == nil {
+ 			err = f.startPullLoop(time.Since(modTime) > f.interval)
+@@ -81,7 +100,9 @@ func (f *Fetcher[V]) Initial() (V, error) {
+ 				modTime = stat.ModTime()
+ 			}
+ 			contents, _, err := f.loadBuf(buf, utils.MakeHash(buf), true)
++			f.loadBufMutex.Lock()
+ 			f.updatedAt = modTime // reset updatedAt to file's modTime
++			f.loadBufMutex.Unlock()
+ 
+ 			if err == nil {
+ 				log.Infoln("[Provider] %s extract successful from bundle file", f.Name())
+@@ -98,7 +119,7 @@ func (f *Fetcher[V]) Initial() (V, error) {
+ 	}
+ 
+ 	// parse local file error, fallback to remote
+-	contents, _, updateErr := f.Update()
++	contents, _, updateErr := f.update()
+ 
+ 	// start the pull loop even if f.Update() failed
+ 	err := f.startPullLoop(false)
+@@ -114,6 +135,21 @@ func (f *Fetcher[V]) Initial() (V, error) {
+ }
+ 
+ func (f *Fetcher[V]) Update() (V, bool, error) {
++	if !f.tasks.Begin(f.ctx) {
++		return lo.Empty[V](), false, f.ctx.Err()
++	}
++	defer f.tasks.End()
++	f.updateMu.Lock()
++	defer f.updateMu.Unlock()
++	f.refreshActive.Add(1)
++	defer f.refreshActive.Add(-1)
++	return f.update()
++}
++
++func (f *Fetcher[V]) update() (V, bool, error) {
++	if err := f.ctx.Err(); err != nil {
++		return lo.Empty[V](), false, err
++	}
+ 	buf, hash, err := f.vehicle.Read(f.ctx, f.hash)
+ 	if err != nil {
+ 		f.backoff.AddAttempt() // add a failed attempt to backoff
+@@ -123,6 +159,14 @@ func (f *Fetcher[V]) Update() (V, bool, error) {
+ }
+ 
+ func (f *Fetcher[V]) SideUpdate(buf []byte) (V, bool, error) {
++	if !f.tasks.Begin(f.ctx) {
++		return lo.Empty[V](), false, f.ctx.Err()
++	}
++	defer f.tasks.End()
++	f.updateMu.Lock()
++	defer f.updateMu.Unlock()
++	f.refreshActive.Add(1)
++	defer f.refreshActive.Add(-1)
+ 	return f.loadBuf(buf, utils.MakeHash(buf), true)
+ }
+ 
+@@ -130,6 +174,9 @@ func (f *Fetcher[V]) loadBuf(buf []byte, hash utils.HashType, updateFile bool) (
+ 	f.loadBufMutex.Lock()
+ 	defer f.loadBufMutex.Unlock()
+ 
++	if err := f.ctx.Err(); err != nil {
++		return lo.Empty[V](), false, err
++	}
+ 	now := time.Now()
+ 	if f.hash.Equal(hash) {
+ 		if updateFile {
+@@ -149,6 +196,9 @@ func (f *Fetcher[V]) loadBuf(buf []byte, hash utils.HashType, updateFile bool) (
+ 		f.backoff.AddAttempt() // add a failed attempt to backoff
+ 		return lo.Empty[V](), false, err
+ 	}
++	if err := f.ctx.Err(); err != nil {
++		return lo.Empty[V](), false, err
++	}
+ 	f.backoff.Reset() // no error, reset backoff
+ 
+ 	if updateFile {
+@@ -156,6 +206,9 @@ func (f *Fetcher[V]) loadBuf(buf []byte, hash utils.HashType, updateFile bool) (
+ 			return lo.Empty[V](), false, err
+ 		}
+ 	}
++	if err := f.ctx.Err(); err != nil {
++		return lo.Empty[V](), false, err
++	}
+ 	f.updatedAt = now
+ 	f.hash = hash
+ 
+@@ -166,8 +219,15 @@ func (f *Fetcher[V]) loadBuf(buf []byte, hash utils.HashType, updateFile bool) (
+ 	return contents, false, nil
+ }
+ 
++// CancelRuntime never waits for a network request or parser.
++func (f *Fetcher[V]) CancelRuntime() { f.ctxCancel() }
++
++func (f *Fetcher[V]) WaitRuntimeIdle(deadline time.Time) bool { return f.tasks.Wait(deadline) }
++
+ func (f *Fetcher[V]) Close() error {
+-	f.ctxCancel()
++	f.CancelRuntime()
++	f.watcherMu.Lock()
++	defer f.watcherMu.Unlock()
+ 	if f.watcher != nil {
+ 		_ = f.watcher.Close()
+ 	}
+@@ -175,33 +235,40 @@ func (f *Fetcher[V]) Close() error {
+ }
+ 
+ func (f *Fetcher[V]) pullLoop(forceUpdate bool) {
+-	initialInterval := f.interval - time.Since(f.updatedAt)
++	defer f.tasks.End()
++	f.updateMu.Lock()
++	initialInterval := f.interval - time.Since(f.UpdatedAt())
+ 	if initialInterval > f.interval {
+ 		initialInterval = f.interval
+ 	}
+ 
++	f.updateMu.Unlock()
+ 	if forceUpdate {
+ 		log.Warnln("[Provider] %s not updated for a long time, force refresh", f.Name())
+ 		f.updateWithLog()
+ 	}
++	f.updateMu.Lock()
+ 	if attempt := f.backoff.Attempt(); attempt > 0 { // f.Update() was failed, decrease the interval from backoff to achieve fast retry
+ 		if duration := f.backoff.ForAttempt(attempt); duration < initialInterval {
+ 			initialInterval = duration
+ 		}
+ 	}
+ 
++	f.updateMu.Unlock()
+ 	timer := time.NewTimer(initialInterval)
+ 	defer timer.Stop()
+ 	for {
+ 		select {
+ 		case <-timer.C:
+ 			f.updateWithLog()
++			f.updateMu.Lock()
+ 			interval := f.interval
+ 			if attempt := f.backoff.Attempt(); attempt > 0 { // f.Update() was failed, decrease the interval from backoff to achieve fast retry
+ 				if duration := f.backoff.ForAttempt(attempt); duration < interval {
+ 					interval = duration
+ 				}
+ 			}
++			f.updateMu.Unlock()
+ 			timer.Reset(interval)
+ 		case <-f.ctx.Done():
+ 			return
+@@ -210,6 +277,11 @@ func (f *Fetcher[V]) pullLoop(forceUpdate bool) {
+ }
+ 
+ func (f *Fetcher[V]) startPullLoop(forceUpdate bool) (err error) {
++	f.watcherMu.Lock()
++	defer f.watcherMu.Unlock()
++	if err = f.ctx.Err(); err != nil {
++		return err
++	}
+ 	// pull contents automatically
+ 	if f.vehicle.Type() == P.File {
+ 		f.watcher, err = fswatch.NewWatcher(fswatch.Options{
+@@ -224,7 +296,9 @@ func (f *Fetcher[V]) startPullLoop(forceUpdate bool) (err error) {
+ 			return err
+ 		}
+ 	} else if f.interval > 0 {
+-		go f.pullLoop(forceUpdate)
++		if f.tasks.Begin(f.ctx) {
++			go f.pullLoop(forceUpdate)
++		}
+ 	}
+ 	return
+ }
+diff --git a/config/config.go b/config/config.go
+index 2013a46..1298716 100644
+--- a/config/config.go
++++ b/config/config.go
+@@ -624,6 +624,12 @@ func UnmarshalRawConfig(buf []byte) (*RawConfig, error) {
+ 
+ func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
+ 	config := &Config{}
++	complete := false
++	defer func() {
++		if !complete {
++			closeParsedProviders(config.Providers, config.RuleProviders)
++		}
++	}()
+ 	log.Infoln("Start initial configuration in progress") //Segment finished in xxm
+ 	startTime := time.Now()
+ 
+@@ -676,6 +682,7 @@ func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
+ 	config.TLS = tlsCfg
+ 
+ 	proxies, providers, err := parseProxies(rawCfg)
++	config.Providers = providers
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -700,6 +707,7 @@ func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
+ 	log.Infoln("Geodata Loader mode: %s", geodata.LoaderName())
+ 	log.Infoln("Geosite Matcher implementation: %s", geodata.SiteMatcherName())
+ 	ruleProviders, err := parseRuleProviders(rawCfg)
++	config.RuleProviders = ruleProviders
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -778,6 +786,7 @@ func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
+ 	elapsedTime := time.Since(startTime) / time.Millisecond                     // duration in ms
+ 	log.Infoln("Initial configuration complete, total time: %dms", elapsedTime) //Segment finished in xxm
+ 
++	complete = true
+ 	return config, nil
+ }
+ 
+@@ -906,6 +915,13 @@ func parseTLS(cfg *RawConfig) (*TLS, error) {
+ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[string]P.ProxyProvider, err error) {
+ 	proxies = make(map[string]C.Proxy)
+ 	providersMap = make(map[string]P.ProxyProvider)
++	owned := providersMap
++	complete := false
++	defer func() {
++		if !complete {
++			closeParsedProviders(owned, nil)
++		}
++	}()
+ 	proxiesConfig := cfg.Proxy
+ 	groupsConfig := cfg.ProxyGroup
+ 	providersConfig := cfg.ProxyProvider
+@@ -1021,6 +1037,7 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
+ 		return nil, nil, err
+ 	}
+ 
++	complete = true
+ 	return proxies, providersMap, nil
+ }
+ 
+@@ -1046,6 +1063,13 @@ func parseListeners(cfg *RawConfig) (listeners map[string]C.InboundListener, err
+ func parseRuleProviders(cfg *RawConfig) (ruleProviders map[string]P.RuleProvider, err error) {
+ 	RP.SetTunnel(T.Tunnel)
+ 	ruleProviders = map[string]P.RuleProvider{}
++	owned := ruleProviders
++	complete := false
++	defer func() {
++		if !complete {
++			closeParsedProviders(nil, owned)
++		}
++	}()
+ 	// parse rule provider
+ 	for name, mapping := range cfg.RuleProvider {
+ 		rp, err := RP.ParseRuleProvider(name, mapping, R.ParseRule, RB.MakeBundleFile)
+@@ -1055,6 +1079,7 @@ func parseRuleProviders(cfg *RawConfig) (ruleProviders map[string]P.RuleProvider
+ 
+ 		ruleProviders[name] = rp
+ 	}
++	complete = true
+ 	return
+ }
+ 
+@@ -2004,3 +2029,17 @@ func parseDomainRuleSet(domainSetName string, adapterName string, ruleProviders
+ 	}
+ 	return RP.NewRuleSet(domainSetName, adapterName, false, true)
+ }
++
++func closeParsedProviders(proxies map[string]P.ProxyProvider, rules map[string]P.RuleProvider) {
++	closeOne := func(value any) {
++		if closer, ok := value.(interface{ Close() error }); ok {
++			_ = closer.Close()
++		}
++	}
++	for _, p := range proxies {
++		closeOne(p)
++	}
++	for _, p := range rules {
++		closeOne(p)
++	}
++}
+diff --git a/hub/executor/executor.go b/hub/executor/executor.go
+index ee6466d..6f2e2a3 100644
+--- a/hub/executor/executor.go
++++ b/hub/executor/executor.go
+@@ -1,6 +1,7 @@
+ package executor
+ 
+ import (
++	"errors"
+ 	"fmt"
+ 	"net"
+ 	"net/netip"
+@@ -82,6 +83,12 @@ func ParseWithBytes(buf []byte) (*config.Config, error) {
+ 
+ // ApplyConfig dispatch configure to all parts without ExternalController
+ func ApplyConfig(cfg *config.Config, force bool) {
++	_ = ApplyConfigWithError(cfg, force)
++}
++
++// ApplyConfigWithError preserves ApplyConfig's behavior and reports Provider
++// initialization failures to hosts that need a controlled startup rollback.
++func ApplyConfigWithError(cfg *config.Config, force bool) error {
+ 	mux.Lock()
+ 	defer mux.Unlock()
+ 	log.SetLevel(cfg.General.LogLevel)
+@@ -112,14 +119,15 @@ func ApplyConfig(cfg *config.Config, force bool) {
+ 	tunnel.OnInnerLoading()
+ 
+ 	initInnerTcp()
+-	loadProvider(cfg.Providers)
++	proxyErr := loadProvider(cfg.Providers)
+ 	updateProfile(cfg)
+-	loadProvider(cfg.RuleProviders)
++	ruleErr := loadProvider(cfg.RuleProviders)
+ 	runtime.GC()
+ 	tunnel.OnRunning()
+ 	updateUpdater(cfg)
+ 
+ 	resolver.ResetConnection()
++	return errors.Join(proxyErr, ruleErr)
+ }
+ 
+ func initInnerTcp() {
+@@ -311,9 +319,19 @@ func updateRules(rules []C.Rule, subRules map[string][]C.Rule, ruleProviders map
+ 	tunnel.UpdateRules(rules, subRules, ruleProviders)
+ }
+ 
+-func loadProvider[T P.Provider](providers map[string]T) {
++func loadProvider[T P.Provider](providers map[string]T) error {
++	var failures []error
++	var failuresMu sync.Mutex
+ 	load := func(pv T) {
+ 		name := pv.Name()
++		defer func() {
++			if recovered := recover(); recovered != nil {
++				failuresMu.Lock()
++				failures = append(failures, fmt.Errorf("provider %s panic: %v", name, recovered))
++				failuresMu.Unlock()
++				log.Errorln("initial provider %s panic: %v", name, recovered)
++			}
++		}()
+ 		if pv.VehicleType() == P.Compatible {
+ 			log.Infoln("Start initial compatible provider %s", name)
+ 		} else {
+@@ -321,6 +339,9 @@ func loadProvider[T P.Provider](providers map[string]T) {
+ 		}
+ 
+ 		if err := pv.Initial(); err != nil {
++			failuresMu.Lock()
++			failures = append(failures, fmt.Errorf("provider %s: %w", name, err))
++			failuresMu.Unlock()
+ 			switch pv.Type() {
+ 			case P.Proxy:
+ 				{
+@@ -346,6 +367,7 @@ func loadProvider[T P.Provider](providers map[string]T) {
+ 		}()
+ 	}
+ 	wg.Wait()
++	return errors.Join(failures...)
+ }
+ 
+ func updateSniffer(snifferConfig *sniffer.Config) {
+diff --git a/ntp/ntp/service.go b/ntp/ntp/service.go
+index a629c62..6b39bc4 100644
+--- a/ntp/ntp/service.go
++++ b/ntp/ntp/service.go
+@@ -2,6 +2,7 @@ package ntp
+ 
+ import (
+ 	"context"
++	"net"
+ 	"sync"
+ 	"time"
+ 
+@@ -12,12 +13,19 @@ import (
+ 	mihomoNtp "github.com/metacubex/mihomo/ntp"
+ 
+ 	M "github.com/metacubex/sing/common/metadata"
++	N "github.com/metacubex/sing/common/network"
+ 	"github.com/metacubex/sing/common/ntp"
+ )
+ 
+ var globalSrv *Service
+ var globalMu sync.Mutex
+ 
++func RuntimeActive() bool {
++	globalMu.Lock()
++	defer globalMu.Unlock()
++	return globalSrv != nil
++}
++
+ type Service struct {
+ 	server         M.Socksaddr
+ 	dialer         proxydialer.SingDialer
+@@ -25,6 +33,7 @@ type Service struct {
+ 	ctx            context.Context
+ 	cancel         context.CancelFunc
+ 	syncSystemTime bool
++	done           chan struct{}
+ }
+ 
+ func ReCreateNTPService(server string, interval time.Duration, dialerProxy string, tunnel C.Tunnel, syncSystemTime bool) {
+@@ -32,6 +41,7 @@ func ReCreateNTPService(server string, interval time.Duration, dialerProxy strin
+ 	defer globalMu.Unlock()
+ 	if globalSrv != nil {
+ 		globalSrv.Stop()
++		globalSrv = nil
+ 	}
+ 	if server == "" || interval <= 0 {
+ 		return
+@@ -46,6 +56,7 @@ func ReCreateNTPService(server string, interval time.Duration, dialerProxy strin
+ 		dialer:         proxydialer.NewSingDialer(cDialer),
+ 		ticker:         time.NewTicker(interval * time.Minute),
+ 		ctx:            ctx,
++		done:           make(chan struct{}),
+ 		cancel:         cancel,
+ 		syncSystemTime: syncSystemTime,
+ 	}
+@@ -60,13 +71,14 @@ func (srv *Service) Start() {
+ func (srv *Service) Stop() {
+ 	log.Infoln("NTP service stop")
+ 	srv.cancel()
++	<-srv.done
+ }
+ 
+ func (srv *Service) update() error {
+ 	var response *ntp.Response
+ 	var err error
+ 	for i := 0; i < 3; i++ {
+-		response, err = ntp.Exchange(srv.ctx, srv.dialer, srv.server)
++		response, err = ntp.Exchange(srv.ctx, cancelDialer{srv.dialer}, srv.server)
+ 		if err != nil {
+ 			if srv.ctx.Err() != nil {
+ 				return nil
+@@ -96,6 +108,7 @@ func (srv *Service) update() error {
+ }
+ 
+ func (srv *Service) loopUpdate() {
++	defer close(srv.done)
+ 	defer mihomoNtp.SetOffset(0)
+ 	defer srv.ticker.Stop()
+ 	for {
+@@ -110,3 +123,20 @@ func (srv *Service) loopUpdate() {
+ 		}
+ 	}
+ }
++
++// No extra polling goroutine: cancellation closes the UDP socket once.
++type cancelDialer struct{ N.Dialer }
++type cancelConn struct {
++	net.Conn
++	stop func() bool
++}
++
++func (c *cancelConn) Close() error { c.stop(); return c.Conn.Close() }
++func (d cancelDialer) DialContext(ctx context.Context, network string, address M.Socksaddr) (net.Conn, error) {
++	conn, err := d.Dialer.DialContext(ctx, network, address)
++	if err != nil {
++		return nil, err
++	}
++	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
++	return &cancelConn{Conn: conn, stop: stop}, nil
++}
+diff --git a/adapter/provider/runtime_lifecycle_test.go b/adapter/provider/runtime_lifecycle_test.go
+new file mode 100644
+--- /dev/null
++++ b/adapter/provider/runtime_lifecycle_test.go
+@@ -0,0 +1,30 @@
++package provider
++
++import (
++	"testing"
++	"time"
++)
++
++func TestRuntimeHealthCheck100Cycles(t *testing.T) {
++	for cycle := 0; cycle < 100; cycle++ {
++		hc := NewHealthCheck(nil, "https://example.invalid", 100, 1, true, nil)
++		done := make(chan struct{})
++		go func() { hc.process(); close(done) }()
++		hc.setProxies(nil)
++		hc.registerHealthCheckTask("https://extra.invalid", nil, "test", 1)
++		hc.check()
++		hc.close()
++		hc.close()
++		if !hc.tasks.Wait(time.Now().Add(time.Second)) {
++			t.Fatal("health-check tasks did not drain")
++		}
++		select {
++		case <-done:
++		case <-time.After(time.Second):
++			t.Fatal("health-check loop retained after cancellation")
++		}
++		// A late check or process start from the previous session is rejected.
++		hc.check()
++		hc.process()
++	}
++}
+diff --git a/component/resource/runtime_lifecycle_test.go b/component/resource/runtime_lifecycle_test.go
+new file mode 100644
+--- /dev/null
++++ b/component/resource/runtime_lifecycle_test.go
+@@ -0,0 +1,132 @@
++package resource
++
++import (
++	"context"
++	"errors"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/metacubex/mihomo/common/utils"
++	P "github.com/metacubex/mihomo/constant/provider"
++)
++
++type blockingVehicle struct {
++	started chan struct{}
++	once    sync.Once
++	reads   atomic.Int32
++}
++
++func (v *blockingVehicle) Type() P.VehicleType { return P.HTTP }
++func (v *blockingVehicle) Path() string        { return "" }
++func (v *blockingVehicle) Url() string         { return "https://example.invalid" }
++func (v *blockingVehicle) Proxy() string       { return "" }
++func (v *blockingVehicle) Write([]byte) error  { return nil }
++func (v *blockingVehicle) Read(ctx context.Context, hash utils.HashType) ([]byte, utils.HashType, error) {
++	v.reads.Add(1)
++	v.once.Do(func() { close(v.started) })
++	<-ctx.Done()
++	return nil, hash, ctx.Err()
++}
++func TestRuntimeCancelRefreshAndPullLoop100Cycles(t *testing.T) {
++	for cycle := 0; cycle < 100; cycle++ {
++		vehicle := &blockingVehicle{started: make(chan struct{})}
++		var writes atomic.Int32
++		fetcher := NewFetcher("test", time.Hour, vehicle, nil, func(data []byte) (int, error) { return len(data), nil }, func(int) { writes.Add(1) })
++		done := make(chan struct{})
++		go func() { defer close(done); _, _ = fetcher.Initial() }()
++		select {
++		case <-vehicle.started:
++		case <-time.After(time.Second):
++			t.Fatal("download did not start")
++		}
++		if fetcher.DiagnosticRefreshActive() != 1 {
++			t.Fatal("active provider refresh was not accounted")
++		}
++		fetcher.CancelRuntime()
++		if !fetcher.WaitRuntimeIdle(time.Now().Add(time.Second)) {
++			t.Fatal("refresh retained worker")
++		}
++		<-done
++		if fetcher.DiagnosticRefreshActive() != 0 {
++			t.Fatal("provider refresh accounting did not return to baseline")
++		}
++		if err := fetcher.Close(); err != nil {
++			t.Fatal(err)
++		}
++		if err := fetcher.Close(); err != nil {
++			t.Fatal(err)
++		}
++		_, _, err := fetcher.Update()
++		if !errors.Is(err, context.Canceled) || writes.Load() != 0 || vehicle.reads.Load() != 1 {
++			t.Fatal("cancelled provider was revived")
++		}
++	}
++}
++func TestRuntimeConcurrentRefreshSingleFlight(t *testing.T) {
++	vehicle := &blockingVehicle{started: make(chan struct{})}
++	fetcher := NewFetcher("test", time.Hour, vehicle, nil, func([]byte) (int, error) { return 1, nil }, nil)
++	var workers sync.WaitGroup
++	for i := 0; i < 12; i++ {
++		workers.Add(1)
++		go func() { defer workers.Done(); _, _, _ = fetcher.Update() }()
++	}
++	<-vehicle.started
++	fetcher.CancelRuntime()
++	if !fetcher.WaitRuntimeIdle(time.Now().Add(time.Second)) {
++		t.Fatal("concurrent refresh did not drain")
++	}
++	workers.Wait()
++	if vehicle.reads.Load() != 1 {
++		t.Fatalf("download fan-out: %d", vehicle.reads.Load())
++	}
++}
++func TestRuntimeTasksAdmissionAfterCancel(t *testing.T) {
++	var tasks RuntimeTasks
++	ctx, cancel := context.WithCancel(context.Background())
++	if !tasks.Begin(ctx) {
++		t.Fatal("initial admission failed")
++	}
++	if tasks.Wait(time.Now().Add(time.Millisecond)) {
++		t.Fatal("active task reported idle")
++	}
++	cancel()
++	if tasks.Begin(ctx) {
++		t.Fatal("admitted old session after cancellation")
++	}
++	tasks.End()
++	if !tasks.Wait(time.Now()) {
++		t.Fatal("idle worker retained")
++	}
++}
++
++type blockedWriteVehicle struct {
++	blockingVehicle
++	writing chan struct{}
++	release chan struct{}
++}
++
++func (v *blockedWriteVehicle) Write([]byte) error {
++	close(v.writing)
++	<-v.release
++	return nil
++}
++
++func TestRuntimeCancelDuringCacheWriteDoesNotPublish(t *testing.T) {
++	vehicle := &blockedWriteVehicle{writing: make(chan struct{}), release: make(chan struct{})}
++	var published atomic.Int32
++	fetcher := NewFetcher("test", time.Hour, vehicle, nil,
++		func([]byte) (int, error) { return 1, nil }, func(int) { published.Add(1) })
++	done := make(chan error, 1)
++	go func() { _, _, err := fetcher.SideUpdate([]byte("new rules")); done <- err }()
++	<-vehicle.writing
++	fetcher.CancelRuntime()
++	close(vehicle.release)
++	if err := <-done; !errors.Is(err, context.Canceled) {
++		t.Fatalf("cancelled cache write returned %v", err)
++	}
++	if published.Load() != 0 || !fetcher.WaitRuntimeIdle(time.Now().Add(time.Second)) {
++		t.Fatal("cancelled cache write published into the runtime")
++	}
++}
+diff --git a/component/resource/runtime_tasks.go b/component/resource/runtime_tasks.go
+new file mode 100644
+--- /dev/null
++++ b/component/resource/runtime_tasks.go
+@@ -0,0 +1,53 @@
++package resource
++
++import (
++	"context"
++	"sync"
++	"time"
++)
++
++// RuntimeTasks tracks control workers only. Admission and idle publication
++// share a lock so cancellation cannot race WaitGroup.Add and Wait.
++type RuntimeTasks struct {
++	mu     sync.Mutex
++	active int
++	idle   chan struct{}
++}
++
++func (t *RuntimeTasks) Begin(ctx context.Context) bool {
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	if ctx.Err() != nil {
++		return false
++	}
++	if t.active == 0 {
++		t.idle = make(chan struct{})
++	}
++	t.active++
++	return true
++}
++func (t *RuntimeTasks) End() {
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	t.active--
++	if t.active == 0 {
++		close(t.idle)
++	}
++}
++func (t *RuntimeTasks) Wait(deadline time.Time) bool {
++	t.mu.Lock()
++	if t.active == 0 {
++		t.mu.Unlock()
++		return true
++	}
++	idle := t.idle
++	t.mu.Unlock()
++	timer := time.NewTimer(time.Until(deadline))
++	defer timer.Stop()
++	select {
++	case <-idle:
++		return true
++	case <-timer.C:
++		return false
++	}
++}
+diff --git a/hub/executor/runtime_lifecycle_test.go b/hub/executor/runtime_lifecycle_test.go
+new file mode 100644
+--- /dev/null
++++ b/hub/executor/runtime_lifecycle_test.go
+@@ -0,0 +1,35 @@
++package executor
++
++import (
++	"errors"
++	"strings"
++	"testing"
++
++	P "github.com/metacubex/mihomo/constant/provider"
++)
++
++type runtimeTestProvider struct{ err error }
++
++type runtimeTestPanicProvider struct{ runtimeTestProvider }
++
++func (runtimeTestPanicProvider) Initial() error { panic("invalid provider") }
++
++func (p runtimeTestProvider) Name() string               { return "failed-start" }
++func (p runtimeTestProvider) VehicleType() P.VehicleType { return P.File }
++func (p runtimeTestProvider) Type() P.ProviderType       { return P.Rule }
++func (p runtimeTestProvider) Initial() error             { return p.err }
++func (p runtimeTestProvider) Update() error              { return nil }
++
++func TestRuntimeProviderInitializationError(t *testing.T) {
++	failure := errors.New("provider could not load")
++	err := loadProvider(map[string]P.Provider{"test": runtimeTestProvider{err: failure}})
++	if !errors.Is(err, failure) {
++		t.Fatalf("initialization failure lost: %v", err)
++	}
++	if err := loadProvider(map[string]P.Provider{"test": runtimeTestProvider{}}); err != nil {
++		t.Fatalf("successful initialization failed: %v", err)
++	}
++	if err := loadProvider(map[string]P.Provider{"test": runtimeTestPanicProvider{}}); err == nil || !strings.Contains(err.Error(), "invalid provider") {
++		t.Fatalf("background initialization panic not reported for rollback: %v", err)
++	}
++}
+diff --git a/ntp/ntp/runtime_lifecycle_test.go b/ntp/ntp/runtime_lifecycle_test.go
+new file mode 100644
+--- /dev/null
++++ b/ntp/ntp/runtime_lifecycle_test.go
+@@ -0,0 +1,53 @@
++package ntp
++
++import (
++	"context"
++	"net"
++	"testing"
++	"time"
++
++	M "github.com/metacubex/sing/common/metadata"
++)
++
++type pipeDialer struct{ peer net.Conn }
++
++func (d pipeDialer) DialContext(context.Context, string, M.Socksaddr) (net.Conn, error) {
++	return d.peer, nil
++}
++func (d pipeDialer) ListenPacket(context.Context, M.Socksaddr) (net.PacketConn, error) {
++	panic("not used")
++}
++func TestRuntimeCancelNTPRead(t *testing.T) {
++	client, server := net.Pipe()
++	defer server.Close()
++	ctx, cancel := context.WithCancel(context.Background())
++	conn, err := (cancelDialer{pipeDialer{client}}).DialContext(ctx, "udp", M.Socksaddr{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	done := make(chan error, 1)
++	go func() { _, err := conn.Read(make([]byte, 1)); done <- err }()
++	cancel()
++	select {
++	case err := <-done:
++		if err == nil {
++			t.Fatal("read unexpectedly succeeded")
++		}
++	case <-time.After(time.Second):
++		t.Fatal("cancel did not close NTP socket")
++	}
++	_ = conn.Close()
++}
++func TestRuntimeNTP100StartStopCycles(t *testing.T) {
++	for i := 0; i < 100; i++ {
++		ReCreateNTPService("127.0.0.1:9", 1, "", nil, false)
++		if !RuntimeActive() {
++			t.Fatal("missing active NTP service")
++		}
++		ReCreateNTPService("", 0, "", nil, false)
++		ReCreateNTPService("", 0, "", nil, false)
++		if RuntimeActive() {
++			t.Fatal("NTP service retained after stop")
++		}
++	}
++}

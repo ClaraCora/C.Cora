@@ -783,7 +783,10 @@ func TestRuntimeStatsReturnsDiagnosticSnapshot(t *testing.T) {
 		"proxyProviders", "ruleProviders", "proxyGroups", "closedQueuePending",
 		"mihomoBufferPoolBuffers", "mihomoBufferPoolBytes", "singBufferPoolBuffers",
 		"singBufferPoolBytes", "bufferPoolRetainedBytes", "proxyCount", "policyGroupCount",
-		"proxyProviderNodes", "ruleProviderRules", "dnsCacheEntries", "dnsCacheCount", "geoMode", "geoLoader", "forceGCSuppressed"} {
+		"proxyProviderNodes", "ruleProviderRules", "closableProviders", "scriptTargetIPCacheEntries",
+		"scriptTargetIPCacheBytes", "scriptTargetIPCacheStaleEntries", "dnsCacheEntries", "dnsCacheCount",
+		"geoMode", "geoLoader", "forceGCSuppressed", "runtimeGeneration",
+		"providerRefreshActive", "logCaptureActive", "ntpActive"} {
 		if _, exists := fields[key]; !exists {
 			t.Fatalf("RuntimeStats omitted %q", key)
 		}
@@ -898,6 +901,22 @@ func TestScriptTargetIPCacheFallsBackToBoundedStaleValue(t *testing.T) {
 	}
 	if got := cachedScriptTargetIP(host, true, now.Add(3*time.Minute)); got != "" {
 		t.Fatalf("expired cache = %q, want empty", got)
+	}
+	scriptTargetIPCacheMu.Lock()
+	scriptTargetIPCache[scriptTargetIPCacheKey(host)] = scriptTargetIPCacheEntry{
+		ip: "203.0.113.7", expiresAt: now.Add(time.Minute)}
+	scriptTargetIPCache["stale.example.com"] = scriptTargetIPCacheEntry{
+		ip: "203.0.113.8", expiresAt: now.Add(-time.Second)}
+	scriptTargetIPCacheMu.Unlock()
+	entries, bytes, stale := scriptTargetIPCacheStats(now)
+	if entries != 1 || bytes != uint64(len(host)+len("203.0.113.7")) || stale != 1 {
+		t.Fatalf("cache stats = (%d, %d, %d), want (1, %d, 1)", entries, bytes,
+			stale, len(host)+len("203.0.113.7"))
+	}
+	clearScriptTargetIPCache()
+	entries, bytes, stale = scriptTargetIPCacheStats(now)
+	if entries != 0 || bytes != 0 || stale != 0 {
+		t.Fatalf("cache clear stats = (%d, %d, %d), want zero", entries, bytes, stale)
 	}
 	if usableScriptTargetIP(netip.MustParseAddr("198.18.0.105")) {
 		t.Fatal("reserved synthetic IP accepted as a node entrance")

@@ -51,6 +51,7 @@ final class IPCResponseCache: @unchecked Sendable {
     private let directory: URL
     private let lifetime: TimeInterval
     private let writePayload: (Data, URL) throws -> Void
+    private let readPayload: (URL, Int, Int) throws -> Data
     private var entries: [String: Entry] = [:]
     private var payloadBytes = 0
     private var memoryBytes = 0
@@ -59,14 +60,28 @@ final class IPCResponseCache: @unchecked Sendable {
     private var cleanupWorkItem: DispatchWorkItem?
     private var cleanupDeadline: Date?
     private var cleanupRevision: UInt64 = 0
+    // File chunks are read without holding the cache lock. A reset/expiry may
+    // therefore defer deleting a file until the corresponding reader exits.
+    private var activeReaders: [String: Int] = [:]
+    private var deferredFileDeletes: [String: URL] = [:]
+    private var readyFileDeletes: [URL] = []
+
+    private func unlockAndDeleteFiles() {
+        let files = readyFileDeletes
+        readyFileDeletes.removeAll(keepingCapacity: false)
+        lock.unlock()
+        for url in files { try? FileManager.default.removeItem(at: url) }
+    }
 
     init(directory: URL = FileManager.default.temporaryDirectory
         .appendingPathComponent("cora-ipc-responses", isDirectory: true),
          lifetime: TimeInterval = 30,
-         writePayload: ((Data, URL) throws -> Void)? = nil) {
+         writePayload: ((Data, URL) throws -> Void)? = nil,
+         readPayload: ((URL, Int, Int) throws -> Data)? = nil) {
         self.directory = directory
         self.lifetime = lifetime
         self.writePayload = writePayload ?? IPCResponseCache.writeFile
+        self.readPayload = readPayload ?? IPCResponseCache.readFile
         // This directory belongs only to this cache in the NE sandbox. A killed
         // extension cannot run reset(), so clear its leftovers on process launch.
         do {
@@ -90,23 +105,24 @@ final class IPCResponseCache: @unchecked Sendable {
         for entry in entries.values {
             if case .file(let url) = entry.storage { try? FileManager.default.removeItem(at: url) }
         }
+        for url in deferredFileDeletes.values { try? FileManager.default.removeItem(at: url) }
     }
 
     func currentGeneration() -> UInt64 {
         lock.lock()
-        defer { lock.unlock() }
+        defer { unlockAndDeleteFiles() }
         return generation
     }
 
     func isCurrent(_ expectedGeneration: UInt64) -> Bool {
         lock.lock()
-        defer { lock.unlock() }
+        defer { unlockAndDeleteFiles() }
         return enabled && expectedGeneration == generation
     }
 
     func stats() -> Stats {
         lock.lock()
-        defer { lock.unlock() }
+        defer { unlockAndDeleteFiles() }
         return Stats(count: entries.count, payloadBytes: payloadBytes,
                      memoryBytes: memoryBytes, fileBytes: payloadBytes - memoryBytes)
     }
@@ -118,17 +134,17 @@ final class IPCResponseCache: @unchecked Sendable {
         let token = UUID().uuidString
         lock.lock()
         guard enabled, expectedGeneration == generation else {
-            lock.unlock()
+            unlockAndDeleteFiles()
             throw CacheError.expiredSession
         }
         purgeExpiredLocked(now: Date())
         if data.count <= Self.memoryResponseThreshold,
            memoryBytes + data.count <= Self.maximumMemoryBytes {
             installLocked(token: token, storage: .memory(data), size: data.count)
-            lock.unlock()
+            unlockAndDeleteFiles()
             return Descriptor(token: token, total: data.count)
         }
-        lock.unlock()
+        unlockAndDeleteFiles()
 
         // Large writes never hold the cache lock or block unrelated chunk reads.
         // The session can end while this write runs; validate again before commit.
@@ -142,7 +158,7 @@ final class IPCResponseCache: @unchecked Sendable {
         }
         lock.lock()
         guard enabled, expectedGeneration == generation else {
-            lock.unlock()
+            unlockAndDeleteFiles()
             if didWrite { try? FileManager.default.removeItem(at: url) }
             throw CacheError.expiredSession
         }
@@ -152,50 +168,68 @@ final class IPCResponseCache: @unchecked Sendable {
         } else if memoryBytes + data.count <= Self.maximumMemoryBytes {
             installLocked(token: token, storage: .memory(data), size: data.count)
         } else {
-            lock.unlock()
+            unlockAndDeleteFiles()
             throw CacheError.storageUnavailable
         }
-        lock.unlock()
+        unlockAndDeleteFiles()
         return Descriptor(token: token, total: data.count)
     }
 
     func chunk(token: String, offset: Int, generation expectedGeneration: UInt64) -> Data {
         guard UUID(uuidString: token) != nil, offset >= 0 else { return Data() }
         lock.lock()
-        defer { lock.unlock() }
-        guard enabled, expectedGeneration == generation else { return Data() }
+        guard enabled, expectedGeneration == generation else {
+            unlockAndDeleteFiles()
+            return Data()
+        }
         purgeExpiredLocked(now: Date())
         guard let entry = entries[token], offset < entry.size else {
             removeLocked(token)
+            unlockAndDeleteFiles()
             return Data()
         }
         let length = min(Self.chunkSize, entry.size - offset)
-        let chunk: Data
+        let storage = entry.storage
+        let totalSize = entry.size
+        activeReaders[token, default: 0] += 1
+        unlockAndDeleteFiles()
+
+        // Disk I/O intentionally happens outside the cache lock. This keeps a
+        // locked device or slow temporary directory from blocking all IPC.
+        var chunk = Data()
+        var readSucceeded = true
         do {
-            switch entry.storage {
+            switch storage {
             case .memory(let data):
                 chunk = data.subdata(in: offset..<(offset + length))
             case .file(let url):
-                let handle = try FileHandle(forReadingFrom: url)
-                defer { try? handle.close() }
-                try handle.seek(toOffset: UInt64(offset))
-                chunk = try handle.read(upToCount: length) ?? Data()
-                guard chunk.count == length else {
-                    removeLocked(token)
-                    return Data()
-                }
+                chunk = try readPayload(url, offset, length)
+                readSucceeded = chunk.count == length
             }
         } catch {
-            removeLocked(token)
-            return Data()
+            readSucceeded = false
         }
-        if offset + chunk.count == entry.size { removeLocked(token) }
-        return chunk
+
+        lock.lock()
+        // A reset/expiry or another reader may have removed this token while
+        // the disk read was in progress. Revalidate both session and entry
+        // before allowing the chunk to cross IPC.
+        let isCurrent = enabled && expectedGeneration == generation
+            && (entries[token].map { $0.expiresAt > Date() } ?? false)
+        if !readSucceeded || !isCurrent {
+            removeLocked(token)
+        } else if offset + chunk.count == totalSize {
+            removeLocked(token)
+        }
+        releaseReaderLocked(token)
+        unlockAndDeleteFiles()
+        return readSucceeded && isCurrent ? chunk : Data()
     }
 
-    func reset(enableCaching: Bool? = nil) {
+    @discardableResult
+    func reset(enableCaching: Bool? = nil) -> UInt64 {
         lock.lock()
-        defer { lock.unlock() }
+        defer { unlockAndDeleteFiles() }
         generation &+= 1
         cleanupRevision &+= 1
         cleanupWorkItem?.cancel()
@@ -204,6 +238,7 @@ final class IPCResponseCache: @unchecked Sendable {
         for token in Array(entries.keys) { removeLocked(token) }
         entries.removeAll(keepingCapacity: false)
         if let enableCaching { enabled = enableCaching }
+        return generation
     }
 
     private func installLocked(token: String, storage: Storage, size: Int) {
@@ -223,7 +258,24 @@ final class IPCResponseCache: @unchecked Sendable {
         payloadBytes -= entry.size
         switch entry.storage {
         case .memory: memoryBytes -= entry.size
-        case .file(let url): try? FileManager.default.removeItem(at: url)
+        case .file(let url):
+            if activeReaders[token, default: 0] > 0 {
+                deferredFileDeletes[token] = url
+            } else {
+                readyFileDeletes.append(url)
+            }
+        }
+    }
+
+    private func releaseReaderLocked(_ token: String) {
+        guard let count = activeReaders[token] else { return }
+        if count > 1 {
+            activeReaders[token] = count - 1
+            return
+        }
+        activeReaders.removeValue(forKey: token)
+        if let url = deferredFileDeletes.removeValue(forKey: token) {
+            readyFileDeletes.append(url)
         }
     }
 
@@ -249,12 +301,19 @@ final class IPCResponseCache: @unchecked Sendable {
 
     private func expire(revision: UInt64, generation expectedGeneration: UInt64) {
         lock.lock()
-        defer { lock.unlock() }
+        defer { unlockAndDeleteFiles() }
         guard revision == cleanupRevision, expectedGeneration == generation else { return }
         cleanupWorkItem = nil
         cleanupDeadline = nil
         purgeExpiredLocked(now: Date())
         scheduleCleanupLocked()
+    }
+
+    private static func readFile(_ url: URL, offset: Int, length: Int) throws -> Data {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        try handle.seek(toOffset: UInt64(offset))
+        return try handle.read(upToCount: length) ?? Data()
     }
 
     private static func writeFile(_ data: Data, to url: URL) throws {

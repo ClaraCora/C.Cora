@@ -30,6 +30,11 @@ struct MemoryDiagnosticAnalyzerTests {
         let cleared = #"{"kind":"summary","session":"current","updatedAtMs":15,"metrics":{"tunRXQueuedPackets":{"first":4,"peak":4,"latestAt":15}}}"#
         let transitioned = MemoryDiagnosticAnalyzer.analyze(oldQueue + "\n" + cleared)
         precondition(transitioned.contains("接收 未知 包"), "cleared latest revived old sample")
+        let lifecycle = #"{"t":20,"session":"current","event":"stopCompleted","cora":{"ipcInFlight":0,"ipcQueueDepth":0,"ipcPeakInFlight":8,"historyClosedRows":12,"historyWriteFailures":2},"go":{"runtimeGeneration":4,"providerRefreshActive":0,"closableProviders":0,"logCaptureActive":false,"ntpActive":false,"scriptTargetIPCacheEntries":0,"scriptTargetIPCacheBytes":0,"scriptTargetIPCacheStaleEntries":0}}"#
+        let lifecycleReport = MemoryDiagnosticAnalyzer.analyze(lifecycle)
+        precondition(lifecycleReport.contains("代次 4，日志订阅 已停止，NTP 已停止"), "stopped runtime not visible")
+        precondition(lifecycleReport.contains("执行 0/8，排队 0/24") && lifecycleReport.contains("关闭批次 12 条"), "control/history counters lost")
+        precondition(legacyReport.contains("日志订阅 未知"), "missing lifecycle field treated as stopped")
         print("MemoryDiagnosticAnalyzerTests passed")
     }
 }

@@ -48,6 +48,7 @@ struct IPCResponseCacheTests {
         try evictionAndPayloadLimit()
         try writeFailures()
         try sessionChangeDuringWrite()
+        try sessionChangeDuringRead()
         try abandonedResponseExpiration()
         try damagedFileAndStartupCleanup()
         print("IPC response cache tests passed")
@@ -187,6 +188,48 @@ struct IPCResponseCacheTests {
         while cache.stats().count != 0 && Date() < deadline { Thread.sleep(forTimeInterval: 0.01) }
         let remainingFiles = try fileCount(directory)
         expect(cache.stats().count == 0 && remainingFiles == 0, "abandoned response required an App read to expire")
+    }
+
+    static func sessionChangeDuringRead() throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let started = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let done = DispatchSemaphore(value: 0)
+        let resetDone = DispatchSemaphore(value: 0)
+        let results = LockedResults()
+        let cache = IPCResponseCache(directory: directory, readPayload: { url, offset, length in
+            started.signal()
+            expect(release.wait(timeout: .now() + 3) == .success, "test read stalled")
+            let handle = try FileHandle(forReadingFrom: url)
+            defer { try? handle.close() }
+            try handle.seek(toOffset: UInt64(offset))
+            return try handle.read(upToCount: length) ?? Data()
+        })
+        let generation = cache.currentGeneration()
+        let descriptor = try cache.store(Data(repeating: 3, count: 65_537), generation: generation)
+        let oldFile = directory.appendingPathComponent(descriptor.token + ".response")
+        DispatchQueue.global().async {
+            let chunk = cache.chunk(token: descriptor.token, offset: 0, generation: generation)
+            if chunk.isEmpty { results.fail() }
+            done.signal()
+        }
+        expect(started.wait(timeout: .now() + 3) == .success, "read did not start")
+        DispatchQueue.global().async {
+            cache.reset(enableCaching: true)
+            resetDone.signal()
+        }
+        expect(resetDone.wait(timeout: .now() + 3) == .success, "disk read held cache lock during reset")
+        expect(cache.stats().count == 0 && FileManager.default.fileExists(atPath: oldFile.path),
+               "reset deleted a leased file before reader exit")
+        let current = cache.currentGeneration()
+        let small = try cache.store(Data([7]), generation: current)
+        expect(consume(cache, small, generation: current) == Data([7]),
+               "slow disk read blocked new-session responses")
+        release.signal()
+        expect(done.wait(timeout: .now() + 3) == .success, "old reader did not exit")
+        expect(results.snapshot().1 == 1, "old-session chunk crossed IPC")
+        expect(try fileCount(directory) == 0, "released read lease left file")
     }
 
     static func damagedFileAndStartupCleanup() throws {

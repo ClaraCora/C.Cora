@@ -460,6 +460,7 @@ private final class ScriptExecution: @unchecked Sendable {
     private var context: JSContext?
     private var completed = false
     private var requestCount = 0
+    private let scriptID = UUID().uuidString
     private var timeoutWorkItem: DispatchWorkItem?
 
     init(source: String,
@@ -556,6 +557,7 @@ private final class ScriptExecution: @unchecked Sendable {
         let request: [String: Any] = [
             "name": nodeName,
             "group": groupName,
+            "scriptID": scriptID,
             "method": method,
             "url": values["url"] as? String ?? "",
             "headers": values["headers"] as? [String: String] ?? [:],

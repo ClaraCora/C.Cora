@@ -69,6 +69,8 @@ readonly HISTORY_TEST_PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-pa
 readonly RESERVED_SYNTHETIC_IP_PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/mihomo-v1.19.31-reserved-synthetic-ip-guard.patch"
 readonly ATOMIC_DNS_RUNTIME_PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/mihomo-v1.19.31-atomic-dns-runtime.patch"
 readonly MRS_DECODE_PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/mihomo-v1.19.31-bounded-mrs-decode.patch"
+readonly RUNTIME_LIFECYCLE_PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/mihomo-v1.19.31-runtime-lifecycle.patch"
+readonly EXPECTED_RUNTIME_LIFECYCLE_PATCH_SHA="4c9b53dec2459963ab26e3b300b0b7cb62624f786064a84bb1e7d6df4e1a5d4c"
 readonly PATCHED_DIR="${RUNNER_TEMP:?}/mihomo-v1.19.31-ios-cora-v1"
 
 check_sha256() {
@@ -213,6 +215,11 @@ git -c core.autocrlf=false -C "$PATCHED_DIR" \
   apply --check --whitespace=error-all "$MEMORY_DIAGNOSTICS_PATCH_FILE"
 git -c core.autocrlf=false -C "$PATCHED_DIR" \
   apply --whitespace=error-all "$MEMORY_DIAGNOSTICS_PATCH_FILE"
+check_sha256 "$EXPECTED_RUNTIME_LIFECYCLE_PATCH_SHA" "$RUNTIME_LIFECYCLE_PATCH_FILE"
+git -c core.autocrlf=false -C "$PATCHED_DIR" \
+  apply --check --whitespace=error-all "$RUNTIME_LIFECYCLE_PATCH_FILE"
+git -c core.autocrlf=false -C "$PATCHED_DIR" \
+  apply --whitespace=error-all "$RUNTIME_LIFECYCLE_PATCH_FILE"
 
 go -C "$PATCHED_DIR" mod edit -require="$SING_MODULE@$EXPECTED_SING_VERSION"
 go -C "$PATCHED_DIR" mod edit -replace="$SING_MODULE@$EXPECTED_SING_VERSION=$PATCHED_SING_DIR"

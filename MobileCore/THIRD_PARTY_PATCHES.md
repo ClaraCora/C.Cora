@@ -1,5 +1,37 @@
 # Third-party patches
 
+## mihomo-v1.19.31-runtime-lifecycle
+
+- Added: 2026-10-07
+- Upstream module: `github.com/metacubex/mihomo v1.19.31`
+- Patched files: Provider health/fetch lifecycle, resource task admission,
+  partial configuration cleanup, checked executor initialization, and NTP shutdown
+- Build tags: default and `with_low_memory`
+
+The Network Extension can replace a complete configuration while a Provider
+refresh, health check, or NTP exchange is still running. This patch gives those
+control-plane workers a cancellable runtime context and a race-free idle wait.
+Provider refreshes are serialized per Provider, cancellation is checked before
+and after parsing/cache writes, and health-check inputs are copied under a short lock before
+network work begins. Failed partial config parses close the Providers they
+created, so a failed start cannot retain their pull loops or HTTP resources.
+`ApplyConfigWithError` additionally reports Provider initialization failures to
+MobileCore, while the upstream `ApplyConfig` signature/behavior remains compatible.
+Fetcher diagnostics count active manual and automatic refresh/parser work;
+waiting ticker loops are not counted as active refreshes.
+
+NTP shutdown now cancels and waits for the service loop and closes an in-flight
+UDP exchange. Recreating the service clears the old global before starting a new
+one, preventing a late old request from changing the new session's offset.
+
+The patch does not change packet forwarding concurrency or Provider update
+intervals. It only bounds and cancels control-plane work during Stop, restart,
+and configuration replacement. Regression tests cover repeated cancellation,
+same-Provider serialization, cancellation during disk writes, 100 Provider,
+health-check and NTP cycles, and partial configuration ownership. The preparation
+script checks this patch's SHA-256 as well as strict patch application against
+the existing functional/diagnostic source baseline. The Go toolchain is unchanged.
+
 ## v1.19.31 migration (2026-09-30)
 
 The active build uses Mihomo v1.19.31, sing-tun v0.4.24,

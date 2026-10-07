@@ -16,6 +16,54 @@ final class MemoryDiagnostics: @unchecked Sendable {
         let logBufferedLines: Int
         let logBufferedBytes: UInt64
         let logPersistedBytes: UInt64
+        var ipcInFlight: Int = 0
+        var ipcQueueDepth: Int = 0
+        var ipcPeakInFlight: Int = 0
+        var ipcRejected: Int = 0
+        var ipcPeakQueueDepth: Int = 0
+        var ipcCancelled: Int = 0
+        var ipcTimedOut: Int = 0
+        var ipcCompletedByClass: [String: Int] = [:]
+        var ipcDurationMsByClass: [String: Double] = [:]
+        var historyStats = ConnectionHistoryRecorder.Stats()
+
+        var metrics: [String: UInt64] {
+            var result: [String: UInt64] = [
+                "ipcInFlight": UInt64(max(0, ipcInFlight)),
+                "ipcQueueDepth": UInt64(max(0, ipcQueueDepth)),
+                "ipcPeakInFlight": UInt64(max(0, ipcPeakInFlight)),
+                "ipcRejected": UInt64(max(0, ipcRejected)),
+                "ipcPeakQueueDepth": UInt64(max(0, ipcPeakQueueDepth)),
+                "ipcCancelled": UInt64(max(0, ipcCancelled)),
+                "ipcTimedOut": UInt64(max(0, ipcTimedOut)),
+                "historySampleBytes": UInt64(max(0, historyStats.sampleBytes)),
+                "historyClosedBytes": UInt64(max(0, historyStats.closedBytes)),
+                "historyClosedRows": UInt64(max(0, historyStats.closedRows)),
+                "historyWriteDurationMs": UInt64(max(0, historyStats.writeDurationMs)),
+                "historyWriteFailures": UInt64(max(0, historyStats.writeFailures)),
+                "historyStoreRetries": UInt64(max(0, historyStats.storeRetries)),
+            ]
+            for workClass in IPCControlScheduler.WorkClass.allCases {
+                let name = workClass.rawValue
+                result["ipc_" + name + "_completed"] = UInt64(max(0, ipcCompletedByClass[name] ?? 0))
+                result["ipc_" + name + "_durationMs"] = UInt64(max(0, ipcDurationMsByClass[name] ?? 0))
+            }
+            return result
+        }
+
+        var json: String {
+            var object = metrics
+            object["ipcResponseCount"] = UInt64(max(0, ipcResponseCount))
+            object["ipcResponseBytes"] = ipcResponseBytes
+            object["ipcResponseMemoryBytes"] = ipcResponseMemoryBytes
+            object["ipcResponseFileBytes"] = ipcResponseFileBytes
+            object["logBufferedLines"] = UInt64(max(0, logBufferedLines))
+            object["logBufferedBytes"] = logBufferedBytes
+            object["logPersistedBytes"] = logPersistedBytes
+            guard let data = try? JSONSerialization.data(withJSONObject: object),
+                  let text = String(data: data, encoding: .utf8) else { return "{}" }
+            return text
+        }
 
         static let empty = SupplementalStats(ipcResponseCount: 0,
                                              ipcResponseBytes: 0,
@@ -323,13 +371,7 @@ final class MemoryDiagnostics: @unchecked Sendable {
                 + "\"compressedSize\":\(vm.compressedSize),"
                 + "\"compressedSizePeak\":\(vm.compressedSizePeak),"
                 + "\"reusableSize\":\(vm.reusableSize)},"
-                + "\"cora\":{\"ipcResponseCount\":\(supplemental.ipcResponseCount),"
-                + "\"ipcResponseBytes\":\(supplemental.ipcResponseBytes),"
-                + "\"ipcResponseMemoryBytes\":\(supplemental.ipcResponseMemoryBytes),"
-                + "\"ipcResponseFileBytes\":\(supplemental.ipcResponseFileBytes),"
-                + "\"logBufferedLines\":\(supplemental.logBufferedLines),"
-                + "\"logBufferedBytes\":\(supplemental.logBufferedBytes),"
-                + "\"logPersistedBytes\":\(supplemental.logPersistedBytes)},"
+                + "\"cora\":\(supplemental.json),"
                 + "\"go\":\(lastGoStats)}\n"
             let data = Data(line.utf8)
             rotateIfNeededLocked(incomingBytes: UInt64(data.count))
@@ -388,6 +430,9 @@ final class MemoryDiagnostics: @unchecked Sendable {
                            timestampMs: timestampMs)
         updateMetricLocked("logPersistedBytes", value: supplemental.logPersistedBytes,
                            timestampMs: timestampMs)
+        for (key, value) in supplemental.metrics {
+            updateMetricLocked(key, value: value, timestampMs: timestampMs)
+        }
 
         // RuntimeStats is already a compact JSON object produced by Go. Parse
         // only these counters for the long-lived summary; the full object is
@@ -428,7 +473,10 @@ final class MemoryDiagnostics: @unchecked Sendable {
         "goGCPercent", "goroutines", "connections", "tcpConnections", "udpConnections",
         "proxyProviders", "ruleProviders", "proxyGroups", "delaySlotsInUse",
         "delaySlotLimit", "activeDelayBatches", "connectionSnapshotBytes",
-        "closedSnapshotBytes", "closedQueuePending", "mihomoBufferPoolBuffers",
+        "closedSnapshotBytes", "closedQueuePending", "runtimeGeneration", "providerRefreshActive",
+        "ntpActive", "logCaptureActive",
+        "closableProviders", "providerRefreshTasks", "scriptTargetIPCacheEntries", "scriptTargetIPCacheBytes",
+        "scriptTargetIPCacheStaleEntries", "mihomoBufferPoolBuffers",
         "mihomoBufferPoolBytes", "mihomoBufferPoolMaxBytes", "singBufferPoolBuffers",
         "singBufferPoolBytes", "singBufferPoolMaxBytes", "bufferPoolRetainedBytes",
         "bufferPoolLastTrimBytes", "bufferPoolTrimmedBytes", "forceGCSuppressed",

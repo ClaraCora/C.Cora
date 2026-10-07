@@ -23,6 +23,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"runtime/debug"
 	"sort"
@@ -51,6 +52,7 @@ import (
 	mdns "github.com/metacubex/mihomo/dns"
 	"github.com/metacubex/mihomo/hub/executor"
 	"github.com/metacubex/mihomo/log"
+	"github.com/metacubex/mihomo/ntp/ntp"
 	"github.com/metacubex/mihomo/tunnel"
 	"github.com/metacubex/mihomo/tunnel/statistic"
 	singBuffer "github.com/metacubex/sing/common/buf"
@@ -183,7 +185,9 @@ func (items *connectionSnapshotHeap) Pop() any {
 // homeDir 是 mihomo 工作目录（= App Group 容器），run.log 也写在这里。
 var (
 	homeDir                string
-	logCaptureMu           sync.Once
+	logCaptureMu           sync.Mutex
+	logCaptureStop         func()
+	logCaptureDone         chan struct{}
 	logFileMu              sync.Mutex
 	forceGCMu              sync.Mutex
 	runLogFile             *os.File
@@ -214,6 +218,8 @@ var (
 	activeProxyDelayBatches     int32
 	lastConnectionSnapshotBytes int64
 	lastClosedSnapshotBytes     int64
+	runtimeGeneration           uint64
+	activeProviderRefresh       int32
 )
 
 // lockConfigApplyForWrite cancels the active multi-node delay run before it
@@ -221,12 +227,17 @@ var (
 // share proxyDelayBatchMu, closing the race where a new batch could acquire a
 // read lock between cancellation and configApplyMu.Lock.
 func lockConfigApplyForWrite() {
+	runtimeControlMu.Lock()
+	for _, cancel := range runtimeControls {
+		cancel()
+	}
 	proxyDelayBatchMu.Lock()
 	if activeProxyDelayBatch != nil {
 		activeProxyDelayBatch.cancel()
 	}
 	configApplyMu.Lock()
 	proxyDelayBatchMu.Unlock()
+	runtimeControlMu.Unlock()
 }
 
 func unlockConfigApplyForWrite() {
@@ -462,8 +473,16 @@ func ValidateGeoDatabase(path string, kind string) error {
 // 配置等；同时本封装把内核日志逐条写入 <home>/run.log。须在 StartWithFd 之前调用。
 // 对应 Swift 侧 `MihomoSetup(_:)`。
 func Setup(home string) {
+	lockConfigApplyForWrite()
+	defer unlockConfigApplyForWrite()
 	configureMemoryLimits()
+	// Setup may be called again after a failed or force-closed session. End
+	// the previous subscription before changing homeDir so its goroutine cannot
+	// continue writing into the next session's log file.
+	stopLogCapture()
+	logFileMu.Lock()
 	homeDir = home
+	logFileMu.Unlock()
 	C.SetHomeDir(home)
 	startLogCapture()
 }
@@ -538,52 +557,96 @@ func ForceGC() {
 //	type Event struct { LogLevel LogLevel; Payload string }
 //	func (e *Event) Type() string  // 级别字符串
 func startLogCapture() {
-	logCaptureMu.Do(func() {
-		f, err := os.OpenFile(filepath.Join(homeDir, "run.log"),
-			os.O_CREATE|os.O_WRONLY, 0o644)
-		if err != nil {
-			return
-		}
-		logFileMu.Lock()
-		runLogFile = f
-		if info, statErr := f.Stat(); statErr == nil {
-			runLogBytes = info.Size()
-		} else {
-			runLogBytes = -1
-		}
-		_, _ = f.Seek(0, io.SeekEnd)
-		logFileMu.Unlock()
-		sub := log.Subscribe()
-		go func() {
-			defer func() {
-				logFileMu.Lock()
-				if runLogFile == f {
-					runLogFile = nil
-					runLogBytes = -1
-				}
-				_ = f.Close()
-				logFileMu.Unlock()
-			}()
-			for elm := range sub {
-				// 总线收所有级别（mihomo 的 logCh 无条件推送），这里按配置级别过滤，
-				// 让 run.log 以「设置里的日志级别」为天花板——复刻 print 的 `< Level()` 逻辑。
-				if elm.LogLevel < log.Level() {
-					continue
-				}
-				// A provider/config error can contain the original payload. Bound it
-				// before fmt.Sprintf so one pathological event cannot allocate an
-				// unbounded temporary string in the Network Extension.
-				payload := boundedLogText(elm.Payload, maxRunLogLineBytes/2)
-				line := fmt.Sprintf("%s [%s] %s\n",
-					logTimestamp(), elm.Type(), payload)
-				logFileMu.Lock()
-				writeRunLogLine(f, line)
-				logFileMu.Unlock()
-				// WriteString 已立即写入系统页缓存，主 App 可以读取；逐行 Sync 会在
-				// 高日志量时强制刷盘，拖慢 Tunnel 和前台 UI。
+	logCaptureMu.Lock()
+	if logCaptureStop != nil {
+		logCaptureMu.Unlock()
+		return
+	}
+	f, err := os.OpenFile(filepath.Join(homeDir, "run.log"),
+		os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		logCaptureMu.Unlock()
+		return
+	}
+	logFileMu.Lock()
+	runLogFile = f
+	if info, statErr := f.Stat(); statErr == nil {
+		runLogBytes = info.Size()
+	} else {
+		runLogBytes = -1
+	}
+	_, _ = f.Seek(0, io.SeekEnd)
+	logFileMu.Unlock()
+	sub := log.Subscribe()
+	done := make(chan struct{})
+	logCaptureDone = done
+	// Store a closure instead of the concrete generic subscription type. This
+	// keeps the gomobile wrapper independent of the observable implementation
+	// while still using mihomo's official UnSubscribe path.
+	logCaptureStop = func() { log.UnSubscribe(sub) }
+	logCaptureMu.Unlock()
+	go func() {
+		defer close(done)
+		defer func() {
+			logFileMu.Lock()
+			if runLogFile == f {
+				runLogFile = nil
+				runLogBytes = -1
 			}
+			_ = f.Close()
+			logFileMu.Unlock()
+			logCaptureMu.Lock()
+			if logCaptureDone == done {
+				logCaptureStop = nil
+				logCaptureDone = nil
+			}
+			logCaptureMu.Unlock()
 		}()
-	})
+		for elm := range sub {
+			// 总线收所有级别（mihomo 的 logCh 无条件推送），这里按配置级别过滤，
+			// 让 run.log 以「设置里的日志级别」为天花板——复刻 print 的 `< Level()` 逻辑。
+			if elm.LogLevel < log.Level() {
+				continue
+			}
+			// A provider/config error can contain the original payload. Bound it
+			// before fmt.Sprintf so one pathological event cannot allocate an
+			// unbounded temporary string in the Network Extension.
+			payload := boundedLogText(elm.Payload, maxRunLogLineBytes/2)
+			line := fmt.Sprintf("%s [%s] %s\n",
+				logTimestamp(), elm.Type(), payload)
+			logFileMu.Lock()
+			writeRunLogLine(f, line)
+			logFileMu.Unlock()
+			// WriteString 已立即写入系统页缓存，主 App 可以读取；逐行 Sync 会在
+			// 高日志量时强制刷盘，拖慢 Tunnel 和前台 UI。
+		}
+	}()
+}
+
+// stopLogCapture unsubscribes from mihomo's global log bus and waits for the
+// writer to close its file. The wait is bounded by the subscription itself:
+// UnSubscribe closes the channel, so no log event can retain the old file
+// after this function returns.
+func stopLogCapture() {
+	logCaptureMu.Lock()
+	stop := logCaptureStop
+	done := logCaptureDone
+	logCaptureStop = nil
+	logCaptureDone = nil
+	logCaptureMu.Unlock()
+	if stop != nil {
+		stop()
+	}
+	if done != nil {
+		<-done
+	}
+}
+
+func logCaptureIsActive() bool {
+	logCaptureMu.Lock()
+	active := logCaptureStop != nil
+	logCaptureMu.Unlock()
+	return active
 }
 
 func boundedLogText(value string, maximum int) string {
@@ -879,15 +942,24 @@ func inspectRuleRequirements(value any) ruleRequirements {
 // 及用户设置合并、按需剔除 geo 规则，再注入 fd 启动。
 // 对应 Swift 侧 `MihomoStartWithConfig(_:_:_:_:error:)`。
 func StartWithConfig(fd int, tunnelMTU int, configYAML string, settingsJSON string) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			stack := fmt.Sprintf("panic: %v\n%s", r, debug.Stack())
-			appendRunLog("===== mihomo 启动 panic =====\n" + stack)
-			err = fmt.Errorf("mihomo panic: %v", r)
-		}
-	}()
 	lockConfigApplyForWrite()
 	defer unlockConfigApplyForWrite()
+	started := false
+	defer func() {
+		if r := recover(); r != nil {
+			appendRunLog(fmt.Sprintf("startRollback: panic: %v\n%s", r, debug.Stack()))
+			err = fmt.Errorf("mihomo panic: %v", r)
+		}
+		if !started {
+			appendRunLog("startRollback: 清理部分启动状态")
+			stopRuntimeLocked()
+		}
+	}()
+	if coreSessionClock != nil {
+		stopRuntimeLocked()
+	}
+	atomic.AddUint64(&runtimeGeneration, 1)
+	startLogCapture()
 
 	resetError := resetRunLog()
 	st := parseSettings(settingsJSON)
@@ -909,6 +981,7 @@ func StartWithConfig(fd int, tunnelMTU int, configYAML string, settingsJSON stri
 	// Only a successfully started new tunnel gets a new clock. App lifecycle,
 	// provider updates, network recovery and memory collection do not reset it.
 	coreSessionClock = sessionclock.New()
+	started = true
 	return nil
 }
 
@@ -960,7 +1033,20 @@ func applyRuntimeConfig(fd int, tunnelMTU int, configYAML string, st appSettings
 	// a stale client-side DNS answer no longer has a reverse mapping.
 	tunnel.SetReservedSyntheticIPPrefixes(coraReservedSyntheticIPPrefixes[:])
 	appendRunLog("启动 ParseRawConfig 成功，已注册 198.18.0.0/15 保留地址防线，开始 ApplyConfig")
-	executor.ApplyConfig(cfg, true)
+	// Do not let old provider pull loops survive a complete configuration
+	// replacement. The write lock prevents new snapshots while each Provider
+	// is cancelled and given the shared deadline to finish its old work.
+	closeRuntimeProviders()
+	applied := false
+	defer func() {
+		if !applied {
+			closeProviders(providerObjects(cfg.Providers, cfg.RuleProviders))
+		}
+	}()
+	if err := executor.ApplyConfigWithError(cfg, true); err != nil {
+		return fmt.Errorf("初始化 Provider 失败: %w", err)
+	}
+	applied = true
 	for group, name := range st.ProxySelections {
 		proxy, exists := tunnel.Proxies()[group]
 		if !exists {
@@ -2005,76 +2091,108 @@ func ValidateProxyProviderPayload(payload string) error {
 
 // UpdateProxyProviders refreshes the active runtime's HTTP proxy providers.
 // File, inline and the reserved compatible provider are intentionally skipped.
-func UpdateProxyProviders() string {
+func UpdateProxyProviders() string { return string(UpdateProxyProvidersData()) }
+
+func UpdateProxyProvidersData() []byte {
 	configApplyMu.RLock()
-	defer configApplyMu.RUnlock()
 	providers := tunnel.Providers()
 	names := make([]string, 0, len(providers))
+	updates := make(map[string]func() error, len(providers))
 	for name, provider := range providers {
 		if provider.VehicleType() == P.HTTP {
 			names = append(names, name)
+			updates[name] = provider.Update
 		}
 	}
+	generation := atomic.LoadUint64(&runtimeGeneration)
+	configApplyMu.RUnlock()
 	sort.Strings(names)
-	return updateRuntimeProviders(names, func(name string) error { return providers[name].Update() })
+	return updateRuntimeProviders(generation, names, func(name string) error { return updates[name]() })
 }
 
 // UpdateProxyProvider refreshes one named HTTP Proxy Provider in the active runtime.
-func UpdateProxyProvider(name string) string {
+func UpdateProxyProvider(name string) string { return string(UpdateProxyProviderData(name)) }
+
+func UpdateProxyProviderData(name string) []byte {
 	configApplyMu.RLock()
-	defer configApplyMu.RUnlock()
 	providers := tunnel.Providers()
 	provider, ok := providers[name]
 	if !ok {
+		configApplyMu.RUnlock()
 		return providerNotFoundResponse(name)
 	}
 	if provider.VehicleType() != P.HTTP {
+		configApplyMu.RUnlock()
 		return providerWrongVehicleResponse(name)
 	}
-	return updateRuntimeProviders([]string{name}, func(string) error { return provider.Update() })
+	update := provider.Update
+	generation := atomic.LoadUint64(&runtimeGeneration)
+	configApplyMu.RUnlock()
+	return updateRuntimeProviders(generation, []string{name}, func(string) error { return update() })
 }
 
 // UpdateRuleProviders refreshes all HTTP Rule Providers in the active runtime.
-func UpdateRuleProviders() string {
+func UpdateRuleProviders() string { return string(UpdateRuleProvidersData()) }
+
+func UpdateRuleProvidersData() []byte {
 	configApplyMu.RLock()
-	defer configApplyMu.RUnlock()
 	providers := tunnel.RuleProviders()
 	names := make([]string, 0, len(providers))
+	updates := make(map[string]func() error, len(providers))
 	for name, provider := range providers {
 		if provider.VehicleType() == P.HTTP {
 			names = append(names, name)
+			updates[name] = provider.Update
 		}
 	}
+	generation := atomic.LoadUint64(&runtimeGeneration)
+	configApplyMu.RUnlock()
 	sort.Strings(names)
-	return updateRuntimeProviders(names, func(name string) error { return providers[name].Update() })
+	return updateRuntimeProviders(generation, names, func(name string) error { return updates[name]() })
 }
 
 // UpdateRuleProvider refreshes one named HTTP Rule Provider in the active runtime.
-func UpdateRuleProvider(name string) string {
+func UpdateRuleProvider(name string) string { return string(UpdateRuleProviderData(name)) }
+
+func UpdateRuleProviderData(name string) []byte {
 	configApplyMu.RLock()
-	defer configApplyMu.RUnlock()
 	providers := tunnel.RuleProviders()
 	provider, ok := providers[name]
 	if !ok {
+		configApplyMu.RUnlock()
 		return providerNotFoundResponse(name)
 	}
 	if provider.VehicleType() != P.HTTP {
+		configApplyMu.RUnlock()
 		return providerWrongVehicleResponse(name)
 	}
-	return updateRuntimeProviders([]string{name}, func(string) error { return provider.Update() })
+	update := provider.Update
+	generation := atomic.LoadUint64(&runtimeGeneration)
+	configApplyMu.RUnlock()
+	return updateRuntimeProviders(generation, []string{name}, func(string) error { return update() })
 }
 
-func updateRuntimeProviders(names []string, update func(string) error) string {
+func updateRuntimeProviders(generation uint64, names []string, update func(string) error) []byte {
+	atomic.AddInt32(&activeProviderRefresh, 1)
+	defer atomic.AddInt32(&activeProviderRefresh, -1)
 	updated := make([]string, 0, len(names))
 	failures := map[string]string{}
 	for _, name := range names {
+		if atomic.LoadUint64(&runtimeGeneration) != generation {
+			failures[name] = "运行时已切换，已取消刷新"
+			continue
+		}
 		if err := update(name); err != nil {
 			failures[name] = err.Error()
 			continue
 		}
+		if atomic.LoadUint64(&runtimeGeneration) != generation {
+			failures[name] = "运行时已切换，已取消刷新"
+			continue
+		}
 		updated = append(updated, name)
 	}
-	result := marshalJSON(map[string]any{
+	result := marshalJSONData(map[string]any{
 		"ok":       len(failures) == 0,
 		"updated":  updated,
 		"failures": failures,
@@ -2144,16 +2262,16 @@ func runtimeRemoteResourceStatusForProvider(name, kind string, provider P.Provid
 	}, true
 }
 
-func providerNotFoundResponse(name string) string {
-	return marshalJSON(map[string]any{
+func providerNotFoundResponse(name string) []byte {
+	return marshalJSONData(map[string]any{
 		"ok":       false,
 		"updated":  []string{},
 		"failures": map[string]string{name: "provider not found"},
 	})
 }
 
-func providerWrongVehicleResponse(name string) string {
-	return marshalJSON(map[string]any{
+func providerWrongVehicleResponse(name string) []byte {
+	return marshalJSONData(map[string]any{
 		"ok":       false,
 		"updated":  []string{},
 		"failures": map[string]string{name: "provider is not an HTTP resource"},
@@ -2834,41 +2952,50 @@ func proxyDelayErrorResponse(err error) string {
 // rule provider. The provider vehicle owns the cache path, so this never
 // performs a second network request and cannot replace the running rules.
 func RuleProviderContent(name string, maxBytes int) string {
-	configApplyMu.RLock()
-	defer configApplyMu.RUnlock()
-	provider, ok := tunnel.RuleProviders()[strings.TrimSpace(name)]
-	if !ok {
-		return marshalJSON(map[string]any{"ok": false, "error": "规则来源不存在"})
-	}
-	vehicleProvider, ok := provider.(interface{ Vehicle() P.Vehicle })
-	if !ok {
-		return marshalJSON(map[string]any{"ok": false, "error": "当前内核不支持读取规则来源原文"})
-	}
-	path := vehicleProvider.Vehicle().Path()
-	if path == "" {
-		return marshalJSON(map[string]any{"ok": false, "error": "规则来源尚未落盘"})
-	}
+	return string(RuleProviderContentData(name, maxBytes))
+}
+
+// RuleProviderContentData is the byte-oriented bridge used by the Network
+// Extension for large rule-provider previews. It shares the same encoder as
+// the legacy string API without creating a string before crossing the bridge.
+func RuleProviderContentData(name string, maxBytes int) []byte {
 	if maxBytes <= 0 || maxBytes > 1<<20 {
 		maxBytes = 1 << 20
 	}
+	configApplyMu.RLock()
+	provider, ok := tunnel.RuleProviders()[strings.TrimSpace(name)]
+	if !ok {
+		configApplyMu.RUnlock()
+		return marshalJSONData(map[string]any{"ok": false, "error": "规则来源不存在"})
+	}
+	vehicleProvider, ok := provider.(interface{ Vehicle() P.Vehicle })
+	if !ok {
+		configApplyMu.RUnlock()
+		return marshalJSONData(map[string]any{"ok": false, "error": "当前内核不支持读取规则来源原文"})
+	}
+	path := vehicleProvider.Vehicle().Path()
+	configApplyMu.RUnlock()
+	if path == "" {
+		return marshalJSONData(map[string]any{"ok": false, "error": "规则来源尚未落盘"})
+	}
 	info, statErr := os.Stat(path)
 	if statErr != nil {
-		return marshalJSON(map[string]any{"ok": false, "error": "规则来源尚未更新"})
+		return marshalJSONData(map[string]any{"ok": false, "error": "规则来源尚未更新"})
 	}
 	file, err := os.Open(path)
 	if err != nil {
-		return marshalJSON(map[string]any{"ok": false, "error": "读取规则来源失败"})
+		return marshalJSONData(map[string]any{"ok": false, "error": "读取规则来源失败"})
 	}
 	defer file.Close()
 	data, err := io.ReadAll(io.LimitReader(file, int64(maxBytes)+1))
 	if err != nil {
-		return marshalJSON(map[string]any{"ok": false, "error": "读取规则来源失败"})
+		return marshalJSONData(map[string]any{"ok": false, "error": "读取规则来源失败"})
 	}
 	truncated := len(data) > maxBytes
 	if truncated {
 		data = data[:maxBytes]
 	}
-	return marshalJSON(map[string]any{
+	return marshalJSONData(map[string]any{
 		"ok":        true,
 		"content":   string(data),
 		"size":      info.Size(),
@@ -2919,6 +3046,11 @@ func ScriptFetchData(requestJSON string) []byte {
 	default:
 		return marshalJSONData(map[string]any{"ok": false, "error": "脚本只允许 GET、POST、HEAD"})
 	}
+	ctx, finish := beginRuntimeControl()
+	defer finish()
+	if ctx.Err() != nil {
+		return marshalJSONData(map[string]any{"ok": false, "error": "内核未运行"})
+	}
 	proxies := tunnel.Proxies()
 	proxy, err := resolveScriptProxy(request.Name, request.Group, proxies)
 	if err != nil {
@@ -2930,7 +3062,7 @@ func ScriptFetchData(requestJSON string) []byte {
 	if request.TimeoutMs <= 0 || request.TimeoutMs > maxScriptRequestTimeoutMs {
 		request.TimeoutMs = maxScriptRequestTimeoutMs
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(request.TimeoutMs)*time.Millisecond)
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(request.TimeoutMs)*time.Millisecond)
 	defer cancel()
 	port := u.Port()
 	if port == "" {
@@ -3020,15 +3152,20 @@ func ScriptFetchData(requestJSON string) []byte {
 // script run. It deliberately exposes only the configured server address and
 // one short-lived IP resolution; scripts never receive credentials or full
 // proxy configuration.
-func ScriptTargetInfo(name, group string) string {
-	configApplyMu.RLock()
+func ScriptTargetInfo(name, group string) string { return string(ScriptTargetInfoData(name, group)) }
+
+func ScriptTargetInfoData(name, group string) []byte {
+	ctx, finish := beginRuntimeControl()
+	defer finish()
+	if ctx.Err() != nil {
+		return marshalJSONData(map[string]any{"ok": false, "error": "内核未运行"})
+	}
 	proxy, err := resolveScriptProxy(name, group, tunnel.Proxies())
-	configApplyMu.RUnlock()
 	if err != nil {
-		return marshalJSON(map[string]any{"ok": false, "error": err.Error()})
+		return marshalJSONData(map[string]any{"ok": false, "error": err.Error()})
 	}
 	if proxy.Type() == C.Direct || proxy.Type() == C.Reject || proxy.Type() == C.RejectDrop {
-		return marshalJSON(map[string]any{"ok": false, "error": "目标不是可查询入口的代理节点"})
+		return marshalJSONData(map[string]any{"ok": false, "error": "目标不是可查询入口的代理节点"})
 	}
 
 	address := strings.TrimSpace(proxy.Addr())
@@ -3041,7 +3178,7 @@ func ScriptTargetInfo(name, group string) string {
 		"port":    port,
 	}
 	if host == "" {
-		return marshalJSON(result)
+		return marshalJSONData(result)
 	}
 
 	if ip, err := netip.ParseAddr(host); err == nil {
@@ -3050,13 +3187,13 @@ func ScriptTargetInfo(name, group string) string {
 		} else {
 			result["resolutionError"] = "节点入口不是可查询的公网地址"
 		}
-		return marshalJSON(result)
+		return marshalJSONData(result)
 	}
 	if cachedIP := cachedScriptTargetIP(host, false, time.Now()); cachedIP != "" {
 		result["ip"] = cachedIP
-		return marshalJSON(result)
+		return marshalJSONData(result)
 	}
-	if ip, err := resolveScriptTargetIP(host); err == nil {
+	if ip, err := resolveScriptTargetIPContext(ctx, host); err == nil {
 		cacheScriptTargetIP(host, ip)
 		result["ip"] = ip
 	} else if cachedIP := cachedScriptTargetIP(host, true, time.Now()); cachedIP != "" {
@@ -3068,11 +3205,15 @@ func ScriptTargetInfo(name, group string) string {
 		// A hostname is still useful to show when its temporary DNS lookup fails.
 		result["resolutionError"] = "节点入口域名暂时无法解析"
 	}
-	return marshalJSON(result)
+	return marshalJSONData(result)
 }
 
 func resolveScriptTargetIP(host string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	return resolveScriptTargetIPContext(context.Background(), host)
+}
+
+func resolveScriptTargetIPContext(parent context.Context, host string) (string, error) {
+	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 	ip, resolveErr := resolver.ResolveIP(ctx, host)
 	cancel()
 	if resolveErr == nil && usableScriptTargetIP(ip) {
@@ -3082,7 +3223,7 @@ func resolveScriptTargetIP(host string) (string, error) {
 	// mihomo DNS can be restarting while the tunnel is reasserting. The system
 	// resolver is a bounded fallback for this display-only lookup; the actual
 	// test request still always travels through the selected mihomo proxy.
-	fallbackCtx, fallbackCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	fallbackCtx, fallbackCancel := context.WithTimeout(parent, 3*time.Second)
 	defer fallbackCancel()
 	addresses, fallbackErr := net.DefaultResolver.LookupNetIP(fallbackCtx, "ip", host)
 	if fallbackErr == nil {
@@ -3130,6 +3271,32 @@ func cachedScriptTargetIP(host string, allowStale bool, now time.Time) string {
 		return ""
 	}
 	return entry.ip
+}
+
+// scriptTargetIPCacheStats reports the small, session-local cache without
+// retaining a diagnostic snapshot. Bytes include map key and IP string storage
+// only; map buckets and allocator overhead remain part of Go heap accounting.
+func scriptTargetIPCacheStats(now time.Time) (entries int, bytes uint64, stale int) {
+	scriptTargetIPCacheMu.Lock()
+	defer scriptTargetIPCacheMu.Unlock()
+	for key, entry := range scriptTargetIPCache {
+		if now.After(entry.expiresAt) {
+			stale++
+			continue
+		}
+		entries++
+		bytes += uint64(len(key) + len(entry.ip))
+	}
+	return entries, bytes, stale
+}
+
+// clearScriptTargetIPCache releases session-owned lookup results on a real
+// tunnel stop or a failed start rollback. The cache is intentionally never
+// persisted with subscription data.
+func clearScriptTargetIPCache() {
+	scriptTargetIPCacheMu.Lock()
+	clear(scriptTargetIPCache)
+	scriptTargetIPCacheMu.Unlock()
 }
 
 func cacheScriptTargetIP(host, ip string) {
@@ -3182,15 +3349,20 @@ func splitScriptTargetAddress(address string) (host, port string) {
 // DirectNetworkInfo obtains the device's public IPv4 through the built-in
 // DIRECT adapter. The endpoints are fixed in the core so a signed external
 // script cannot issue arbitrary direct requests that bypass the selected node.
-func DirectNetworkInfo() string {
-	configApplyMu.RLock()
+func DirectNetworkInfo() string { return string(DirectNetworkInfoData()) }
+
+func DirectNetworkInfoData() []byte {
+	parent, finish := beginRuntimeControl()
+	defer finish()
+	if parent.Err() != nil {
+		return marshalJSONData(map[string]any{"ok": false, "error": "内核未运行"})
+	}
 	direct, exists := tunnel.Proxies()["DIRECT"]
-	configApplyMu.RUnlock()
 	if !exists || direct.Type() != C.Direct {
-		return marshalJSON(map[string]any{"ok": false, "error": "DIRECT 出站不可用"})
+		return marshalJSONData(map[string]any{"ok": false, "error": "DIRECT 出站不可用"})
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
 	providers := []struct {
 		url  string
@@ -3208,10 +3380,10 @@ func DirectNetworkInfo() string {
 		if result, ok := parseDirectNetworkInfo(data); ok {
 			result["ok"] = true
 			result["provider"] = provider.name
-			return marshalJSON(result)
+			return marshalJSONData(result)
 		}
 	}
-	return marshalJSON(map[string]any{"ok": false, "error": "直连公网信息查询失败"})
+	return marshalJSONData(map[string]any{"ok": false, "error": "直连公网信息查询失败"})
 }
 
 func directNetworkGET(ctx context.Context, proxy C.Proxy, rawURL string) ([]byte, error) {
@@ -3477,11 +3649,16 @@ func SetMode(mode string) {
 
 // TrafficNow 返回当前每秒上下行速率与本次内核运行秒数。
 // 取自 mihomo 统计管理器（与 REST /traffic 同源），对应 Swift 侧 `MihomoTrafficNow()`。
-func TrafficNow() string {
+func TrafficNow() string { return string(TrafficNowData()) }
+
+func TrafficNowData() []byte {
 	configApplyMu.RLock()
 	defer configApplyMu.RUnlock()
 	up, down := statistic.DefaultManager.Now()
-	uptime := coreSessionClock.Seconds()
+	uptime := int64(0)
+	if coreSessionClock != nil {
+		uptime = coreSessionClock.Seconds()
+	}
 	// This response is emitted once per second while the tunnel is visible.
 	// Build the three integer fields directly so the hot path does not pay the
 	// reflection and intermediate value allocations of json.Marshal.
@@ -3494,7 +3671,7 @@ func TrafficNow() string {
 	out = append(out, `,"uptime":`...)
 	out = strconv.AppendInt(out, uptime, 10)
 	out = append(out, '}')
-	return string(out)
+	return out
 }
 
 // ConnectionsSnapshot returns a bounded, newest-first connection list for the
@@ -3650,7 +3827,9 @@ func CloseAllConnections() int {
 // RuntimeStats returns a compact process snapshot for the Network Extension's
 // persistent OOM diagnostics. It reads runtime/statistic counters without
 // forcing a garbage collection.
-func RuntimeStats() string {
+func RuntimeStats() string { return string(RuntimeStatsData()) }
+
+func RuntimeStatsData() []byte {
 	configApplyMu.RLock()
 	defer configApplyMu.RUnlock()
 	var mem runtime.MemStats
@@ -3733,6 +3912,10 @@ func RuntimeStats() string {
 		ConnectionSnapshotBytes  int64   `json:"connectionSnapshotBytes"`
 		ClosedSnapshotBytes      int64   `json:"closedSnapshotBytes"`
 		ClosedQueuePending       int     `json:"closedQueuePending"`
+		RuntimeGeneration        uint64  `json:"runtimeGeneration"`
+		ProviderRefreshActive    int     `json:"providerRefreshActive"`
+		LogCaptureActive         bool    `json:"logCaptureActive"`
+		NTPActive                bool    `json:"ntpActive"`
 		MihomoBufferPoolBuffers  int     `json:"mihomoBufferPoolBuffers"`
 		MihomoBufferPoolBytes    uint64  `json:"mihomoBufferPoolBytes"`
 		MihomoBufferPoolMaxBytes uint64  `json:"mihomoBufferPoolMaxBytes"`
@@ -3787,6 +3970,10 @@ func RuntimeStats() string {
 		ConnectionSnapshotBytes:  atomic.LoadInt64(&lastConnectionSnapshotBytes),
 		ClosedSnapshotBytes:      atomic.LoadInt64(&lastClosedSnapshotBytes),
 		ClosedQueuePending:       statistic.DefaultManager.ClosedPending(),
+		RuntimeGeneration:        atomic.LoadUint64(&runtimeGeneration),
+		ProviderRefreshActive:    int(atomic.LoadInt32(&activeProviderRefresh)),
+		LogCaptureActive:         logCaptureIsActive(),
+		NTPActive:                ntp.RuntimeActive(),
 		MihomoBufferPoolBuffers:  mihomoPoolSnapshot.Buffers,
 		MihomoBufferPoolBytes:    mihomoPoolSnapshot.Bytes,
 		MihomoBufferPoolMaxBytes: mihomoPoolSnapshot.MaxBufferBytes,
@@ -3799,9 +3986,9 @@ func RuntimeStats() string {
 	}
 	out, err := json.Marshal(snapshot)
 	if err != nil {
-		return `{}`
+		return []byte(`{}`)
 	}
-	return string(out)
+	return out
 }
 
 // SetDefaultInterface 把所有出站绑定到指定物理接口（en0/pdp_ip0…）。
@@ -4242,11 +4429,90 @@ func resetDNSResolverTransport(oldResolver resolver.Resolver) {
 	}
 }
 
-// Stop 关闭内核与所有监听器。对应 Swift 侧 `MihomoStop()`。
-func Stop() {
+// closeRuntimeProviders closes the concrete provider implementations before
+// a complete runtime replacement. The public provider interface intentionally
+// does not require Close, so this remains compatible with file/inline
+// providers while releasing HTTP fetchers and health-check workers when the
+// implementation exposes the lifecycle method.
+func providerObjects(proxies map[string]P.ProxyProvider, rules map[string]P.RuleProvider) []any {
+	objects := make([]any, 0, len(proxies)+len(rules))
+	seen := make(map[any]struct{})
+	add := func(provider any) {
+		if provider == nil {
+			return
+		}
+		value := reflect.ValueOf(provider)
+		if value.Kind() == reflect.Ptr && value.IsNil() {
+			return
+		}
+		if value.Type().Comparable() {
+			if _, exists := seen[provider]; exists {
+				return
+			}
+			seen[provider] = struct{}{}
+		}
+		objects = append(objects, provider)
+	}
+	for _, p := range proxies {
+		add(p)
+	}
+	for _, p := range rules {
+		add(p)
+	}
+	return objects
+}
+
+func closeRuntimeProviders() {
+	closeProviders(providerObjects(tunnel.Providers(), tunnel.RuleProviders()))
+}
+
+func closeProviders(objects []any) {
+	for _, provider := range objects {
+		if canceller, ok := provider.(interface{ CancelRuntime() }); ok {
+			canceller.CancelRuntime()
+		}
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for _, provider := range objects {
+		if waiter, ok := provider.(interface{ WaitRuntimeIdle(time.Time) bool }); ok && !waiter.WaitRuntimeIdle(deadline) {
+			appendRunLog("providerRefresh: 取消后收尾超时，旧对象保持独立，结果不得回写新会话")
+		}
+		switch closer := provider.(type) {
+		case interface{ Close() error }:
+			if err := closer.Close(); err != nil {
+				appendRunLog("Provider Close: " + err.Error())
+			}
+		case interface{ Close() }:
+			closer.Close()
+		}
+	}
+}
+
+// resetDNSRuntime releases resolver transports and the DNS listener while
+// preserving Fake-IP's on-disk state. The atomic DNS runtime patch makes the
+// zero snapshot a single coherent publication for data-plane readers.
+func resetDNSRuntime() {
+	runtimeState := resolver.CurrentDNSRuntime()
+	resetDNSResolverTransport(runtimeState.DefaultResolver)
+	resetDNSResolverTransport(runtimeState.ProxyServerHostResolver)
+	resetDNSResolverTransport(runtimeState.DirectHostResolver)
+	if resolver.SystemResolver != nil {
+		resolver.SystemResolver.ResetConnection()
+	}
+	resolver.PublishDNSRuntime(resolver.DNSRuntimeSnapshot{})
+	resolver.DefaultHostMapper = nil
+	mdns.ReCreateServer("", nil, nil)
+}
+
+func stopNTPService() { ntp.ReCreateNTPService("", 0, "", nil, false) }
+
+// stopRuntimeLocked is the single rollback/stop path. Callers must hold
+// configApplyMu's write lock; keeping cleanup in one path prevents failed
+// starts from retaining a partially applied runtime.
+func stopRuntimeLocked() {
+	tunnel.OnSuspend()
+	atomic.AddUint64(&runtimeGeneration, 1)
 	po0Whitelist.stop()
-	lockConfigApplyForWrite()
-	defer unlockConfigApplyForWrite()
 	appendRunLog("Stop: 关闭内核")
 	storePhysicalInterface("")
 	activeDNSConfig = nil
@@ -4256,19 +4522,44 @@ func Stop() {
 	activeSystemDNS = nil
 	activeGeneralIPv6 = false
 	activeUsesSystemDNS = false
+	pendingUsesSystemDNS = false
+	pendingSourceDNSMode = ""
 	activeDNSGeneration = 0
 	coreSessionClock = nil
+	atomic.StoreInt64(&lastConnectionSnapshotBytes, 0)
+	atomic.StoreInt64(&lastClosedSnapshotBytes, 0)
+	clearScriptTargetIPCache()
 	CloseAllConnections()
 	// The recorder is stopped by the Swift host before MihomoStop runs. Do not
 	// leave the final close snapshots in the bounded ring when no consumer can
 	// persist them; the next tunnel session starts with a fresh cursor.
 	statistic.DefaultManager.DiscardClosed()
-	executor.Shutdown()
+	closeRuntimeProviders()
+	// ReCreateNTPService(false) cancels the old ticker/context even when the
+	// next configuration does not declare an NTP service.
+	stopNTPService()
+	executor.Shutdown() // persists Fake-IP while the old mapper is still attached
+	resetDNSRuntime()
+	tunnel.UpdateProxies(nil, nil)
+	tunnel.UpdateRules(nil, nil, nil)
+	tunnel.UpdateListeners(nil)
+	geodata.ClearGeoSiteCache()
+	geodata.ClearGeoIPCache()
 	tunnel.SetReservedSyntheticIPPrefixes(nil)
-	// 旧运行时必须在下一次 StartWithConfig 前尽量归还 Go 堆页，
-	// 避免完整 stop/start 重载在 NE 中形成短暂的内存峰值。FreeOSMemory
-	// 已包含一次完整 GC，不再额外扫描一遍堆。
+	appendRunLog("dnsReset: DNS runtime/传输已释放，Fake-IP 持久化文件保留")
+	appendRunLog("logUnsubscribe: 退订旧日志订阅")
+	stopLogCapture()
+	appendRunLog("stopCompleted: 会话资源已解除引用")
+	// FreeOSMemory includes a full GC and releases idle pages after all
+	// session-owned objects above have been detached.
 	debug.FreeOSMemory()
+}
+
+// Stop 关闭内核与所有监听器。对应 Swift 侧 `MihomoStop()`。
+func Stop() {
+	lockConfigApplyForWrite()
+	defer unlockConfigApplyForWrite()
+	stopRuntimeLocked()
 }
 
 func storePhysicalInterface(name string) {
@@ -4290,11 +4581,11 @@ func isCellularInterface(name string) bool {
 
 // appendRunLog 追加一行到 <home>/run.log（封装层自己的标记，便于和内核日志混排）。
 func appendRunLog(msg string) {
+	logFileMu.Lock()
+	defer logFileMu.Unlock()
 	if homeDir == "" {
 		return
 	}
-	logFileMu.Lock()
-	defer logFileMu.Unlock()
 	// Keep wrapper-generated errors bounded too. Panic stacks and provider
 	// errors can otherwise be formatted into a multi-megabyte temporary string
 	// before writeRunLogLine gets a chance to rotate/truncate it.
@@ -4350,6 +4641,10 @@ func writeRunLogLine(file *os.File, line string) {
 // the app detect startup truncation even if the new file has already regrown
 // beyond the previous byte offset.
 func RunLogChunk(offset int, generation int) string {
+	return string(RunLogChunkData(offset, generation))
+}
+
+func RunLogChunkData(offset int, generation int) []byte {
 	type response struct {
 		Offset     int64  `json:"offset"`
 		Generation int64  `json:"generation"`
@@ -4364,20 +4659,20 @@ func RunLogChunk(offset int, generation int) string {
 	if homeDir == "" {
 		result.Error = "日志目录尚未初始化"
 		out, _ := json.Marshal(result)
-		return string(out)
+		return out
 	}
 	f, err := os.Open(filepath.Join(homeDir, "run.log"))
 	if err != nil {
 		result.Error = err.Error()
 		out, _ := json.Marshal(result)
-		return string(out)
+		return out
 	}
 	defer f.Close()
 	info, err := f.Stat()
 	if err != nil {
 		result.Error = err.Error()
 		out, _ := json.Marshal(result)
-		return string(out)
+		return out
 	}
 
 	start := int64(offset)
@@ -4399,7 +4694,7 @@ func RunLogChunk(offset int, generation int) string {
 		result.Error = readErr.Error()
 		result.Offset = start
 		out, _ := json.Marshal(result)
-		return string(out)
+		return out
 	}
 	data := buffer[:read]
 	if offset < 0 && start > 0 {
@@ -4416,17 +4711,17 @@ func RunLogChunk(offset int, generation int) string {
 	result.Offset = start + int64(len(data))
 	result.Text = string(data)
 	out, _ := json.Marshal(result)
-	return string(out)
+	return out
 }
 
 // 每次真实启动都开启新的 run.log 会话。日志页在内存中保留上一会话，因此这里截断
 // 不会让用户断开后看不到日志，同时避免同一 NE 进程重连时重复读取历史内容。
 func resetRunLog() error {
+	logFileMu.Lock()
+	defer logFileMu.Unlock()
 	if homeDir == "" {
 		return nil
 	}
-	logFileMu.Lock()
-	defer logFileMu.Unlock()
 	if runLogFile != nil {
 		if err := runLogFile.Truncate(0); err != nil {
 			return err
