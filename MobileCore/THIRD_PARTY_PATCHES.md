@@ -20,6 +20,37 @@ This upgrade does not change Cora's GC, memory limit, IPC budgets, rankings,
 or unlock-test settings. Validation and remaining device checks are recorded
 in [the v1.19.32 upgrade record](../docs/mihomo-v1.19.32-upgrade.md).
 
+## sing-tun-v0.4.27-mipstack-test-fixture
+
+- Added: 2026-10-08
+- Upstream module: `github.com/metacubex/sing-tun v0.4.27`
+- Patch: `sing-tun-v0.4.27-mipstack-test-fixture.patch`
+- Patched file: `stack_mipstack_io_test.go` (tests only)
+
+`TestMipsWindowsReadFailureExitsReadLoop` constructs a `Mipstack` without its
+underlying `mipstack.Stack`. The new `readLoop` sets RX checksum offload before
+reading from a system TUN, dereferencing that nil pointer. The platform-neutral
+fake Windows TUN triggers this failure on the macOS CI runner as well. Normal
+`Mipstack.Start` initializes the stack before launching the loop; Cora continues
+to select gVisor.
+
+The fixture now creates an addressless promiscuous stack, matching the wrapper's
+configuration, and closes it with `t.Cleanup`. The original read-failure test
+and the complete Darwin transport suite remain enabled. Production source,
+stack selection, queue limits, GC settings and NE memory budgets are unchanged.
+The preparation script verifies the pristine and patched test file hashes and
+applies this patch after the existing queue/diagnostic patches.
+
+Windows default and `with_gvisor,with_low_memory` sing-tun tests pass, as do
+100 repetitions of this regression and low-memory vet. Darwin arm64/amd64 test
+binaries cross-compile; all 17 dependency patches and 54 source-hash checks pass.
+Actual Darwin execution and full iOS builds still require macOS. Initial
+cross-compilation alone could not detect this runtime test-fixture error.
+
+Remove this test-only patch and its preparation-script paths/hash/apply wiring
+together once an upstream upgrade supplies an equivalent fix. Keep all runtime
+optimization and diagnostic patches.
+
 ## mihomo-v1.19.32-runtime-lifecycle
 
 - Added: 2026-10-07

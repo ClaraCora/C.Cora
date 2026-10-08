@@ -56,6 +56,22 @@ Windows 本地使用缓存的 Go 1.25.5，项目 CI 仍固定 1.25.4。使用隔
 以上结果证明本地源码与绑定兼容，不等同于完整 iOS 构建或真机运行结果。
 历史内存与吞吐测量仍见原记录，未将旧版本数据改称 v1.19.32 测量。
 
+## CI 测试初始化修复（2026-10-08）
+
+首轮 macOS CI 在 `TestMipsWindowsReadFailureExitsReadLoop` 崩溃。该上游测试
+使用模拟 Windows TUN，直接创建 Mipstack，却未初始化底层 Stack；新版读取循环
+在读错误之前调用 `SetRXChecksumOffload`，因此出现空指针。测试名称中的 Windows
+不代表仅在 Windows 执行，macOS 的完整测试也会运行它。
+
+新增 `sing-tun-v0.4.27-mipstack-test-fixture.patch`，只为此测试建立有效的 Stack
+并注册清理。保持原读失败断言与完整 CI 测试，不修改生产代码。准备脚本同步增加
+原始及补丁后测试文件 SHA-256 校验。内核仍为 v1.19.32，Cora 仍使用 gVisor。
+
+修复后，Windows 的 sing-tun 默认及低内存完整测试、专项 100 次循环和低内存 vet
+通过，Darwin arm64/amd64 测试二进制交叉编译通过。当前共 17 个补丁、54 项源码
+哈希和脚本语法检查通过。初次 Windows 验证仅交叉编译 Darwin 测试，不能发现
+运行时空指针；完整 macOS 测试、XCFramework/Xcode 和真机结果仍需后续确认。
+
 ## macOS 与真机待确认
 
 Windows 无法执行完整标准/Legacy XCFramework、Swift/Xcode 构建、macOS race 检查或
