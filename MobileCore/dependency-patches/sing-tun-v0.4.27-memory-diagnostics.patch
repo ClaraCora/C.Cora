@@ -1,6 +1,5 @@
 diff --git a/internal/fdbased_darwin/memory_diagnostics.go b/internal/fdbased_darwin/memory_diagnostics.go
 new file mode 100644
-index 0000000..90fc7e3
 --- /dev/null
 +++ b/internal/fdbased_darwin/memory_diagnostics.go
 @@ -0,0 +1,30 @@
@@ -36,7 +35,6 @@ index 0000000..90fc7e3
 +}
 diff --git a/internal/fdbased_darwin/memory_diagnostics_test.go b/internal/fdbased_darwin/memory_diagnostics_test.go
 new file mode 100644
-index 0000000..b842f56
 --- /dev/null
 +++ b/internal/fdbased_darwin/memory_diagnostics_test.go
 @@ -0,0 +1,29 @@
@@ -71,7 +69,6 @@ index 0000000..b842f56
 +}
 diff --git a/memory_diagnostics.go b/memory_diagnostics.go
 new file mode 100644
-index 0000000..a05435e
 --- /dev/null
 +++ b/memory_diagnostics.go
 @@ -0,0 +1,19 @@
@@ -96,7 +93,6 @@ index 0000000..a05435e
 +type queueStatsSource interface{ QueueStats() (int, uint64) }
 diff --git a/memory_diagnostics_darwin.go b/memory_diagnostics_darwin.go
 new file mode 100644
-index 0000000..8b92b2a
 --- /dev/null
 +++ b/memory_diagnostics_darwin.go
 @@ -0,0 +1,14 @@
@@ -116,7 +112,6 @@ index 0000000..8b92b2a
 +}
 diff --git a/memory_diagnostics_darwin_test.go b/memory_diagnostics_darwin_test.go
 new file mode 100644
-index 0000000..a2f5d6e
 --- /dev/null
 +++ b/memory_diagnostics_darwin_test.go
 @@ -0,0 +1,29 @@
@@ -150,18 +145,9 @@ index 0000000..a2f5d6e
 +	}
 +}
 diff --git a/tun_darwin.go b/tun_darwin.go
-index 21b5db6..b83701b 100644
 --- a/tun_darwin.go
 +++ b/tun_darwin.go
-@@ -5,6 +5,7 @@ import (
- 	"net"
- 	"net/netip"
- 	"os"
-+	"sync"
- 	"syscall"
- 	"unsafe"
- 
-@@ -25,20 +26,24 @@ var _ DarwinTUN = (*NativeTun)(nil)
+@@ -27,20 +27,24 @@
  const PacketOffset = 4
  
  type NativeTun struct {
@@ -197,10 +183,10 @@ index 21b5db6..b83701b 100644
 +	inet6Address     [16]byte
 +	routeSet         bool
 +	writeMsgX        bool
- }
  
- type iovecBuffer struct {
-@@ -156,6 +161,10 @@ func init() {
+ 	// writeAccess serializes writers on tunFd: sendmsg_x uses MSG_DONTWAIT, so a
+ 	// concurrent writer holding SB_LOCK makes the kernel free the whole batch yet
+@@ -165,6 +169,10 @@
  }
  
  func (t *NativeTun) Close() error {
@@ -212,10 +198,9 @@ index 21b5db6..b83701b 100644
  	t.stopFd.Stop()
  	err := t.tunFile.Close()
 diff --git a/tun_darwin_gvisor.go b/tun_darwin_gvisor.go
-index 8e51264..d2e0599 100644
 --- a/tun_darwin_gvisor.go
 +++ b/tun_darwin_gvisor.go
-@@ -65,7 +65,12 @@ func (t *NativeTun) NewEndpoint() (stack.LinkEndpoint, stack.NICOptions, error)
+@@ -69,7 +69,12 @@
  	if err != nil {
  		return nil, stack.NICOptions{}, err
  	}

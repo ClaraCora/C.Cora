@@ -1565,6 +1565,26 @@ func TestParseSettingsKeepsIOSRuntimeValuesSafe(t *testing.T) {
 	}
 }
 
+// Mihomo v1.19.32 defaults an omitted TUN stack to mips. Validate the parsed
+// core config, so changing that upstream default cannot switch Cora's stack.
+func TestIOSConfigKeepsGVisorWithUpstreamDefault(t *testing.T) {
+	for _, settingsJSON := range []string{"", `{"stack":"mips"}`, `{"stack":"system"}`} {
+		for _, source := range []string{"", "tun:\n  stack: mips\n", "tun:\n  stack: system\n"} {
+			merged, err := mergeConfig(source, parseSettings(settingsJSON), 1420)
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw, err := config.UnmarshalRawConfig(merged)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if raw.Tun.Stack != C.TunGvisor {
+				t.Fatalf("settings=%q config=%q selected %s", settingsJSON, source, raw.Tun.Stack)
+			}
+		}
+	}
+}
+
 func TestParseSettingsIncludesOfflineProxySelections(t *testing.T) {
 	settings := parseSettings(`{"proxySelections":{"Proxy":"HK One"}}`)
 	if got := settings.ProxySelections["Proxy"]; got != "HK One" {

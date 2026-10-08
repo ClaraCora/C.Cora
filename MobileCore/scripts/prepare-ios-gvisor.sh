@@ -2,13 +2,13 @@
 set -euo pipefail
 
 readonly MODULE="github.com/metacubex/gvisor"
-readonly EXPECTED_VERSION="v0.0.0-20260826100401-79317d808312"
+readonly EXPECTED_VERSION="v0.0.0-20260922041103-e2cbcd6e7400"
 readonly SOURCE_REL="pkg/tcpip/transport/tcp/segment_queue.go"
 readonly EXPECTED_SOURCE_SHA="1f1f3c893472009f0f566c7dd783c014d684493bf48750783a2064685db91e7e"
 readonly EXPECTED_PATCHED_SHA="4a4a5566d456d9411a70710824ad4c7f396aec22fcf83ffdf380cd121a8c40f5"
-readonly PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/gvisor-79317d808312-tcp-ack-queue.patch"
-readonly MEMORY_DIAGNOSTICS_PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/gvisor-79317d808312-memory-diagnostics.patch"
-readonly PATCHED_DIR="${RUNNER_TEMP:?}/gvisor-79317d808312-ios-memory-v1"
+readonly PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/gvisor-e2cbcd6e7400-tcp-ack-queue.patch"
+readonly MEMORY_DIAGNOSTICS_PATCH_FILE="${GITHUB_WORKSPACE:?}/MobileCore/dependency-patches/gvisor-e2cbcd6e7400-memory-diagnostics.patch"
+readonly PATCHED_DIR="${RUNNER_TEMP:?}/gvisor-e2cbcd6e7400-ios-memory-v1"
 
 check_sha256() {
   local expected="$1"

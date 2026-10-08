@@ -122,8 +122,8 @@ jobs:
           cd MobileCore
           PATCHED_SING_TUN="$(bash scripts/prepare-ios-sing-tun.sh)"
           printf 'PATCHED_SING_TUN=%s\n' "$PATCHED_SING_TUN" >> "$GITHUB_ENV"
-          go -C "$PATCHED_MIHOMO" mod edit -replace="github.com/metacubex/sing-tun@v0.4.24=$PATCHED_SING_TUN"
-          go -C "$PATCHED_MIHOMO" mod edit -replace="github.com/metacubex/gvisor@v0.0.0-20260826100401-79317d808312=$PATCHED_GVISOR"
+          go -C "$PATCHED_MIHOMO" mod edit -replace="github.com/metacubex/sing-tun@v0.4.27=$PATCHED_SING_TUN"
+          go -C "$PATCHED_MIHOMO" mod edit -replace="github.com/metacubex/gvisor@v0.0.0-20260922041103-e2cbcd6e7400=$PATCHED_GVISOR"
 
       - name: Prepare patched Shadowsocks reader
         run: |
@@ -142,8 +142,8 @@ jobs:
       - name: Verify patched Mihomo
         run: |
           set -euxo pipefail
-          go -C "$PATCHED_MIHOMO" test ./common/pool ./common/lru ./component/fakeip ./config ./tunnel ./tunnel/statistic ./component/dialer ./component/resolver ./component/resource ./dns ./adapter/outbound ./adapter/provider ./hub/executor ./hub/route ./rules/provider ./ntp/ntp
-          go -C "$PATCHED_MIHOMO" test -tags "with_low_memory" ./common/pool ./common/lru ./component/fakeip ./config ./tunnel ./tunnel/statistic ./component/dialer ./component/resolver ./component/resource ./dns ./adapter/outbound ./adapter/provider ./hub/executor ./hub/route ./rules/provider ./ntp/ntp
+          go -C "$PATCHED_MIHOMO" test ./common/pool ./common/lru ./component/fakeip ./config ./tunnel ./tunnel/statistic ./component/dialer ./component/resolver ./component/resource ./dns ./adapter/outbound ./adapter/provider ./adapter/outboundgroup ./hub/executor ./hub/route ./rules/provider ./ntp/ntp ./transport/anytls/session ./transport/openvpn
+          go -C "$PATCHED_MIHOMO" test -tags "with_low_memory" ./common/pool ./common/lru ./component/fakeip ./config ./tunnel ./tunnel/statistic ./component/dialer ./component/resolver ./component/resource ./dns ./adapter/outbound ./adapter/provider ./adapter/outboundgroup ./hub/executor ./hub/route ./rules/provider ./ntp/ntp ./transport/anytls/session ./transport/openvpn
           go -C "$PATCHED_MIHOMO" test -race -run 'TestTrimIdle|TestDiagnostic' ./common/pool ./common/lru ./component/fakeip ./dns ./rules/provider
           go -C "$PATCHED_MIHOMO" test -race -run 'TestRuntime' ./component/resource ./adapter/provider ./hub/executor ./ntp/ntp
           go -C "$PATCHED_MIHOMO" vet ./tunnel ./component/dialer ./component/resolver ./component/resource ./dns ./adapter/outbound ./adapter/provider ./hub/executor ./hub/route ./rules/provider ./ntp/ntp

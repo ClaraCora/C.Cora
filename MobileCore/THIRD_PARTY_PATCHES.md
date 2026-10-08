@@ -1,9 +1,29 @@
 # Third-party patches
 
-## mihomo-v1.19.31-runtime-lifecycle
+## v1.19.32 migration (2026-10-08)
+
+The active build uses Mihomo v1.19.32, sing v0.5.8, sing-tun v0.4.27,
+sing-shadowsocks2 v0.2.8, and gVisor e2cbcd6e7400. Module sums, preparation
+scripts, pinned replacements, and patch filenames are synchronized. Go remains
+pinned to 1.25.4 in CI.
+
+All nine Mihomo patches and existing allocator, Shadowsocks reader, queue,
+and diagnostic patches remain enabled. Pristine/functional source checksums
+were rechecked against the new modules. The sing-tun diagnostic patch was
+rebased around upstream's Darwin writeAccess mutex; Cora keeps the new writer
+serialization, socket setup, and closed-descriptor handling while preserving
+its existing queue limits and diagnostic lifetime cleanup.
+
+Upstream now defaults the TUN stack to mips. Cora continues to inject gVisor
+explicitly, with a regression test that checks the actual parsed core config.
+This upgrade does not change Cora's GC, memory limit, IPC budgets, rankings,
+or unlock-test settings. Validation and remaining device checks are recorded
+in [the v1.19.32 upgrade record](../docs/mihomo-v1.19.32-upgrade.md).
+
+## mihomo-v1.19.32-runtime-lifecycle
 
 - Added: 2026-10-07
-- Upstream module: `github.com/metacubex/mihomo v1.19.31`
+- Upstream module: `github.com/metacubex/mihomo v1.19.32`
 - Patched files: Provider health/fetch lifecycle, resource task admission,
   partial configuration cleanup, checked executor initialization, and NTP shutdown
 - Build tags: default and `with_low_memory`
@@ -34,7 +54,7 @@ the existing functional/diagnostic source baseline. The Go toolchain is unchange
 
 ## v1.19.31 migration (2026-09-30)
 
-The active build uses Mihomo v1.19.31, sing-tun v0.4.24,
+The v1.19.31 build used Mihomo v1.19.31, sing-tun v0.4.24,
 sing-shadowsocks2 v0.2.8, and gVisor 79317d808312. Preparation scripts pin
 these versions and verify pristine and patched source hashes. All seven
 Mihomo patches, the sing allocator patch, and the Shadowsocks/gVisor patches
@@ -47,10 +67,10 @@ they have not been relabeled as measurements of v1.19.31. Current regression
 coverage and the remaining macOS/device checks are recorded in
 [the upgrade verification record](../docs/ne-memory-optimization-v1.19.31.md).
 
-## mihomo-v1.19.31-bounded-mrs-decode
+## mihomo-v1.19.32-bounded-mrs-decode
 
 - Added: 2026-09-30
-- Upstream module: `github.com/metacubex/mihomo v1.19.31`
+- Upstream module: `github.com/metacubex/mihomo v1.19.32`
 - Patched file: `rules/provider/mrs_reader.go`; added
   `rules/provider/mrs_decoder.go` and its regression tests
 - Build tags: default and `with_low_memory`
@@ -143,10 +163,10 @@ Remove the bounded MRS patch, its preparation-script paths/hashes/apply wiring,
 and `./rules/provider` from the Mihomo CI test/vet lists as one change. No rule
 file conversion, configuration change, or stored-data migration is involved.
 
-## mihomo-v1.19.31-atomic-dns-runtime
+## mihomo-v1.19.32-atomic-dns-runtime
 
 - Added: 2026-08-23
-- Upstream module: `github.com/metacubex/mihomo v1.19.31`
+- Upstream module: `github.com/metacubex/mihomo v1.19.32`
 - Patched files: `component/resolver`, `dns/server.go`,
   `hub/executor/executor.go`, `adapter/outbound/direct.go`, and the DNS
   controller routes
@@ -196,7 +216,7 @@ dispatch, and zero-allocation snapshot reads.
 
 Revert the commit that added this section and remove:
 
-- `dependency-patches/mihomo-v1.19.31-atomic-dns-runtime.patch`;
+- `dependency-patches/mihomo-v1.19.32-atomic-dns-runtime.patch`;
 - its preparation-script paths, hashes, and apply wiring;
 - `./component/resolver`, `./dns`, `./hub/executor`, and `./hub/route` from the
   Mihomo CI test and vet package lists; and
@@ -206,10 +226,10 @@ Restore the original direct assignments only as one rollback unit. Removing
 just the patch while leaving MobileCore's snapshot API calls will intentionally
 fail compilation. No stored configuration or user-data migration is involved.
 
-## mihomo-v1.19.31-reserved-synthetic-ip-guard
+## mihomo-v1.19.32-reserved-synthetic-ip-guard
 
 - Added: 2026-08-23
-- Upstream module: `github.com/metacubex/mihomo v1.19.31`
+- Upstream module: `github.com/metacubex/mihomo v1.19.32`
 - Patched file: `tunnel/tunnel.go`; added
   `tunnel/reserved_synthetic_ip.go` and its regression tests
 - Build tags: default and `with_low_memory`
@@ -271,17 +291,17 @@ and power-of-two diagnostics.
 
 Revert the commit that added this section and remove:
 
-- `dependency-patches/mihomo-v1.19.31-reserved-synthetic-ip-guard.patch`;
+- `dependency-patches/mihomo-v1.19.32-reserved-synthetic-ip-guard.patch`;
 - its preparation-script SHA and apply wiring;
 - `./tunnel` from the Mihomo CI test and vet package lists; and
 - the MobileCore calls to `tunnel.SetReservedSyntheticIPPrefixes`.
 
 No stored configuration or user-data migration is involved.
 
-## mihomo-v1.19.31-connection-close-queue
+## mihomo-v1.19.32-connection-close-queue
 
 - Added: 2026-08-13
-- Upstream module: `github.com/metacubex/mihomo v1.19.31`
+- Upstream module: `github.com/metacubex/mihomo v1.19.32`
 - Patched file: `tunnel/statistic/manager.go`
 - Build tags: default and `with_low_memory`
 
@@ -334,8 +354,8 @@ entire ring at shutdown.
 
 Revert the commit that added this section and remove:
 
-- `dependency-patches/mihomo-v1.19.31-connection-close-queue.patch`;
-- `dependency-patches/mihomo-v1.19.31-connection-close-queue-test.patch`;
+- `dependency-patches/mihomo-v1.19.32-connection-close-queue.patch`;
+- `dependency-patches/mihomo-v1.19.32-connection-close-queue-test.patch`;
 - the history patch preparation and verification wiring;
 - `ClosedConnectionsSnapshot` and the Packet Tunnel history recorder.
 
@@ -345,8 +365,8 @@ earlier versions.
 ## sing-and-mihomo-ss-record-oversize-buffer-pool
 
 - Added: 2026-07-25
-- Upstream modules: `github.com/metacubex/sing v0.5.7`,
-  `github.com/metacubex/mihomo v1.19.31`
+- Upstream modules: `github.com/metacubex/sing v0.5.8`,
+  `github.com/metacubex/mihomo v1.19.32`
 - Patched files: sing `common/buf/alloc.go`, `common/buf/buffer.go`;
   Mihomo `common/pool/alloc.go`
 - Build tags: default and `with_low_memory`
@@ -354,7 +374,7 @@ earlier versions.
 ### Reason
 
 An SS AEAD record can contain 65535 bytes of plaintext. Its 16-byte AEAD tag
-makes the receive buffer 65551 bytes. In sing v0.5.7, `buf.NewSize` manages only
+makes the receive buffer 65551 bytes. In sing v0.5.8, `buf.NewSize` manages only
 sizes up to 65535 bytes, so every protocol-maximum SS record allocates a fresh
 65551-byte backing array and `Release` leaves it to the garbage collector.
 Parallel SS2022 streams can therefore allocate at nearly payload rate and
@@ -406,8 +426,8 @@ peak-memory behavior.
 
 Revert the commit that added this patch. For a manual rollback, remove:
 
-- `dependency-patches/sing-v0.5.7-oversize-buffer-pool.patch`;
-- `dependency-patches/mihomo-v1.19.31-oversize-buffer-pool.patch`;
+- `dependency-patches/sing-v0.5.8-oversize-buffer-pool.patch`;
+- `dependency-patches/mihomo-v1.19.32-oversize-buffer-pool.patch`;
 - `scripts/prepare-ios-sing.sh` and its CI invocation;
 - `scripts/prepare-ios-mihomo.sh` and its CI invocation;
 - the `PATCHED_SING_DIR` wiring in `prepare-ios-sing-shadowsocks2.sh`;
@@ -418,12 +438,12 @@ No configuration or user-data migration is involved.
 ## steady-memory-diagnostics-and-idle-buffer-trim
 
 - Added: 2026-10-02
-- Upstream modules: Mihomo v1.19.31, sing v0.5.7, sing-tun v0.4.24,
-  gVisor v0.0.0-20260826100401-79317d808312
-- Diagnostic patches: `mihomo-v1.19.31-memory-diagnostics.patch`,
-  `sing-v0.5.7-memory-diagnostics.patch`,
-  `sing-tun-v0.4.24-memory-diagnostics.patch`, and
-  `gvisor-79317d808312-memory-diagnostics.patch`
+- Upstream modules: Mihomo v1.19.32, sing v0.5.8, sing-tun v0.4.27,
+  gVisor v0.0.0-20260922041103-e2cbcd6e7400
+- Diagnostic patches: `mihomo-v1.19.32-memory-diagnostics.patch`,
+  `sing-v0.5.8-memory-diagnostics.patch`,
+  `sing-tun-v0.4.27-memory-diagnostics.patch`, and
+  `gvisor-e2cbcd6e7400-memory-diagnostics.patch`
 - Preparation: applied after functional patches and their source-hash checks.
   The patched sing-tun and Mihomo modules use the same patched gVisor/sing-tun
   dependencies as MobileCore, including standalone dependency tests.
@@ -539,10 +559,10 @@ Revert the commit that added this patch. For a manual rollback, remove:
 
 No configuration or user-data migration is involved.
 
-## sing-tun-v0.4.24-darwin-queue-bounds
+## sing-tun-v0.4.27-darwin-queue-bounds
 
 - Added: 2026-07-25
-- Upstream module: `github.com/metacubex/sing-tun v0.4.24`
+- Upstream module: `github.com/metacubex/sing-tun v0.4.27`
 - Patched files: `internal/fdbased_darwin/processors.go`,
   `tun_darwin_gvisor.go`
 - Build tags: `with_gvisor,with_low_memory`
@@ -559,7 +579,7 @@ more likely than a single stream.
 ### Local behavior
 
 Each Darwin processor queue is capped at one nominal 512 KiB receive batch,
-calculated from the configured TUN MTU. Upstream v0.4.24 defaults to one receive
+calculated from the configured TUN MTU. Upstream v0.4.27 defaults to one receive
 processor and exposes a processor option. Cora keeps one processor per Darwin
 TUN channel so its queue cap cannot be multiplied by the device CPU count or
 that experimental option. Because packet-pool allocations round up, real retained memory is
@@ -597,17 +617,17 @@ from the patched module, then compiles MobileCore with
 
 Revert the commit that added this patch. For a manual rollback, remove:
 
-- `dependency-patches/sing-tun-v0.4.24-darwin-queue.patch`;
+- `dependency-patches/sing-tun-v0.4.27-darwin-queue.patch`;
 - `scripts/prepare-ios-sing-tun.sh` and its CI invocation;
 - the post-`ApplyConfig` `debug.FreeOSMemory()` call;
 - this section of the patch record.
 
 No configuration or user-data migration is involved.
 
-## gvisor-79317d808312-tcp-pure-ack-queue
+## gvisor-e2cbcd6e7400-tcp-pure-ack-queue
 
 - Added: 2026-07-25
-- Upstream module: `github.com/metacubex/gvisor v0.0.0-20260826100401-79317d808312`
+- Upstream module: `github.com/metacubex/gvisor v0.0.0-20260922041103-e2cbcd6e7400`
 - Patched file: `pkg/tcpip/transport/tcp/segment_queue.go`
 
 ### Reason
@@ -643,7 +663,7 @@ receive-memory reference accounting.
 
 Revert the commit that added this patch. For a manual rollback, remove:
 
-- `dependency-patches/gvisor-79317d808312-tcp-ack-queue.patch`;
+- `dependency-patches/gvisor-e2cbcd6e7400-tcp-ack-queue.patch`;
 - `scripts/prepare-ios-gvisor.sh` and its CI invocation;
 - this section of the patch record.
 

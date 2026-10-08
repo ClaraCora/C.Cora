@@ -4,7 +4,7 @@ set -euo pipefail
 readonly MODULE="github.com/metacubex/sing-shadowsocks2"
 readonly EXPECTED_VERSION="v0.2.8"
 readonly SING_MODULE="github.com/metacubex/sing"
-readonly EXPECTED_SING_VERSION="v0.5.7"
+readonly EXPECTED_SING_VERSION="v0.5.8"
 readonly PATCHED_SING_DIR="${PATCHED_SING_DIR:?Run prepare-ios-sing.sh first and pass its output as PATCHED_SING_DIR}"
 readonly SOURCE_REL="internal/shadowio/reader.go"
 readonly TEST_REL="internal/shadowio/reader_reuse_test.go"
