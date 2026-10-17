@@ -20,6 +20,10 @@ final class CoreStateManager: ObservableObject {
     /// 连接状态（驱动连接按钮与状态文案）。
     @Published private(set) var status: NEVPNStatus = .invalid
 
+    /// Invalidates control replies from an earlier tunnel, without treating a
+    /// path reassertion within the same tunnel as a new session.
+    private(set) var connectionEpoch: UInt64 = 0
+
     /// 是否正在执行启停（防抖，避免重复点击）。
     @Published private(set) var isBusy = false
 
@@ -106,7 +110,15 @@ final class CoreStateManager: ObservableObject {
     /// reasserting 会话。它不会再触发新的状态通知，因此需要一个只在 App
     /// 进程存活期间运行的有限看门狗，超时后主动撤销该隧道。
     private func updateConnectionStatus(_ newStatus: NEVPNStatus) {
+        let becameConnected = newStatus == .connected && status != .connected
+        if status != newStatus,
+           newStatus == .connecting || newStatus == .disconnected || newStatus == .invalid {
+            connectionEpoch &+= 1
+        }
         status = newStatus
+        if becameConnected {
+            Task { await IOSUpdateBlockStore.shared.applyAfterConnectionIfNeeded() }
+        }
         switch newStatus {
         case .connecting, .reasserting:
             if !stalledConnectionRecoveryPending, connectionWatchdogTask == nil {

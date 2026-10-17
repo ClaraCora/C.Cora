@@ -2,7 +2,7 @@
 
 基于 [mihomo](https://github.com/MetaCubeX/mihomo) 内核的 iOS 代理客户端，SwiftUI + MVVM，个人自签测试。
 
-当前版本：**1.0.6**
+当前版本：**1.0.7**
 
 详细路线见 [PLAN.md](PLAN.md)。
 
@@ -12,6 +12,7 @@
 
 - 推送到 `main` 或手动触发 `Build unsigned IPA` 工作流。
 - Actions 同时产出标准版与 `CoraLegacy`（iOS 16.4+）的普通 IPA、TrollStore IPA。
+- 构建成功后上传到 [GitHub Releases](https://github.com/ClaraCora/C.Cora/releases)，每次构建保留一个预发布版本，含四个 IPA 与 `SHA256SUMS.txt`。Actions 摘要提供下载链接，不再使用 Actions artifact 存储。
 - 用自有 Apple 开发者证书自行签名后安装（工程内不含任何证书/描述文件/Secrets）。
 
 本地有 Mac 时，先准备 mihomo 框架并生成工程：
@@ -55,12 +56,12 @@ Bundle ID 与核心代码，二者为替换安装关系，不能同时安装。L
 控制中心磁贴；VPN 启停、订阅、策略、测速、记录、日志、外部检测脚本和 Connect On
 Demand 自动连接均保留。
 
-GitHub Actions 产物名称如下：
+GitHub Releases 的附件名称如下：
 
-- `Cora-unsigned-ipa`：标准普通 IPA，主 App / Tunnel 最低 iOS 17。
-- `Cora-trollstore-ipa`：标准 TrollStore IPA，不含 iOS 18 控制中心磁贴。
-- `CoraLegacy-unsigned-ipa`：iOS 16.4+ 普通 IPA。
-- `CoraLegacy-trollstore-ipa`：iOS 16.4+ TrollStore IPA。
+- `Cora-unsigned.ipa`：标准普通 IPA，主 App / Tunnel 最低 iOS 17。
+- `Cora-TrollStore.ipa`：标准 TrollStore IPA，不含 iOS 18 控制中心磁贴。
+- `CoraLegacy-unsigned.ipa`：iOS 16.4+ 普通 IPA。
+- `CoraLegacy-TrollStore.ipa`：iOS 16.4+ TrollStore IPA。
 
 Legacy 的 mihomo 框架仍使用 ARM64 AES-GCM 加速，要求 A12 或更新芯片；iPhone SE
 第三代的 A15 满足此前提。A11 及更早设备不在该加速构建的支持范围内。
@@ -82,6 +83,7 @@ Legacy 的 mihomo 框架仍使用 ARM64 AES-GCM 加速，要求 A12 或更新芯
 - 记录页支持活动连接详情、关闭连接、日志和分页历史。
 - 记录使用 App Group SQLite 限制为最近 7 天、最多 20,000 条、约 50 MB；VPN 断开后清空本次会话。
 - 支持 GEO/ASN、隧道路由、STUN 直连拦截、混合代理端口和内核诊断；开发者模式默认关闭，开启后才按 5 秒采样并限制为 256KB，可在设置中分析、复制或清理。
+- 支持默认关闭的 [iOS 更新检查拦截](docs/ios-update-block.md)，仅匹配两个更新目录域名，查看本次 VPN 会话中的真实拒绝计数。
 
 ## Network Extension 内存策略
 
@@ -90,8 +92,8 @@ Legacy 的 mihomo 框架仍使用 ARM64 AES-GCM 加速，要求 A12 或更新芯
 处理，SQLite 的过期/WAL 维护每 60 秒执行一次，并使用文件临时存储和小页面缓存。
 总览只走 totals-only 连接 IPC；记录页打开时才读取完整活动连接，从而减少 App 与
 Network Extension 的重复 JSON 分配。连接历史仍限制最近 7 天、20,000 条和约 50 MB，
-不会因清理失败影响 VPN 转发。异步控制请求最多同时运行两个，停止或重连时会丢弃
-尚未开始的旧请求，避免测速、Provider 刷新和大响应在 NE 中排队占用内存。
+不会因清理失败影响 VPN 转发。控制面按任务类别调度，总计最多 8 个运行中请求，
+重任务最多 2 个；停止或重连时丢弃旧会话的排队请求，避免控制面工作无界积累。
 节点 TOP5 在 App 侧按需从已有 SQLite 记录计算；App 被划掉时 NE 仍继续写入连接历史，
 重新打开 App 后会补算这段期间的节点流量，不在 NE 中维护额外的节点聚合状态。
 

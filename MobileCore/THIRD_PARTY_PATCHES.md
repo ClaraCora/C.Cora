@@ -699,3 +699,38 @@ Revert the commit that added this patch. For a manual rollback, remove:
 - this section of the patch record.
 
 No configuration or user-data migration is involved.
+## mihomo-v1.19.32-ios-update-block
+
+- Added: 2026-10-17
+- Upstream: `github.com/metacubex/mihomo v1.19.32`
+- Patch: `dependency-patches/mihomo-v1.19.32-ios-update-block.patch`
+- Applied after the runtime lifecycle patch, with checksums for the patch,
+  pre-hook DNS/tunnel sources and all six resulting source/test files.
+
+This opt-in policy exactly matches `gdmf.apple.com` and `mesu.apple.com`,
+case-insensitively and without a trailing DNS dot. The shared `component/iosupdate`
+matcher owns only two fixed counters/timestamps and session/configuration
+revisions. It creates no worker, timer, request history or DNS/IP cache.
+
+`dns.Service.ServeMsg` refuses matching questions before Hosts/cache/Fake-IP or
+upstream work, preserving the DNS ID/question and EDNS0 response behavior.
+TCP/new UDP sender decisions reject known original domains and domains recovered
+from existing DNS mapping/sniffing before SpecialProxy and Rule/Global/Direct
+selection. Refusal does not create a tracked connection or persistent UDP sender.
+No packet-loop hook, IP block, forced sniffing or route/IPv6 change is introduced.
+
+MobileCore arms the policy before ApplyConfig and resets it on stop/rollback.
+Hot enabling closes only currently recognized matching connections. Statistics
+survive toggles within a session; explicit reset and a new tunnel clear them.
+Public byte APIs encode snapshots directly, with string compatibility wrappers.
+
+CI covers exact matching, all DNS query types, routing modes, Fake-IP recovery,
+concurrent counters/reset, zero-allocation matching, targeted closes and rollback.
+It also runs Swift persistence/session/synchronization tests and the complete
+standard/Legacy XCFramework and Xcode builds. Local Windows results and remaining
+device checks are documented in `docs/ios-update-block.md`.
+
+Rollback must remove this policy together with its MobileCore imports/APIs,
+startup/IPC bridge and App setting. Removing the dependency patch alone leaves
+MobileCore referencing the patched package. The stored preference is isolated;
+no subscription YAML or user rule migration is involved.

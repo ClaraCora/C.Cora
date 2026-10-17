@@ -43,6 +43,7 @@ import (
 	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/geodata"
 	"github.com/metacubex/mihomo/component/iface"
+	"github.com/metacubex/mihomo/component/iosupdate"
 	"github.com/metacubex/mihomo/component/mmdb"
 	"github.com/metacubex/mihomo/component/profile/cachefile"
 	"github.com/metacubex/mihomo/component/resolver"
@@ -354,7 +355,7 @@ func ControlInfo() string {
 		"coreVersion":     Version(),
 		"capabilities": []string{
 			"connections", "logs", "proxies", "runtime", "memory-diagnostics",
-			"script-network-info",
+			"script-network-info", "ios-update-block",
 		},
 	})
 	if err != nil {
@@ -662,27 +663,28 @@ func boundedLogText(value string, maximum int) string {
 
 // appSettings 是主 App 下发的设置（JSON）。零值即各项默认。
 type appSettings struct {
-	Stack                        string                 `json:"stack"`
-	IPv6                         bool                   `json:"ipv6"`
-	GeoEnabled                   bool                   `json:"geoEnabled"`
-	GeoLoader                    string                 `json:"geoLoader"`
-	GeodataMode                  bool                   `json:"geodataMode"`
-	GeoIPDatURL                  string                 `json:"geoIPDatURL"`
-	GeoMMDBURL                   string                 `json:"geoMMDBURL"`
-	GeoSiteURL                   string                 `json:"geoSiteURL"`
-	IgnoreGeoNegation            bool                   `json:"ignoreGeoNegation"`
-	GeoAutoUpdate                bool                   `json:"geoAutoUpdate"`
-	GeoUpdateInterval            int                    `json:"geoUpdateInterval"`
-	RemoteResourceUpdatePolicy   string                 `json:"remoteResourceUpdatePolicy"`
-	RemoteResourceUpdateInterval int                    `json:"remoteResourceUpdateInterval"`
-	LogLevel                     string                 `json:"logLevel"`
-	UnifiedDelay                 bool                   `json:"unifiedDelay"`
-	MixedPort                    int                    `json:"mixedPort"`
-	BlockDirectSTUN              bool                   `json:"blockDirectSTUN"`
-	SystemDNS                    []string               `json:"systemDNS"`
-	ApplyOverrides               bool                   `json:"applyOverrides"`
-	Overrides                    configOverrideSettings `json:"overrides"`
-	ProxySelections              map[string]string      `json:"proxySelections"`
+	IOSUpdateBlock               iosUpdateBlockConfiguration `json:"iosUpdateBlock"`
+	Stack                        string                      `json:"stack"`
+	IPv6                         bool                        `json:"ipv6"`
+	GeoEnabled                   bool                        `json:"geoEnabled"`
+	GeoLoader                    string                      `json:"geoLoader"`
+	GeodataMode                  bool                        `json:"geodataMode"`
+	GeoIPDatURL                  string                      `json:"geoIPDatURL"`
+	GeoMMDBURL                   string                      `json:"geoMMDBURL"`
+	GeoSiteURL                   string                      `json:"geoSiteURL"`
+	IgnoreGeoNegation            bool                        `json:"ignoreGeoNegation"`
+	GeoAutoUpdate                bool                        `json:"geoAutoUpdate"`
+	GeoUpdateInterval            int                         `json:"geoUpdateInterval"`
+	RemoteResourceUpdatePolicy   string                      `json:"remoteResourceUpdatePolicy"`
+	RemoteResourceUpdateInterval int                         `json:"remoteResourceUpdateInterval"`
+	LogLevel                     string                      `json:"logLevel"`
+	UnifiedDelay                 bool                        `json:"unifiedDelay"`
+	MixedPort                    int                         `json:"mixedPort"`
+	BlockDirectSTUN              bool                        `json:"blockDirectSTUN"`
+	SystemDNS                    []string                    `json:"systemDNS"`
+	ApplyOverrides               bool                        `json:"applyOverrides"`
+	Overrides                    configOverrideSettings      `json:"overrides"`
+	ProxySelections              map[string]string           `json:"proxySelections"`
 }
 
 type configOverrideSettings struct {
@@ -733,6 +735,7 @@ type tunOverrideSettings struct {
 // parseSettings 解析设置 JSON，缺省值兜底（与主 App SettingsStore 默认一致）。
 func parseSettings(settingsJSON string) appSettings {
 	s := appSettings{Stack: "gvisor", LogLevel: "info", UnifiedDelay: true,
+		IOSUpdateBlock: iosUpdateBlockConfiguration{ID: "default"},
 		ApplyOverrides: true,
 		GeoEnabled:     true, GeoLoader: "memconservative", GeodataMode: true,
 		IgnoreGeoNegation: false, GeoUpdateInterval: 24,
@@ -963,6 +966,12 @@ func StartWithConfig(fd int, tunnelMTU int, configYAML string, settingsJSON stri
 
 	resetError := resetRunLog()
 	st := parseSettings(settingsJSON)
+	if err := validateIOSUpdateBlockConfiguration(st); err != nil {
+		return err
+	}
+	// Arm the shared DNS/connection policy before ApplyConfig can resume any
+	// listener. A failed start uses the same Stop path to clear this state.
+	iosupdate.Begin(uint64(time.Now().UnixNano()), st.IOSUpdateBlock.ID, st.IOSUpdateBlock.Enabled)
 	appendRunLog(fmt.Sprintf("StartWithConfig: fd=%d mtu=%d stack=%s ipv6=%v geo=%v(mode=%v,%s,ignoreNegation=%v) log=%s",
 		fd, tunnelMTU, st.Stack, st.IPv6, st.GeoEnabled, st.GeodataMode, st.GeoLoader,
 		st.IgnoreGeoNegation, st.LogLevel))
@@ -4511,6 +4520,7 @@ func stopNTPService() { ntp.ReCreateNTPService("", 0, "", nil, false) }
 // starts from retaining a partially applied runtime.
 func stopRuntimeLocked() {
 	tunnel.OnSuspend()
+	iosupdate.Stop()
 	atomic.AddUint64(&runtimeGeneration, 1)
 	po0Whitelist.stop()
 	appendRunLog("Stop: 关闭内核")

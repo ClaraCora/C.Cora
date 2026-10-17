@@ -89,6 +89,7 @@ struct SettingsView: View {
                             message: "设置流量接管范围、系统服务排除和防泄露选项。",
                             category: .privacy,
                             destination: TunnelRouteSettingsView())
+                        IOSUpdateBlockSettingsEntry()
                         SettingsNavigationRow(
                             title: "测速",
                             systemImage: "speedometer",
@@ -969,7 +970,7 @@ private struct GeoSettingsView: View {
     }
 }
 
-private struct TunnelRouteSettingsView: View {
+struct TunnelRouteSettingsView: View {
     @EnvironmentObject private var settings: SettingsStore
     @EnvironmentObject private var core: CoreStateManager
     @State private var isUpdatingAutoConnect = false

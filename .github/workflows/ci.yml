@@ -10,6 +10,8 @@ on:
 jobs:
   build:
     runs-on: macos-26
+    permissions:
+      contents: write # Create build tags/releases and upload IPA assets.
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -50,6 +52,12 @@ jobs:
 
       - name: Test PO0 whitelist settings
         run: bash scripts/test-po0-whitelist.sh
+
+      - name: Test iOS update block settings and session state
+        run: bash scripts/test-ios-update-block.sh
+
+      - name: Test IPA release publication
+        run: python3 scripts/test-ipa-release.py
 
       # ───────────── Phase 1：gomobile 编 mihomo 内核 ─────────────
       - name: Set up Go
@@ -142,12 +150,13 @@ jobs:
       - name: Verify patched Mihomo
         run: |
           set -euxo pipefail
-          go -C "$PATCHED_MIHOMO" test ./common/pool ./common/lru ./component/fakeip ./config ./tunnel ./tunnel/statistic ./component/dialer ./component/resolver ./component/resource ./dns ./adapter/outbound ./adapter/provider ./adapter/outboundgroup ./hub/executor ./hub/route ./rules/provider ./ntp/ntp ./transport/anytls/session ./transport/openvpn
-          go -C "$PATCHED_MIHOMO" test -tags "with_low_memory" ./common/pool ./common/lru ./component/fakeip ./config ./tunnel ./tunnel/statistic ./component/dialer ./component/resolver ./component/resource ./dns ./adapter/outbound ./adapter/provider ./adapter/outboundgroup ./hub/executor ./hub/route ./rules/provider ./ntp/ntp ./transport/anytls/session ./transport/openvpn
+          go -C "$PATCHED_MIHOMO" test ./common/pool ./common/lru ./component/fakeip ./config ./tunnel ./tunnel/statistic ./component/dialer ./component/resolver ./component/iosupdate ./component/resource ./dns ./adapter/outbound ./adapter/provider ./adapter/outboundgroup ./hub/executor ./hub/route ./rules/provider ./ntp/ntp ./transport/anytls/session ./transport/openvpn
+          go -C "$PATCHED_MIHOMO" test -tags "with_low_memory" ./common/pool ./common/lru ./component/fakeip ./config ./tunnel ./tunnel/statistic ./component/dialer ./component/resolver ./component/iosupdate ./component/resource ./dns ./adapter/outbound ./adapter/provider ./adapter/outboundgroup ./hub/executor ./hub/route ./rules/provider ./ntp/ntp ./transport/anytls/session ./transport/openvpn
           go -C "$PATCHED_MIHOMO" test -race -run 'TestTrimIdle|TestDiagnostic' ./common/pool ./common/lru ./component/fakeip ./dns ./rules/provider
+          go -C "$PATCHED_MIHOMO" test -race -run 'TestIOSUpdateBlock|TestConcurrentCounters|TestExactDomains' ./component/iosupdate ./dns ./tunnel
           go -C "$PATCHED_MIHOMO" test -race -run 'TestRuntime' ./component/resource ./adapter/provider ./hub/executor ./ntp/ntp
-          go -C "$PATCHED_MIHOMO" vet ./tunnel ./component/dialer ./component/resolver ./component/resource ./dns ./adapter/outbound ./adapter/provider ./hub/executor ./hub/route ./rules/provider ./ntp/ntp
-          go -C "$PATCHED_MIHOMO" vet -tags "with_low_memory" ./tunnel ./component/dialer ./component/resolver ./component/resource ./dns ./adapter/outbound ./adapter/provider ./hub/executor ./hub/route ./rules/provider ./ntp/ntp
+          go -C "$PATCHED_MIHOMO" vet ./tunnel ./component/dialer ./component/resolver ./component/iosupdate ./component/resource ./dns ./adapter/outbound ./adapter/provider ./hub/executor ./hub/route ./rules/provider ./ntp/ntp
+          go -C "$PATCHED_MIHOMO" vet -tags "with_low_memory" ./tunnel ./component/dialer ./component/resolver ./component/iosupdate ./component/resource ./dns ./adapter/outbound ./adapter/provider ./hub/executor ./hub/route ./rules/provider ./ntp/ntp
 
       - name: Verify patched gVisor TCP
         run: |
@@ -173,7 +182,7 @@ jobs:
           cd MobileCore
           go test ./...
           go test -tags "with_gvisor,with_low_memory" ./...
-          go test -race -run 'TestRuntimeControl|TestRuntimeLogHome' ./...
+          go test -race -run 'TestRuntimeControl|TestRuntimeLogHome|TestIOSUpdateBlock' ./...
           go vet ./...
           go vet -tags "with_gvisor,with_low_memory" ./...
 
@@ -330,30 +339,12 @@ jobs:
             "$RUNNER_TEMP/cora-legacy-trollstore" CoraLegacy-TrollStore.ipa
           echo "已生成 Cora-TrollStore.ipa 与 CoraLegacy-TrollStore.ipa"
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: Cora-unsigned-ipa
-          path: Cora-unsigned.ipa
-          if-no-files-found: error
-
-      - name: Upload TrollStore artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: Cora-trollstore-ipa
-          path: Cora-TrollStore.ipa
-          if-no-files-found: error
-
-      - name: Upload Legacy artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: CoraLegacy-unsigned-ipa
-          path: CoraLegacy-unsigned.ipa
-          if-no-files-found: error
-
-      - name: Upload Legacy TrollStore artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: CoraLegacy-trollstore-ipa
-          path: CoraLegacy-TrollStore.ipa
-          if-no-files-found: error
+      - name: Publish IPAs to GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          APP_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
+            build/Build/Products/Release-iphoneos/Cora.app/Info.plist)"
+          export APP_VERSION
+          bash scripts/publish-ipa-release.sh
