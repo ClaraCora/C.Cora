@@ -33,12 +33,9 @@ struct PO0WhitelistSettingsEntry: View {
                 accessibilityLabel: "查看 PO0 白名单说明")
         }
         .alignmentGuide(.listRowSeparatorLeading) { _ in iconSize + 12 }
-        .task(id: scenePhase) {
+        .task(id: "\(scenePhase)-\(core.status.rawValue)") {
             guard scenePhase == .active else { return }
-            while !Task.isCancelled {
-                await store.refresh()
-                do { try await Task.sleep(nanoseconds: 3_000_000_000) } catch { return }
-            }
+            await store.refresh()
         }
     }
 }

@@ -53,9 +53,6 @@ jobs:
       - name: Test PO0 whitelist settings
         run: bash scripts/test-po0-whitelist.sh
 
-      - name: Test iOS update block settings and session state
-        run: bash scripts/test-ios-update-block.sh
-
       - name: Test IPA release publication
         run: python3 scripts/test-ipa-release.py
 
@@ -93,8 +90,7 @@ jobs:
             done
           }
           cd MobileCore
-          # 仅下载固定版本的模块源码，供补丁脚本定位；此时不能解析源码 import。
-          # component/iosupdate 等包由补丁新增，上游模块不包含这些包。
+          # 先下载固定版本的模块源码，供补丁脚本定位；补丁就绪后再解析依赖。
           retry go mod download
 
       - name: Prepare patched sing allocator
@@ -168,13 +164,12 @@ jobs:
       - name: Verify patched Mihomo
         run: |
           set -euxo pipefail
-          go -C "$PATCHED_MIHOMO" test ./common/pool ./common/lru ./component/fakeip ./config ./tunnel ./tunnel/statistic ./component/dialer ./component/resolver ./component/iosupdate ./component/resource ./dns ./adapter/outbound ./adapter/provider ./adapter/outboundgroup ./hub/executor ./hub/route ./rules/provider ./ntp/ntp ./transport/anytls/session ./transport/openvpn
-          go -C "$PATCHED_MIHOMO" test -tags "with_low_memory" ./common/pool ./common/lru ./component/fakeip ./config ./tunnel ./tunnel/statistic ./component/dialer ./component/resolver ./component/iosupdate ./component/resource ./dns ./adapter/outbound ./adapter/provider ./adapter/outboundgroup ./hub/executor ./hub/route ./rules/provider ./ntp/ntp ./transport/anytls/session ./transport/openvpn
+          go -C "$PATCHED_MIHOMO" test ./common/pool ./common/lru ./component/fakeip ./config ./tunnel ./tunnel/statistic ./component/dialer ./component/resolver ./component/resource ./dns ./adapter/outbound ./adapter/provider ./adapter/outboundgroup ./hub/executor ./hub/route ./rules/provider ./ntp/ntp ./transport/anytls/session ./transport/openvpn
+          go -C "$PATCHED_MIHOMO" test -tags "with_low_memory" ./common/pool ./common/lru ./component/fakeip ./config ./tunnel ./tunnel/statistic ./component/dialer ./component/resolver ./component/resource ./dns ./adapter/outbound ./adapter/provider ./adapter/outboundgroup ./hub/executor ./hub/route ./rules/provider ./ntp/ntp ./transport/anytls/session ./transport/openvpn
           go -C "$PATCHED_MIHOMO" test -race -run 'TestTrimIdle|TestDiagnostic' ./common/pool ./common/lru ./component/fakeip ./dns ./rules/provider
-          go -C "$PATCHED_MIHOMO" test -race -run 'TestIOSUpdateBlock|TestConcurrentCounters|TestExactDomains' ./component/iosupdate ./dns ./tunnel
           go -C "$PATCHED_MIHOMO" test -race -run 'TestRuntime' ./component/resource ./adapter/provider ./hub/executor ./ntp/ntp
-          go -C "$PATCHED_MIHOMO" vet ./tunnel ./component/dialer ./component/resolver ./component/iosupdate ./component/resource ./dns ./adapter/outbound ./adapter/provider ./hub/executor ./hub/route ./rules/provider ./ntp/ntp
-          go -C "$PATCHED_MIHOMO" vet -tags "with_low_memory" ./tunnel ./component/dialer ./component/resolver ./component/iosupdate ./component/resource ./dns ./adapter/outbound ./adapter/provider ./hub/executor ./hub/route ./rules/provider ./ntp/ntp
+          go -C "$PATCHED_MIHOMO" vet ./tunnel ./component/dialer ./component/resolver ./component/resource ./dns ./adapter/outbound ./adapter/provider ./hub/executor ./hub/route ./rules/provider ./ntp/ntp
+          go -C "$PATCHED_MIHOMO" vet -tags "with_low_memory" ./tunnel ./component/dialer ./component/resolver ./component/resource ./dns ./adapter/outbound ./adapter/provider ./hub/executor ./hub/route ./rules/provider ./ntp/ntp
 
       - name: Verify patched gVisor TCP
         run: |
@@ -200,7 +195,7 @@ jobs:
           cd MobileCore
           go test ./...
           go test -tags "with_gvisor,with_low_memory" ./...
-          go test -race -run 'TestRuntimeControl|TestRuntimeLogHome|TestIOSUpdateBlock' ./...
+          go test -race -run 'TestRuntimeControl|TestRuntimeLogHome' ./...
           go vet ./...
           go vet -tags "with_gvisor,with_low_memory" ./...
 

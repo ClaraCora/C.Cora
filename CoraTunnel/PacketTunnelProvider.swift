@@ -43,7 +43,6 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     // Observability is kept outside the packet data path. The recorder writes
     // bounded rows to the App Group SQLite file.
     private let connectionHistoryRecorder = ConnectionHistoryRecorder()
-    private let iosUpdateBlockState = IOSUpdateBlockTunnelState()
 
     /// 隧道建立前抓取的物理网络 DNS，供配置里的 `system` nameserver 替换用。
     private var systemDNSServers: [String] = []
@@ -130,7 +129,6 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             developerModeEnabled = false
             isStopping = false
             tunnelFileDescriptor = nil
-            iosUpdateBlockState.reset()
             AppGroupState.vpnConnected = false
             // Persisted session/log state follows the same serialized boundary.
             // FileLog rotates the previous session into ne.previous.log.
@@ -156,18 +154,6 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         let hasConfigOption = options?["config"] != nil
         var incomingConfig = options?["config"] as? String
         let settingsJSON = (options?["settings"] as? String) ?? ""
-        if AppGroup.containerURL == nil,
-           let json = options?["iosUpdateBlock"] as? String, json.utf8.count <= 512,
-           let value = try? JSONDecoder().decode(IOSUpdateBlockConfiguration.self, from: Data(json.utf8)),
-           let validated = try? value.validated() {
-            do { try IOSUpdateBlockStorage.save(validated) }
-            catch {
-                cleanupFailedStart(generation: startGeneration)
-                completionHandler(NSError(domain: "CoraTunnel", code: -6,
-                    userInfo: [NSLocalizedDescriptionKey: "无法保存 iOS 更新拦截设置"]))
-                return
-            }
-        }
         // Credential-bearing options are never included in logs or diagnostics.
         var po0Configuration = PO0WhitelistStorage.load()
         if let po0JSON = options?["po0Whitelist"] as? String,
@@ -296,13 +282,6 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 self.configureMemoryDiagnostics(enabled: developerMode,
                                                  home: home,
                                                  persistState: !settingsJSON.isEmpty)
-                do {
-                    resolvedSettings = try IOSUpdateBlockStorage.injecting(
-                        IOSUpdateBlockStorage.load(), into: resolvedSettings)
-                } catch {
-                    startError = error as NSError
-                    return false
-                }
                 let ok = MihomoStartWithConfig(
                     Int(fd), actualMTU, configYAML, resolvedSettings, &startError)
                 guard self.isCurrentIPCSession(startGeneration) else {
@@ -310,21 +289,6 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                     return nil
                 }
                 if ok {
-                    // Catch a save made while Go was parsing. This also keeps
-                    // system launches independent of stale settings.json.
-                    if let latest = try? IOSUpdateBlockStorage.load().json() {
-                        _ = MihomoConfigureIOSUpdateBlockData(latest)
-                    }
-                    let proto = self.protocolConfiguration as? NETunnelProviderProtocol
-                    var excludesDevices = false
-                    if #available(iOS 17.4, *) { excludesDevices = proto?.excludeDeviceCommunication ?? false }
-                    self.iosUpdateBlockState.activate(IOSUpdateBlockCoverage(
-                        includeAllNetworks: proto?.includeAllNetworks ?? false,
-                        enforceRoutes: proto?.enforceRoutes ?? false,
-                        excludeCellularServices: proto?.excludeCellularServices ?? false,
-                        excludeAPNs: proto?.excludeAPNs ?? false,
-                        excludeDeviceCommunication: excludesDevices,
-                        ipv6: ipv6Enabled))
                     FileLog.write("MihomoStartWithConfig 返回成功")
                     self.log.info("mihomo 启动成功")
                     self.tunnelFileDescriptor = fd
@@ -393,7 +357,6 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             clearStoredIPCResponses(enableCaching: false)
             isStopping = true
             tunnelFileDescriptor = nil
-            iosUpdateBlockState.reset()
             AppGroupState.vpnConnected = false
             stopPathMonitor()
             connectionHistoryRecorder.stop()
@@ -458,7 +421,6 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             trollStoreIPCServer = nil
             isStopping = true
             tunnelFileDescriptor = nil
-            iosUpdateBlockState.reset()
             AppGroupState.vpnConnected = false // 同步给控制中心磁贴
             if #available(iOS 18.0, *) {
                 ControlCenter.shared.reloadControls(ofKind: ControlWidgetKind.vpn)
@@ -908,55 +870,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             ]))
             return
         }
-        if cmd != "traffic" && cmd != "memory" && cmd != "po0WhitelistStatus" && cmd != "iosUpdateBlockStatus" {
+        if cmd != "traffic" && cmd != "memory" && cmd != "po0WhitelistStatus" {
             FileLog.write("handleAppMessage：cmd=\(cmd)")
         }
 
         switch cmd {
-        case "iosUpdateBlockStatus":
-            enqueueIPCWork(generation: sessionGeneration, workClass: .light, reply: reply) {
-                reply(self.iosUpdateBlockState.response(MihomoIOSUpdateBlockStatusData()))
-            }
-        case "configureIOSUpdateBlock", "resetIOSUpdateBlockStats":
-            enqueueIPCWork(generation: sessionGeneration, workClass: .light, reply: reply) {
-                self.runtimeQueue.sync {
-                    guard !self.isStopping, self.tunnelFileDescriptor != nil,
-                          self.isCurrentIPCSession(sessionGeneration) else {
-                        reply(Self.jsonData(["error": "VPN 尚未连接，请稍后重试"]))
-                        return
-                    }
-                    if let expected = obj?["session"] as? String,
-                       let current = try? JSONDecoder().decode(IOSUpdateBlockSnapshot.self,
-                                                               from: MihomoIOSUpdateBlockStatusData() ?? Data()),
-                       expected != String(current.session) {
-                        reply(Self.jsonData(["error": "VPN 会话已切换，请刷新状态后重试", "code": "cancelled"]))
-                        return
-                    }
-                    if cmd == "resetIOSUpdateBlockStats" {
-                        reply(self.iosUpdateBlockState.response(MihomoResetIOSUpdateBlockStatsData()))
-                        return
-                    }
-                    guard let json = obj?["configuration"] as? String, json.utf8.count <= 512,
-                          let value = try? JSONDecoder().decode(IOSUpdateBlockConfiguration.self, from: Data(json.utf8)),
-                          let validated = try? value.validated() else {
-                        reply(Self.jsonData(["error": "iOS 更新拦截设置格式不正确"]))
-                        return
-                    }
-                    do {
-                        if AppGroup.containerURL != nil {
-                            guard IOSUpdateBlockStorage.load() == validated else {
-                                reply(Self.jsonData(["error": "设置已更新，请同步最新设置"]))
-                                return
-                            }
-                        } else {
-                            try IOSUpdateBlockStorage.save(validated)
-                        }
-                        reply(self.iosUpdateBlockState.response(MihomoConfigureIOSUpdateBlockData(try validated.json())))
-                    } catch {
-                        reply(Self.jsonData(["error": "VPN 无法保存拦截设置，请重试同步"]))
-                    }
-                }
-            }
         case "po0WhitelistStatus":
             reply(Data(MihomoPO0WhitelistStatus().utf8))
         case "setPO0Whitelist", "checkPO0Whitelist", "refreshPO0Whitelist":

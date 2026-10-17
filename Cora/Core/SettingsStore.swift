@@ -333,7 +333,6 @@ final class SettingsStore: ObservableObject {
             "unifiedDelay": unifiedDelay,
             "mixedPort": mixedPort,
             "blockDirectSTUN": blockDirectSTUN,
-            "iosUpdateBlock": IOSUpdateBlockStorage.load().dictionary,
             "proxySelections": proxySelections,
             "applyOverrides": applyOverrides,
             "overrides": ConfigOverrideStore.shared.asDictionary(),

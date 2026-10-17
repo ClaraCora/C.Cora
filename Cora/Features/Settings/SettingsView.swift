@@ -6,7 +6,9 @@ struct SettingsView: View {
     @EnvironmentObject private var core: CoreStateManager
     @EnvironmentObject private var settings: SettingsStore
     @EnvironmentObject private var configOverrides: ConfigOverrideStore
+    @EnvironmentObject private var subscriptions: SubscriptionStore
     @State private var pendingApplyError: String?
+    @ScaledMetric(relativeTo: .body) private var iconSize: CGFloat = 30
 
     var body: some View {
         NavigationStack {
@@ -21,7 +23,12 @@ struct SettingsView: View {
                                     .font(.subheadline)
                                     .fixedSize(horizontal: false, vertical: true)
                             }
-                            if core.isActive {
+                            if subscriptions.activeOverridesEnabled && !configOverrides.validationWarnings.isEmpty {
+                                Text("配置覆写存在无效内容，请修正后再应用。")
+                                    .font(.footnote)
+                                    .foregroundStyle(.secondary)
+                                NavigationLink("检查配置覆写") { ConfigOverrideSettingsView() }
+                            } else if core.isActive {
                                 Button {
                                     Task {
                                         let applied = await core.applyPendingSettings()
@@ -61,6 +68,12 @@ struct SettingsView: View {
                             message: "查看配置引用的节点来源和规则来源。节点来源可离线缓存；规则来源需连接当前配置后更新。",
                             category: .resources,
                             destination: RemoteResourcesView())
+                        SettingsNavigationRow(
+                            title: "规则数据",
+                            systemImage: "globe.americas",
+                            message: "管理 GEO、GeoSite 和 ASN 规则数据。",
+                            category: .rules,
+                            destination: GeoSettingsView())
                     }
                     .settingsSectionStyle()
 
@@ -72,29 +85,17 @@ struct SettingsView: View {
                             category: .graphite,
                             destination: KernelSettingsView())
                         SettingsNavigationRow(
-                            title: "开发者模式",
-                            systemImage: "wrench.and.screwdriver",
-                            message: "按需采集和分析 Network Extension 内存快照，普通模式不会持续采样。",
-                            category: .graphite,
-                            destination: DeveloperDiagnosticsView())
-                        SettingsNavigationRow(
-                            title: "规则数据",
-                            systemImage: "globe.americas",
-                            message: "管理 GEO、GeoSite 和 ASN 规则数据。",
-                            category: .rules,
-                            destination: GeoSettingsView())
-                        SettingsNavigationRow(
                             title: "隧道与隐私",
                             systemImage: "arrow.triangle.branch",
                             message: "设置流量接管范围、系统服务排除和防泄露选项。",
                             category: .privacy,
                             destination: TunnelRouteSettingsView())
-                        IOSUpdateBlockSettingsEntry()
                         SettingsNavigationRow(
                             title: "测速",
                             systemImage: "speedometer",
                             message: "设置测速地址和测速超时时间。",
                             category: .speed,
+                            value: "超时 \(settings.delayTestTimeout) 秒",
                             destination: DelayTestSettingsView())
                         PO0WhitelistSettingsEntry()
                     }
@@ -112,6 +113,13 @@ struct SettingsView: View {
                             message: "管理节点解锁检测脚本。脚本在 Cora 外部仓库维护，更新前会校验签名和摘要。",
                             category: .scripts,
                             destination: UnlockScriptSettingsView())
+                        SettingsNavigationRow(
+                            title: "开发者模式",
+                            systemImage: "wrench.and.screwdriver",
+                            message: "按需采集和分析 Network Extension 内存快照，普通模式不会持续采样。",
+                            category: .graphite,
+                            value: settings.developerMode ? "开启" : "关闭",
+                            destination: DeveloperDiagnosticsView())
                         HStack(spacing: 12) {
                             SettingsSymbol(systemImage: "info.circle", category: .graphite)
                             Text("App 版本").font(.body)
@@ -120,9 +128,13 @@ struct SettingsView: View {
                                 .font(.subheadline)
                                 .foregroundStyle(.secondary)
                                 .monospacedDigit()
+                                .multilineTextAlignment(.trailing)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .textSelection(.enabled)
                         }
                         .frame(minHeight: 44)
-                        .alignmentGuide(.listRowSeparatorLeading) { _ in 42 }
+                        .alignmentGuide(.listRowSeparatorLeading) { _ in iconSize + 12 }
+                        .accessibilityElement(children: .combine)
                     }
                     .settingsSectionStyle()
                 }
@@ -1057,7 +1069,9 @@ struct SettingsNavigationRow<Destination: View>: View {
     let systemImage: String
     let message: String
     var category: SettingsCategory = .configuration
+    var value: String? = nil
     let destination: Destination
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @ScaledMetric(relativeTo: .body) private var iconSize: CGFloat = 30
 
     var body: some View {
@@ -1067,11 +1081,20 @@ struct SettingsNavigationRow<Destination: View>: View {
             } label: {
                 HStack(spacing: 12) {
                     SettingsSymbol(systemImage: systemImage, category: category)
-                    Text(title)
-                        .font(.body)
-                        .foregroundStyle(.primary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Spacer(minLength: 4)
+                    if dynamicTypeSize.isAccessibilitySize, let value {
+                        VStack(alignment: .leading, spacing: 3) {
+                            titleLabel
+                            valueLabel(value)
+                        }
+                        Spacer(minLength: 4)
+                    } else {
+                        titleLabel
+                        Spacer(minLength: 4)
+                        if let value {
+                            valueLabel(value)
+                                .multilineTextAlignment(.trailing)
+                        }
+                    }
                 }
                 .frame(minHeight: 44)
                 .contentShape(Rectangle())
@@ -1080,6 +1103,20 @@ struct SettingsNavigationRow<Destination: View>: View {
             InfoButton(message: message, accessibilityLabel: "查看\(title)说明")
         }
         .alignmentGuide(.listRowSeparatorLeading) { _ in iconSize + 12 }
+    }
+
+    private var titleLabel: some View {
+        Text(title)
+            .font(.body)
+            .foregroundStyle(.primary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func valueLabel(_ value: String) -> some View {
+        Text(value)
+            .font(.subheadline)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
     }
 }
 
