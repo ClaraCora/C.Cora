@@ -15,7 +15,7 @@ struct SettingsView: View {
             ZStack {
                 AppAmbientBackground()
                 Form {
-                    if settings.pendingConnectionApply || configOverrides.pendingConnectionApply {
+                    if settings.pendingConnectionApply || configOverrides.pendingConnectionApply || subscriptions.pendingProxyChainApply {
                         Section {
                             HStack(spacing: 12) {
                                 SettingsSymbol(systemImage: "arrow.triangle.2.circlepath", category: .speed)
@@ -78,6 +78,13 @@ struct SettingsView: View {
                     .settingsSectionStyle()
 
                     Section("运行") {
+                        SettingsNavigationRow(
+                            title: "节点前置代理",
+                            systemImage: "point.3.connected.trianglepath.dotted",
+                            message: "为当前配置选择前置节点，仅作用于勾选的后置节点，重连后生效。",
+                            category: .speed,
+                            value: subscriptions.selected?.proxyChain.summary ?? "请先选择配置",
+                            destination: ProxyChainSettingsView())
                         SettingsNavigationRow(
                             title: "内核运行",
                             systemImage: "gearshape.2",
@@ -143,7 +150,7 @@ struct SettingsView: View {
                 .listStyle(.insetGrouped)
                 .coraListSectionSpacing(12)
                 .listRowSeparatorTint(Color.primary.opacity(0.08))
-                .settingsChangeAnimation(value: settings.pendingConnectionApply || configOverrides.pendingConnectionApply)
+                .settingsChangeAnimation(value: settings.pendingConnectionApply || configOverrides.pendingConnectionApply || subscriptions.pendingProxyChainApply)
             }
             .navigationTitle("设置")
             .task { await core.refreshStatus() }

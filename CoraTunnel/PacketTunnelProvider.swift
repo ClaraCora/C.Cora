@@ -188,6 +188,10 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
         let cachedInput = runtimeQueue.sync { () -> (String, String)? in
             guard !isStopping, isCurrentIPCSession(startGeneration) else { return nil }
+            if !hasConfigOption,
+               let snapshot = RuntimeConfigurationSnapshotStorage.load(in: URL(fileURLWithPath: home, isDirectory: true)) {
+                return (snapshot.configYAML, snapshot.settingsJSON)
+            }
             return (resolveConfig(incoming: incomingConfig, hasOption: hasConfigOption, home: home),
                     resolveCached(incoming: settingsJSON.isEmpty ? nil : settingsJSON,
                                   home: home, file: "settings.json") ?? "")
@@ -289,6 +293,18 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                     return nil
                 }
                 if ok {
+                    do {
+                        try RuntimeConfigurationSnapshotStorage.save(
+                            RuntimeConfigurationSnapshot(configYAML: configYAML, settingsJSON: resolvedSettings),
+                            in: URL(fileURLWithPath: home, isDirectory: true))
+                    } catch {
+                        // Do not replace the previous manifest with an incomplete
+                        // pair. No credentials or raw configuration enter logs.
+                        FileLog.write("运行配置快照提交失败，取消本次启动并保留上次成功快照")
+                        startError = NSError(domain: "CoraTunnel", code: -8,
+                            userInfo: [NSLocalizedDescriptionKey: "无法保存运行配置，已取消连接；请检查可用存储空间后重试"])
+                        return false
+                    }
                     FileLog.write("MihomoStartWithConfig 返回成功")
                     self.log.info("mihomo 启动成功")
                     self.tunnelFileDescriptor = fd
@@ -376,10 +392,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         let cachePath = (home as NSString).appendingPathComponent("config.yaml")
         if hasOption {
             let value = (incoming?.isEmpty == false) ? incoming! : MihomoConfig.directModeYAML()
-            try? value.write(toFile: cachePath, atomically: true, encoding: .utf8)
             FileLog.write(incoming?.isEmpty == false
-                ? "使用 App options config.yaml（\(value.count) 字节，已缓存）"
-                : "App 明确无活动配置：使用内建 DIRECT（已覆盖缓存）")
+                ? "使用 App options config.yaml（\(value.count) 字节，成功启动后提交快照）"
+                : "App 明确无活动配置：使用内建 DIRECT")
             return value
         }
         if let cached = try? String(contentsOfFile: cachePath, encoding: .utf8), !cached.isEmpty {
@@ -395,12 +410,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         return MihomoConfig.directModeYAML()
     }
 
-    /// 普通值优先级：options 传入（并写缓存）→ 缓存文件 → nil。
+    /// 普通值优先级：options 传入 → 旧版缓存文件 → nil；成功启动后再提交成对快照。
     private func resolveCached(incoming: String?, home: String, file: String) -> String? {
         let cachePath = (home as NSString).appendingPathComponent(file)
         if let value = incoming {
-            try? value.write(toFile: cachePath, atomically: true, encoding: .utf8)
-            FileLog.write("使用 options \(file)（\(value.count) 字节，已缓存）")
+            FileLog.write("使用 options \(file)（\(value.count) 字节，成功启动后提交快照）")
             return value
         }
         if let cached = try? String(contentsOfFile: cachePath, encoding: .utf8), !cached.isEmpty {
@@ -920,6 +934,16 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         case "queryProxies":
             enqueueIPCWork(generation: sessionGeneration, workClass: .snapshot, reply: reply) {
                 reply(MihomoQueryProxiesData())
+            }
+        case "proxyChainCatalog":
+            enqueueIPCWork(generation: sessionGeneration, workClass: .snapshot, reply: reply) {
+                var result = ((try? JSONSerialization.jsonObject(with: Data(MihomoProxyChainRuntimeCatalog().utf8))) as? [String: Any]) ?? [:]
+                if let home = self.homeDir,
+                   let settings = RuntimeConfigurationSnapshotStorage.settings(in: URL(fileURLWithPath: home, isDirectory: true)),
+                   let envelope = (try? JSONSerialization.jsonObject(with: Data(settings.utf8))) as? [String: Any] {
+                    result["subscriptionID"] = envelope["subscriptionID"]
+                }
+                reply(Self.jsonData(result))
             }
         case "remoteResourceStatus":
             enqueueIPCWork(generation: sessionGeneration, workClass: .light, reply: reply) {

@@ -683,6 +683,7 @@ type appSettings struct {
 	ApplyOverrides               bool                   `json:"applyOverrides"`
 	Overrides                    configOverrideSettings `json:"overrides"`
 	ProxySelections              map[string]string      `json:"proxySelections"`
+	ProxyChain                   proxyChainSettings     `json:"proxyChain"`
 }
 
 type configOverrideSettings struct {
@@ -1256,6 +1257,11 @@ func mergeConfig(subYAML string, st appSettings, tunnelMTU int) ([]byte, error) 
 
 	// 收集本次合并的「不适用内容」提示。
 	configNotices = nil
+	chainNotices, err := applyProxyChain(m, st.ProxyChain)
+	if err != nil {
+		return nil, err
+	}
+	configNotices = append(configNotices, chainNotices...)
 	// DNS URL 的 #名称区分大小写。名称写错时 mihomo 会把它当作物理接口，
 	// 查询在建立普通连接之前即失败，因此浏览器只显示“找不到服务器”。
 	normalizeDNSProxyReferences(m)

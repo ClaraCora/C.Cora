@@ -14,6 +14,14 @@ enum MihomoCore {
         MihomoVersion()
     }
 
+    static func proxyChainCatalog(configYAML: String, providerPayloadsJSON: String) -> Data {
+        Data(MihomoProxyChainCatalog(configYAML, providerPayloadsJSON).utf8)
+    }
+
+    static func validateProxyChain(configYAML: String, providerPayloadsJSON: String, chainJSON: String) -> Data {
+        Data(MihomoValidateProxyChain(configYAML, providerPayloadsJSON, chainJSON).utf8)
+    }
+
     static func proxyProviderManifest(configYAML: String) -> Data {
         Data(MihomoProxyProviderManifest(configYAML).utf8)
     }
