@@ -22,10 +22,15 @@ struct ProxyChainConfigurationTests {
         try expect(ProxyChainReference(source: "a", name: "bc").id != ProxyChainReference(source: "ab", name: "c").id,
                    "reference IDs collide")
         var chain = ProxyChainConfiguration()
-        try expect(!chain.enabled && chain.targets.isEmpty, "legacy default is enabled")
+        try expect(!chain.enabled && chain.groups.isEmpty, "legacy default is enabled")
         chain.enabled = true
-        chain.upstream = .init(source: "Q", name: "Front")
-        chain.targets = [inline, provider]
+        chain.groups = [
+            .init(id: ProxyChainGroup.legacyID, name: "分组 1", enabled: true,
+                  upstream: .init(source: "Q", name: "Front"), targets: [inline, provider]),
+            .init(name: "分组 2", enabled: true, mode: "custom",
+                  yaml: "name: Front\ntype: socks5\nserver: 127.0.0.1\nport: 1080\n",
+                  targets: [.init(source: "P", name: "C")])
+        ]
         let decoded = try JSONDecoder().decode(ProxyChainConfiguration.self, from: Data(chain.json.utf8))
         try expect(decoded == chain, "settings did not survive serialization")
         try expect(ProxyChainConfiguration.fromSettings("{\"logLevel\":\"info\"}") == .init(), "old settings failed migration")
@@ -47,9 +52,58 @@ struct ProxyChainConfigurationTests {
         try expect(chain.requiresApply(settingsJSON: appliedSettings, subscriptionID: UUID()),
                    "configuration switch lost pending state")
         var changedChain = chain
-        changedChain.targets = [provider]
+        changedChain.groups[0].targets = [provider]
         try expect(changedChain.requiresApply(settingsJSON: appliedSettings, subscriptionID: subscriptionID),
                    "changed selection lost pending state")
+
+        let legacyJSON = "{\"enabled\":true,\"mode\":\"existing\",\"upstream\":{\"source\":\"Q\",\"name\":\"Front\"},\"targets\":[{\"source\":\"\",\"name\":\"B\"},{\"source\":\"P\",\"name\":\"B\"}]}"
+        let migrated = try JSONDecoder().decode(ProxyChainConfiguration.self, from: Data(legacyJSON.utf8))
+        try expect(migrated.groups.count == 1 && migrated.groups[0] == chain.groups[0], "legacy group changed on migration")
+        let migratedAgain = try JSONDecoder().decode(ProxyChainConfiguration.self, from: Data(legacyJSON.utf8))
+        try expect(migrated == migratedAgain, "legacy migration generated random identity")
+        let disabledLegacy = try JSONDecoder().decode(ProxyChainConfiguration.self,
+            from: Data(legacyJSON.replacingOccurrences(of: "\"enabled\":true", with: "\"enabled\":false").utf8))
+        try expect(!disabledLegacy.enabled && disabledLegacy.groups[0].enabled, "legacy off switch or saved content lost")
+        try expect(chain.dictionary["version"] as? Int == 2, "new settings did not encode schema version")
+        try expect(chain.dictionary["upstream"] == nil, "legacy single group fields encoded in version 2")
+        let legacyEnvelope = String(decoding: try JSONSerialization.data(withJSONObject: [
+            "proxyChain": try JSONSerialization.jsonObject(with: Data(legacyJSON.utf8)),
+            "subscriptionID": subscriptionID.uuidString
+        ]), as: UTF8.self)
+        try expect(!migrated.requiresApply(settingsJSON: legacyEnvelope, subscriptionID: subscriptionID),
+                   "legacy snapshot migration falsely requires reconnect")
+
+        var presentationOnly = chain
+        presentationOnly.groups[0].name = "新组名"
+        presentationOnly.groups.reverse()
+        presentationOnly.groups[1].targets.reverse()
+        presentationOnly.groups[1].yaml = "inactive source text"
+        presentationOnly.groups.append(.init(name: "关闭的草稿", targets: [inline]))
+        try expect(!presentationOnly.requiresApply(settingsJSON: appliedSettings, subscriptionID: subscriptionID),
+                   "display name, ordering or disabled draft falsely requires reconnect")
+        var disabledGroup = chain
+        disabledGroup.groups[1].enabled = false
+        try expect(disabledGroup.requiresApply(settingsJSON: appliedSettings, subscriptionID: subscriptionID),
+                   "disabling a group did not require applying")
+        var allDisabled = chain
+        allDisabled.enabled = false
+        try expect(allDisabled.requiresApply(settingsJSON: appliedSettings, subscriptionID: subscriptionID),
+                   "master switch did not require applying")
+        try expect(allDisabled.activeGroups.isEmpty && allDisabled.groups == chain.groups,
+                   "master switch destroyed saved groups")
+        var empty = chain
+        empty.groups.append(.init(name: "空组", enabled: true))
+        try expect(!empty.requiresApply(settingsJSON: appliedSettings, subscriptionID: subscriptionID), "empty group created overlay")
+        let owners = chain.targetOwners(excluding: chain.groups[1].id)
+        try expect(owners[inline] == "分组 1" && owners[provider] == "分组 1", "occupancy lost exact source")
+        let upstreamOwners = chain.upstreamOwners(excluding: chain.groups[1].id)
+        try expect(upstreamOwners[chain.groups[0].upstream!] == "分组 1", "upstream occupancy missing")
+        disabledGroup.groups[0].enabled = false
+        try expect(disabledGroup.targetOwners(excluding: chain.groups[1].id).isEmpty, "disabled group still reserves nodes")
+        let conflictJSON = "{\"error\":\"conflict\",\"groupID\":\"\(chain.groups[0].id)\",\"conflictingGroupID\":\"\(chain.groups[1].id)\"}"
+        let conflict = try JSONDecoder().decode(ProxyChainValidation.self, from: Data(conflictJSON.utf8))
+        try expect(conflict.groupID == chain.groups[0].id && conflict.conflictingGroupID == chain.groups[1].id,
+                   "validation lost group locations")
 
         let first = RuntimeConfigurationSnapshot(configYAML: "# original bytes\r\nproxies: []\r\n", settingsJSON: settings)
         try RuntimeConfigurationSnapshotStorage.save(first, in: directory)
@@ -69,7 +123,7 @@ struct ProxyChainConfigurationTests {
         try expect(RuntimeConfigurationSnapshotStorage.load(in: directory) == first, "uncommitted start poisoned reconnect")
 
         var nextChain = chain
-        nextChain.targets = [provider]
+        nextChain.groups[0].targets = [provider]
         let secondSettings = String(decoding: try JSONSerialization.data(withJSONObject: ["proxyChain": nextChain.dictionary]), as: UTF8.self)
         let second = RuntimeConfigurationSnapshot(configYAML: "# second\nproxies: []\n", settingsJSON: secondSettings)
         try RuntimeConfigurationSnapshotStorage.save(second, in: directory)
@@ -80,8 +134,14 @@ struct ProxyChainConfigurationTests {
 
         try RuntimeConfigurationSnapshotStorage.save(first, in: directory)
         try expect(RuntimeConfigurationSnapshotStorage.load(in: directory) == first, "rollback did not restore both YAML and settings")
-        try expect(nextChain != ProxyChainConfiguration.fromSettings(RuntimeConfigurationSnapshotStorage.settings(in: directory)),
+        try expect(nextChain.requiresApply(settingsJSON: RuntimeConfigurationSnapshotStorage.settings(in: directory), subscriptionID: nil),
                    "rollback cleared the desired settings' pending state")
+        let legacySnapshot = RuntimeConfigurationSnapshot(configYAML: first.configYAML, settingsJSON: legacyEnvelope)
+        try RuntimeConfigurationSnapshotStorage.save(legacySnapshot, in: directory)
+        try expect(RuntimeConfigurationSnapshotStorage.load(in: directory) == legacySnapshot, "legacy snapshot changed raw data")
+        try expect(ProxyChainConfiguration.fromSettings(RuntimeConfigurationSnapshotStorage.settings(in: directory)) == migrated,
+                   "system reconnect cannot decode old successful settings")
+        try RuntimeConfigurationSnapshotStorage.save(first, in: directory)
 
         // Permission failures must leave the last successful manifest intact.
         try manager.setAttributes([.posixPermissions: 0o500], ofItemAtPath: root.path)

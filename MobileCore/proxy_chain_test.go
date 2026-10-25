@@ -502,3 +502,282 @@ func TestProxyChainMergeIsRuntimeOnlyAndRemovalRestoresBaseline(t *testing.T) {
 		t.Fatalf("empty selection retained runtime overlay: %v", err)
 	}
 }
+
+func chainMultiSettings() proxyChainSettings {
+	return proxyChainSettings{Version: 2, Enabled: true, Groups: []proxyChainGroup{
+		{ID: chainLegacyID, Name: "分组 1", Enabled: true, Mode: "existing", Upstream: &chainReference{"", "A"}, Targets: []chainReference{{"", "B"}, {"P", "C"}}},
+		{ID: "11111111-1111-1111-1111-111111111111", Name: "分组 2", Enabled: true, Mode: "existing", Upstream: &chainReference{"Q", "C"}, Targets: []chainReference{{"", "D"}, {"P", "B"}}},
+	}}
+}
+
+func TestProxyChainMultipleGroupsAndHelperIsolation(t *testing.T) {
+	settings := chainMultiSettings()
+	settings.Groups = append(settings.Groups, proxyChainGroup{ID: "22222222-2222-2222-2222-222222222222", Name: "分组 3", Enabled: true, Mode: "custom", YAML: "name: F\ntype: socks5\nserver: 127.0.0.1\nport: 7\nudp: true\n", Targets: []chainReference{{"", "E"}}})
+	fixture := strings.Replace(chainFixture, "proxy-providers:", "  - {name: E, type: socks5, server: 127.0.0.1, port: 9, udp: true}\n  - {name: Unselected, type: socks5, server: 127.0.0.1, port: 10}\nproxy-providers:", 1)
+	original := chainTestConfig(t, chainTestMap(t, fixture))
+	raw := chainTestMap(t, fixture)
+	if _, err := applyProxyChain(raw, settings); err != nil {
+		t.Fatal(err)
+	}
+	cfg := chainTestConfig(t, raw)
+	for _, c := range []*config.Config{original, cfg} {
+		for _, pd := range c.Providers {
+			if err := pd.Initial(); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	for i, name := range []string{"B", "D", "E"} {
+		if got := cfg.Proxies[name].ProxyInfo().DialerProxy; got != settings.Groups[i].upstreamName() {
+			t.Fatalf("%s routed to %s", name, got)
+		}
+	}
+	if got := cfg.Proxies["Unselected"].ProxyInfo().DialerProxy; got != "" {
+		t.Fatal("unselected node changed")
+	}
+	for _, proxy := range cfg.Providers["P"].Proxies() {
+		want := settings.Groups[0].upstreamName()
+		if proxy.Name() == "B" {
+			want = settings.Groups[1].upstreamName()
+		}
+		if proxy.ProxyInfo().DialerProxy != want {
+			t.Fatalf("same provider routed %s to wrong group", proxy.Name())
+		}
+	}
+	for _, name := range []string{"All", "Manual", "GLOBAL"} {
+		members := func(c *config.Config) []string {
+			out := []string{}
+			for _, p := range c.Proxies[name].Adapter().(interface{ GetProxies(bool) []C.Proxy }).GetProxies(false) {
+				out = append(out, p.Name())
+			}
+			return out
+		}
+		if !reflect.DeepEqual(members(original), members(cfg)) {
+			t.Fatalf("group %s membership changed", name)
+		}
+	}
+	previousProxies, previousProviders := tunnel.Proxies(), tunnel.Providers()
+	tunnel.UpdateProxies(cfg.Proxies, cfg.Providers)
+	defer tunnel.UpdateProxies(previousProxies, previousProviders)
+	var catalog struct {
+		Nodes []chainCatalogNode `json:"nodes"`
+	}
+	if err := json.Unmarshal([]byte(ProxyChainRuntimeCatalog()), &catalog); err != nil {
+		t.Fatal(err)
+	}
+	for _, node := range catalog.Nodes {
+		if chainInternalName(node.Name) {
+			t.Fatal("helper leaked into node picker")
+		}
+	}
+
+	recorders := []*chainDialRecorder{}
+	for _, g := range settings.Groups {
+		r := &chainDialRecorder{ProxyAdapter: outbound.NewReject()}
+		recorders = append(recorders, r)
+		cfg.Proxies[g.upstreamName()] = adapter.NewProxy(r)
+	}
+	for i, name := range []string{"B", "D", "E"} {
+		before := make([]int, len(recorders))
+		for j, recorder := range recorders {
+			before[j] = recorder.tcp
+		}
+		_, err := cfg.Proxies[name].DialContext(context.Background(), &C.Metadata{Host: "example.invalid", DstPort: 443, NetWork: C.TCP})
+		if err == nil || recorders[i].tcp != before[i]+1 {
+			t.Fatalf("%s TCP bypassed own front", name)
+		}
+		_, err = cfg.Proxies[name].ListenPacketContext(context.Background(), &C.Metadata{DstIP: netip.MustParseAddr("1.1.1.1"), DstPort: 443, NetWork: C.UDP})
+		if err == nil || recorders[i].tcp <= before[i]+1 {
+			t.Fatalf("%s SOCKS UDP bypassed own front", name)
+		}
+		for j, recorder := range recorders {
+			if j != i && recorder.tcp != before[j] {
+				t.Fatal("groups crossed during TCP/UDP dial")
+			}
+		}
+	}
+}
+
+func TestProxyChainMultiGroupConflictsAreAtomicAndLocated(t *testing.T) {
+	for _, test := range []string{"duplicate", "cross", "existing-dialer", "invalid-custom", "same-id"} {
+		t.Run(test, func(t *testing.T) {
+			settings := chainMultiSettings()
+			fixture := chainFixture
+			switch test {
+			case "duplicate":
+				settings.Groups[1].Targets = append(settings.Groups[1].Targets, chainReference{"P", "C"})
+			case "cross":
+				settings.Groups[1].Upstream = &chainReference{"", "B"}
+			case "existing-dialer":
+				fixture = strings.Replace(fixture, "port: 3,", "port: 3, dialer-proxy: A,", 1)
+			case "invalid-custom":
+				settings.Groups[1].Mode = "custom"
+				settings.Groups[1].YAML = "name: invalid\ntype: secret-password\npassword: SECRET\n"
+			case "same-id":
+				settings.Groups[1].ID = settings.Groups[0].ID
+			}
+			raw := chainTestMap(t, fixture)
+			before, _ := yaml.Marshal(raw)
+			if _, err := applyProxyChain(raw, settings); err == nil {
+				t.Fatal("conflict accepted")
+			}
+			after, _ := yaml.Marshal(raw)
+			if string(before) != string(after) {
+				t.Fatal("failed preflight partially mutated config")
+			}
+			encoded, _ := json.Marshal(settings)
+			var result struct {
+				Error   string `json:"error"`
+				GroupID string `json:"groupID"`
+				Other   string `json:"conflictingGroupID"`
+			}
+			if err := json.Unmarshal([]byte(ValidateProxyChain(fixture, "{}", string(encoded))), &result); err != nil {
+				t.Fatal(err)
+			}
+			if result.Error == "" || strings.Contains(result.Error, "SECRET") {
+				t.Fatal("missing or unsafe validation error")
+			}
+			if test != "same-id" && result.GroupID != settings.Groups[1].ID {
+				t.Fatal("error did not locate offending group")
+			}
+			if (test == "duplicate" || test == "cross") && result.Other != settings.Groups[0].ID {
+				t.Fatal("missing conflicting group")
+			}
+		})
+	}
+}
+
+func TestProxyChainMultiGroupDisableRemoveAndSharedFront(t *testing.T) {
+	settings := chainMultiSettings()
+	settings.Groups[1].Upstream = settings.Groups[0].Upstream
+	if _, err := applyProxyChain(chainTestMap(t, chainFixture), settings); err != nil {
+		t.Fatalf("shared front rejected: %v", err)
+	}
+	settings.Groups[1].Targets = settings.Groups[0].Targets
+	settings.Groups[1].Enabled = false
+	if _, err := applyProxyChain(chainTestMap(t, chainFixture), settings); err != nil {
+		t.Fatalf("disabled group reserved nodes: %v", err)
+	}
+	settings.Groups[1].Enabled = true
+	if _, err := applyProxyChain(chainTestMap(t, chainFixture), settings); err == nil {
+		t.Fatal("reenabled conflict accepted")
+	}
+	settings.Groups = settings.Groups[1:]
+	raw := chainTestMap(t, chainFixture)
+	if _, err := applyProxyChain(raw, settings); err != nil {
+		t.Fatal(err)
+	}
+	cfg := chainTestConfig(t, raw)
+	if cfg.Proxies[chainUpstreamName] != nil || cfg.Proxies["B"].ProxyInfo().DialerProxy != settings.Groups[0].upstreamName() {
+		t.Fatal("deleted group persisted")
+	}
+	settings.Enabled = false
+	raw = chainTestMap(t, chainFixture)
+	before, _ := yaml.Marshal(raw)
+	if _, err := applyProxyChain(raw, settings); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := yaml.Marshal(raw)
+	if string(before) != string(after) {
+		t.Fatal("master switch retained overlay")
+	}
+}
+
+func TestProxyChainMultiProviderUpdateRetainsRawCacheOnConflict(t *testing.T) {
+	Setup(t.TempDir())
+	defer Stop()
+	raw := chainTestMap(t, chainFixture)
+	settings := chainMultiSettings()
+	if _, err := applyProxyChain(raw, settings); err != nil {
+		t.Fatal(err)
+	}
+	def := raw["proxy-providers"].(map[string]any)["P"].(map[string]any)
+	def["type"], def["url"], def["path"] = "http", "https://example.invalid/provider", "multi-chain.yaml"
+	delete(def, "payload")
+	pd, err := provider.ParseProxyProvider("P", def, tunnel.Tunnel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	set := pd.(*provider.ProxySetProvider)
+	defer set.Close()
+	good := []byte("proxies:\n - {name: B, type: socks5, server: 127.0.0.1, port: 8}\n - {name: C, type: socks5, server: 127.0.0.1, port: 9}\n - {name: Other, type: socks5, server: 127.0.0.1, port: 10}\n")
+	if _, _, err := set.SideUpdate(good); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"B": settings.Groups[1].upstreamName(), "C": settings.Groups[0].upstreamName(), "Other": ""}
+	for _, proxy := range set.Proxies() {
+		if proxy.ProxyInfo().DialerProxy != want[proxy.Name()] {
+			t.Fatal("refresh crossed groups")
+		}
+	}
+	version := set.Version()
+	for _, bad := range []string{
+		"{name: C, type: socks5, server: 127.0.0.1, port: 8, dialer-proxy: A}",
+		"{name: B, type: DIRECT}",
+		"{name: Other, type: socks5, server: 127.0.0.1, port: 8, dialer-proxy: D}",
+		"{name: " + settings.Groups[1].customName() + ", type: socks5, server: 127.0.0.1, port: 8}",
+		"{name: Other, type: socks5, server: 127.0.0.1, port: 8, dialer-proxy: __CORA_CHAIN_NODE__future}",
+	} {
+		if _, _, err := set.SideUpdate([]byte("proxies:\n - " + bad + "\n")); err == nil {
+			t.Fatal("unsafe refresh accepted")
+		}
+		if set.Version() != version {
+			t.Fatal("failed refresh replaced adapters")
+		}
+		contents, err := os.ReadFile(filepath.Join(C.Path.HomeDir(), "multi-chain.yaml"))
+		if err != nil || string(contents) != string(good) {
+			t.Fatal("failed refresh changed raw cache")
+		}
+	}
+	renamed := []byte(strings.Replace(string(good), "name: C,", "name: Renamed,", 1))
+	if _, _, err := set.SideUpdate(renamed); err != nil {
+		t.Fatal(err)
+	}
+	for _, proxy := range set.Proxies() {
+		if proxy.Name() == "Renamed" && proxy.ProxyInfo().DialerProxy != "" {
+			t.Fatal("renamed target inherited selection")
+		}
+	}
+}
+
+func TestProxyChainLegacyMigrationAndLimits(t *testing.T) {
+	legacy := chainTestSettings()
+	groups, err := legacy.normalizedGroups()
+	if err != nil || len(groups) != 1 || groups[0].ID != chainLegacyID {
+		t.Fatal("legacy migration lost stable identity")
+	}
+	newer := proxyChainSettings{Version: 2, Enabled: legacy.Enabled, Groups: groups}
+	a, b := chainTestMap(t, chainFixture), chainTestMap(t, chainFixture)
+	if _, err := applyProxyChain(a, legacy); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := applyProxyChain(b, newer); err != nil {
+		t.Fatal(err)
+	}
+	first, _ := yaml.Marshal(a)
+	second, _ := yaml.Marshal(b)
+	if string(first) != string(second) {
+		t.Fatal("legacy reconnect produces different route")
+	}
+	for _, kind := range []string{"groups", "targets", "yaml", "version"} {
+		t.Run(kind, func(t *testing.T) {
+			settings := chainMultiSettings()
+			switch kind {
+			case "groups":
+				for i := 0; i < chainMaxGroups; i++ {
+					settings.Groups = append(settings.Groups, proxyChainGroup{})
+				}
+			case "targets":
+				settings.Groups[1].Targets = make([]chainReference, chainMaxTargets)
+			case "yaml":
+				settings.Groups[1].Enabled = false
+				settings.Groups[1].YAML = strings.Repeat("x", chainMaxYAMLBytes+1)
+			case "version":
+				settings.Version = 3
+			}
+			if _, err := applyProxyChain(chainTestMap(t, chainFixture), settings); err == nil {
+				t.Fatal("limit accepted")
+			}
+		})
+	}
+}

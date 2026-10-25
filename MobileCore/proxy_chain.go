@@ -2,6 +2,7 @@ package mihomo
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"sort"
@@ -19,13 +20,18 @@ import (
 )
 
 const (
-	chainUpstreamName = "__CORA_CHAIN_UPSTREAM__"
-	chainCustomName   = "__CORA_CHAIN_NODE__"
-	chainMaxTargets   = 4096
-	chainMaxYAMLBytes = 64 * 1024
+	chainLegacyID       = "00000000-0000-0000-0000-000000000001"
+	chainUpstreamPrefix = "__CORA_CHAIN_UPSTREAM__"
+	chainCustomPrefix   = "__CORA_CHAIN_NODE__"
+	chainUpstreamName   = chainUpstreamPrefix + "00000000000000000000000000000001"
+	chainCustomName     = chainCustomPrefix + "00000000000000000000000000000001"
+	chainMaxGroups      = 32
+	chainMaxTargets     = 4096
+	chainMaxYAMLBytes   = 64 * 1024
 )
 
 var chainNonProxyTypes = []string{"", "direct", "reject", "reject-drop", "pass", "pass-rule", "compatible", "dns", "rematch", "select", "selector", "url-test", "urltest", "fallback", "load-balance", "loadbalance", "relay"}
+var chainGroupIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 // Source is empty for top-level proxies, otherwise it is the exact provider
 // name. A provider's final (post-override) name is used, never a fuzzy match.
@@ -35,11 +41,89 @@ type chainReference struct {
 }
 
 type proxyChainSettings struct {
+	Version  int               `json:"version,omitempty"`
+	Groups   []proxyChainGroup `json:"groups,omitempty"`
+	Enabled  bool              `json:"enabled"`
+	Mode     string            `json:"mode"`
+	Upstream *chainReference   `json:"upstream,omitempty"`
+	YAML     string            `json:"yaml"`
+	Targets  []chainReference  `json:"targets"`
+}
+
+type proxyChainGroup struct {
+	ID       string           `json:"id"`
+	Name     string           `json:"name"`
 	Enabled  bool             `json:"enabled"`
 	Mode     string           `json:"mode"`
 	Upstream *chainReference  `json:"upstream,omitempty"`
 	YAML     string           `json:"yaml"`
 	Targets  []chainReference `json:"targets"`
+}
+
+func (g proxyChainGroup) upstreamName() string {
+	return chainUpstreamPrefix + strings.ReplaceAll(strings.ToLower(g.ID), "-", "")
+}
+func (g proxyChainGroup) customName() string {
+	return chainCustomPrefix + strings.ReplaceAll(strings.ToLower(g.ID), "-", "")
+}
+
+type chainGroupError struct {
+	GroupID      string
+	OtherGroupID string
+	Message      string
+}
+
+func (e *chainGroupError) Error() string { return e.Message }
+func chainGroupFailure(g proxyChainGroup, message string, other ...proxyChainGroup) error {
+	e := &chainGroupError{GroupID: g.ID, Message: g.Name + "：" + message}
+	if len(other) > 0 {
+		e.OtherGroupID = other[0].ID
+		e.Message += "（" + other[0].Name + "）"
+	}
+	return e
+}
+
+// Legacy snapshots use the same stable ID as the App migration. No random
+// identity is generated while decoding a successful reconnect snapshot.
+func (s proxyChainSettings) normalizedGroups() ([]proxyChainGroup, error) {
+	if s.Version != 0 && s.Version != 2 {
+		return nil, fmt.Errorf("前置设置版本不受支持")
+	}
+	groups := s.Groups
+	if s.Version == 0 && groups == nil {
+		mode := s.Mode
+		if mode == "" {
+			mode = "existing"
+		}
+		if s.Enabled || s.Upstream != nil || s.YAML != "" || len(s.Targets) > 0 || mode != "existing" {
+			groups = []proxyChainGroup{{ID: chainLegacyID, Name: "分组 1", Enabled: true, Mode: mode, Upstream: s.Upstream, YAML: s.YAML, Targets: s.Targets}}
+		}
+	}
+	if len(groups) > chainMaxGroups {
+		return nil, fmt.Errorf("每份配置最多可添加 32 组前置")
+	}
+	groups = append([]proxyChainGroup(nil), groups...)
+	seen := map[string]bool{}
+	total := 0
+	for i := range groups {
+		g := &groups[i]
+		g.ID = strings.ToLower(g.ID)
+		if !chainGroupIDPattern.MatchString(g.ID) || seen[g.ID] {
+			return nil, fmt.Errorf("分组标识无效或重复，请重新创建分组")
+		}
+		seen[g.ID] = true
+		if strings.TrimSpace(g.Name) == "" {
+			g.Name = fmt.Sprintf("分组 %d", i+1)
+		}
+		total += len(g.Targets)
+		if total > chainMaxTargets {
+			return nil, fmt.Errorf("全部分组最多可勾选 4096 个后置节点")
+		}
+		if len(g.YAML) > chainMaxYAMLBytes {
+			return nil, chainGroupFailure(*g, "单节点 YAML 不能超过 64 KB")
+		}
+	}
+	return groups, nil
 }
 
 type chainCatalogNode struct {
@@ -86,6 +170,12 @@ func chainCopyValue(value any) any {
 		copy := make(map[string]any, len(v))
 		for key, child := range v {
 			copy[key] = chainCopyValue(child)
+		}
+		return copy
+	case []map[string]any:
+		copy := make([]map[string]any, len(v))
+		for index, child := range v {
+			copy[index] = chainCopy(child)
 		}
 		return copy
 	case []any:
@@ -323,7 +413,15 @@ func ValidateProxyChain(configYAML, providerPayloadsJSON, chainJSON string) stri
 		warnings, err = applyProxyChain(m, settings)
 	}
 	if err != nil {
-		return marshalJSON(map[string]any{"error": err.Error()})
+		result := map[string]any{"error": err.Error()}
+		var groupError *chainGroupError
+		if errors.As(err, &groupError) {
+			result["groupID"] = groupError.GroupID
+			if groupError.OtherGroupID != "" {
+				result["conflictingGroupID"] = groupError.OtherGroupID
+			}
+		}
+		return marshalJSON(result)
 	}
 	return marshalJSON(map[string]any{"warnings": warnings})
 }
@@ -419,61 +517,98 @@ func chainProtectedNames(m map[string]any, targets []chainReference) map[string]
 	return protected
 }
 
+// Prepare all groups against the original configuration. Commit the derived
+// map only when every provider expression and dependency check has succeeded.
 func applyProxyChain(m map[string]any, settings proxyChainSettings) ([]string, error) {
-	warnings := []string{}
+	groups, err := settings.normalizedGroups()
+	if err != nil {
+		return nil, err
+	}
 	if !settings.Enabled {
-		return warnings, nil
+		return []string{}, nil
 	}
-	if len(settings.Targets) > chainMaxTargets {
-		return nil, fmt.Errorf("后置节点最多可勾选 4096 个")
-	}
-	if settings.Mode != "existing" && settings.Mode != "custom" {
-		return nil, fmt.Errorf("请选择前置节点来源")
-	}
-	if settings.Mode == "existing" && (settings.Upstream == nil || settings.Upstream.Name == "") {
-		return nil, fmt.Errorf("请选择前置节点")
-	}
-	if settings.Mode == "existing" && chainReservedName(settings.Upstream.Name) {
-		return nil, fmt.Errorf("前置必须是真实代理节点")
-	}
-	targetSet := map[chainReference]bool{}
-	for _, ref := range settings.Targets {
-		if ref.Name == "" || chainReservedName(ref.Name) {
-			return nil, fmt.Errorf("后置必须是真实代理节点")
-		}
-		if settings.Mode == "existing" && ref == *settings.Upstream {
-			return nil, fmt.Errorf("前置节点不能同时作为后置节点")
-		}
-		targetSet[ref] = true
-	}
-	var custom map[string]any
-	var err error
-	if settings.Mode == "custom" {
-		custom, err = chainCustomProxy(settings.YAML)
-		if err != nil {
-			return nil, err
+	active := []proxyChainGroup{}
+	for _, g := range groups {
+		if g.Enabled && len(g.Targets) > 0 {
+			active = append(active, g)
 		}
 	}
-	if len(settings.Targets) == 0 {
-		return warnings, nil
+	if len(active) == 0 {
+		return []string{}, nil
+	}
+	candidate := chainCopy(m)
+	warnings, err := chainApplyGroups(candidate, active)
+	if err != nil {
+		return nil, err
+	}
+	for key := range m {
+		delete(m, key)
+	}
+	for key, value := range candidate {
+		m[key] = value
+	}
+	return warnings, nil
+}
+
+func chainApplyGroups(m map[string]any, groups []proxyChainGroup) ([]string, error) {
+	warnings := []string{}
+	owners := map[chainReference]proxyChainGroup{}
+	required := map[chainReference]proxyChainGroup{}
+	customs := map[string]map[string]any{}
+	targets := []chainReference{}
+	for _, g := range groups {
+		if g.Mode != "existing" && g.Mode != "custom" {
+			return nil, chainGroupFailure(g, "请选择前置节点来源")
+		}
+		if g.Mode == "existing" {
+			if g.Upstream == nil || g.Upstream.Name == "" {
+				return nil, chainGroupFailure(g, "请选择前置节点")
+			}
+			if chainReservedName(g.Upstream.Name) {
+				return nil, chainGroupFailure(g, "前置必须是真实代理节点")
+			}
+			required[*g.Upstream] = g
+		} else {
+			custom, err := chainCustomProxy(g.YAML)
+			if err != nil {
+				return nil, chainGroupFailure(g, err.Error())
+			}
+			custom["name"] = g.customName()
+			customs[g.ID] = custom
+		}
+		for _, ref := range g.Targets {
+			if ref.Name == "" || chainReservedName(ref.Name) {
+				return nil, chainGroupFailure(g, "后置必须是真实代理节点")
+			}
+			if previous, exists := owners[ref]; exists {
+				if previous.ID != g.ID {
+					return nil, chainGroupFailure(g, "后置节点 "+ref.Name+" 已用于其他启用组", previous)
+				}
+				continue
+			}
+			owners[ref] = g
+			required[ref] = g
+			targets = append(targets, ref)
+		}
+	}
+	for _, g := range groups {
+		if g.Mode == "existing" {
+			if owner, exists := owners[*g.Upstream]; exists {
+				return nil, chainGroupFailure(g, "前置节点不能同时作为启用组的后置节点", owner)
+			}
+		}
 	}
 	for _, section := range []string{"proxies", "proxy-groups"} {
 		for _, item := range chainMaps(m[section]) {
-			if name := chainString(item, "name"); name == chainCustomName || name == chainUpstreamName {
+			if chainInternalName(chainString(item, "name")) {
 				return nil, fmt.Errorf("配置节点名与 App 内部前置名称冲突")
 			}
 		}
 	}
 	providers, _ := m["proxy-providers"].(map[string]any)
-	if _, exists := providers[chainUpstreamName]; exists {
-		return nil, fmt.Errorf("Provider 名称与 App 内部前置名称冲突")
-	}
-	for source, value := range providers {
-		def, _ := value.(map[string]any)
-		for _, entry := range chainMaps(def["payload"]) {
-			if name := chainString(entry, "name"); name == chainUpstreamName || name == chainCustomName {
-				return nil, fmt.Errorf("Provider %s 的节点名与 App 内部前置名称冲突", source)
-			}
+	for source := range providers {
+		if chainInternalName(source) {
+			return nil, fmt.Errorf("Provider 名称与 App 内部前置名称冲突")
 		}
 	}
 	nodes, mappings, notices, err := chainInventory(m)
@@ -482,62 +617,43 @@ func applyProxyChain(m map[string]any, settings proxyChainSettings) ([]string, e
 	}
 	warnings = append(warnings, notices...)
 	for _, node := range nodes {
-		if node.Issue != "" && (targetSet[node.chainReference] || settings.Mode == "existing" && settings.Upstream != nil && node.chainReference == *settings.Upstream) {
-			return nil, fmt.Errorf("节点重名，无法精确应用前置：%s", node.Name)
+		if g, exists := required[node.chainReference]; exists && node.Issue != "" {
+			return nil, chainGroupFailure(g, "节点重名，无法精确应用前置："+node.Name)
 		}
 	}
-	protected := chainProtectedNames(m, settings.Targets)
+	protected := chainProtectedNames(m, targets)
+	for _, g := range groups {
+		protected[g.upstreamName()] = true
+		protected[g.customName()] = true
+	}
 	for ref, mapping := range mappings {
 		dialer := chainString(mapping, "dialer-proxy")
-		if dialer != "" && (targetSet[ref] || protected[dialer]) {
-			return nil, fmt.Errorf("节点 %s 的已有代理链与勾选范围冲突，请先取消勾选相关节点", ref.Name)
+		if g, selected := owners[ref]; selected && dialer != "" {
+			return nil, chainGroupFailure(g, "节点 "+ref.Name+" 已有代理链，请先取消勾选")
+		}
+		if protected[dialer] || chainInternalName(dialer) {
+			return nil, fmt.Errorf("节点 %s 的已有代理链引用了勾选范围，无法保持未勾选节点原链路", ref.Name)
 		}
 	}
-	// Include non-proxy builtins in dependency validation as well.
 	for _, mapping := range chainMaps(m["proxies"]) {
-		if targetSet[chainReference{"", chainString(mapping, "name")}] && !chainRealType(chainString(mapping, "type")) {
-			return nil, fmt.Errorf("勾选项已不是真实代理节点，请重新选择")
+		ref := chainReference{"", chainString(mapping, "name")}
+		if g, exists := required[ref]; exists && !chainRealType(chainString(mapping, "type")) {
+			return nil, chainGroupFailure(g, "引用项已不是真实代理节点，请重新选择")
 		}
-		if protected[chainString(mapping, "dialer-proxy")] {
+		dialer := chainString(mapping, "dialer-proxy")
+		if protected[dialer] || chainInternalName(dialer) {
 			return nil, fmt.Errorf("已有代理链引用了勾选节点，无法保持未勾选节点原链路")
 		}
 	}
-	for ref := range targetSet {
+	for _, ref := range targets {
 		if mappings[ref] == nil {
-			warnings = append(warnings, "勾选节点当前不存在或尚未缓存："+ref.Name)
+			warnings = append(warnings, owners[ref].Name+"：勾选节点当前不存在或尚未缓存："+ref.Name)
 		}
 	}
-	chainPreserveGlobalGroup(m)
-	// Keep every original group dynamic while preventing the App-only custom
-	// proxy from entering include-all groups. Provider refreshes therefore keep
-	// their normal membership and the user's original filters remain intact.
-	if settings.Mode == "custom" {
-		chainExcludeInternalProxyFromGroups(m)
-	}
-	upstream := map[string]any{"name": chainUpstreamName, "type": "select", "hidden": true, "empty-fallback": "REJECT"}
-	if settings.Mode == "custom" {
-		items, _ := m["proxies"].([]any)
-		m["proxies"] = append(items, custom)
-		upstream["proxies"] = []any{chainCustomName}
-	} else if ref := *settings.Upstream; ref.Source == "" {
-		if mappings[ref] == nil {
-			upstream["proxies"] = []any{"REJECT"}
-			warnings = append(warnings, "前置节点不存在，勾选节点将拒绝连接")
-		} else {
-			upstream["proxies"] = []any{ref.Name}
-		}
-	} else if _, exists := providers[ref.Source]; exists {
-		upstream["use"] = []any{ref.Source}
-		upstream["filter"] = `\A` + strings.ReplaceAll(regexp.QuoteMeta(ref.Name), "`", `\x60`) + `\z`
-	} else {
-		upstream["proxies"] = []any{"REJECT"}
-		warnings = append(warnings, "前置来源不存在，勾选节点将拒绝连接")
-	}
-	for _, mapping := range chainMaps(m["proxies"]) {
-		if targetSet[chainReference{"", chainString(mapping, "name")}] {
-			mapping["dialer-proxy"] = chainUpstreamName
-		}
-	}
+
+	// One provider guard covers the union of all groups before any App
+	// assignment. Evaluating another group's assignment as an original dialer
+	// would incorrectly reject independent groups sharing a provider.
 	unsafe := make([]string, 0, len(protected))
 	for name := range protected {
 		unsafe = append(unsafe, name)
@@ -549,37 +665,36 @@ func applyProxyChain(m map[string]any, settings proxyChainSettings) ([]string, e
 		if override == nil {
 			override = map[string]any{}
 		}
-		var selected []chainReference
-		for _, target := range settings.Targets {
-			if target.Source == source {
-				selected = append(selected, target)
+		selected := []chainReference{}
+		requiredRefs := []chainReference{}
+		for _, ref := range targets {
+			if ref.Source == source {
+				selected = append(selected, ref)
 			}
 		}
+		for ref := range required {
+			if ref.Source == source {
+				requiredRefs = append(requiredRefs, ref)
+			}
+		}
+		sort.Slice(requiredRefs, func(i, j int) bool { return requiredRefs[i].Name < requiredRefs[j].Name })
 		condition := chainNameCondition(selected)
 		guard := "(" + condition + " == false or (.dialer-proxy // \"\") == \"\")"
-		required := append([]chainReference{}, selected...)
-		if settings.Mode == "existing" && settings.Upstream.Source == source {
-			required = append(required, *settings.Upstream)
-		}
-		if len(required) > 0 {
-			var realType []string
+		if len(requiredRefs) > 0 {
+			realType := []string{}
 			for _, typ := range chainNonProxyTypes {
-				realType = append(realType, "(.type // \"\") != "+chainLiteral(typ))
+				realType = append(realType, "(.type // \"\" | downcase) != "+chainLiteral(typ))
 			}
-			guard += " and (" + chainNameCondition(required) + " == false or (" + strings.Join(realType, " and ") + "))"
+			guard += " and (" + chainNameCondition(requiredRefs) + " == false or (" + strings.Join(realType, " and ") + "))"
 		}
-		// Keep Provider refreshes from introducing a node that collides with
-		// the hidden helper objects added by this overlay. A false select makes
-		// mihomo retain the previous Provider version rather than dropping only
-		// the offending entry.
-		guard += " and .name != " + chainLiteral(chainUpstreamName)
-		guard += " and .name != " + chainLiteral(chainCustomName)
+		// Reserve the full helper namespace, including old snapshot names.
+		for _, prefix := range []string{chainUpstreamPrefix, chainCustomPrefix} {
+			guard += " and (.name | test(" + chainLiteral("^"+regexp.QuoteMeta(prefix)) + ")) == false"
+			guard += " and ((.dialer-proxy // \"\") | test(" + chainLiteral("^"+regexp.QuoteMeta(prefix)) + ")) == false"
+		}
 		for _, name := range unsafe {
 			guard += " and (.dialer-proxy // \"\") != " + chainLiteral(name)
 		}
-		// A failing filter returns an error (not a dropped node), so the native
-		// fetcher retains both its previous adapters and the raw cache file.
-		expressions := stringList(override["override-expr"])
 		guardSource := ". | select(" + guard + ")"
 		guardExpr, err := provider.NewOverrideExpr(guardSource)
 		if err != nil {
@@ -591,12 +706,23 @@ func applyProxyChain(m map[string]any, settings proxyChainSettings) ([]string, e
 		}
 		for _, entry := range entries {
 			if err := guardExpr.Apply(entry); err != nil {
+				if g, exists := required[chainReference{source, chainString(entry, "name")}]; exists {
+					return nil, chainGroupFailure(g, "Provider "+source+" 的节点类型、名称或已有代理链与前置设置冲突")
+				}
 				return nil, fmt.Errorf("Provider %s 的节点与前置设置冲突，请检查节点类型、名称及已有代理链", source)
 			}
 		}
-		expressions = append(expressions, guardSource)
-		if len(selected) > 0 {
-			expressions = append(expressions, "(select("+condition+") | .dialer-proxy) = "+chainLiteral(chainUpstreamName))
+		expressions := append(stringList(override["override-expr"]), guardSource)
+		for _, g := range groups {
+			refs := []chainReference{}
+			for _, ref := range g.Targets {
+				if ref.Source == source {
+					refs = append(refs, ref)
+				}
+			}
+			if len(refs) > 0 {
+				expressions = append(expressions, "(select("+chainNameCondition(refs)+") | .dialer-proxy) = "+chainLiteral(g.upstreamName()))
+			}
 		}
 		for _, expression := range expressions {
 			if _, err := provider.NewOverrideExpr(expression); err != nil {
@@ -606,12 +732,59 @@ func applyProxyChain(m map[string]any, settings proxyChainSettings) ([]string, e
 		override["override-expr"] = stringsToAny(expressions)
 		def["override"] = override
 	}
-	groups, _ := m["proxy-groups"].([]any)
-	m["proxy-groups"] = append(groups, upstream)
+	chainPreserveGlobalGroup(m)
+	customNames := []string{}
+	for _, g := range groups {
+		if g.Mode == "custom" {
+			customNames = append(customNames, g.customName())
+		}
+	}
+	chainExcludeInternalProxiesFromGroups(m, customNames)
+	proxyItems := []any{}
+	for _, proxy := range chainMaps(m["proxies"]) {
+		if g, selected := owners[chainReference{"", chainString(proxy, "name")}]; selected {
+			proxy["dialer-proxy"] = g.upstreamName()
+		}
+		proxyItems = append(proxyItems, proxy)
+	}
+	groupItems := []any{}
+	for _, group := range chainMaps(m["proxy-groups"]) {
+		groupItems = append(groupItems, group)
+	}
+	for _, g := range groups {
+		upstream := map[string]any{"name": g.upstreamName(), "type": "select", "hidden": true, "empty-fallback": "REJECT"}
+		if g.Mode == "custom" {
+			proxyItems = append(proxyItems, customs[g.ID])
+			upstream["proxies"] = []any{g.customName()}
+		} else if ref := *g.Upstream; ref.Source == "" {
+			if mappings[ref] == nil {
+				upstream["proxies"] = []any{"REJECT"}
+				warnings = append(warnings, g.Name+"：前置节点不存在，勾选节点将拒绝连接")
+			} else {
+				upstream["proxies"] = []any{ref.Name}
+			}
+		} else if _, exists := providers[ref.Source]; exists {
+			upstream["use"] = []any{ref.Source}
+			upstream["filter"] = `\A` + strings.ReplaceAll(regexp.QuoteMeta(ref.Name), "`", `\x60`) + `\z`
+		} else {
+			upstream["proxies"] = []any{"REJECT"}
+			warnings = append(warnings, g.Name+"：前置来源不存在，勾选节点将拒绝连接")
+		}
+		groupItems = append(groupItems, upstream)
+	}
+	m["proxies"] = proxyItems
+	m["proxy-groups"] = groupItems
 	return warnings, nil
 }
 
+func chainInternalName(name string) bool {
+	return strings.HasPrefix(name, chainUpstreamPrefix) || strings.HasPrefix(name, chainCustomPrefix)
+}
+
 func chainReservedName(name string) bool {
+	if chainInternalName(name) {
+		return true
+	}
 	switch name {
 	case "DIRECT", "REJECT", "REJECT-DROP", "PASS", "PASS-RULE", "COMPATIBLE", "GLOBAL", chainUpstreamName, chainCustomName:
 		return true
@@ -619,8 +792,15 @@ func chainReservedName(name string) bool {
 	return false
 }
 
-func chainExcludeInternalProxyFromGroups(m map[string]any) {
-	pattern := `\A` + regexp.QuoteMeta(chainCustomName) + `\z`
+func chainExcludeInternalProxiesFromGroups(m map[string]any, names []string) {
+	if len(names) == 0 {
+		return
+	}
+	patterns := []string{}
+	for _, name := range names {
+		patterns = append(patterns, `\A`+regexp.QuoteMeta(name)+`\z`)
+	}
+	pattern := strings.Join(patterns, "`")
 	for _, group := range chainMaps(m["proxy-groups"]) {
 		all, _ := group["include-all"].(bool)
 		allProxies, _ := group["include-all-proxies"].(bool)
