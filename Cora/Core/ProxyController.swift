@@ -333,9 +333,9 @@ final class ProxyController: ObservableObject {
             let providerJSON = SubscriptionStore.shared.providerPayloadsJSON(for: subscription.id)
             let selectionJSON = Self.jsonString(subscription.proxySelections)
             let data = await Task.detached(priority: .userInitiated) {
-                MihomoCore.offlineProxySnapshot(configYAML: subscription.yaml,
+                CoraCore.offlineProxySnapshot(configYAML: subscription.yaml,
                                                 providerPayloadsJSON: providerJSON,
-                                                selectionsJSON: selectionJSON)
+                                                selectionsJSON: selectionJSON, profileID: subscription.id.uuidString)
             }.value
             result = .ok(data)
         } else {

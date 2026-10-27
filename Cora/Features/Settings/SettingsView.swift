@@ -97,7 +97,7 @@ struct SettingsView: View {
                             category: .speed,
                             value: "超时 \(settings.delayTestTimeout) 秒",
                             destination: DelayTestSettingsView())
-                        PO0WhitelistSettingsEntry()
+                        Label("PO0 白名单：当前内核不可用（旧设置保留）", systemImage: "checkmark.shield").font(.footnote).foregroundStyle(.secondary)
                     }
                     .settingsSectionStyle()
 
@@ -113,6 +113,9 @@ struct SettingsView: View {
                             message: "管理节点解锁检测脚本。脚本在 Cora 外部仓库维护，更新前会校验签名和摘要。",
                             category: .scripts,
                             destination: UnlockScriptSettingsView())
+                            .disabled(true)
+                        Text("meow-rs 暂不支持检测脚本请求，旧脚本与设置保留。")
+                            .font(.footnote).foregroundStyle(.secondary)
                         SettingsNavigationRow(
                             title: "开发者模式",
                             systemImage: "wrench.and.screwdriver",
@@ -583,7 +586,7 @@ private struct RemoteResourceUpdateSettingsView: View {
         case "disabled":
             return "关闭后不再定时检查。首次没有本地缓存时仍会下载，后续只能手动刷新。"
         case "fixed":
-            return "下次连接 VPN 后，HTTP 节点来源和规则来源会由 mihomo 在扩展内每 \(intervalText(settings.remoteResourceUpdateInterval)) 原地更新，不会重载 VPN。"
+            return "下次连接 VPN 后，HTTP 节点来源和规则来源会由 meow-rs 在扩展内每 \(intervalText(settings.remoteResourceUpdateInterval)) 原地更新，不会重载 VPN。"
         default:
             return "保留配置文件中每个 HTTP Provider 自带的 interval。配置未设置 interval 时不会自动更新。"
         }
@@ -740,9 +743,10 @@ private struct DelayTestSettingsView: View {
         Form {
             Section("测试方式") {
                 InfoToggleRow(
-                    title: "统一测速地址",
-                    message: "让 mihomo 的策略组使用统一的测速地址。关闭时保留配置内各策略组自带的测速地址；主 App 手动测速仍使用下方地址。",
+                    title: "统一延迟（当前内核不可用）",
+                    message: "旧 unified-delay 偏好保留。当前 meow-rs 没有等价实现；各策略组沿用配置中的测速地址，手动测速使用下方地址。",
                     isOn: $settings.unifiedDelay)
+                    .disabled(true)
             }
             .settingsSectionStyle()
 
@@ -764,7 +768,7 @@ private struct DelayTestSettingsView: View {
             Section("测试地址") {
                 DelayTestURLField(
                     title: "代理测速地址",
-                    message: "普通代理节点的策略组与单节点测速使用此 HTTP 或 HTTPS 地址。留空时使用默认地址；修改后立即用于下一次测速。",
+                    message: "App 手动执行的策略组与单节点测速使用此 HTTP 或 HTTPS 地址；不改写配置内策略组的自动测速地址。留空时使用默认地址。",
                     placeholder: SettingsStore.defaultDelayTestURL,
                     defaultValue: SettingsStore.defaultDelayTestURL,
                     text: $settings.delayTestURL)
@@ -848,20 +852,20 @@ private struct KernelSettingsView: View {
                     InfoLabel(title: "日志级别", message: "控制内核输出的日志详细程度。修改后重新连接 VPN 生效。")
                 }
                 HStack {
-                    InfoLabel(title: "TCP 栈", message: "iOS Network Extension 仅使用经过验证的 gVisor 栈。system 和 mixed 在本项目中可能导致连接后无网络，因此不提供切换。")
+                    InfoLabel(title: "TCP 栈", message: "iOS Network Extension 使用 packetFlow 接入 Rust lwIP；旧栈偏好保留，但不参与当前内核运行。")
                     Spacer()
-                    Text("gVisor")
+                    Text("Rust lwIP")
                         .foregroundStyle(.secondary)
                 }
                 InfoToggleRow(title: "IPv6", message: "允许隧道处理 IPv6 流量。部分网络或配置不支持 IPv6 时可以关闭。", systemImage: "network", isOn: $settings.ipv6)
                 HStack {
                     Label {
-                        InfoLabel(title: "本机代理端口", message: "在本机回环监听 HTTP+SOCKS 混合代理端口，设为 0 表示关闭。")
+                        InfoLabel(title: "本机代理端口", message: "在本机回环监听 HTTP+SOCKS 混合代理端口；设为 0 时自动选择内部端口，供 Rust 数据路径使用。")
                     } icon: {
                         Image(systemName: "point.3.connected.trianglepath.dotted")
                     }
                     Spacer()
-                    TextField("0=不开", value: $settings.mixedPort,
+                    TextField("0=自动", value: $settings.mixedPort,
                               format: IntegerFormatStyle<Int>.number.grouping(.never))
                         .keyboardType(.numberPad)
                         .multilineTextAlignment(.trailing)
@@ -878,7 +882,7 @@ private struct KernelSettingsView: View {
                         .foregroundStyle(isKernelAvailable ? Color.green : Color.secondary)
                 }
                 HStack {
-                    InfoLabel(title: "代理模式", message: "运行中的 mihomo 当前代理模式。")
+                    InfoLabel(title: "代理模式", message: "运行中的 meow-rs 当前代理模式。")
                     Spacer()
                     Text(diagnosticSnapshot.mode).foregroundStyle(.secondary)
                 }
@@ -889,9 +893,9 @@ private struct KernelSettingsView: View {
                         .font(.footnote.monospacedDigit()).foregroundStyle(.secondary)
                 }
                 HStack {
-                    InfoLabel(title: "活动连接", message: "当前内核维护的 TCP 与 UDP 连接数量。")
+                    InfoLabel(title: "活动连接", message: "当前内核只提供 TCP 连接明细；UDP 明细不可用。")
                     Spacer()
-                    Text("\(diagnosticSnapshot.activeCount)（TCP \(diagnosticSnapshot.tcpCount) / UDP \(diagnosticSnapshot.udpCount)）")
+                    Text("\(diagnosticSnapshot.activeCount)（TCP / UDP 明细不可用）")
                         .font(.footnote.monospacedDigit()).foregroundStyle(.secondary)
                 }
                 HStack {
@@ -1017,6 +1021,9 @@ struct TunnelRouteSettingsView: View {
 
             Section("隐私防护") {
                 InfoToggleRow(title: "防止 WebRTC 泄露", message: "仅阻止常见公网 STUN 探测端点以降低 WebRTC 泄露风险，不封锁普通 DIRECT 的语音、视频和 P2P 流量。", systemImage: "lock.shield", isOn: $settings.blockDirectSTUN)
+                    .disabled(true)
+                Text("meow-rs 暂不支持 Cora 的 STUN 拦截，旧设置保留但不应用。")
+                    .font(.footnote).foregroundStyle(.secondary)
             }
             .settingsSectionStyle()
 
@@ -1157,7 +1164,7 @@ private struct GeoSettingsContent: View {
 
             if settings.geoEnabled {
                 if AppGroup.containerURL == nil {
-                    Label("签名未授予 \(AppGroup.identifier)，连接时会自动忽略 GEO/ASN 规则。",
+                    Label("签名未授予 \(AppGroup.identifier)，需要 GEO/ASN 的配置将无法连接，规则不会被静默删除。",
                           systemImage: "exclamationmark.triangle")
                         .font(.caption)
                         .foregroundStyle(.orange)
@@ -1168,7 +1175,7 @@ private struct GeoSettingsContent: View {
                         .foregroundStyle(.green)
                 }
             } else {
-                Label("关闭后将忽略配置中的 GEO/ASN 规则。",
+                Label("关闭后，依赖 GEO/ASN 的配置将阻止连接，请先调整配置。",
                       systemImage: "pause.circle")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -1178,22 +1185,9 @@ private struct GeoSettingsContent: View {
 
         if settings.geoEnabled {
             Section("加载格式") {
-                Picker(selection: $settings.geoLoader) {
-                    Text("内存保守").tag("memconservative")
-                    Text("标准").tag("standard")
-                } label: {
-                    InfoLabel(title: "加载方式", message: "控制规则数据被内核读取的方式。更改后在下一次连接时生效。")
-                }
-                Picker(selection: $settings.geodataMode) {
-                    Text("GeoIP.dat").tag(true)
-                    Text("MMDB").tag(false)
-                } label: {
-                    InfoLabel(title: "GeoIP 数据格式", message: "选择内核读取的 GeoIP 数据格式。切换后需要重新连接，下载地址也会随格式切换。")
-                }
-                InfoToggleRow(
-                    title: "忽略 GEO 取反规则",
-                    message: "忽略配置中以 GEO 规则取反的匹配条件。",
-                    isOn: $settings.ignoreGeoNegation)
+                LabeledContent("GeoIP 数据格式", value: "MMDB（geoip.metadb）")
+                Text("Rust 内核固定使用 MMDB、GeoSite.dat 和 ASN.mmdb。旧加载格式、加载器与取反偏好保留，当前不可用。更新在下次连接生效。")
+                    .font(.footnote).foregroundStyle(.secondary)
             }
             .settingsSectionStyle()
 
@@ -1256,11 +1250,7 @@ private struct GeoSettingsContent: View {
             .settingsSectionStyle()
 
             Section("下载来源") {
-                if settings.geodataMode {
-                    GeoURLField(title: "GeoIP 下载地址", defaultValue: SettingsStore.defaultGeoIPDatURL, text: $settings.geoIPDatURL)
-                } else {
-                    GeoURLField(title: "MMDB 下载地址", defaultValue: SettingsStore.defaultGeoMMDBURL, text: $settings.geoMMDBURL)
-                }
+                GeoURLField(title: "MMDB 下载地址", defaultValue: SettingsStore.defaultGeoMMDBURL, text: $settings.geoMMDBURL)
                 GeoURLField(title: "GeoSite 下载地址", defaultValue: SettingsStore.defaultGeoSiteURL, text: $settings.geoSiteURL)
             }
             .settingsSectionStyle()
@@ -1438,18 +1428,18 @@ private struct KernelStatusView: View {
                 DiagnosticValueRow(title: "实时上行", value: ByteFormat.rate(snapshot.up))
                 DiagnosticValueRow(title: "累计下行", value: ByteFormat.size(snapshot.downloadTotal))
                 DiagnosticValueRow(title: "累计上行", value: ByteFormat.size(snapshot.uploadTotal))
-                DiagnosticValueRow(title: "活动连接", value: "\(snapshot.activeCount)（TCP \(snapshot.tcpCount) / UDP \(snapshot.udpCount)）")
+                DiagnosticValueRow(title: "活动连接", value: "\(snapshot.activeCount)（TCP / UDP 明细不可用）")
                 DiagnosticValueRow(title: "返回详情", value: "\(snapshot.connections.count) 条（最多 20 条）")
             }
 
             diagnosticSection("runtime", title: "内核资源", icon: "memorychip", tint: .orange) {
                 DiagnosticValueRow(title: "NE 物理内存", value: snapshot.physFootprint)
-                DiagnosticValueRow(title: "Go 堆已用", value: snapshot.heapAlloc)
-                DiagnosticValueRow(title: "Go 运行时内存", value: snapshot.goSys)
-                DiagnosticValueRow(title: "Goroutines", value: snapshot.goroutines)
+                DiagnosticValueRow(title: "Rust RSS", value: snapshot.residentBytes)
+                DiagnosticValueRow(title: "活动 TCP 流", value: snapshot.activeTCP)
+                DiagnosticValueRow(title: "引擎状态", value: snapshot.engineState)
                 DiagnosticValueRow(title: "Provider / 规则", value: "\(snapshot.proxyProviders) / \(snapshot.ruleProviders)")
                 DiagnosticValueRow(title: "策略组", value: snapshot.proxyGroups)
-                DiagnosticValueRow(title: "待处理关闭连接", value: snapshot.closedQueuePending)
+                DiagnosticValueRow(title: "UDP 连接明细", value: "当前内核不可用")
             }
 
             if !snapshot.connections.isEmpty {
@@ -1595,9 +1585,9 @@ private struct KernelDiagnosticSnapshot {
     var systemDNS = "未知"
     var utunText = "未知"
     var physFootprint = "不可用"
-    var heapAlloc = "不可用"
-    var goSys = "不可用"
-    var goroutines = "不可用"
+    var residentBytes = "不可用"
+    var activeTCP = "不可用"
+    var engineState = "不可用"
     var proxyProviders = "不可用"
     var ruleProviders = "不可用"
     var proxyGroups = "不可用"
@@ -1667,9 +1657,9 @@ private struct KernelDiagnosticSnapshot {
 
     private mutating func consumeRuntime(_ response: TunnelManager.IPCResult) {
         guard case .ok(let data) = response, let object = Self.object(data) else { errors.append("runtime：\(Self.reason(response))"); return }
-        heapAlloc = Self.bytes(object["heapAlloc"])
-        goSys = Self.bytes(object["sys"])
-        goroutines = Self.integer(object["goroutines"])
+        residentBytes = Self.bytes(object["residentBytes"])
+        activeTCP = Self.integer(object["activeTCP"])
+        engineState = (object["running"] as? Bool).map { $0 ? "运行中" : "已停止" } ?? "不可用"
         proxyProviders = Self.integer(object["proxyProviders"])
         ruleProviders = Self.integer(object["ruleProviders"])
         proxyGroups = Self.integer(object["proxyGroups"])
@@ -1688,7 +1678,7 @@ private struct KernelDiagnosticSnapshot {
         systemDNS = (object["systemDNS"] as? [String])?.joined(separator: ", ") ?? "未获取"
         let fd = (object["utunFD"] as? NSNumber)?.intValue ?? -1
         let mtu = (object["utunMTU"] as? NSNumber)?.intValue ?? 0
-        utunText = fd >= 0 ? "fd \(fd) · MTU \(mtu > 0 ? String(mtu) : "系统")" : "未创建"
+        utunText = object["packetFlow"] as? Bool == true ? "Apple packetFlow → Rust lwIP" : "不可用"
     }
 
     private mutating func consumeNotices(_ response: TunnelManager.IPCResult) {
@@ -1710,6 +1700,6 @@ private struct KernelDiagnosticSnapshot {
 
     private static func object(_ data: Data) -> [String: Any]? { try? JSONSerialization.jsonObject(with: data) as? [String: Any] }
     private static func reason(_ response: TunnelManager.IPCResult) -> String { if case .failure(let value) = response { return value }; return "无效响应" }
-    private static func integer(_ value: Any?) -> String { (value as? NSNumber)?.stringValue ?? "0" }
-    private static func bytes(_ value: Any?) -> String { guard let n = (value as? NSNumber)?.int64Value else { return "0 B" }; return ByteFormat.size(n) }
+    private static func integer(_ value: Any?) -> String { (value as? NSNumber)?.stringValue ?? "不可用" }
+    private static func bytes(_ value: Any?) -> String { guard let n = (value as? NSNumber)?.int64Value else { return "不可用" }; return ByteFormat.size(n) }
 }

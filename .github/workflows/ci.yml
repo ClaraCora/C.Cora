@@ -1,363 +1,95 @@
 name: Build unsigned IPA
 
-# 在 macos-26（Xcode 26）上：先用 gomobile 把 mihomo 编成 Mihomo.xcframework，
-# 再生成 Xcode 工程并构建未签名 ipa。签名由用户用自有开发者证书自理。
 on:
   push:
-    branches: [ main ]
+    branches: [main, meow-rs]
   workflow_dispatch:
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: macos-26
     permissions:
-      contents: write # Create build tags/releases and upload IPA assets.
+      contents: write
+    env:
+      CARGO_TERM_COLOR: always
+      # rustup selects by working directory, not --manifest-path. Pin root
+      # test commands as well as the commands run inside MobileCoreRust/.
+      RUSTUP_TOOLCHAIN: '1.95.0'
+      IPHONEOS_DEPLOYMENT_TARGET: '18.0'
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      # 固定 Xcode 26，确保 SwiftUI 原生液态玻璃 Tab 栏 API 可编译。
+      - uses: actions/checkout@v4
       - name: Select pinned Xcode
         run: |
           set -euo pipefail
-          XCODE_APP="/Applications/Xcode_26.4.1.app"
-          if [ ! -d "$XCODE_APP" ]; then
-            echo "$XCODE_APP 不存在，当前 runner 可用 Xcode："
-            ls -d /Applications/Xcode*.app
-            exit 1
-          fi
-          echo "Selecting $XCODE_APP"
+          XCODE_APP=/Applications/Xcode_26.4.1.app
+          test -d "$XCODE_APP" || { ls -d /Applications/Xcode*.app; exit 1; }
           sudo xcode-select -s "$XCODE_APP/Contents/Developer"
           xcodebuild -version
-          echo "--- installed iphoneos SDKs ---"
-          xcodebuild -showsdks | grep -i iphoneos || true
-
-      - name: Test connection history persistence
-        run: bash scripts/test-connection-history.sh
-
-      - name: Test bounded IPC response storage
-        run: bash scripts/test-ipc-response-cache.sh
-
-      - name: Test bounded IPC control scheduling
-        run: bash scripts/test-ipc-control-scheduler.sh
-
-      - name: Test TrollStore IPC request limits
-        run: bash scripts/test-trollstore-ipc-policy.sh
-
-      - name: Test manual NE memory release
-        run: bash scripts/test-kernel-memory.sh
-
-      - name: Test single-node delay feedback
-        run: bash scripts/test-proxy-controller.sh
-
-      - name: Test PO0 whitelist settings
-        run: bash scripts/test-po0-whitelist.sh
-
-      - name: Test IPA release publication
-        run: python3 scripts/test-ipa-release.py
-
-      # ───────────── Phase 1：gomobile 编 mihomo 内核 ─────────────
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.25.4'
-
-      - name: Enable iOS ARM64 AES-GCM acceleration
-        run: bash MobileCore/scripts/prepare-ios-go-toolchain.sh
-
-      - name: Cache Go modules
+      - name: Install pinned Rust and Apple targets
+        run: |
+          cd MobileCoreRust
+          rustup show active-toolchain
+          rustup component add rustfmt
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+      - name: Cache Rust dependencies
         uses: actions/cache@v4
         with:
           path: |
-            ~/go/pkg/mod
-            ~/Library/Caches/go-build
-          key: ${{ runner.os }}-go-${{ hashFiles('MobileCore/go.sum', 'MobileCore/dependency-patches/**', 'MobileCore/scripts/**') }}
-          restore-keys: ${{ runner.os }}-go-
-
-      - name: Download pinned Go module sources
+            ~/.cargo/registry
+            ~/.cargo/git
+            MobileCoreRust/cora-config/target
+            MobileCoreRust/meow-ios-ffi/target
+          key: ${{ runner.os }}-rust-${{ hashFiles('MobileCoreRust/rust-toolchain.toml', 'MobileCoreRust/**/Cargo.lock', 'MobileCoreRust/**/Cargo.toml') }}
+      - name: Test immutable configuration and project boundaries
         run: |
-          set -euxo pipefail
-          # “|direct” 会在代理 DNS/网络错误时也回退源码站；逗号仅在 404/410 时回退。
-          export GOPROXY="https://proxy.golang.org|direct"
-          retry() {
-            local n=1
-            until "$@"; do
-              if [ "$n" -ge 5 ]; then
-                return 1
-              fi
-              sleep $((n * 10))
-              n=$((n + 1))
-            done
-          }
-          cd MobileCore
-          # 先下载固定版本的模块源码，供补丁脚本定位；补丁就绪后再解析依赖。
-          retry go mod download
-
-      - name: Prepare patched sing allocator
+          cargo fmt --check --manifest-path MobileCoreRust/cora-config/Cargo.toml
+          cargo fmt --check --manifest-path MobileCoreRust/meow-ios-ffi/Cargo.toml
+          cargo test --locked --manifest-path MobileCoreRust/cora-config/Cargo.toml
+          python3 scripts/test-meow-migration.py
+          python3 scripts/test-ipa-release.py
+      - name: Test FFI lifecycle, packets and traffic
         run: |
-          set -euxo pipefail
-          cd MobileCore
-          PATCHED_SING="$(bash scripts/prepare-ios-sing.sh)"
-          printf 'PATCHED_SING=%s\n' "$PATCHED_SING" >> "$GITHUB_ENV"
-
-      - name: Prepare patched Mihomo
+          cd MobileCoreRust/meow-ios-ffi
+          # Tests share process-wide engine/home/runtime state.
+          cargo test --locked --lib -- --test-threads=1
+      - name: Test Swift persistence and control protocol
         run: |
-          set -euxo pipefail
-          cd MobileCore
-          PATCHED_MIHOMO="$(PATCHED_SING_DIR="$PATCHED_SING" bash scripts/prepare-ios-mihomo.sh)"
-          printf 'PATCHED_MIHOMO=%s\n' "$PATCHED_MIHOMO" >> "$GITHUB_ENV"
-
-      - name: Prepare patched gVisor
+          bash scripts/test-connection-history.sh
+          bash scripts/test-ipc-response-cache.sh
+          bash scripts/test-ipc-control-scheduler.sh
+          bash scripts/test-proxy-controller.sh
+          bash scripts/test-kernel-memory.sh
+          bash scripts/test-core-compatibility.sh
+      - name: Build MeowCore device and arm64 simulator slices
+        run: bash MobileCoreRust/scripts/build-ios-xcframework.sh
+      - name: Install XcodeGen and generate standard project
         run: |
-          set -euxo pipefail
-          cd MobileCore
-          PATCHED_GVISOR="$(bash scripts/prepare-ios-gvisor.sh)"
-          printf 'PATCHED_GVISOR=%s\n' "$PATCHED_GVISOR" >> "$GITHUB_ENV"
-
-      - name: Prepare patched sing-tun
-        run: |
-          set -euxo pipefail
-          cd MobileCore
-          PATCHED_SING_TUN="$(bash scripts/prepare-ios-sing-tun.sh)"
-          printf 'PATCHED_SING_TUN=%s\n' "$PATCHED_SING_TUN" >> "$GITHUB_ENV"
-          go -C "$PATCHED_MIHOMO" mod edit -replace="github.com/metacubex/sing-tun@v0.4.27=$PATCHED_SING_TUN"
-          go -C "$PATCHED_MIHOMO" mod edit -replace="github.com/metacubex/gvisor@v0.0.0-20260922041103-e2cbcd6e7400=$PATCHED_GVISOR"
-
-      - name: Prepare patched Shadowsocks reader
-        run: |
-          set -euxo pipefail
-          cd MobileCore
-          PATCHED_SS2="$(PATCHED_SING_DIR="$PATCHED_SING" bash scripts/prepare-ios-sing-shadowsocks2.sh)"
-          printf 'PATCHED_SS2=%s\n' "$PATCHED_SS2" >> "$GITHUB_ENV"
-
-      - name: Install Go mobile tools and resolve patched MobileCore
-        run: |
-          set -euxo pipefail
-          export GOPROXY="https://proxy.golang.org|direct"
-          retry() {
-            local n=1
-            until "$@"; do
-              if [ "$n" -ge 5 ]; then
-                return 1
-              fi
-              sleep $((n * 10))
-              n=$((n + 1))
-            done
-          }
-          MOBILE_VERSION="v0.0.0-20260611195102-4dd8f1dbf5d2"
-          retry go install golang.org/x/mobile/cmd/gomobile@${MOBILE_VERSION}
-          retry go install golang.org/x/mobile/cmd/gobind@${MOBILE_VERSION}
-          printf '%s\n' "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-          cd MobileCore
-          # 所有版本绑定补丁及 replace 就绪后，才能运行解析源码 import 的命令。
-          # 用 tool 指令保留 golang.org/x/mobile，避免 tidy 剪掉 gomobile 所需依赖。
-          retry go get -tool golang.org/x/mobile/cmd/gobind@${MOBILE_VERSION}
-          retry go mod tidy
-
-      - name: Verify patched sing allocator
-        run: |
-          set -euxo pipefail
-          go -C "$PATCHED_SING" test ./common/buf
-          go -C "$PATCHED_SING" test -tags "with_low_memory" ./common/buf
-          go -C "$PATCHED_SING" test -race -run 'TestTrimIdle' ./common/buf
-
-      - name: Verify patched Mihomo
-        run: |
-          set -euxo pipefail
-          go -C "$PATCHED_MIHOMO" test ./common/pool ./common/lru ./component/fakeip ./config ./tunnel ./tunnel/statistic ./component/dialer ./component/resolver ./component/resource ./dns ./adapter/outbound ./adapter/provider ./adapter/outboundgroup ./hub/executor ./hub/route ./rules/provider ./ntp/ntp ./transport/anytls/session ./transport/openvpn
-          go -C "$PATCHED_MIHOMO" test -tags "with_low_memory" ./common/pool ./common/lru ./component/fakeip ./config ./tunnel ./tunnel/statistic ./component/dialer ./component/resolver ./component/resource ./dns ./adapter/outbound ./adapter/provider ./adapter/outboundgroup ./hub/executor ./hub/route ./rules/provider ./ntp/ntp ./transport/anytls/session ./transport/openvpn
-          go -C "$PATCHED_MIHOMO" test -race -run 'TestTrimIdle|TestDiagnostic' ./common/pool ./common/lru ./component/fakeip ./dns ./rules/provider
-          go -C "$PATCHED_MIHOMO" test -race -run 'TestRuntime' ./component/resource ./adapter/provider ./hub/executor ./ntp/ntp
-          go -C "$PATCHED_MIHOMO" vet ./tunnel ./component/dialer ./component/resolver ./component/resource ./dns ./adapter/outbound ./adapter/provider ./hub/executor ./hub/route ./rules/provider ./ntp/ntp
-          go -C "$PATCHED_MIHOMO" vet -tags "with_low_memory" ./tunnel ./component/dialer ./component/resolver ./component/resource ./dns ./adapter/outbound ./adapter/provider ./hub/executor ./hub/route ./rules/provider ./ntp/ntp
-
-      - name: Verify patched gVisor TCP
-        run: |
-          set -euxo pipefail
-          go -C "$PATCHED_GVISOR" test ./pkg/tcpip/transport/tcp ./pkg/tcpip/link/qdisc ./pkg/tcpip/link/qdisc/fifo
-          go -C "$PATCHED_GVISOR" test -race -run 'TestDiagnostic' ./pkg/tcpip/link/qdisc/fifo
-
-      - name: Verify patched sing-tun Darwin transport
-        run: |
-          set -euxo pipefail
-          go -C "$PATCHED_SING_TUN" test -tags "with_gvisor,with_low_memory" \
-            . ./internal/fdbased_darwin
-
-      - name: Verify patched Shadowsocks reader
-        run: |
-          set -euxo pipefail
-          go -C "$PATCHED_SS2" test ./internal/shadowio
-          go -C "$PATCHED_SS2" test -tags "with_low_memory" ./internal/shadowio
-
-      - name: Test MobileCore with patched dependencies
-        run: |
-          set -euxo pipefail
-          cd MobileCore
-          go test ./...
-          go test -tags "with_gvisor,with_low_memory" ./...
-          go test -race -run 'TestRuntimeControl|TestRuntimeLogHome' ./...
-          go vet ./...
-          go vet -tags "with_gvisor,with_low_memory" ./...
-
-      - name: Verify memory diagnostic analysis compatibility
-        run: |
-          set -euxo pipefail
-          swiftc Cora/Core/ByteFormat.swift Cora/Core/MemoryDiagnosticAnalyzer.swift \
-            Tests/MemoryDiagnosticAnalyzerTests.swift -o "$RUNNER_TEMP/memory-diagnostic-analyzer-tests"
-          "$RUNNER_TEMP/memory-diagnostic-analyzer-tests"
-
-      - name: Build standard and Legacy Mihomo.xcframeworks (gomobile bind)
-        run: |
-          set -euxo pipefail
-          bash MobileCore/scripts/build-ios-xcframework.sh
-          bash MobileCore/scripts/build-ios-xcframework.sh --legacy
-
-      # ───────────── 生成工程并构建 App ─────────────
-      - name: Install XcodeGen
-        run: brew install xcodegen
-
-      - name: Generate Xcode project
-        run: xcodegen generate
-
-      - name: Build standard and Legacy apps (unsigned)
+          brew list xcodegen >/dev/null 2>&1 || brew install xcodegen
+          xcodegen generate
+      - name: Build standard iOS 18 app unsigned
         run: |
           set -euo pipefail
-          # 两个 App、Tunnel 产物都必须随每次构建递增 build 号；否则覆盖安装时
-          # iOS 可能继续使用旧的 Network Extension 注册，表现为连接后立即断开。
           BUILD_NUMBER="${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
-          echo "CFBundleVersion: ${BUILD_NUMBER}"
-          build_scheme() {
-            local scheme="$1"
-            local derived_data="$2"
-            local build_log="$RUNNER_TEMP/${scheme}-xcodebuild.log"
-            set +e
-            xcodebuild \
-              -project Cora.xcodeproj \
-              -scheme "$scheme" \
-              -configuration Release \
-              -destination 'generic/platform=iOS' \
-              -derivedDataPath "$derived_data" \
-              CURRENT_PROJECT_VERSION="${BUILD_NUMBER}" \
-              CODE_SIGNING_ALLOWED=NO \
-              CODE_SIGNING_REQUIRED=NO \
-              CODE_SIGN_IDENTITY="" \
-              clean build 2>&1 | tee "$build_log"
-            local build_status="${PIPESTATUS[0]}"
-            set -e
-            if [[ "$build_status" -ne 0 ]]; then
-              while IFS= read -r diagnostic; do
-                echo "::error title=${scheme} Xcode build::$diagnostic"
-              done < <({ grep -E '\.swift:[0-9]+:[0-9]+: error:|error:' "$build_log" || true; } | tail -n 50)
-              exit "$build_status"
-            fi
-          }
-          build_scheme Cora build
-          build_scheme CoraLegacy build-legacy
-
-      - name: Package into .ipa (unsigned)
+          xcodebuild -project Cora.xcodeproj -scheme Cora -configuration Release \
+            -destination 'generic/platform=iOS' -derivedDataPath build \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY='' \
+            clean build 2>&1 | tee "$RUNNER_TEMP/cora-xcodebuild.log"
+      - name: Verify standard binary and deployment gates
+        run: bash scripts/verify-meow-app.sh build/Build/Products/Release-iphoneos/Cora.app
+      - name: Package standard unsigned IPA
         run: |
           set -euo pipefail
-          APP_PATH="build/Build/Products/Release-iphoneos/Cora.app"
-          if [ ! -d "$APP_PATH" ]; then
-            echo "未找到 $APP_PATH"; exit 1
-          fi
-          rm -rf Payload
           mkdir -p Payload
-          cp -R "$APP_PATH" Payload/
+          ditto build/Build/Products/Release-iphoneos/Cora.app Payload/Cora.app
           zip -qr Cora-unsigned.ipa Payload
-          echo "已生成 Cora-unsigned.ipa"
-
-      - name: Package Legacy into .ipa (unsigned)
-        run: |
-          set -euo pipefail
-          APP_PATH="build-legacy/Build/Products/Release-iphoneos/Cora.app"
-          if [ ! -d "$APP_PATH" ]; then
-            echo "未找到 $APP_PATH"; exit 1
-          fi
-          rm -rf Payload
-          mkdir -p Payload
-          cp -R "$APP_PATH" Payload/
-          zip -qr CoraLegacy-unsigned.ipa Payload
-          echo "已生成 CoraLegacy-unsigned.ipa"
-
-      - name: Package TrollStore IPAs
-        run: |
-          set -euo pipefail
-          package_trollstore() {
-            local source_app="$1"
-            local package_root="$2"
-            local output_ipa="$3"
-            local main_entitlements="$RUNNER_TEMP/$(basename "$output_ipa" .ipa)-main-entitlements.plist"
-            local tunnel_entitlements="$RUNNER_TEMP/$(basename "$output_ipa" .ipa)-tunnel-entitlements.plist"
-            local ts_app="$package_root/Payload/Cora.app"
-
-            test -d "$source_app"
-            rm -rf "$package_root"
-            mkdir -p "$package_root/Payload"
-            ditto "$source_app" "$ts_app"
-
-            # 标准包含有 iOS 18 ControlWidget；Legacy 本身不含。对两者执行删除是安全的。
-            rm -rf "$ts_app/PlugIns/CoraControl.appex"
-
-            /usr/libexec/PlistBuddy -c \
-              'Add :CoraTrollStoreBuild bool true' "$ts_app/Info.plist"
-            /usr/libexec/PlistBuddy -c \
-              'Add :CoraTrollStoreBuild bool true' \
-              "$ts_app/PlugIns/CoraTunnel.appex/Info.plist"
-
-            codesign --force --sign - --generate-entitlement-der \
-              --entitlements CoraTunnel/CoraTunnel-TrollStore.entitlements \
-              "$ts_app/PlugIns/CoraTunnel.appex"
-            codesign --force --sign - --generate-entitlement-der \
-              --entitlements Cora/Cora-TrollStore.entitlements \
-              "$ts_app"
-
-            codesign -d --entitlements :- "$ts_app" > "$main_entitlements" 2>/dev/null
-            codesign -d --entitlements :- \
-              "$ts_app/PlugIns/CoraTunnel.appex" > "$tunnel_entitlements" 2>/dev/null
-            test "$(/usr/libexec/PlistBuddy -c \
-              'Print :CoraTrollStoreBuild' "$ts_app/Info.plist")" = "true"
-            test "$(/usr/libexec/PlistBuddy -c \
-              'Print :CoraTrollStoreBuild' \
-              "$ts_app/PlugIns/CoraTunnel.appex/Info.plist")" = "true"
-            test "$(/usr/libexec/PlistBuddy -c \
-              'Print :application-identifier' "$main_entitlements")" \
-              = "TROLLTROLL.com.miclash.app"
-            test "$(/usr/libexec/PlistBuddy -c \
-              'Print :application-identifier' "$tunnel_entitlements")" \
-              = "TROLLTROLL.com.miclash.app.tunnel"
-            test "$(/usr/libexec/PlistBuddy -c \
-              'Print :com.apple.private.security.no-sandbox' "$main_entitlements")" = "true"
-            test "$(/usr/libexec/PlistBuddy -c \
-              'Print :com.apple.private.security.no-sandbox' "$tunnel_entitlements")" = "true"
-            for entitlements in "$main_entitlements" "$tunnel_entitlements"; do
-              test "$(/usr/libexec/PlistBuddy -c \
-                'Print :platform-application' "$entitlements")" = "true"
-              test "$(/usr/libexec/PlistBuddy -c \
-                'Print :com.apple.private.security.storage.AppDataContainers' \
-                "$entitlements")" = "true"
-              test "$(/usr/libexec/PlistBuddy -c \
-                'Print :com.apple.developer.team-identifier' "$entitlements")" \
-                = "TROLLTROLL"
-              test "$(/usr/libexec/PlistBuddy -c \
-                'Print :com.apple.developer.networking.networkextension:0' \
-                "$entitlements")" = "packet-tunnel-provider"
-            done
-            (cd "$package_root" && zip -qr "$GITHUB_WORKSPACE/$output_ipa" Payload)
-          }
-
-          package_trollstore "build/Build/Products/Release-iphoneos/Cora.app" \
-            "$RUNNER_TEMP/cora-trollstore" Cora-TrollStore.ipa
-          package_trollstore "build-legacy/Build/Products/Release-iphoneos/Cora.app" \
-            "$RUNNER_TEMP/cora-legacy-trollstore" CoraLegacy-TrollStore.ipa
-          echo "已生成 Cora-TrollStore.ipa 与 CoraLegacy-TrollStore.ipa"
-
-      - name: Publish IPAs to GitHub Releases
+      - name: Publish standard IPA prerelease
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
-          APP_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
-            build/Build/Products/Release-iphoneos/Cora.app/Info.plist)"
-          export APP_VERSION
+          export APP_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' build/Build/Products/Release-iphoneos/Cora.app/Info.plist)"
           bash scripts/publish-ipa-release.sh

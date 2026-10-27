@@ -51,7 +51,7 @@ final class CoreStateManager: ObservableObject {
         if AppGroupState.vpnConnected { status = .connected }
         observeVPNStatus()
         // 调用内核取版本号：能返回即证明 mihomo 已正确链接进 App
-        coreVersion = MihomoCore.version()
+        coreVersion = CoraCore.version()
         Task { await refreshStatus() }
     }
 
@@ -218,6 +218,13 @@ final class CoreStateManager: ObservableObject {
     /// `configYAML` 仅用于失败回滚；正常连接和重载都明确传入当前订阅内容。
     private func startCurrentConfiguration(configYAML: String? = nil,
                                            useCurrentConfiguration: Bool = true) async throws {
+        if !useCurrentConfiguration {
+            // Ask the NE to restore its atomic source + settings snapshot.
+            // Reusing the edited settings would just repeat the failed start.
+            try await tunnel.start(configYAML: nil, settingsJSON: "",
+                                   protocolOptions: TunnelManager.ProtocolOptions(), restoreLastSuccess: true)
+            return
+        }
         let yaml = useCurrentConfiguration ? SubscriptionStore.shared.activeYAML : configYAML
         // GEO 首次下载与定时更新在主 App 完成，避免 NE 启动阶段联网和冲高内存。
         try await GeoDatabaseManager.shared.prepareForConnection(configYAML: yaml)

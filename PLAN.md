@@ -1,4 +1,8 @@
-# Cora 实施方案
+# Cora 历史实施方案（Mihomo）
+
+> 以下保留为旧 Go 内核与 Legacy 版本的历史参考，不代表 `meow-rs` 分支当前工程。
+> 本分支当前仅构建 iOS 18+ 标准版；Rust 迁移、兼容边界与验收见
+> [meow-rs 迁移说明](docs/meow-rs-migration.md)，构建入口见 [README](README.md)。
 
 基于 mihomo 内核的 iOS 代理客户端，SwiftUI + MVVM，面向个人自签测试。
 

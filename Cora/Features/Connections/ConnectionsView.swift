@@ -55,6 +55,8 @@ private struct ConnectionOverview: View {
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 20) {
+                Text("meow-rs 仅提供 TCP 连接明细；UDP 明细与 UDP 历史不可用。总流量仍包含 UDP。")
+                    .font(.footnote).foregroundStyle(.secondary)
                 HStack(spacing: 12) {
                     NavigationLink {
                         ConnectionListView(title: "全部连接",

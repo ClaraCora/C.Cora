@@ -1,5 +1,4 @@
 import Foundation
-import Mihomo
 
 private let geoMaximumAssetBytes: Int64 = 64 * 1_024 * 1_024
 
@@ -66,9 +65,8 @@ final class GeoDatabaseManager: ObservableObject {
             settingsJSON: settings.asJSON(
                 applyOverrides: SubscriptionStore.shared.activeOverridesEnabled))
         guard settings.geoEnabled && (resolved.geoRequired || resolved.asnRequired) else { return }
-        // 重签环境可能拿不到 App Group。连接层会把有效 geo 设置降级为关闭，
-        // 由配置合并层剔除依赖数据库的规则，不能因此阻断整个 VPN。
-        guard AppGroup.containerURL != nil else { return }
+        // Missing shared storage must never silently remove routing rules.
+        guard AppGroup.containerURL != nil else { throw GeoError.appGroupUnavailable }
         try await updateIfNeeded(force: false, configYAML: yaml)
         do {
             try await validateInstalledAssets(configYAML: yaml)
@@ -175,10 +173,8 @@ final class GeoDatabaseManager: ObservableObject {
                     throw GeoError.tooLarge(asset.fileName, geoMaximumAssetBytes)
                 }
                 let path = home.appendingPathComponent(asset.fileName).path
-                var validationError: NSError?
-                guard MihomoValidateGeoDatabase(path, asset.kind, &validationError) else {
-                    throw GeoError.validationFailed(asset.fileName,
-                                                    validationError?.localizedDescription)
+                if let validationError = CoraCore.validateGeoDatabase(path, kind: asset.kind) {
+                    throw GeoError.validationFailed(asset.fileName, validationError)
                 }
             }
         }.value
@@ -208,10 +204,8 @@ final class GeoDatabaseManager: ObservableObject {
         var assets: [AssetDownload] = []
         if settings.geoEnabled && (includeAll || resolved.geoRequired) {
             assets.append(AssetDownload(
-                label: geodataMode ? "GeoIP.dat" : "geoip.metadb",
-                url: geodataMode ? resolved.geoip : resolved.mmdb,
-                fileName: geodataMode ? "GeoIP.dat" : "geoip.metadb",
-                kind: geodataMode ? "geoip" : "mmdb"))
+                label: "geoip.metadb", url: resolved.mmdb,
+                fileName: "geoip.metadb", kind: "mmdb"))
             assets.append(AssetDownload(label: "GeoSite.dat", url: resolved.geosite,
                                         fileName: "GeoSite.dat", kind: "geosite"))
         }
@@ -223,7 +217,7 @@ final class GeoDatabaseManager: ObservableObject {
     }
 
     private func resolveURLs(configYAML: String, settingsJSON: String) -> ResolvedGeoURLs {
-        let json = MihomoResolveGeoDownloadURLs(configYAML, settingsJSON)
+        let json = CoraCore.resolveGeoDownloadURLs(configYAML, settingsJSON)
         guard let data = json.data(using: .utf8),
               let resolved = try? JSONDecoder().decode(ResolvedGeoURLs.self, from: data) else {
             return ResolvedGeoURLs(
@@ -250,13 +244,13 @@ final class GeoDatabaseManager: ObservableObject {
     nonisolated private static func readInstalledInfo(
         _ config: InstalledInfoConfiguration
     ) -> GeoInstalledInfo? {
-        let resolvedJSON = MihomoResolveGeoDownloadURLs(config.configYAML,
+        let resolvedJSON = CoraCore.resolveGeoDownloadURLs(config.configYAML,
                                                         config.settingsJSON)
         let resolved = resolvedJSON.data(using: .utf8).flatMap {
             try? JSONDecoder().decode(ResolvedGeoURLs.self, from: $0)
         }
         guard config.geoEnabled else { return nil }
-        var names = [config.geodataMode ? "GeoIP.dat" : "geoip.metadb", "GeoSite.dat"]
+        var names = ["geoip.metadb", "GeoSite.dat"]
         if resolved?.asnRequired == true
             || FileManager.default.fileExists(
                 atPath: config.home.appendingPathComponent("ASN.mmdb").path) {
@@ -380,13 +374,11 @@ final class GeoDatabaseManager: ObservableObject {
             throw GeoError.invalidContent(label)
         }
 
-        var validationError: NSError?
-        guard MihomoValidateGeoDatabase(temporaryURL.path, kind, &validationError) else {
-            throw GeoError.validationFailed(label, validationError?.localizedDescription)
+        let stagedURL = try CoreAtomicFile.stage(temporaryURL, fileName: fileName, home: home) { candidate in
+            if let validationError = CoraCore.validateGeoDatabase(candidate.path, kind: kind) {
+                throw GeoError.validationFailed(label, validationError)
+            }
         }
-
-        let stagedURL = home.appendingPathComponent(".\(fileName).\(UUID().uuidString).download")
-        try FileManager.default.copyItem(at: temporaryURL, to: stagedURL)
         return StagedAsset(url: stagedURL, fileName: fileName)
     }
 
@@ -437,11 +429,7 @@ final class GeoDatabaseManager: ObservableObject {
     nonisolated private static func install(_ asset: StagedAsset, home: URL) throws {
         let fileManager = FileManager.default
         let target = home.appendingPathComponent(asset.fileName)
-        if fileManager.fileExists(atPath: target.path) {
-            _ = try fileManager.replaceItemAt(target, withItemAt: asset.url)
-        } else {
-            try fileManager.moveItem(at: asset.url, to: target)
-        }
+        try CoreAtomicFile.install(asset.url, at: target)
         try fileManager.setAttributes([.modificationDate: Date()], ofItemAtPath: target.path)
     }
 }

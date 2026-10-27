@@ -1,5 +1,4 @@
 import Foundation
-import Foundation
 import NetworkExtension
 
 /// 负责与系统 VPN 子系统打交道：安装/加载 VPN 描述文件、启停隧道、上报状态。
@@ -106,12 +105,13 @@ final class TunnelManager {
 
     /// 启动隧道，并把订阅配置 + 设置经 options 下发给 NE（不依赖 App Group）。
     /// App 启动始终携带 config：非空=订阅，空串=明确 DIRECT；系统无 options 重连才复用缓存。
-    func start(configYAML: String?, settingsJSON: String, protocolOptions: ProtocolOptions) async throws {
-        let mgr = try await loadOrCreateManager(options: protocolOptions)
-        var options: [String: NSObject] = ["config": (configYAML ?? "") as NSString]
-        if let po0 = try? PO0WhitelistStorage.load().json() {
-            options["po0Whitelist"] = po0 as NSString
-        }
+    func start(configYAML: String?, settingsJSON: String, protocolOptions: ProtocolOptions,
+               restoreLastSuccess: Bool = false) async throws {
+        let effectiveProtocol = restoreLastSuccess ? try Self.savedProtocolOptions() : protocolOptions
+        let mgr = try await loadOrCreateManager(options: effectiveProtocol)
+        var options: [String: NSObject] = restoreLastSuccess
+            ? ["restoreLastSuccess": NSNumber(value: true)]
+            : ["config": (configYAML ?? "") as NSString]
         if !settingsJSON.isEmpty { options["settings"] = settingsJSON as NSString }
         let startupAttemptID = UUID().uuidString
         options["startupAttemptID"] = startupAttemptID as NSString
@@ -160,6 +160,22 @@ final class TunnelManager {
                 : "隧道在启动阶段断开，本次启动未建立共享日志回退"
             throw Self.startupError(message)
         }
+    }
+
+    private static func savedProtocolOptions() throws -> ProtocolOptions {
+        guard let file = AppGroup.containerURL?.appendingPathComponent("meow-last-success.json"),
+              let data = try? Data(contentsOf: file),
+              let snapshot = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let settings = snapshot["settings"] as? String,
+              let object = try JSONSerialization.jsonObject(with: Data(settings.utf8)) as? [String: Any],
+              let options = object["protocolOptions"] as? [String: Bool] else {
+            throw startupError("无法读取上次成功的隧道路由设置，未使用默认值替代")
+        }
+        return ProtocolOptions(includeAllNetworks: options["includeAllNetworks"] ?? false,
+            excludeCellularServices: options["excludeCellularServices"] ?? true,
+            excludeAPNs: options["excludeAPNs"] ?? true,
+            excludeDeviceCommunication: options["excludeDeviceCommunication"] ?? true,
+            enforceRoutes: options["enforceRoutes"] ?? false)
     }
 
     private static func resetPersistedNELog() -> Bool {

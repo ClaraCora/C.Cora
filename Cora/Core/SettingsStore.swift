@@ -3,16 +3,15 @@ import Combine
 
 /// 应用与内核设置（持久化到 UserDefaults）。
 ///
-/// 内核运行项影响 NE 内 mihomo 的启动配置：连接时序列化为 JSON 经 startVPNTunnel(options) 下发，
-/// Go 侧 StartWithConfig 据此覆盖 tun.stack / ipv6 / geo / log-level 等运行设置。
+/// 内核运行项连接时序列化为 JSON 经 startVPNTunnel(options) 下发，
+/// CoraCoreAdapter 据此生成独立 Rust 运行副本，不覆盖源配置。
 /// 这些运行项修改后需重新连接；App 导航与手动测速偏好即时生效。
 @MainActor
 final class SettingsStore: ObservableObject {
 
     static let shared = SettingsStore()
 
-    /// iOS Packet Tunnel 只支持经过验证的 gVisor 栈。保留字段用于兼容旧版本，
-    /// 但不向用户暴露 system/mixed，避免保存不可用的网络配置。
+    /// 仅为旧设置解码保留原值。Rust Packet Tunnel 固定使用 lwIP，忽略此字段。
     static let fixedStack = "gvisor"
 
     /// App-only navigation preferences; saved immediately without changing NE settings.
@@ -26,7 +25,7 @@ final class SettingsStore: ObservableObject {
     /// 当前连接尚未应用的运行设置。设置页用它显示“下次连接生效”。
     @Published private(set) var pendingConnectionApply = false
 
-    /// TCP/IP 栈。iOS NE 只使用经过验证的 gVisor，system/mixed 会被强制回退。
+    /// 历史栈偏好，保留旧持久化格式；不影响 Rust 数据路径。
     @Published var stack: String {
         didSet {
             guard stack == Self.fixedStack else {
@@ -40,7 +39,7 @@ final class SettingsStore: ObservableObject {
     @Published var ipv6: Bool {
         didSet { d.set(ipv6, forKey: K.ipv6); markConnectionSettingsPending() }
     }
-    /// 启用 geo 规则（默认开启）。关闭时剔除 GEOIP/GEOSITE/IP-ASN 规则。
+    /// 启用 GEO 数据库（默认开启）。关闭时若配置仍依赖 GEO，明确报错而不删除规则。
     @Published var geoEnabled: Bool {
         didSet { d.set(geoEnabled, forKey: K.geoEnabled); markConnectionSettingsPending() }
     }
@@ -123,7 +122,7 @@ final class SettingsStore: ObservableObject {
         }
     }
     /// 开发者内存诊断。默认关闭；开启后才会在 Network Extension 中按 5 秒间隔
-    /// 采集有限的物理内存、Go 堆、连接和 goroutine 快照。
+    /// 采集有限的物理内存、Rust RSS、活动 TCP 和流量快照。
     @Published var developerMode: Bool {
         didSet {
             d.set(developerMode, forKey: K.developerMode)
@@ -315,9 +314,10 @@ final class SettingsStore: ObservableObject {
                 applyOverrides: Bool = true,
                 proxySelections: [String: String] = [:]) -> String {
         let dict: [String: Any] = [
+            "profileID": SubscriptionStore.shared.selectedID?.uuidString ?? "direct",
             "stack": Self.fixedStack,
             "ipv6": ipv6,
-            "geoEnabled": geoEnabled && geoAvailable,
+            "geoEnabled": geoEnabled,
             "geoLoader": geoLoader,
             "geodataMode": geodataMode,
             "geoIPDatURL": Self.effectiveHTTPURL(geoIPDatURL, fallback: Self.defaultGeoIPDatURL),
@@ -332,6 +332,9 @@ final class SettingsStore: ObservableObject {
             "developerMode": developerMode,
             "unifiedDelay": unifiedDelay,
             "mixedPort": mixedPort,
+            "protocolOptions": ["includeAllNetworks": includeAllNetworks,
+                "excludeCellularServices": excludeCellularServices, "excludeAPNs": excludeAPNs,
+                "excludeDeviceCommunication": excludeDeviceCommunication, "enforceRoutes": enforceRoutes],
             "blockDirectSTUN": blockDirectSTUN,
             "proxySelections": proxySelections,
             "applyOverrides": applyOverrides,

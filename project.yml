@@ -1,6 +1,6 @@
 # XcodeGen 工程定义。由 CI 执行 `xcodegen generate` 生成 Cora.xcodeproj（不入库）。
-# 标准 App + Network Extension 支持 iOS 17；控制中心扩展单独要求 iOS 18。
-# CoraLegacy / CoraTunnelLegacy 为 iOS 16.4+ 的独立构建，不嵌入 Control Widget。
+# 标准 App、Network Extension 与控制中心扩展统一支持 iOS 18。
+# Legacy / Go 源码仅保留作回退参考，不再参与构建。
 name: Cora
 
 configs:
@@ -11,7 +11,7 @@ configs:
 options:
   bundleIdPrefix: com.miclash
   deploymentTarget:
-    iOS: "17.0"
+    iOS: "18.0"
   createIntermediateGroups: true
   # CI 不签名，签名由用户自理
   defaultConfig: Release
@@ -26,9 +26,10 @@ settings:
     # Team 不写入仓库，首次在 Xcode 的 Signing & Capabilities 中为三个 target 选择同一团队。
     CODE_SIGN_STYLE: Automatic
     TARGETED_DEVICE_FAMILY: "1"   # 1=iPhone
-    # mihomo（Go 运行时）的 net 包在 Darwin 上引用 libresolv 的 res_9_* 符号，
-    # 精简的 NE 扩展不会隐式链接它，需显式补链，否则报 undefined symbols。
-    OTHER_LDFLAGS: -lresolv -lsqlite3
+    # 系统 DNS 桥接使用 libresolv；Rust logbook 与连接历史共用系统 SQLite。
+    # rustc's static archives do not propagate native framework linker flags
+    # to Swift. These are needed by Apple's DNS/network and TLS/cert bindings.
+    OTHER_LDFLAGS: -lresolv -lsqlite3 -lc++ -framework Security -framework SystemConfiguration -framework CoreFoundation
 
 targets:
   # ───────────────────────── 主 App ─────────────────────────
@@ -55,9 +56,8 @@ targets:
       # 控制中心小组件扩展
       - target: CoraControl
         embed: true
-      # mihomo 内核框架（CI 由 gomobile bind 产出）。
-      # gomobile 的 iOS 输出是静态框架 → 只链接、不嵌入（embed: false）。
-      - framework: Vendor/Mihomo.xcframework
+      # Rust C ABI 静态库：App 仅调用离线配置与校验接口。
+      - framework: Vendor/MeowCore.xcframework
         embed: false
 
   # ──────────────────── Network Extension ───────────────────
@@ -77,61 +77,13 @@ targets:
         # 暴露 libresolv（res_9_*）给 Swift：读取物理网络 DNS，见 SystemDNS.swift
         SWIFT_OBJC_BRIDGING_HEADER: CoraTunnel/CoraTunnel-Bridging-Header.h
     dependencies:
-      # mihomo 内核必须在 NE 进程内运行（代理逻辑所在）。静态框架，只链接不嵌入。
-      - framework: Vendor/Mihomo.xcframework
-        embed: false
-
-  # ──────────────── iOS 16.4+ Legacy App ─────────────────
-  # 与标准版共用业务代码和 Bundle ID，因此二者是替换安装关系，不能并存。
-  # 该 target 不嵌入 iOS 18 Control Widget，供 TrollStore / iOS 16.4 设备使用。
-  CoraLegacy:
-    type: application
-    platform: iOS
-    sources:
-      - path: Cora
-      - path: Shared
-    settings:
-      base:
-        IPHONEOS_DEPLOYMENT_TARGET: "16.4"
-        PRODUCT_NAME: Cora
-        PRODUCT_BUNDLE_IDENTIFIER: com.miclash.app
-        GENERATE_INFOPLIST_FILE: YES
-        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
-        INFOPLIST_KEY_CFBundleDisplayName: Cora
-        INFOPLIST_KEY_UILaunchScreen_Generation: YES
-        INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
-        INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait"
-        CODE_SIGN_ENTITLEMENTS: Cora/Cora.entitlements
-    dependencies:
-      - target: CoraTunnelLegacy
-        embed: true
-      - framework: VendorLegacy/Mihomo.xcframework
-        embed: false
-
-  # Legacy Tunnel 单独编译，以保留标准 CoraTunnel 的 iOS 17 部署目标。
-  CoraTunnelLegacy:
-    type: app-extension
-    platform: iOS
-    sources:
-      - path: CoraTunnel
-      - path: Shared
-      - path: Cora/Shared
-    settings:
-      base:
-        IPHONEOS_DEPLOYMENT_TARGET: "16.4"
-        PRODUCT_NAME: CoraTunnel
-        PRODUCT_BUNDLE_IDENTIFIER: com.miclash.app.tunnel
-        GENERATE_INFOPLIST_FILE: NO
-        INFOPLIST_FILE: CoraTunnel/Info.plist
-        CODE_SIGN_ENTITLEMENTS: CoraTunnel/CoraTunnel.entitlements
-        SWIFT_OBJC_BRIDGING_HEADER: CoraTunnel/CoraTunnel-Bridging-Header.h
-    dependencies:
-      - framework: VendorLegacy/Mihomo.xcframework
+      # Rust engine / tun2socks 在 NE 进程运行，静态链接。
+      - framework: Vendor/MeowCore.xcframework
         embed: false
 
   # ──────────────────── 控制中心小组件 ───────────────────
   # iOS 18+ ControlWidget：控制中心里一个「代理开关」磁贴，点击启停 NE 隧道。
-  # 只用系统框架（WidgetKit/AppIntents/NetworkExtension，Swift 自动链接），不碰 mihomo。
+  # 只用系统框架（WidgetKit/AppIntents/NetworkExtension，Swift 自动链接），不链接代理内核。
   CoraControl:
     type: app-extension
     platform: iOS
@@ -146,7 +98,7 @@ targets:
         INFOPLIST_FILE: CoraControl/Info.plist
         CODE_SIGN_ENTITLEMENTS: CoraControl/CoraControl.entitlements
 
-# 显式 scheme，标准版保留 Control Widget；Legacy 仅包含主 App 与 Packet Tunnel。
+# 标准版唯一 scheme，保留 Control Widget。
 schemes:
   Cora:
     build:
@@ -156,11 +108,3 @@ schemes:
       config: Debug
     archive:
       config: InternalTestFlight
-  CoraLegacy:
-    build:
-      targets:
-        CoraLegacy: all
-    run:
-      config: Debug
-    archive:
-      config: Release

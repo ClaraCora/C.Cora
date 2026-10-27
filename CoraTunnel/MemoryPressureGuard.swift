@@ -1,44 +1,24 @@
 import Foundation
-import Mihomo
 
-/// A tiny always-on safety net for the memory-constrained Packet Tunnel.
-/// Detailed sampling remains opt-in through developer mode; this listener only
-/// reacts to system pressure and never retains diagnostic history.
+/// Rust has no Go garbage collector. Memory pressure is recorded by the
+/// bounded diagnostic stream; no fake collection result is reported.
 final class MemoryPressureGuard: @unchecked Sendable {
-    private static let minimumActionInterval: TimeInterval = 20
-
-    private let queue = DispatchQueue(label: "com.cora.tunnel.memory-pressure",
-                                       qos: .utility)
+    private let queue = DispatchQueue(label: "com.cora.tunnel.memory-pressure", qos: .utility)
     private var source: (any DispatchSourceMemoryPressure)?
-    private var lastActionUptime: TimeInterval = 0
-
+    private weak var diagnostics: MemoryDiagnostics?
+    init(diagnostics: MemoryDiagnostics? = nil) { self.diagnostics = diagnostics }
     func start() {
         queue.sync {
             guard source == nil else { return }
-            let source = DispatchSource.makeMemoryPressureSource(
-                eventMask: [.warning, .critical], queue: queue)
+            let source = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical], queue: queue)
             source.setEventHandler { [weak self] in
-                self?.handlePressureLocked()
+                self?.diagnostics?.record(event: "memoryPressure")
+                FileLog.write("系统内存压力：已记录 Rust 运行态，不执行伪 GC")
             }
-            self.source = source
-            source.resume()
+            self.source = source; source.resume()
         }
     }
-
     func stop() {
-        queue.sync {
-            source?.setEventHandler {}
-            source?.cancel()
-            source = nil
-            lastActionUptime = 0
-        }
-    }
-
-    private func handlePressureLocked() {
-        let uptime = ProcessInfo.processInfo.systemUptime
-        guard uptime - lastActionUptime >= Self.minimumActionInterval else { return }
-        lastActionUptime = uptime
-        FileLog.write("系统内存压力：执行受限 GC，未启用详细诊断")
-        MihomoForceGC()
+        queue.sync { source?.setEventHandler {}; source?.cancel(); source = nil }
     }
 }

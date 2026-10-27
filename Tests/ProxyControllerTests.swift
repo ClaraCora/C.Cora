@@ -49,10 +49,10 @@ final class SubscriptionStore {
     func selectProxyOffline(subscriptionID: UUID, group: String, name: String) {}
 }
 
-enum MihomoCore {
+enum CoraCore {
     static var offlineReply = Data()
     static func offlineProxySnapshot(configYAML: String, providerPayloadsJSON: String,
-                                     selectionsJSON: String) -> Data { offlineReply }
+                                     selectionsJSON: String, profileID: String = "legacy") -> Data { offlineReply }
 }
 
 @MainActor
@@ -141,7 +141,7 @@ struct ProxyControllerTests {
             core.beforeProxyReply = nil
             core.status = .connected
             SubscriptionStore.shared.selected = nil
-            MihomoCore.offlineReply = Data()
+            CoraCore.offlineReply = Data()
         }
         let catalog: [String: Any] = [
             "mode": "rule",
@@ -199,7 +199,7 @@ struct ProxyControllerTests {
 
         core.status = .disconnected
         SubscriptionStore.shared.selected = .init(id: UUID(), yaml: "saved config", proxySelections: [:])
-        MihomoCore.offlineReply = try snapshot([
+        CoraCore.offlineReply = try snapshot([
             "SS Node": "ss", "Snell Node": "snell", "VLESS Node": "vless", "SSR Node": "shadowsocksr",
             "DIRECT": "direct", "REJECT": "reject", "Drop": "reject-drop", "HY": "hysteria2",
         ])

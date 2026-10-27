@@ -108,6 +108,14 @@ final class LogFileTailer: @unchecked Sendable {
 
     /// 解析带时区的新时间戳，并兼容旧版只有 UTC 时分秒的日志。
     static func parseLine(_ line: String) -> LogLine {
+        // tracing fmt: RFC3339 timestamp, level, target: message.
+        let fields = line.split(maxSplits: 2, omittingEmptySubsequences: true, whereSeparator: \.isWhitespace)
+        if fields.count == 3, ["ERROR", "WARN", "INFO", "DEBUG", "TRACE"].contains(String(fields[1])) {
+            let token = String(fields[0])
+            let time = Self.timestampFormatter.date(from: token) ?? ISO8601DateFormatter().date(from: token) ?? Date()
+            let level = fields[1] == "WARN" ? "warning" : fields[1].lowercased()
+            return LogLine(time: time, type: level, payload: String(fields[2]))
+        }
         guard let lb = line.firstIndex(of: "["),
               let rb = line.firstIndex(of: "]"), lb < rb else {
             return LogLine(time: Date(), type: "info", payload: line)

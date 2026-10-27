@@ -83,14 +83,10 @@ final class ConfigOverrideStore: ObservableObject {
     var validationWarnings: [String] {
         var warnings: [String] = []
         if overwriteDNS {
-            if !Self.isValidListenAddress(dnsListen) {
-                warnings.append("DNS 监听地址无效，应为 host:port，例如 0.0.0.0:1053")
-            }
             for (title, values) in [
                 ("默认域名解析服务器", defaultNameservers),
                 ("域名解析服务器", nameservers),
                 ("代理域名解析服务器", proxyNameservers),
-                ("直连域名解析服务器", directNameservers),
                 ("Fallback 域名解析服务器", fallbackNameservers)
             ] where values.contains(where: { !Self.isValidResolver($0) }) {
                 warnings.append("\(title)中存在无法识别的地址")
@@ -101,9 +97,6 @@ final class ConfigOverrideStore: ObservableObject {
             }) {
                 warnings.append("Hosts 中存在空域名或无效 IP 地址")
             }
-        }
-        if overwriteTun && tunDNSHijack.contains(where: { !Self.isValidHijackRule($0) }) {
-            warnings.append("DNS 接管规则中存在无效的端口")
         }
         return warnings
     }

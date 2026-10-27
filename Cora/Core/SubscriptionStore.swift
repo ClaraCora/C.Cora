@@ -502,7 +502,7 @@ final class SubscriptionStore: ObservableObject {
                     guard let payload = String(data: data, encoding: .utf8) else {
                         throw SubscriptionRefreshError.notText
                     }
-                    if let validationError = MihomoCore.validateProxyProviderPayload(payload) {
+                    if let validationError = CoraCore.validateProxyProviderPayload(payload) {
                         throw ProxyProviderRefreshError.invalidPayload(provider.name, validationError)
                     }
                     cached[provider.name] = payload
@@ -821,9 +821,9 @@ final class SubscriptionStore: ObservableObject {
               let payloadJSON = String(data: payloadData, encoding: .utf8),
               let selectionData = try? JSONEncoder().encode(subscriptions[index].proxySelections),
               let selectionJSON = String(data: selectionData, encoding: .utf8) else { return }
-        let data = MihomoCore.offlineProxySnapshot(configYAML: subscriptions[index].yaml,
+        let data = CoraCore.offlineProxySnapshot(configYAML: subscriptions[index].yaml,
                                                    providerPayloadsJSON: payloadJSON,
-                                                   selectionsJSON: selectionJSON)
+                                                   selectionsJSON: selectionJSON, profileID: id.uuidString)
         guard let response = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
               response["error"] == nil,
               let count = response["nodeCount"] as? Int else { return }
@@ -844,14 +844,14 @@ final class SubscriptionStore: ObservableObject {
     }
 
     private static func providerManifest(_ yaml: String) throws -> [RemoteProxyProvider] {
-        let data = MihomoCore.proxyProviderManifest(configYAML: yaml)
+        let data = CoraCore.proxyProviderManifest(configYAML: yaml)
         let response = try JSONDecoder().decode(ProxyProviderManifestResponse.self, from: data)
         if let error = response.error { throw ProxyProviderRefreshError.manifest(error) }
         return response.providers
     }
 
     private static func remoteResourceManifest(_ yaml: String) throws -> RemoteResourceManifestResponse {
-        let data = MihomoCore.remoteResourceManifest(configYAML: yaml)
+        let data = CoraCore.remoteResourceManifest(configYAML: yaml)
         let response = try JSONDecoder().decode(RemoteResourceManifestResponse.self, from: data)
         if let error = response.error { throw ProxyProviderRefreshError.manifest(error) }
         return response
@@ -874,7 +874,7 @@ final class SubscriptionStore: ObservableObject {
         guard let payload = String(data: data, encoding: .utf8) else {
             throw SubscriptionRefreshError.notText
         }
-        if let validationError = MihomoCore.validateProxyProviderPayload(payload) {
+        if let validationError = CoraCore.validateProxyProviderPayload(payload) {
             throw ProxyProviderRefreshError.invalidPayload(provider.name, validationError)
         }
         return payload

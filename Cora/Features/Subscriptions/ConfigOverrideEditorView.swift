@@ -67,6 +67,9 @@ struct ConfigOverrideSettingsView: View {
                     OverrideCategoryLabel(title: "TUN", systemImage: "arrow.triangle.branch",
                                           enabled: overrides.overwriteTun)
                 }
+                .disabled(true)
+                Text("TUN 由 iOS packetFlow 固定管理；原 TUN 覆写已保留，当前内核不可用。")
+                    .font(.footnote).foregroundStyle(.secondary)
             }
             .listRowBackground(AppListRowBackground())
 
@@ -127,16 +130,22 @@ private struct DNSOverrideSettingsView: View {
             }
             .listRowBackground(AppListRowBackground())
 
+            Section {
+                Text("监听端口由内核分配。灰色选项当前不可用，旧值保留；支持的 DNS、HTTP/TLS 嗅探设置仍可应用。")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
             Section("基础") {
                 HStack {
                     Text("监听地址")
                     Spacer()
                     TextField("0.0.0.0:1053", text: $overrides.dnsListen)
+                        .disabled(true)
                         .multilineTextAlignment(.trailing)
                         .autocorrectionDisabled()
                         .textInputAutocapitalization(.never)
                 }
                 Toggle("DoH H3 优先", isOn: $overrides.dnsPreferH3)
+                    .disabled(true)
                 Toggle("使用系统 Hosts", isOn: $overrides.dnsUseSystemHosts)
                 Toggle("使用内置 Hosts", isOn: $overrides.dnsUseHosts)
                 NavigationLink("编辑 Hosts") {
@@ -147,9 +156,7 @@ private struct DNSOverrideSettingsView: View {
             .listRowBackground(AppListRowBackground())
 
             Section("解析模式") {
-                Picker("DNS 模式", selection: $overrides.dnsEnhancedMode) {
-                    ForEach(ConfigOverrideStore.dnsModeOptions, id: \.self) { Text($0).tag($0) }
-                }
+                LabeledContent("DNS 模式", value: "fake-ip（iOS 固定）")
                 Picker("Fake IP 过滤模式", selection: $overrides.fakeIPFilterMode) {
                     ForEach(ConfigOverrideStore.fakeIPFilterModeOptions, id: \.self) {
                         Text($0).tag($0)
@@ -167,6 +174,7 @@ private struct DNSOverrideSettingsView: View {
                     overrides.fakeIPFilter = ConfigOverrideStore.commonFakeIPFilter
                 }
                 Toggle("遵循分流规则", isOn: $overrides.dnsRespectRules)
+                    .disabled(true)
             }
             .disabled(!overrides.overwriteDNS)
             .listRowBackground(AppListRowBackground())
@@ -175,7 +183,7 @@ private struct DNSOverrideSettingsView: View {
                 nameserverLink("默认域名解析服务器", values: $overrides.defaultNameservers)
                 nameserverLink("域名解析服务器", values: $overrides.nameservers)
                 nameserverLink("代理域名解析服务器", values: $overrides.proxyNameservers)
-                nameserverLink("直连域名解析服务器", values: $overrides.directNameservers)
+                nameserverLink("直连域名解析服务器（不可用）", values: $overrides.directNameservers).disabled(true)
                 nameserverLink("Fallback 域名解析服务器", values: $overrides.fallbackNameservers)
                 Toggle("备用 GeoIP", isOn: $overrides.fallbackGeoIP)
             }
@@ -212,6 +220,7 @@ private struct SnifferOverrideSettingsView: View {
 
             Section("行为") {
                 Toggle("强制 DNS 映射", isOn: $overrides.snifferForceDNSMapping)
+                    .disabled(true)
                 Toggle("解析纯 IP 流量", isOn: $overrides.snifferParsePureIP)
                 Toggle("覆写目标地址", isOn: $overrides.snifferOverrideDestination)
             }
@@ -222,6 +231,7 @@ private struct SnifferOverrideSettingsView: View {
                 Toggle("HTTP", isOn: $overrides.sniffHTTP)
                 Toggle("TLS", isOn: $overrides.sniffTLS)
                 Toggle("QUIC", isOn: $overrides.sniffQUIC)
+                    .disabled(true)
             }
             .disabled(!overrides.overwriteSniffer || !overrides.snifferEnabled)
             .listRowBackground(AppListRowBackground())

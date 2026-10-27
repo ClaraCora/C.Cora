@@ -57,7 +57,7 @@ struct DeveloperDiagnosticsView: View {
                 .tint(Color(uiColor: .systemGreen))
                 .disabled(isUpdatingMode)
             } footer: {
-                Text("开启后每 5 秒记录一次物理内存、VM、Go 堆、闲置缓冲池、TUN 队列、DNS 和 Provider 摘要，并保留当前/上一会话的数字摘要及最近释放前后对比。关闭后不会持续采样；诊断数据可能包含连接数量等运行态信息。")
+                Text("开启后每 5 秒记录 NE 物理内存、Rust RSS、活动 TCP 流、累计流量、接口流量和引擎状态，文件按大小轮换。关闭后不持续采样。RSS 与物理内存分开显示，UDP 连接明细不可用。")
             }
             .settingsSectionStyle()
 

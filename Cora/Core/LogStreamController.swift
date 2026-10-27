@@ -50,7 +50,7 @@ final class LogStreamController: ObservableObject {
     private let maxLines = 1000
 
     private static var sharedLogURL: URL? {
-        AppGroup.containerURL?.appendingPathComponent("run.log")
+        AppGroup.containerURL?.appendingPathComponent("logs/meow-tunnel.log")
     }
 
     func start(awaitingNewSession: Bool = false) {

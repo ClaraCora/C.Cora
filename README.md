@@ -1,101 +1,60 @@
-# Cora
+# Cora — meow-rs iOS 18 分支
 
-基于 [mihomo](https://github.com/MetaCubeX/mihomo) 内核的 iOS 代理客户端，SwiftUI + MVVM，个人自签测试。
-
-当前版本：**1.0.7**
-
-详细路线见 [PLAN.md](PLAN.md)。
+此分支将标准 Cora App 和 Packet Tunnel 切换到 Rust meow-rs，最低 **iOS 18**。
+固定内核提交 `fa7a7d6dc94e886ae0bc43eeb0227082ae5bf2e6`，Cargo.lock 随源码保存。
+App 版本保持 1.0.7，CI 构建号使用运行编号与重试编号。
 
 ## 构建
 
-工程用 [XcodeGen](https://github.com/yonsm/XcodeGen) 管理，`.xcodeproj` 不入库。开发机为 Windows，靠 GitHub Actions（macos-26 / Xcode 26）构建未签名 ipa。
+需要 macOS、Xcode 26.4.1、Rust 1.95.0、CMake、XcodeGen。
+Apple Rust targets 为 `aarch64-apple-ios` 与 `aarch64-apple-ios-sim`。
 
-- 推送到 `main` 或手动触发 `Build unsigned IPA` 工作流。
-- Actions 同时产出标准版与 `CoraLegacy`（iOS 16.4+）的普通 IPA、TrollStore IPA。
-- 构建成功后上传到 [GitHub Releases](https://github.com/ClaraCora/C.Cora/releases)，每次构建保留一个预发布版本，含四个 IPA 与 `SHA256SUMS.txt`。Actions 摘要提供下载链接，不再使用 Actions artifact 存储。
-- 用自有 Apple 开发者证书自行签名后安装（工程内不含任何证书/描述文件/Secrets）。
-
-本地有 Mac 时，先准备 mihomo 框架并生成工程：
-
-```bash
-brew install xcodegen
-bash scripts/prepare-xcode.sh
-open Cora.xcodeproj
-```
-
-首次构建前，在 Xcode 的 `Signing & Capabilities` 中为 `Cora`、
-`CoraTunnel`、`CoraControl` 三个标准 target 选择同一个开发者团队。若构建
-Legacy，则为 `CoraLegacy`、`CoraTunnelLegacy` 选择同一团队。
-工程使用自动签名，不需要手动创建或下载 provisioning profile；App Group
-`group.com.miclash.app` 和三个 Bundle ID 仍需属于该团队。
-
-`prepare-xcode.sh` 要求 macOS、Xcode 和 XcodeGen。首次构建内核时还需要 Go 1.25.4，
-脚本会下载 Go 依赖，并生成标准版 `Vendor/Mihomo.xcframework` 与 Legacy
-`VendorLegacy/Mihomo.xcframework`；后续直接复用。MobileCore 或依赖变化后运行：
-
-```bash
+```sh
 bash scripts/prepare-xcode.sh --rebuild-core
+xcodebuild -project Cora.xcodeproj -scheme Cora -configuration Release \
+  -destination 'generic/platform=iOS' -derivedDataPath build \
+  CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY='' build
+bash scripts/verify-meow-app.sh build/Build/Products/Release-iphoneos/Cora.app
 ```
 
-## 内部 TestFlight
+本地签名时，在 Xcode 给 Cora、CoraTunnel、CoraControl 选择同一开发团队，确认 Network Extension 与 App Group 权限。
+CI 只生成普通未签名 `Cora-unsigned.ipa`，需使用自己的证书签名安装。
+`main`、`meow-rs` push 以及 workflow_dispatch 可触发本分支工作流；成功后仅发布一个 IPA 和 SHA-256 校验文件。
+不构建 Legacy 或 TrollStore IPA。旧 Go MobileCore、旧框架目录与 Swift 回退参考保留，但未加入新 targets。
 
-工程的 `Cora` scheme 使用 `InternalTestFlight` Release 配置进行 Archive：
+## 配置与兼容
 
-1. 在 App Store Connect 创建与 `com.miclash.app` 对应的 App 记录。
-2. 在 Xcode 选择 `Any iOS Device (arm64)`，执行 `Product > Archive`。
-3. 在 Organizer 中选择 `Distribute App`，然后选择 `TestFlight Internal Only` 上传。
-4. 每次上传使用新的 Build Number，并在 App Store Connect 添加内部测试成员。
+- 订阅、本地 YAML 和原 Provider 文件按原文保存；Rust 仅读取它们并生成独立运行副本。
+- packetFlow 回调连接 Rust lwIP，不扫描 utun fd，不再链接 Mihomo 或 Go。
+- 运行副本固定 iOS DNS/fake-IP、内部 mixed listener 和受认证 loopback controller；不向 App 暴露 controller 凭据。
+- HTTP Provider 使用按配置 ID 与内容摘要隔离的 Rust 缓存。inline Proxy Provider 仅在独立运行目录物化为文件，原 payload 与 use 引用保留。
+- 不支持的源配置字段带 YAML 路径报错；启动失败保留上次成功 source/settings/runtime 快照，系统重连使用成功快照。
+- GEO 使用 geoip.metadb（MMDB）、GeoSite.dat、ASN.mmdb，下载后先校验再原子替换，下次 VPN 连接生效。缺数据库不能静默删除规则。
+- 不提供 App 内前置代理或链式代理分组。WindowsConfigTool 不属于此次迁移，也不加入本分支提交。
 
-内部 TestFlight 构建只能分配给 App Store Connect 团队内的测试人员，不能转为外部测试
-或正式发布。若之后需要外部 TestFlight，应重新上传未标记为 Internal Only 的构建。
+## 当前功能差异
 
-## iOS 16.4 Legacy
+保留策略组、Provider、规则、模式、测速、日志、统计、TCP 连接历史和系统重连接口。
+meow-rs 没有 UDP 连接明细，页面明确显示不可用；总流量包含 UDP，但历史与按连接聚合排行不能代表完整 UDP 用量。
+PO0、Cora 检测脚本请求、特殊探测与手动 Go GC 不可用；旧设置不删除，相关入口禁用或返回明确错误。
+原 TUN 覆写、direct-nameserver、respect-rules、DoH H3 优先、QUIC 嗅探与旧 GEO 加载器等非等价选项保留并明确标为不可用。
+Rust RSS 与 NE phys_footprint 分开显示。内存诊断仅开发者模式采样，文件和日志队列均有上限。
 
-`CoraLegacy` 是面向 iOS 16.4+ 的独立 Scheme，和标准版共用配置、VPN 描述文件、
-Bundle ID 与核心代码，二者为替换安装关系，不能同时安装。Legacy 不包含 iOS 18 的
-控制中心磁贴；VPN 启停、订阅、策略、测速、记录、日志、外部检测脚本和 Connect On
-Demand 自动连接均保留。
+## 验证
 
-GitHub Releases 的附件名称如下：
+```sh
+cargo +1.95.0 test --locked --manifest-path MobileCoreRust/cora-config/Cargo.toml
+cargo +1.95.0 test --locked --manifest-path MobileCoreRust/meow-ios-ffi/Cargo.toml --lib -- --test-threads=1
+python3 scripts/test-meow-migration.py
+python3 scripts/test-ipa-release.py
+bash scripts/test-connection-history.sh
+bash scripts/test-ipc-response-cache.sh
+bash scripts/test-ipc-control-scheduler.sh
+bash scripts/test-proxy-controller.sh
+bash scripts/test-kernel-memory.sh
+bash scripts/test-core-compatibility.sh
+```
 
-- `Cora-unsigned.ipa`：标准普通 IPA，主 App / Tunnel 最低 iOS 17。
-- `Cora-TrollStore.ipa`：标准 TrollStore IPA，不含 iOS 18 控制中心磁贴。
-- `CoraLegacy-unsigned.ipa`：iOS 16.4+ 普通 IPA。
-- `CoraLegacy-TrollStore.ipa`：iOS 16.4+ TrollStore IPA。
-
-Legacy 的 mihomo 框架仍使用 ARM64 AES-GCM 加速，要求 A12 或更新芯片；iPhone SE
-第三代的 A15 满足此前提。A11 及更早设备不在该加速构建的支持范围内。
-
-## 标识
-
-| 项 | 值 |
-|---|---|
-| 主 App | `com.miclash.app` |
-| NE 扩展 | `com.miclash.app.tunnel` |
-| App Group | `group.com.miclash.app` |
-
-## 功能概览
-
-- 总览、策略、节点、记录、设置五个页面；策略组与节点组分开展示并共享选择状态。
-- 策略与节点页支持列表/网格模式，网格默认开启；卡片显示最终节点和共享延迟，支持测试本页当前节点、展开分组或单个节点测速。
-- 订阅支持远程 Provider 刷新，支持自定义订阅 UA。
-- 记录页提供策略、节点 TOP5 和主机流量聚合，并可进入对应的分页连接记录。
-- 记录页支持活动连接详情、关闭连接、日志和分页历史。
-- 记录使用 App Group SQLite 限制为最近 7 天、最多 20,000 条、约 50 MB；VPN 断开后清空本次会话。
-- 支持 GEO/ASN、隧道路由、STUN 直连拦截、混合代理端口和内核诊断；开发者模式默认关闭，开启后才按 5 秒采样并限制为 256KB，可在设置中分析、复制或清理。
-
-## Network Extension 内存策略
-
-开发者内存诊断的压力事件有 20 秒冷却，避免重复 GC 和同步写盘放大内存压力。
-连接历史在 Network Extension 中使用有界活动快照（8 秒）和关闭队列（2 秒）分离
-处理，SQLite 的过期/WAL 维护每 60 秒执行一次，并使用文件临时存储和小页面缓存。
-总览只走 totals-only 连接 IPC；记录页打开时才读取完整活动连接，从而减少 App 与
-Network Extension 的重复 JSON 分配。连接历史仍限制最近 7 天、20,000 条和约 50 MB，
-不会因清理失败影响 VPN 转发。控制面按任务类别调度，总计最多 8 个运行中请求，
-重任务最多 2 个；停止或重连时丢弃旧会话的排队请求，避免控制面工作无界积累。
-节点 TOP5 在 App 侧按需从已有 SQLite 记录计算；App 被划掉时 NE 仍继续写入连接历史，
-重新打开 App 后会补算这段期间的节点流量，不在 NE 中维护额外的节点聚合状态。
-
-## 当前状态
-
-项目已完成主要功能和 CI 无签名 IPA 构建流程。后续以真机签名测试、证书更新和兼容性修复为主。
+Swift 脚本、Apple slices 与 IPA 门禁须在 macOS 上执行。主机 Rust 测试通过不等于 iOS 构建或真机验证通过。
+迁移验收细则见 docs/meow-rs-migration.md；未完成真机验收的构建只能视为测试构建。
+第三方来源、MIT 许可证与版本固定信息见 MobileCoreRust/UPSTREAM.md。

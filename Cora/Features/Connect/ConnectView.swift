@@ -224,13 +224,10 @@ private struct ConnectionHero: View {
                     .background(Capsule().fill(.thinMaterial))
                     .frame(minHeight: 44)
                     .contentShape(Rectangle())
-                    .onLongPressGesture(minimumDuration: 0.6) { releaseMemory() }
                     .accessibilityElement(children: .ignore)
                     .accessibilityLabel(kernel.isReleasingMemory ? "正在释放空闲内存"
                                         : "NE 内存 \(kernel.memoryFootprint.map(ByteFormat.size) ?? "未知")")
-                    .accessibilityHint(core.status == .connected ? "长按释放空闲内存" : "连接 VPN 后可释放空闲内存")
-                    .accessibilityAddTraits(.isButton)
-                    .accessibilityAction(named: Text("释放空闲内存")) { releaseMemory() }
+                    .accessibilityHint("Rust 内核内存由系统管理")
 
                 HStack(spacing: 10) {
                     OverviewModeMenu()
@@ -246,7 +243,8 @@ private struct ConnectionHero: View {
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("PO0 白名单设置")
-                    .accessibilityHint("查看白名单并设置自动检测")
+                    .accessibilityHint("meow-rs 暂不支持 PO0，旧设置保留")
+                    .disabled(true)
                 }
             }
 

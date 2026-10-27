@@ -1,7 +1,6 @@
 import Foundation
-import Mihomo
 
-/// Samples Mihomo's bounded active-connection snapshot while the App may be
+/// Samples meow-rs's bounded active-connection snapshot while the App may be
 /// absent, then writes only compact rows to the shared SQLite store. The sample
 /// map is capped well below a Packet Tunnel's memory budget and is never sent
 /// across IPC as a history payload.
@@ -155,7 +154,8 @@ final class ConnectionHistoryRecorder {
     private func sampleActiveLocked() {
         guard let store else { return }
         autoreleasepool {
-            if let payload = MihomoConnectionHistorySnapshot(Self.snapshotLimit),
+            let payload = CoraNativeCore.request("historyActive", ["limit": Self.snapshotLimit])
+            if !payload.isEmpty,
                let snapshot = ConnectionHistoryRecord.coreSnapshot(from: payload) {
                 let started = ProcessInfo.processInfo.systemUptime
                 let committed = store.upsertActive(snapshot.records)
@@ -175,7 +175,9 @@ final class ConnectionHistoryRecorder {
     private func drainClosedQueueLocked() {
         guard let store else { return }
         autoreleasepool {
-            if let payload = MihomoClosedConnectionHistorySnapshot(closedCursor, Self.closedBatchLimit),
+            let payload = CoraNativeCore.request("historyClosed", ["cursor": closedCursor,
+                                                                    "limit": Self.closedBatchLimit])
+            if !payload.isEmpty,
                let snapshot = ConnectionHistoryRecord.coreSnapshot(from: payload) {
                 let started = ProcessInfo.processInfo.systemUptime
                 let committed = store.upsertClosed(snapshot.records)

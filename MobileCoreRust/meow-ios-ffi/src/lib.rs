@@ -1,0 +1,2400 @@
+//! Rust half of the meow-ios native stack — unified into a single C ABI that
+//! the PacketTunnel extension and the main app both link against via
+//! `MeowCore.xcframework`.
+//!
+//! Embeds the meow-rs proxy engine and the tun2socks layer in one static
+//! library. TCP and non-DNS UDP flows now go through the same local mixed
+//! listener that LAN clients use:
+//!
+//!   NEPacketTunnelFlow ⇆ mpsc ⇆ netstack-smoltcp ⇆ SOCKS5 loopback ⇆ meow-listener
+//!                                                                          ↓
+//!                                                      rules / proxies / DNS / REST API
+//!
+//! The staticlib owns separate tokio runtimes for the packet/netstack driver
+//! and for meow engine work so lwIP backpressure cannot starve the
+//! REST/API/proxy workers. DNS is delegated to a local meow-dns UDP listener
+//! running in fake-IP mode: the tun2socks UDP/53 path still answers
+//! IPv6-disabled AAAA and HTTP/3-blocked HTTPS/SVCB queries NOERROR-empty
+//! itself, then sends other DNS queries to the listener. The FFI no longer
+//! carries its own fake-IP pool, china-DNS split-horizon, CN-IP table, DoH
+//! cache, or in-FFI TCP-DNS client.
+
+pub mod cora;
+mod diagnostics;
+mod engine;
+mod file_log;
+mod ip_info;
+mod logbook;
+mod logging;
+mod network_traffic;
+mod probe;
+pub mod rss;
+mod subscription;
+mod tun2socks;
+
+#[cfg(test)]
+mod xdg_home_dir_tests;
+
+/// Live per-flow state-map sizes (TCP flows, UDP reply readers, UDP NAT
+/// table) for the dev harness RSS monitor — see the slow-leak hunt. Not part
+/// of the C ABI; consumed by `macos-utun-harness` via the rlib.
+pub use tun2socks::{debug_counts, DebugCounts};
+
+use parking_lot::Mutex;
+use std::cell::RefCell;
+use std::ffi::{CStr, CString};
+use std::os::raw::{c_char, c_int};
+use std::sync::OnceLock;
+use std::time::Duration;
+
+// ---------------------------------------------------------------------------
+// Global state
+// ---------------------------------------------------------------------------
+
+static ENGINE_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+static TUN2SOCKS_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+static API_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+
+const TOKIO_RUNTIME_WORKERS: usize = 2;
+/// The REST control API serves a bursty, host-app-driven workload (a wave of
+/// `/proxies` + `/configs` requests on every connection-stage transition) and
+/// is otherwise idle. One worker is plenty — its only job is to keep that
+/// burst OFF the engine runtime so a synchronous `/proxies` serialization
+/// cannot starve the data-path relay / DNS tasks.
+const TOKIO_API_RUNTIME_WORKERS: usize = 1;
+const TOKIO_RUNTIME_STACK_SIZE: usize = 1024 * 1024;
+
+fn build_runtime(
+    name: &'static str,
+    worker_threads: usize,
+    stack_size: usize,
+) -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .thread_name(name)
+        .thread_stack_size(stack_size)
+        .enable_all()
+        .build()
+        .unwrap_or_else(|e| panic!("failed to create {name} tokio runtime: {e}"))
+}
+
+pub(crate) fn get_engine_runtime() -> &'static tokio::runtime::Runtime {
+    ENGINE_RUNTIME.get_or_init(|| {
+        // Meow engine work includes REST/API, config validation, DNS resolver,
+        // proxy dials, TLS, and serde. Keep two workers so heavy proxy/API
+        // bursts can overlap without sharing workers with the lwIP stack.
+        //
+        // Stack size is 1 MiB (tokio's default is 2 MiB). This is a *virtual*
+        // limit, not a resident allocation: Darwin demand-pages thread stacks,
+        // so RSS tracks the deepest poll actually executed, not the cap. The
+        // deeper real frames are on this runtime: BoringSSL handshakes
+        // inside layered transports plus relay combinator frames.
+        build_runtime(
+            "meow-engine",
+            TOKIO_RUNTIME_WORKERS,
+            TOKIO_RUNTIME_STACK_SIZE,
+        )
+    })
+}
+
+pub(crate) fn get_api_runtime() -> &'static tokio::runtime::Runtime {
+    API_RUNTIME.get_or_init(|| {
+        // The REST/external-controller server runs on its OWN runtime, isolated
+        // from both the engine workers (proxy dials, DNS, relay) and the
+        // tun2socks workers (lwIP / packet I/O). Before this split, a burst of
+        // REST calls on app foreground — `get_proxies` is a no-`await`
+        // synchronous CPU sink that builds + serialises the whole proxy table —
+        // could peg both engine workers and stall packet forwarding (the
+        // "open app → engine freeze" report). Keeping the API on a separate
+        // single-worker pool means a REST burst can no longer steal CPU from
+        // the data path.
+        build_runtime(
+            "meow-api",
+            TOKIO_API_RUNTIME_WORKERS,
+            TOKIO_RUNTIME_STACK_SIZE,
+        )
+    })
+}
+
+pub(crate) fn get_tun2socks_runtime() -> &'static tokio::runtime::Runtime {
+    TUN2SOCKS_RUNTIME.get_or_init(|| {
+        // Tun2socks owns packet ingress/egress, lwIP stack driving, and
+        // accept-loop bookkeeping. It deliberately does not run meow proxy
+        // dials or REST/API tasks.
+        build_runtime(
+            "meow-tun2socks",
+            TOKIO_RUNTIME_WORKERS,
+            TOKIO_RUNTIME_STACK_SIZE,
+        )
+    })
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    fn runtime_worker_name(rt: &tokio::runtime::Runtime) -> String {
+        rt.block_on(async {
+            tokio::spawn(async {
+                std::thread::current()
+                    .name()
+                    .unwrap_or("unnamed")
+                    .to_string()
+            })
+            .await
+            .expect("runtime worker name task")
+        })
+    }
+
+    #[test]
+    fn engine_and_tun2socks_use_distinct_tokio_worker_pools() {
+        let engine = runtime_worker_name(crate::get_engine_runtime());
+        let tun2socks = runtime_worker_name(crate::get_tun2socks_runtime());
+
+        assert_eq!(engine, "meow-engine");
+        assert_eq!(tun2socks, "meow-tun2socks");
+        assert_ne!(engine, tun2socks);
+    }
+}
+
+pub(crate) static HOME_DIR: Mutex<Option<String>> = Mutex::new(None);
+
+thread_local! {
+    static LAST_ERROR: RefCell<CString> = RefCell::new(CString::new("").unwrap());
+}
+
+fn set_error(msg: String) {
+    let cstr = CString::new(msg).unwrap_or_else(|_| CString::new("error").unwrap());
+    LAST_ERROR.with(|e| *e.borrow_mut() = cstr);
+}
+
+unsafe fn cstr_to_str<'a>(p: *const c_char) -> Option<&'a str> {
+    if p.is_null() {
+        None
+    } else {
+        CStr::from_ptr(p).to_str().ok()
+    }
+}
+
+/// Copy `src` into `out`/`out_cap` with a NUL terminator. Returns the number
+/// of bytes needed (not counting the NUL); callers allocate `ret + 1` and
+/// retry if the return exceeds `out_cap`.
+unsafe fn write_out(src: &[u8], out: *mut c_char, out_cap: c_int) -> c_int {
+    let needed = src.len();
+    if !out.is_null() && out_cap > 0 {
+        let cap = (out_cap as usize).saturating_sub(1);
+        let n = std::cmp::min(cap, needed);
+        std::ptr::copy_nonoverlapping(src.as_ptr(), out as *mut u8, n);
+        *out.add(n) = 0;
+    }
+    needed as c_int
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle / logging (shared surface)
+// ---------------------------------------------------------------------------
+
+/// Initialize logging. Safe to call more than once.
+#[no_mangle]
+pub extern "C" fn meow_core_init() {
+    logging::init_os_logger();
+    logging::install_panic_hook();
+    logging::bridge_log("meow_core_init: os_log initialized");
+}
+
+/// Emit a log line from the NetworkExtension host (ObjC) into the same tracing
+/// pipeline the engine uses, so NE lifecycle events — start/stop, sleep/wake,
+/// `reasserting`, errors — land in the App Group file log (and os_log, and the
+/// REST `/logs` stream) interleaved with engine output on one timeline.
+///
+/// `level`: 0 = error, 1 = warn, 2 = info, 3 = debug, 4 = trace; anything else
+/// is treated as info. No-op on a NULL or non-UTF-8 `msg`.
+///
+/// # Safety
+/// `msg` must point to a NUL-terminated UTF-8 string or be NULL.
+#[no_mangle]
+pub unsafe extern "C" fn meow_core_log(level: c_int, msg: *const c_char) {
+    let Some(text) = cstr_to_str(msg) else {
+        return;
+    };
+    match level {
+        0 => tracing::error!(target: "ne", "{}", text),
+        1 => tracing::warn!(target: "ne", "{}", text),
+        3 => tracing::debug!(target: "ne", "{}", text),
+        4 => tracing::trace!(target: "ne", "{}", text),
+        _ => tracing::info!(target: "ne", "{}", text),
+    }
+}
+
+/// Set the app-group container path where config.yaml and cache files live.
+/// `dir` may be NULL or empty.
+///
+/// Also exports `$XDG_CONFIG_HOME=<dir>` into the process env so `meow-config`
+/// finds its GeoIP database at `<dir>/meow/Country.mmdb` (upstream meow's
+/// resolution order is `$XDG_CONFIG_HOME/meow/` → `$HOME/.config/meow/`).
+/// iOS sandbox HOME has no `.config`, so the env var is how the bundled Country.mmdb
+/// lands on the engine's load path.
+///
+/// # Safety
+/// `dir` must point to a NUL-terminated UTF-8 string or be NULL.
+#[no_mangle]
+pub unsafe extern "C" fn meow_core_set_home_dir(dir: *const c_char) {
+    let parsed = cstr_to_str(dir)
+        .map(str::to_owned)
+        .filter(|s| !s.is_empty());
+    // The NE reuses one immutable App Group home across stop/start cycles.
+    // Avoid rewriting process environment after worker runtimes have started.
+    if HOME_DIR.lock().as_ref() == parsed.as_ref() {
+        return;
+    }
+    logging::bridge_log(&format!("meow_core_set_home_dir: {:?}", parsed));
+    if let Some(ref d) = parsed {
+        // SAFETY: `std::env::set_var` is safe in edition 2021 (the unsafe-by-default
+        // shift is edition 2024 only, see rust-lang/rust#124636). Callers invoke
+        // this at process startup (AppModel.init / TunnelEngine.start) *before*
+        // the tokio runtime or any engine thread spawns, so no concurrent env
+        // reader races with this write.
+        std::env::set_var("XDG_CONFIG_HOME", d);
+    }
+    *HOME_DIR.lock() = parsed;
+}
+
+/// Return the last error message for the calling thread. The pointer is
+/// owned by the crate and valid until the next error is set on the same
+/// thread — copy immediately if retention is needed.
+#[no_mangle]
+pub extern "C" fn meow_core_last_error() -> *const c_char {
+    LAST_ERROR.with(|e| e.borrow().as_ptr())
+}
+
+// ---------------------------------------------------------------------------
+// Engine (meow-rs) — lifecycle + config
+// ---------------------------------------------------------------------------
+
+/// Start the meow-rs engine using the YAML at `config_path`. Idempotent.
+/// Returns 0 on success, -1 on error (inspect `meow_core_last_error`).
+///
+/// # Safety
+/// `config_path` must point to a NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn meow_engine_start(config_path: *const c_char) -> c_int {
+    let Some(path) = cstr_to_str(config_path) else {
+        set_error("config_path is null or not utf-8".into());
+        return -1;
+    };
+    logging::bridge_log(&format!("meow_engine_start: {}", path));
+    match engine::start(path) {
+        Ok(()) => 0,
+        Err(e) => {
+            meow_common::logbook::engine_stopped(meow_common::logbook::Stop::Failed(&format!(
+                "{e:#}"
+            )));
+            set_error(format!("engine start failed: {}", e));
+            -1
+        }
+    }
+}
+
+/// Stop the meow-rs engine. Idempotent.
+#[no_mangle]
+pub extern "C" fn meow_engine_stop() {
+    logging::bridge_log("meow_engine_stop");
+    // A probe holds a route snapshot, so it would keep dialing through the
+    // stopped engine's proxies until its own budget ran out.
+    probe::cancel_all();
+    engine::stop();
+}
+
+/// Returns 1 if the engine is running, 0 otherwise.
+#[no_mangle]
+pub extern "C" fn meow_engine_is_running() -> c_int {
+    if engine::is_running() {
+        1
+    } else {
+        0
+    }
+}
+
+/// Hot-reload mode/rules/proxies from `config_path` into the running engine
+/// without stopping listeners, DNS, or any in-flight flow. Returns 0 on
+/// success, -1 on error (inspect `meow_core_last_error`) — on error the old
+/// configuration keeps running untouched.
+///
+/// # Safety
+/// `config_path` must point to a NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn meow_engine_reload(config_path: *const c_char) -> c_int {
+    let Some(path) = cstr_to_str(config_path) else {
+        set_error("config_path is null or not utf-8".into());
+        return -1;
+    };
+    logging::bridge_log(&format!("meow_engine_reload: {}", path));
+    match engine::reload(path) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_error(format!("engine reload failed: {}", e));
+            -1
+        }
+    }
+}
+
+/// Validate a Clash YAML config. Returns 0 on success, -1 on error.
+///
+/// # Safety
+/// `yaml` must point to `len` bytes of UTF-8.
+#[no_mangle]
+pub unsafe extern "C" fn meow_engine_validate_config(yaml: *const c_char, len: c_int) -> c_int {
+    if yaml.is_null() || len <= 0 {
+        set_error("empty yaml".into());
+        return -1;
+    }
+    let slice = std::slice::from_raw_parts(yaml as *const u8, len as usize);
+    let Ok(text) = std::str::from_utf8(slice) else {
+        set_error("yaml is not utf-8".into());
+        return -1;
+    };
+    match engine::validate(text) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_error(format!("invalid config: {}", e));
+            -1
+        }
+    }
+}
+
+/// Return the number of currently active (in-flight) TCP flows dispatched
+/// through the tun2socks layer. Useful for diagnosing connection accumulation.
+#[no_mangle]
+pub extern "C" fn meow_active_tcp_conns() -> i64 {
+    // `.max(0)` defensively: `ACTIVE_TCP_CONNS` could in principle dip below
+    // zero if a flow's spawn-aborted path decremented before the matching
+    // increment landed. Cheap clamp keeps the FFI return non-negative even
+    // if that race ever materializes.
+    tun2socks::ACTIVE_TCP_CONNS
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .max(0)
+}
+
+/// Write cumulative upload/download byte counters. Safe to call before
+/// `meow_engine_start` — returns zero counters.
+///
+/// # Safety
+/// Pointers, if non-NULL, must reference writable 64-bit integer slots.
+#[no_mangle]
+pub unsafe extern "C" fn meow_engine_traffic(out_upload: *mut i64, out_download: *mut i64) {
+    let (up, down) = engine::traffic();
+    if !out_upload.is_null() {
+        *out_upload = up;
+    }
+    if !out_download.is_null() {
+        *out_download = down;
+    }
+}
+
+/// Report the kind of network the engine's sockets now go out on, one of the
+/// `MEOW_NETWORK_KIND_*` constants (`MEOW_NETWORK_KIND_NONE` while there is
+/// none). What the totals gained since the last report is charged to the
+/// previous kind; see `meow_engine_interface_traffic`. Safe to call before
+/// `meow_engine_start`: the kind carries over to the runs that follow.
+///
+/// Returns 0 on success, -1 on an unknown kind.
+#[no_mangle]
+pub extern "C" fn meow_engine_set_network_kind(kind: c_int) -> c_int {
+    let Ok(kind) = network_traffic::Kind::from_c(kind) else {
+        set_error(format!("unknown network kind {kind}"));
+        return -1;
+    };
+    network_traffic::set_kind(kind);
+    0
+}
+
+/// Write the running engine's `meow_engine_traffic` totals split by the
+/// kind of network they went out on, as reported through
+/// `meow_engine_set_network_kind`. Bytes counted while no kind was known go
+/// to the next one reported, so the split can trail the totals. Restarts
+/// from zero with every `meow_engine_start`.
+///
+/// # Safety
+/// `out`, if non-NULL, must reference a writable `MeowInterfaceTraffic`.
+#[no_mangle]
+pub unsafe extern "C" fn meow_engine_interface_traffic(
+    out: *mut network_traffic::MeowInterfaceTraffic,
+) {
+    let split = network_traffic::read();
+    if !out.is_null() {
+        *out = split;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subscription conversion
+// ---------------------------------------------------------------------------
+
+/// Convert a subscription body (Clash YAML, or base64-wrapped / plain v2rayN
+/// URI list) to Clash YAML. Writes NUL-terminated UTF-8 into `out`/`out_cap`.
+/// Returns the total bytes needed (not counting NUL); if the return exceeds
+/// `out_cap`, the output was truncated — allocate `ret + 1` and retry.
+/// Returns -1 on error (inspect `meow_core_last_error`).
+///
+/// # Safety
+/// `body` must reference `len` bytes; `out` must reference `out_cap` bytes
+/// if non-NULL.
+#[no_mangle]
+pub unsafe extern "C" fn meow_engine_convert_subscription(
+    body: *const c_char,
+    len: c_int,
+    out: *mut c_char,
+    out_cap: c_int,
+) -> c_int {
+    if body.is_null() || len <= 0 {
+        set_error("empty subscription body".into());
+        return -1;
+    }
+    let slice = std::slice::from_raw_parts(body as *const u8, len as usize);
+    match subscription::convert(slice) {
+        Ok(yaml) => write_out(yaml.as_bytes(), out, out_cap),
+        Err(e) => {
+            set_error(format!("convert failed: {}", e));
+            -1
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostics
+// ---------------------------------------------------------------------------
+
+/// Measure direct TCP connect latency to `host:port`. Writes elapsed ms into
+/// `out_ms`; returns 0 on success, -1 on error.
+///
+/// # Safety
+/// `host` must be NUL-terminated; `out_ms` must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn meow_engine_test_direct_tcp(
+    host: *const c_char,
+    port: c_int,
+    timeout_ms: c_int,
+    out_ms: *mut i64,
+) -> c_int {
+    let Some(h) = cstr_to_str(host) else {
+        set_error("host is null or not utf-8".into());
+        return -1;
+    };
+    let to = Duration::from_millis(timeout_ms.max(1) as u64);
+    let result = get_engine_runtime().block_on(diagnostics::test_direct_tcp(h, port as u16, to));
+    match result {
+        Ok(elapsed) => {
+            if !out_ms.is_null() {
+                *out_ms = elapsed.as_millis() as i64;
+            }
+            0
+        }
+        Err(e) => {
+            set_error(e.to_string());
+            -1
+        }
+    }
+}
+
+/// HTTP reachability via the engine's default (direct) adapter.
+///
+/// # Safety
+/// `url` must be NUL-terminated; outputs may be NULL.
+#[no_mangle]
+pub unsafe extern "C" fn meow_engine_test_proxy_http(
+    url: *const c_char,
+    timeout_ms: c_int,
+    out_status: *mut c_int,
+    out_ms: *mut i64,
+) -> c_int {
+    let Some(u) = cstr_to_str(url) else {
+        set_error("url is null or not utf-8".into());
+        return -1;
+    };
+    let Some(tunnel) = engine::tunnel() else {
+        set_error("engine not running".into());
+        return -1;
+    };
+    let to = Duration::from_millis(timeout_ms.max(1) as u64);
+    let result = get_engine_runtime().block_on(diagnostics::test_proxy_http(&tunnel, u, to));
+    match result {
+        Ok((status, elapsed)) => {
+            if !out_status.is_null() {
+                *out_status = status as c_int;
+            }
+            if !out_ms.is_null() {
+                *out_ms = elapsed.as_millis() as i64;
+            }
+            0
+        }
+        Err(e) => {
+            set_error(e.to_string());
+            -1
+        }
+    }
+}
+
+/// Resolve `host` via the engine resolver. Writes comma-separated IPs into
+/// `out`/`out_cap` (same truncation rules as `meow_engine_convert_subscription`).
+///
+/// # Safety
+/// `host` must be NUL-terminated; `out` must reference `out_cap` bytes if
+/// non-NULL.
+#[no_mangle]
+pub unsafe extern "C" fn meow_engine_test_dns(
+    host: *const c_char,
+    timeout_ms: c_int,
+    out: *mut c_char,
+    out_cap: c_int,
+) -> c_int {
+    let Some(h) = cstr_to_str(host) else {
+        set_error("host is null or not utf-8".into());
+        return -1;
+    };
+    let Some(tunnel) = engine::tunnel() else {
+        set_error("engine not running".into());
+        return -1;
+    };
+    let to = Duration::from_millis(timeout_ms.max(1) as u64);
+    match get_engine_runtime().block_on(diagnostics::test_dns(&tunnel, h, to)) {
+        Ok(ips) => {
+            use std::fmt::Write;
+            let mut joined = String::new();
+            for (i, ip) in ips.iter().enumerate() {
+                if i > 0 {
+                    joined.push(',');
+                }
+                let _ = write!(joined, "{}", ip);
+            }
+            write_out(joined.as_bytes(), out, out_cap)
+        }
+        Err(e) => {
+            set_error(e.to_string());
+            -1
+        }
+    }
+}
+
+/// Select a member proxy inside a `type: select` group, in-process —
+/// the same mutation that `PUT /proxies/{group}` performs against the
+/// REST API, but without the loopback hop. `group` and `name` are
+/// matched against the upstream `SelectorGroup` byte-for-byte: no
+/// Unicode normalization, no percent-decoding, no whitespace folding.
+/// Emoji + CJK + space names therefore round-trip verbatim from YAML
+/// to selector lookup, eliminating a class of bugs the URL-encoded
+/// path is sensitive to.
+///
+/// Return codes:
+/// * `0`  — selection applied.
+/// * `-1` — argument is null or not valid UTF-8.
+/// * `-2` — engine is not running.
+/// * `-3` — group not found, or the named proxy is not a select group.
+/// * `-4` — `name` is not a member of the selector.
+///
+/// On non-zero returns, `meow_core_last_error` carries a sanitized
+/// reason suitable for surfacing in the UI.
+///
+/// # Safety
+/// `group` and `name` must each be a NUL-terminated UTF-8 C string.
+#[no_mangle]
+pub unsafe extern "C" fn meow_proxy_select(group: *const c_char, name: *const c_char) -> c_int {
+    let Some(group_name) = cstr_to_str(group) else {
+        set_error("group is null or not utf-8".into());
+        return -1;
+    };
+    let Some(target) = cstr_to_str(name) else {
+        set_error("name is null or not utf-8".into());
+        return -1;
+    };
+    let Some(tunnel) = engine::tunnel() else {
+        set_error("engine not running".into());
+        return -2;
+    };
+    let Some(proxy) = tunnel.proxy(group_name) else {
+        set_error(format!("proxy group not found: {group_name}"));
+        return -3;
+    };
+    let Some(selector) = proxy
+        .as_any()
+        .and_then(|a| a.downcast_ref::<meow_proxy::SelectorGroup>())
+    else {
+        set_error(format!("'{group_name}' is not a select-type group"));
+        return -3;
+    };
+    if selector.select(target) {
+        0
+    } else {
+        set_error(format!("'{target}' is not a member of '{group_name}'"));
+        -4
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Proxy detail probes
+// ---------------------------------------------------------------------------
+
+/// Run one diagnostic probe through the proxy named `proxy` and return its
+/// JSON answer: `udp-latency`, `http-get` (GET of `arg`), `nat`, `download`
+/// or `upload` — see `probe` for each answer's shape. A probe that measured
+/// nothing answers `{"error": …, "code": …}`, with `code` one of `failed`,
+/// `timeout`, `udp-unsupported`, `bad-request`, `no-proxy`,
+/// `engine-stopped` or `cancelled`.
+///
+/// Blocks the calling thread until the probe ends (20 s at most). `id`
+/// names the probe for `meow_cancel_proxy_probe`. Never returns NULL; free
+/// the answer with `meow_string_free`.
+///
+/// # Safety
+/// `proxy`, `kind` and `arg` must each be a NUL-terminated UTF-8 C string
+/// or NULL (read as empty).
+#[no_mangle]
+pub unsafe extern "C" fn meow_probe_proxy(
+    id: i64,
+    proxy: *const c_char,
+    kind: *const c_char,
+    arg: *const c_char,
+) -> *mut c_char {
+    let proxy = cstr_to_str(proxy).unwrap_or_default();
+    let kind = cstr_to_str(kind).unwrap_or_default();
+    let arg = cstr_to_str(arg).unwrap_or_default();
+    let answer = probe::run_guarded(id, proxy, kind, arg);
+    // serde_json escapes control characters, so the answer has no NUL.
+    CString::new(answer)
+        .unwrap_or_else(|_| CString::new(r#"{"error":"bad answer","code":"failed"}"#).unwrap())
+        .into_raw()
+}
+
+/// End probe `id` early; its `meow_probe_proxy` call returns a `cancelled`
+/// answer. A cancel that arrives before its probe starts still ends it. A
+/// no-op once the probe has ended.
+#[no_mangle]
+pub extern "C" fn meow_cancel_proxy_probe(id: i64) {
+    probe::cancel(id);
+}
+
+/// Free a string returned by `meow_probe_proxy`, `meow_lookup_ip` or
+/// `meow_logbook_read`. NULL is a no-op.
+///
+/// # Safety
+/// `s` must be NULL or a pointer from `meow_probe_proxy`, `meow_lookup_ip` or
+/// `meow_logbook_read`, freed only once.
+#[no_mangle]
+pub unsafe extern "C" fn meow_string_free(s: *mut c_char) {
+    if !s.is_null() {
+        drop(CString::from_raw(s));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Connection detail: offline IP lookup
+// ---------------------------------------------------------------------------
+
+/// Where `ip` is registered, from the GeoX databases in `dir` (the App
+/// Group config dir the app stages them into): `{"country": "CN", "asn":
+/// 136958, "org": "…"}`, with each field it has no answer for left out, so
+/// an unparseable IP or a missing database gets `{}`. `country` is an ISO
+/// 3166-1 code or one of the database's own (`GOOGLE`, `PRIVATE`…).
+///
+/// Runs in the calling process and needs no engine. Never returns NULL;
+/// free the answer with `meow_string_free`.
+///
+/// # Safety
+/// `dir` and `ip` must each be a NUL-terminated UTF-8 C string or NULL
+/// (read as empty).
+#[no_mangle]
+pub unsafe extern "C" fn meow_lookup_ip(dir: *const c_char, ip: *const c_char) -> *mut c_char {
+    let dir = cstr_to_str(dir).unwrap_or_default();
+    let ip = cstr_to_str(ip).unwrap_or_default();
+    let answer = ip_info::lookup_json(dir, ip);
+    // serde_json escapes control characters, so the answer has no NUL.
+    CString::new(answer)
+        .unwrap_or_else(|_| CString::new("{}").unwrap())
+        .into_raw()
+}
+
+// ---------------------------------------------------------------------------
+// Paw Print: the engine's logbook
+// ---------------------------------------------------------------------------
+
+/// A page of the engine's logbook under the engine home `home` (the App
+/// Group config dir), newest first, as `GET /logbook` serves it:
+/// `{"entries": [...], "rev": n, "more": bool}`, or `{"error": "..."}`.
+/// `before` pages back from an entry id, `since` polls for what was written
+/// after a page's `rev`; 0 leaves either unset. `level` is the lowest level
+/// returned, `kind` a kind or its area (`config` matches `config.reload`);
+/// NULL or empty for all.
+///
+/// Runs in the calling process and needs no engine, so the app reads it
+/// while the VPN is down. Never returns NULL; free the answer with
+/// `meow_string_free`.
+///
+/// # Safety
+/// `home`, `level` and `kind` must each be a NUL-terminated UTF-8 C string
+/// or NULL (read as empty).
+#[no_mangle]
+pub unsafe extern "C" fn meow_logbook_read(
+    home: *const c_char,
+    before: i64,
+    since: i64,
+    limit: c_int,
+    level: *const c_char,
+    kind: *const c_char,
+) -> *mut c_char {
+    let home = cstr_to_str(home).unwrap_or_default();
+    let level = cstr_to_str(level).unwrap_or_default();
+    let kind = cstr_to_str(kind).unwrap_or_default();
+    let answer = std::panic::catch_unwind(|| {
+        logbook::read_page(
+            std::path::Path::new(home),
+            before,
+            since,
+            limit,
+            level,
+            kind,
+        )
+    })
+    .unwrap_or_else(|_| logbook::error_json("logbook read panicked"));
+    // serde_json escapes control characters, so the answer has no NUL.
+    CString::new(answer)
+        .unwrap_or_else(|_| CString::new("{}").unwrap())
+        .into_raw()
+}
+
+// ---------------------------------------------------------------------------
+// REST-API credentials (random port + bearer secret)
+// ---------------------------------------------------------------------------
+
+/// Resolve the loopback REST-API credentials, minting them once and persisting
+/// to `<home>/api-credentials.json` so the app and the packet-tunnel extension
+/// — both of which patch the config — bind and authenticate with the same
+/// values. The file lives in the App Group container (set via
+/// `meow_core_set_home_dir`), which only this app and its extension can read,
+/// so the secret never leaves the sandbox.
+///
+/// Falls back to an ephemeral in-memory pair if the home dir isn't set yet or
+/// the file can't be read/written (e.g. first-run race) — the engine still
+/// comes up authenticated; a subsequent patch will persist a stable pair.
+fn api_credentials() -> (u16, String) {
+    let path = HOME_DIR
+        .lock()
+        .clone()
+        .map(|d| std::path::Path::new(&d).join("api-credentials.json"));
+
+    if let Some(ref p) = path {
+        if let Ok(bytes) = std::fs::read(p) {
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                if let (Some(port), Some(secret)) = (
+                    v.get("port").and_then(serde_json::Value::as_u64),
+                    v.get("secret").and_then(|s| s.as_str()),
+                ) {
+                    if (1024..=65535).contains(&port) && !secret.is_empty() {
+                        return (port as u16, secret.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let port = available_loopback_port().unwrap_or_else(random_port);
+    let secret = random_hex_64();
+
+    if let Some(ref p) = path {
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let body = serde_json::json!({ "port": port, "secret": secret }).to_string();
+        let tmp = p.with_extension("json.tmp");
+        // Best-effort atomic persist; if it fails we still return the freshly
+        // minted pair so this engine start is authenticated.
+        if std::fs::write(&tmp, &body).is_ok() {
+            let _ = std::fs::rename(&tmp, p);
+        } else {
+            let _ = std::fs::write(p, body);
+        }
+    }
+
+    (port, secret)
+}
+
+/// Fill `buf` from the operating system's CSPRNG. `rand` is already used by
+/// the engine; OsRng also lets the same FFI tests run on a Windows host.
+fn os_random(buf: &mut [u8]) {
+    use rand::TryRngCore;
+    rand::rngs::OsRng
+        .try_fill_bytes(buf)
+        .expect("operating system entropy must be available");
+}
+
+/// 32 random bytes of OS entropy, hex-encoded — a 256-bit bearer secret.
+fn random_hex_64() -> String {
+    let mut buf = [0u8; 32];
+    os_random(&mut buf);
+    let mut s = String::with_capacity(64);
+    for b in buf {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// Ask the OS for an available loopback port. The socket is dropped before
+/// meow-api binds, so this is not a hard reservation, but it avoids minting a
+/// credential for a port already in use at patch time.
+fn available_loopback_port() -> Option<u16> {
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).ok()?;
+    listener.local_addr().ok().map(|addr| addr.port())
+}
+
+/// A random port in the IANA dynamic/ephemeral range (49152–65535), drawn from
+/// OS entropy. Fallback only; normally `available_loopback_port` lets the OS
+/// choose a currently free loopback port. Persisted, so it's stable across
+/// launches but not the well-known 9090.
+fn random_port() -> u16 {
+    let mut buf = [0u8; 2];
+    os_random(&mut buf);
+    let raw = u16::from_le_bytes(buf);
+    49152 + (raw % (65535 - 49152 + 1))
+}
+
+// ---------------------------------------------------------------------------
+// Config patching (replaces the Swift/Yams EffectiveConfigWriter)
+// ---------------------------------------------------------------------------
+
+/// The `name:` of every entry in a top-level sequence-of-mappings key
+/// (`proxies`, `proxy-groups`). Entries without a string `name` are skipped —
+/// meow-config drops them too.
+fn declared_names(root: &serde_yaml::Mapping, key: &str) -> Vec<String> {
+    root.get(key)
+        .and_then(serde_yaml::Value::as_sequence)
+        .map(|seq| {
+            seq.iter()
+                .filter_map(|item| item.as_mapping()?.get("name")?.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Policy names meow resolves internally. They are never *declared* in the
+/// config, so a rule may target them but they can never be the proxy this
+/// config is built around.
+const BUILTIN_POLICIES: [&str; 7] = [
+    "DIRECT",
+    "REJECT",
+    "REJECT-DROP",
+    "PASS",
+    "COMPATIBLE",
+    "GLOBAL",
+    "BLOCK",
+];
+
+/// The outbound this config is effectively built around: the target of the
+/// final `MATCH,` rule when it names a proxy or group declared here, else the
+/// first proxy-group, else the first proxy. Built-in policies never qualify —
+/// they carry no traffic of their own. `None` for a config with nothing but
+/// built-ins to route to.
+fn primary_proxy_target(root: &serde_yaml::Mapping) -> Option<String> {
+    let groups = declared_names(root, "proxy-groups");
+    let proxies = declared_names(root, "proxies");
+    let usable = |name: &str| {
+        !BUILTIN_POLICIES.contains(&name.to_ascii_uppercase().as_str())
+            && (groups.iter().any(|n| n == name) || proxies.iter().any(|n| n == name))
+    };
+
+    let match_target = root
+        .get("rules")
+        .and_then(serde_yaml::Value::as_sequence)
+        .and_then(|rules| {
+            rules.iter().rev().find_map(|rule| {
+                let rule = rule.as_str()?;
+                let mut parts = rule.split(',').map(str::trim);
+                if !parts.next()?.eq_ignore_ascii_case("MATCH") {
+                    return None;
+                }
+                parts.next().map(str::to_string)
+            })
+        });
+    if let Some(target) = match_target {
+        if usable(&target) {
+            return Some(target);
+        }
+    }
+    groups
+        .iter()
+        .find(|n| usable(n))
+        .or_else(|| proxies.iter().find(|n| usable(n)))
+        .cloned()
+}
+
+/// Declare the `GLOBAL` selector explicitly, ordered so its *first* member is
+/// the outbound the user actually routes through.
+///
+/// `global` mode dispatches every connection to whatever `GLOBAL` resolves to
+/// (`Tunnel::resolve_proxy`), and a `select` group with no stored pick uses its
+/// first member. meow-config auto-creates `GLOBAL` for mihomo compatibility
+/// when the config omits it, but builds the member list by sorting *all*
+/// registry keys — built-ins included — so the head of that list is whatever
+/// happens to sort first. On a typical subscription that is either `DIRECT`
+/// (global mode silently degrades to no proxying at all) or a bookkeeping
+/// pseudo-node the provider prepends to advertise quota — `137.15 G | 500.00 G`,
+/// `Expire Date：2026/09/10` — whose "server" answers nothing, so global mode
+/// black-holes every connection.
+///
+/// The app hides `GLOBAL` from the group picker, so there is no UI to correct
+/// the pick afterwards; it has to be right at parse time. Pointing it at
+/// `primary` — normally the top-level selector the rules already send unmatched
+/// traffic to — makes global mode mean "everything through the proxy I picked",
+/// and it keeps tracking that group's own selection because the member is the
+/// group, not a frozen snapshot of its current node.
+///
+/// The remaining members preserve mihomo's "GLOBAL lists everything" contract
+/// for external frontends. A config that declares its own `GLOBAL` is left
+/// alone.
+/// Port of a `dns.listen` value (`host:port`, IPv6 in brackets, or a bare
+/// port). Returns `None` for anything that does not end in a numeric port.
+fn parse_listen_port(listen: &str) -> Option<u16> {
+    let listen = listen.trim();
+    if listen.is_empty() {
+        return None;
+    }
+    if let Ok(addr) = listen.parse::<std::net::SocketAddr>() {
+        return Some(addr.port());
+    }
+    listen
+        .rsplit_once(':')
+        .map(|(_, port)| port)
+        .unwrap_or(listen)
+        .parse::<u16>()
+        .ok()
+}
+
+/// True when `host` names the local machine — the only hosts on which the
+/// config's own `dns.listen` socket could have been reachable.
+fn is_local_host(host: &str) -> bool {
+    let host = host.trim_matches(|c| c == '[' || c == ']');
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback() || ip.is_unspecified(),
+        Err(_) => false,
+    }
+}
+
+/// Rewrite one nameserver entry (`[scheme://]host:port[/path][#tag]`) whose
+/// `host:port` is the config's own listen socket on `user_port` so it targets
+/// the relocated listener on `127.0.0.1:{new_port}`. Everything else — other
+/// hosts, other ports, DoH/DoT URLs to real servers — is returned unchanged.
+fn rewrite_self_referential_nameserver(entry: &str, user_port: u16, new_port: u16) -> String {
+    let (scheme, rest) = match entry.split_once("://") {
+        Some((scheme, rest)) => (Some(scheme), rest),
+        None => (None, entry),
+    };
+    // Only plain/UDP/TCP entries can address the listener; DoH/DoT/QUIC
+    // schemes would need a TLS stack the listener does not have.
+    if !matches!(scheme, None | Some("udp") | Some("tcp")) {
+        return entry.to_string();
+    }
+    let (authority, suffix) = match rest.find(['/', '#', '?']) {
+        Some(idx) => rest.split_at(idx),
+        None => (rest, ""),
+    };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() => (host, port),
+        _ => return entry.to_string(),
+    };
+    let Ok(port) = port.parse::<u16>() else {
+        return entry.to_string();
+    };
+    if port != user_port || !is_local_host(host) {
+        return entry.to_string();
+    }
+    let scheme = scheme.map(|s| format!("{s}://")).unwrap_or_default();
+    format!("{scheme}127.0.0.1:{new_port}{suffix}")
+}
+
+/// Apply [`rewrite_self_referential_nameserver`] to every nameserver list in
+/// the `dns` block, plus the values of `nameserver-policy` (string or list).
+fn rewrite_self_referential_nameservers(
+    dns: &mut serde_yaml::Mapping,
+    user_port: u16,
+    new_port: u16,
+) {
+    fn rewrite_value(value: &mut serde_yaml::Value, user_port: u16, new_port: u16) {
+        match value {
+            serde_yaml::Value::String(entry) => {
+                *entry = rewrite_self_referential_nameserver(entry, user_port, new_port);
+            }
+            serde_yaml::Value::Sequence(list) => {
+                for item in list {
+                    rewrite_value(item, user_port, new_port);
+                }
+            }
+            _ => {}
+        }
+    }
+    for key in [
+        "nameserver",
+        "fallback",
+        "default-nameserver",
+        "proxy-server-nameserver",
+        "direct-nameserver",
+    ] {
+        if let Some(value) = dns.get_mut(serde_yaml::Value::String(key.into())) {
+            rewrite_value(value, user_port, new_port);
+        }
+    }
+    if let Some(serde_yaml::Value::Mapping(policy)) =
+        dns.get_mut(serde_yaml::Value::String("nameserver-policy".into()))
+    {
+        for (_, value) in policy.iter_mut() {
+            rewrite_value(value, user_port, new_port);
+        }
+    }
+}
+
+fn inject_global_selector(root: &mut serde_yaml::Mapping, primary: &str) {
+    let groups = declared_names(root, "proxy-groups");
+    let proxies = declared_names(root, "proxies");
+    // Either kind of declaration occupies the same registry slot meow-config
+    // checks before auto-creating, so either one means the config owns the name.
+    if groups.iter().chain(&proxies).any(|n| n == "GLOBAL") {
+        return;
+    }
+
+    let mut members = vec![primary.to_string()];
+    members.extend(groups.into_iter().chain(proxies).filter(|n| n != primary));
+    members.push("DIRECT".into());
+    members.push("REJECT".into());
+
+    let mut group = serde_yaml::Mapping::new();
+    group.insert(
+        serde_yaml::Value::String("name".into()),
+        serde_yaml::Value::String("GLOBAL".into()),
+    );
+    group.insert(
+        serde_yaml::Value::String("type".into()),
+        serde_yaml::Value::String("select".into()),
+    );
+    group.insert(
+        serde_yaml::Value::String("proxies".into()),
+        serde_yaml::Value::Sequence(
+            members
+                .into_iter()
+                .map(serde_yaml::Value::String)
+                .collect::<Vec<_>>(),
+        ),
+    );
+
+    let key = serde_yaml::Value::String("proxy-groups".into());
+    match root
+        .get_mut(&key)
+        .and_then(serde_yaml::Value::as_sequence_mut)
+    {
+        Some(seq) => seq.push(serde_yaml::Value::Mapping(group)),
+        None => {
+            root.insert(
+                key,
+                serde_yaml::Value::Sequence(vec![serde_yaml::Value::Mapping(group)]),
+            );
+        }
+    }
+}
+
+/// Whether a DNS server entry is a mihomo DHCP resolver (`dhcp://en0`,
+/// `dhcp://system`).
+fn is_dhcp_nameserver(entry: &serde_yaml::Value) -> bool {
+    entry.as_str().is_some_and(|address| {
+        url::Url::parse(address.trim()).is_ok_and(|url| url.scheme() == "dhcp")
+    })
+}
+
+/// Drop DHCP resolvers from every DNS server list the engine parses.
+///
+/// meow-rs rejects the `dhcp` scheme, and one bad entry in `nameserver`,
+/// `fallback`, `default-nameserver` or `proxy-server-nameserver` fails the
+/// whole engine start (#358). Resolving one would mean reading the
+/// interface's DHCP lease, which the NE has no API for, so the entries are
+/// dropped and the built-in defaults (appended to `nameserver` by the
+/// caller) take over. In `nameserver-policy`, a domain left with no
+/// servers is removed, so it falls back to the main nameservers instead of
+/// erroring.
+fn strip_dhcp_nameservers(dns: &mut serde_yaml::Mapping) {
+    for key in [
+        "nameserver",
+        "fallback",
+        "default-nameserver",
+        "proxy-server-nameserver",
+    ] {
+        if let Some(serde_yaml::Value::Sequence(list)) = dns.get_mut(key) {
+            list.retain(|entry| !is_dhcp_nameserver(entry));
+        }
+    }
+    if let Some(serde_yaml::Value::Mapping(policy)) = dns.get_mut("nameserver-policy") {
+        policy.retain(|_, servers| match servers {
+            serde_yaml::Value::Sequence(list) => {
+                list.retain(|entry| !is_dhcp_nameserver(entry));
+                !list.is_empty()
+            }
+            single => !is_dhcp_nameserver(single),
+        });
+    }
+}
+
+/// Patch a Clash YAML config for iOS: strips `subscriptions`; keeps the
+/// user's `dns` block but pins the fake-ip keys the tunnel requires on top
+/// (supported user nameservers stay first, unsupported DHCP resolvers are
+/// omitted, and the built-in defaults are always appended);
+/// pins `mixed-port`, `allow-lan`, listener bind address, and DNS listen
+/// socket; declares a `GLOBAL` selector headed by the config's primary
+/// outbound (so `mode: global` proxies rather than black-holes); injects a
+/// hardened `external-controller` (random loopback port) + random bearer
+/// `secret`; injects `geox-url` when absent.
+///
+/// Writes NUL-terminated UTF-8 into `out`/`out_cap`. Returns bytes needed (excl
+/// NUL) on success; callers allocate `ret + 1` and retry if `ret >= out_cap`.
+/// Returns -1 on error (inspect `meow_core_last_error`).
+///
+/// # Safety
+/// `source_yaml` must be NUL-terminated UTF-8. `out` must reference `out_cap`
+/// bytes if non-NULL.
+#[no_mangle]
+pub unsafe extern "C" fn meow_patch_config(
+    source_yaml: *const c_char,
+    mixed_port: c_int,
+    allow_lan: c_int,
+    dns_port: c_int,
+    out: *mut c_char,
+    out_cap: c_int,
+) -> c_int {
+    let Some(yaml) = cstr_to_str(source_yaml) else {
+        set_error("source_yaml is null or not utf-8".into());
+        return -1;
+    };
+
+    let mut doc: serde_yaml::Value = match serde_yaml::from_str(yaml) {
+        Ok(v) => v,
+        Err(e) => {
+            set_error(format!("yaml parse error: {e}"));
+            return -1;
+        }
+    };
+
+    let Some(root) = doc.as_mapping_mut() else {
+        set_error("config root is not a yaml mapping".into());
+        return -1;
+    };
+
+    // Strip `sniffer` because iOS pins TLS SNI inspection on the mixed
+    // listener below. Strip `subscriptions` as well (handled app-side).
+    // `secret` is intentionally NOT stripped here — we overwrite it below with
+    // a per-install random token so the REST API on loopback is authenticated
+    // rather than open. `dns` is merged, not stripped — see below.
+    for key in ["sniffer", "subscriptions"] {
+        root.remove(serde_yaml::Value::String(key.to_string()));
+    }
+
+    // Before any group is appended, so the "first declared group" fallback
+    // still describes the user's own config.
+    if let Some(primary) = primary_proxy_target(root) {
+        inject_global_selector(root, &primary);
+    }
+
+    let port = if mixed_port > 0 {
+        mixed_port as i64
+    } else {
+        7890
+    };
+    let dns_port = if dns_port > 0 { dns_port as i64 } else { 1053 };
+    let bind_addr = if allow_lan != 0 {
+        "0.0.0.0"
+    } else {
+        "127.0.0.1"
+    };
+    root.insert(
+        serde_yaml::Value::String("mixed-port".into()),
+        serde_yaml::Value::Number(port.into()),
+    );
+    root.insert(
+        serde_yaml::Value::String("allow-lan".into()),
+        serde_yaml::Value::Bool(allow_lan != 0),
+    );
+    root.insert(
+        serde_yaml::Value::String("bind-address".into()),
+        serde_yaml::Value::String(bind_addr.into()),
+    );
+
+    // Start from the user's own `dns` block so their resolver choices
+    // (nameserver, fallback, fake-ip-filter, …) survive, then pin the keys the
+    // tunnel requires on top: the packet tunnel routes 28.0.0.0/8 into the tun
+    // and reverse-maps fake IPs back to hostnames, so `enhanced-mode`, the
+    // fake-ip range, and the listen socket are not user-configurable.
+    let mut dns = match root.remove(serde_yaml::Value::String("dns".into())) {
+        Some(serde_yaml::Value::Mapping(user_dns)) => user_dns,
+        _ => serde_yaml::Mapping::new(),
+    };
+    // Some subscriptions (Nexitally, for one) point `proxy-server-nameserver`
+    // (or `nameserver`/`fallback`) at the config's own `dns.listen` socket,
+    // e.g. `udp://127.0.0.1:7874` with `listen: 127.0.0.1:7874`, so proxy
+    // server hostnames resolve through the listener and pick up its
+    // fake-ip-filter + upstream choice. We pin `listen` to our own port
+    // below, which would leave those entries dialing a closed socket — and
+    // the proxy-server resolver has no fallback, so every node fails with
+    // "no address for <server>". Re-point them at the relocated listener.
+    let user_listen_port = dns
+        .get("listen")
+        .and_then(serde_yaml::Value::as_str)
+        .and_then(parse_listen_port);
+    if let Some(user_port) = user_listen_port {
+        rewrite_self_referential_nameservers(&mut dns, user_port, dns_port as u16);
+    }
+    for (k, v) in [
+        ("enable", serde_yaml::Value::Bool(true)),
+        (
+            "listen",
+            serde_yaml::Value::String(format!("{bind_addr}:{dns_port}")),
+        ),
+        ("enhanced-mode", serde_yaml::Value::String("fake-ip".into())),
+        ("store-fake-ip", serde_yaml::Value::Bool(true)),
+        (
+            "fake-ip-range",
+            serde_yaml::Value::String("28.0.0.0/8".into()),
+        ),
+    ] {
+        dns.insert(serde_yaml::Value::String(k.into()), v);
+    }
+    strip_dhcp_nameservers(&mut dns);
+    // Supported user-supplied nameservers stay first; the built-in defaults
+    // are always appended (deduped) so the tunnel keeps a known-good plain-UDP
+    // resolver even when the user's entries are unreachable, DoH-only, or were
+    // all DHCP resolvers dropped above.
+    let mut nameservers = match dns.get("nameserver") {
+        Some(serde_yaml::Value::Sequence(list)) => list.clone(),
+        _ => Vec::new(),
+    };
+    for default in ["119.29.29.29", "223.5.5.5"] {
+        let entry = serde_yaml::Value::String(default.into());
+        if !nameservers.contains(&entry) {
+            nameservers.push(entry);
+        }
+    }
+    dns.insert(
+        serde_yaml::Value::String("nameserver".into()),
+        serde_yaml::Value::Sequence(nameservers),
+    );
+    root.insert(
+        serde_yaml::Value::String("dns".into()),
+        serde_yaml::Value::Mapping(dns),
+    );
+
+    // Always inspect TLS ClientHello SNI on the ports used by HTTPS. The
+    // sniffer writes `metadata.sniff_host`, which domain rules prefer, while
+    // `override-destination: false` deliberately preserves the hostname that
+    // fake-IP reverse mapping recovered as the actual dial target.
+    let mut tls = serde_yaml::Mapping::new();
+    tls.insert(
+        serde_yaml::Value::String("ports".into()),
+        serde_yaml::Value::Sequence(vec![
+            serde_yaml::Value::Number(443.into()),
+            serde_yaml::Value::Number(8443.into()),
+        ]),
+    );
+    let mut sniff = serde_yaml::Mapping::new();
+    sniff.insert(
+        serde_yaml::Value::String("TLS".into()),
+        serde_yaml::Value::Mapping(tls),
+    );
+    let mut sniffer = serde_yaml::Mapping::new();
+    for (key, value) in [
+        ("enable", serde_yaml::Value::Bool(true)),
+        ("parse-pure-ip", serde_yaml::Value::Bool(true)),
+        ("override-destination", serde_yaml::Value::Bool(false)),
+        ("sniff", serde_yaml::Value::Mapping(sniff)),
+    ] {
+        sniffer.insert(serde_yaml::Value::String(key.into()), value);
+    }
+    root.insert(
+        serde_yaml::Value::String("sniffer".into()),
+        serde_yaml::Value::Mapping(sniffer),
+    );
+
+    // Harden the meow external-controller. It binds on loopback, but iOS
+    // does not isolate 127.0.0.1 per app — any other process on the device
+    // could otherwise reach an open control plane (read the running config +
+    // proxy servers, dump live connections/logs, switch proxies). Two
+    // mitigations, both sourced from a per-install credential file in the
+    // App Group container (readable only by this app + its extension):
+    //   1. a random high port instead of the well-known 9090, so the surface
+    //      isn't trivially discoverable, and
+    //   2. a strong random `secret`, which meow-api enforces as
+    //      `Authorization: Bearer <secret>` on every route.
+    // The credentials are minted once and persisted, so the app and the
+    // extension (which both invoke this patch) agree on the same pair.
+    let (api_port, api_secret) = api_credentials();
+    root.insert(
+        serde_yaml::Value::String("external-controller".into()),
+        serde_yaml::Value::String(format!("127.0.0.1:{api_port}")),
+    );
+    root.insert(
+        serde_yaml::Value::String("secret".into()),
+        serde_yaml::Value::String(api_secret),
+    );
+
+    let geox_key = serde_yaml::Value::String("geox-url".into());
+    if !root.contains_key(&geox_key) {
+        let mut geox = serde_yaml::Mapping::new();
+        for (k, v) in [
+            (
+                "geoip",
+                "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.metadb",
+            ),
+            (
+                "mmdb",
+                "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/country.mmdb",
+            ),
+            (
+                "geosite",
+                "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geosite.dat",
+            ),
+        ] {
+            geox.insert(
+                serde_yaml::Value::String(k.into()),
+                serde_yaml::Value::String(v.into()),
+            );
+        }
+        root.insert(geox_key, serde_yaml::Value::Mapping(geox));
+    }
+
+    match serde_yaml::to_string(&doc) {
+        Ok(s) => write_out(s.as_bytes(), out, out_cap),
+        Err(e) => {
+            set_error(format!("yaml serialize error: {e}"));
+            -1
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// tun2socks (NEPacketTunnelFlow bridge) — dispatches through local listeners
+// ---------------------------------------------------------------------------
+
+/// C-compatible egress callback. Called from the tun2socks tokio runtime
+/// whenever tun2socks produces a packet bound for Swift's `NEPacketTunnelFlow`.
+/// Swift guarantees `ctx` remains live between `meow_tun_start` and
+/// `meow_tun_stop`.
+pub type MeowWritePacket =
+    unsafe extern "C" fn(ctx: *mut std::os::raw::c_void, data: *const u8, len: usize);
+
+/// Start tun2socks with a Swift-owned egress callback. The ingest side is
+/// driven by `meow_tun_ingest`; the tunnel uses an internal mpsc queue so
+/// there's no file descriptor between Swift and Rust.
+///
+/// Returns 0 on success, -1 on error (inspect `meow_core_last_error`).
+///
+/// # Safety
+/// `ctx` is opaque to Rust but must remain valid for any dispatch that occurs
+/// between this call and `meow_tun_stop`. `write_cb` must be a non-null C
+/// function pointer that stays valid for the lifetime of the tunnel.
+#[no_mangle]
+pub unsafe extern "C" fn meow_tun_start(
+    ctx: *mut std::os::raw::c_void,
+    write_cb: MeowWritePacket,
+) -> c_int {
+    logging::bridge_log("meow_tun_start (direct callback)");
+    match tun2socks::start(ctx, write_cb) {
+        Ok(()) => 0,
+        Err(e) => {
+            logging::bridge_log(&format!("meow_tun_start ERROR: {}", e));
+            set_error(e);
+            -1
+        }
+    }
+}
+
+/// Feed a raw IP packet from `NEPacketTunnelFlow.readPackets` into the
+/// netstack. Returns 0 if the packet was queued (or dropped under backpressure),
+/// -1 if tun2socks isn't running. Non-blocking; callers shouldn't hold
+/// `readPackets` completion handlers waiting.
+///
+/// # Safety
+/// `data` must reference `len` bytes of readable memory.
+#[no_mangle]
+pub unsafe extern "C" fn meow_tun_ingest(data: *const u8, len: usize) -> c_int {
+    if data.is_null() || len == 0 {
+        return 0;
+    }
+    let slice = std::slice::from_raw_parts(data, len);
+    tun2socks::ingest(slice)
+}
+
+/// Stop the tun2socks task. Idempotent. Fire-and-forget: the run task drains
+/// on the runtime after this returns. Use only when the egress `ctx` is retained
+/// until a later start or explicit blocking stop.
+#[no_mangle]
+pub extern "C" fn meow_tun_stop() {
+    logging::bridge_log("meow_tun_stop");
+    tun2socks::stop();
+}
+
+/// Stop the tun2socks task and BLOCK until its run task (including the egress
+/// callback loop) has fully torn down. Once this returns, the egress write
+/// callback is guaranteed never to fire again, so the caller may safely
+/// release the `ctx` it passed to `meow_tun_start` — required for a terminal
+/// stop, where releasing the writer while the egress task is still draining
+/// is a use-after-free. Call from a NON-runtime thread (the Swift tunnel
+/// control queue). Idempotent.
+#[no_mangle]
+pub extern "C" fn meow_tun_stop_blocking() {
+    logging::bridge_log("meow_tun_stop_blocking");
+    tun2socks::stop_blocking();
+}
+
+/// Active end-to-end data-path health probe. Injects a synthetic in-TUN DNS
+/// query (IPv4/UDP from `src_ip`:53535 to `dns_ip`:53 — the same shape as a
+/// real resolver query) through the full pipeline: ingress channel → lwip
+/// stack driver → UDP accept → DNS dispatch → meow-dns listener → reply
+/// writer → lwip egress. The reply frame is intercepted before the egress
+/// callback, so Swift never sees probe traffic.
+///
+/// Pass the TUN's own IPv4 address as `src_ip` and the advertised in-TUN DNS
+/// server as `dns_ip` (the `NEPacketTunnelNetworkSettings` values). In
+/// fake-IP mode the answer is synthesised locally, so a healthy verdict does
+/// not depend on upstream reachability — safe to run while the physical
+/// interface is still coming up after a wake.
+///
+/// Returns 0 when a reply came back (path is live), -1 when tun2socks is not
+/// running, -2 when no reply arrived within `timeout_ms` (path or engine DNS
+/// listener wedged — restart the engine), -3 on invalid arguments.
+///
+/// BLOCKS up to `timeout_ms`; call from a NON-runtime thread (the Swift
+/// tunnel control queue), never from an engine callback. Callers must
+/// serialize probes.
+///
+/// # Safety
+/// `src_ip` and `dns_ip` must be NUL-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn meow_tun_health_probe(
+    src_ip: *const c_char,
+    dns_ip: *const c_char,
+    timeout_ms: c_int,
+) -> c_int {
+    let (Some(src), Some(dns)) = (cstr_to_str(src_ip), cstr_to_str(dns_ip)) else {
+        set_error("src_ip/dns_ip is null or not utf-8".into());
+        return -3;
+    };
+    let (Ok(src), Ok(dns)) = (
+        src.parse::<std::net::Ipv4Addr>(),
+        dns.parse::<std::net::Ipv4Addr>(),
+    ) else {
+        set_error(format!("invalid probe addresses: {src} / {dns}"));
+        return -3;
+    };
+    let rc = tun2socks::health_probe(src, dns, timeout_ms.max(1) as u64);
+    logging::bridge_log(&format!("meow_tun_health_probe -> {rc}"));
+    rc as c_int
+}
+
+/// Abort every in-flight TCP flow tracked by tun2socks. This is an
+/// emergency diagnostic/teardown hook for dropping stale flows without
+/// tearing down the engine or the TUN itself.
+///
+/// Each abort cancels the dispatch_tcp future, which drops the netstack
+/// stream side and (via `ConnectionGuard::drop` inside meow-tunnel)
+/// removes the corresponding entry from `Statistics.connections` —
+/// keeping our flow registry and meow's state in sync.
+///
+/// UDP flows are intentionally untouched: they're connectionless from
+/// the app's perspective, meow's NAT entries time out on their own,
+/// and aborting them mid-flight would pointlessly drop in-flight DNS
+/// replies during the interface flip.
+///
+/// Returns the number of flows aborted.
+#[no_mangle]
+pub extern "C" fn meow_tun_close_all_tcp_flows() -> c_int {
+    let n = tun2socks::close_all_tcp_flows();
+    logging::bridge_log(&format!("meow_tun_close_all_tcp_flows: aborted {n} flows"));
+    n as c_int
+}
+
+// The old `meow_tun_set_dial_deadline_ms` / `meow_tun_dial_deadline_ms`
+// FFI pair is gone: the per-flow "dial deadline" watchdog it configured
+// had been inert since the meow-listener refactor and was removed. Hung
+// DIRECT dials are now bounded inside the engine via the
+// `tcp-connect-timeout` config field that `prepare_ios_config` injects
+// (default 10 s) — see the note above the first-payload gate in
+// tun2socks.rs.
+
+/// Set the TCP first-payload wait budget, in milliseconds. lwIP completes
+/// the local 3-way handshake on its own, so without this gate every SYN
+/// entering the TUN created a real meow connection (SOCKS5 CONNECT through
+/// the rule engine) even when the app never sent a byte — port probes,
+/// Safari preconnect, cancelled happy-eyeballs racers. With the gate,
+/// `dispatch_tcp` only dials meow once the app's first payload arrives; a
+/// flow that closes before sending data never creates an internal
+/// connection. If the budget elapses with the flow still open, the dial
+/// proceeds without a payload so server-speaks-first protocols (STARTTLS
+/// mail, FTP control) keep working.
+///
+/// Default 1000 ms. Pass `0` to disable the gate (legacy dial-on-accept
+/// behaviour). Negative values are rejected.
+///
+/// Takes effect on the next flow accepted; does not affect in-flight
+/// flows.
+///
+/// Returns 0 on success, -1 on invalid input.
+#[no_mangle]
+pub extern "C" fn meow_tun_set_tcp_first_payload_wait_ms(ms: c_int) -> c_int {
+    if ms < 0 {
+        set_error("tcp first-payload wait must be >= 0".into());
+        return -1;
+    }
+    tun2socks::set_tcp_first_payload_wait_ms(ms as u64);
+    0
+}
+
+/// Read the currently-configured TCP first-payload wait budget, in
+/// milliseconds. `0` means the gate is disabled.
+#[no_mangle]
+pub extern "C" fn meow_tun_tcp_first_payload_wait_ms() -> c_int {
+    tun2socks::tcp_first_payload_wait_ms() as c_int
+}
+
+/// Set the per-UDP-session first-reply deadline, in milliseconds. The
+/// UDP counterpart of the engine-side `tcp-connect-timeout` bound —
+/// UDP doesn't connect, but iOS auto-bypass can silently drop
+/// the outbound sendto when the scoped-routing cache is stale, leaving
+/// the reply reader parked on `read_packet` forever. Bounding the
+/// *first* reply lets us evict a dead session so the next app datagram
+/// dispatches a fresh socket against a refreshed iOS route.
+///
+/// Default 10000 ms. Pass `0` to disable the deadline (legacy unbounded
+/// behaviour — relies on meow's NAT-table TTL to reap idle sessions).
+/// Negative values are rejected.
+///
+/// Takes effect on the next UDP session whose reply reader spawns;
+/// existing readers keep their captured deadline.
+///
+/// Returns 0 on success, -1 on invalid input.
+#[no_mangle]
+pub extern "C" fn meow_tun_set_udp_first_reply_deadline_ms(ms: c_int) -> c_int {
+    if ms < 0 {
+        set_error("udp first-reply deadline must be >= 0".into());
+        return -1;
+    }
+    tun2socks::set_udp_first_reply_deadline_ms(ms as u64);
+    0
+}
+
+/// Read the currently-configured UDP first-reply deadline, in
+/// milliseconds. `0` means the deadline is disabled.
+#[no_mangle]
+pub extern "C" fn meow_tun_udp_first_reply_deadline_ms() -> c_int {
+    tun2socks::udp_first_reply_deadline_ms() as c_int
+}
+
+/// Set the per-TCP-flow idle TTL, in milliseconds. The complement to
+/// the engine-side `tcp-connect-timeout` bound, for flows whose dial *succeeded* but
+/// then went permanently quiet — e.g. the upstream proxy EOF'd an idle
+/// connection and the (suspended) app never FINs back, parking the relay
+/// forever while it pins an accept-cap permit and an lwip pcb. Hours of
+/// such accumulation exhausts the accept cap and the tunnel stops
+/// passing new TCP flows ("connected but no traffic").
+///
+/// Default 600000 ms (10 min). Raised from the conventional 5-min proxy
+/// idle timeout so no-keepalive server-push channels with multi-minute quiet
+/// gaps aren't reaped while alive (2026-06-14 long-lived-TCP audit). Pass `0`
+/// to disable the sweeper. Negative values are rejected.
+///
+/// Takes effect on the sweeper's next 30 s tick; no restart needed.
+///
+/// Returns 0 on success, -1 on invalid input.
+#[no_mangle]
+pub extern "C" fn meow_tun_set_tcp_idle_ttl_ms(ms: c_int) -> c_int {
+    if ms < 0 {
+        set_error("tcp idle ttl must be >= 0".into());
+        return -1;
+    }
+    tun2socks::set_tcp_idle_ttl_ms(ms as u64);
+    0
+}
+
+/// Read the currently-configured TCP idle TTL, in milliseconds. `0`
+/// means the sweeper is disabled.
+#[no_mangle]
+pub extern "C" fn meow_tun_tcp_idle_ttl_ms() -> c_int {
+    tun2socks::tcp_idle_ttl_ms() as c_int
+}
+
+/// Enable or disable "block HTTP/3 (QUIC)". Default OFF (0): current
+/// behaviour is preserved. When enabled (non-zero) the tunnel drops
+/// outbound UDP datagrams to destination port 443 (QUIC's transport) and
+/// answers SVCB (64) / HTTPS (65) DNS queries NOERROR-empty from the
+/// intercept itself (no h3/SvcParams advertisement), forcing clients onto
+/// the A / fake-IPv4 + TCP path.
+///
+/// At the FFI layer the new value applies immediately to subsequent UDP
+/// datagrams and DNS queries (the backing flag is a plain atomic). The
+/// meow-ios app only invokes this at tunnel start, so toggling the user
+/// preference applies on the next tunnel (re)connect — same as allowLan.
+///
+/// Returns 0 unconditionally.
+#[no_mangle]
+pub extern "C" fn meow_tun_set_block_http3(enabled: c_int) -> c_int {
+    tun2socks::set_block_http3(enabled != 0);
+    0
+}
+
+/// Read whether "block HTTP/3 (QUIC)" is currently enabled. Returns 1 if
+/// enabled, 0 otherwise.
+#[no_mangle]
+pub extern "C" fn meow_tun_block_http3() -> c_int {
+    c_int::from(tun2socks::block_http3())
+}
+
+/// Enable or disable IPv6. Default OFF (0): current behaviour is preserved —
+/// the tunnel is IPv4-only and AAAA (28) DNS queries are answered NOERROR-empty
+/// from the intercept so clients fall back to the IPv4 path. When enabled
+/// (non-zero), AAAA queries are forwarded to the meow-dns listener like A
+/// queries (the resolver returns real upstream IPv6 addresses). The caller MUST
+/// also configure the TUN with an IPv6 address + default route (see
+/// `MWTunnelSettings`) so those v6 connections enter the netstack; otherwise
+/// they black-hole.
+///
+/// At the FFI layer the new value applies immediately to subsequent DNS
+/// queries (the backing flag is a plain atomic). The meow-ios app only invokes
+/// this at tunnel start, so toggling the user preference applies on the next
+/// tunnel (re)connect — same as allowLan / blockHTTP3.
+///
+/// Returns 0 unconditionally.
+#[no_mangle]
+pub extern "C" fn meow_tun_set_ipv6_enabled(enabled: c_int) -> c_int {
+    tun2socks::set_ipv6_enabled(enabled != 0);
+    0
+}
+
+/// Read whether IPv6 is currently enabled. Returns 1 if enabled, 0 otherwise.
+#[no_mangle]
+pub extern "C" fn meow_tun_ipv6_enabled() -> c_int {
+    c_int::from(tun2socks::ipv6_enabled())
+}
+
+/// Resident memory size (RSS) of the containing process, in bytes. RSS is
+/// distinct from task_vm_info.phys_footprint; do not interpret it as the
+/// extension's memory budget. Returns 0 on platforms where
+/// the mach call isn't available (non-Apple targets).
+#[no_mangle]
+pub extern "C" fn meow_resident_bytes() -> u64 {
+    rss::resident_bytes().unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{meow_patch_config, parse_listen_port};
+    use std::ffi::CString;
+
+    fn patch_config(yaml: &str, mixed_port: i32, allow_lan: i32, dns_port: i32) -> String {
+        let source = CString::new(yaml).expect("fixture yaml has no nul");
+        let needed = unsafe {
+            meow_patch_config(
+                source.as_ptr(),
+                mixed_port,
+                allow_lan,
+                dns_port,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        assert!(needed > 0);
+        let mut out = vec![0i8; needed as usize + 1];
+        let wrote = unsafe {
+            meow_patch_config(
+                source.as_ptr(),
+                mixed_port,
+                allow_lan,
+                dns_port,
+                out.as_mut_ptr(),
+                out.len() as i32,
+            )
+        };
+        assert_eq!(wrote, needed);
+        let bytes = out
+            .into_iter()
+            .take(wrote as usize)
+            .map(|b| b as u8)
+            .collect::<Vec<_>>();
+        String::from_utf8(bytes).expect("patched yaml is utf8")
+    }
+
+    #[test]
+    fn patch_config_repoints_nameservers_at_relocated_dns_listener() {
+        // Nexitally-style: proxy-server-nameserver dials the config's own
+        // listener. After we pin `listen` to our port the entry must follow.
+        let patched = patch_config(
+            r#"
+dns:
+  enable: true
+  listen: 127.0.0.1:7874
+  proxy-server-nameserver:
+    - udp://127.0.0.1:7874
+    - tcp://[::1]:7874#Proxies
+  default-nameserver:
+    - 223.5.5.5
+  nameserver:
+    - https://kfzzxcx.com:44443/dns-query/f2c7731d
+    - 127.0.0.1:7874
+    - 127.0.0.1:7875
+    - udp://10.0.0.1:7874
+    - https://127.0.0.1:7874/dns-query
+  fallback:
+    - localhost:7874
+  nameserver-policy:
+    "geosite:cn": udp://0.0.0.0:7874
+    "+.example.com": [127.0.0.1:7874, 1.1.1.1]
+proxies:
+  - {name: a, type: socks5, server: 127.0.0.1, port: 1}
+rules:
+  - MATCH,DIRECT
+"#,
+            7890,
+            0,
+            1053,
+        );
+        let doc: serde_yaml::Value = serde_yaml::from_str(&patched).expect("patched yaml");
+        let dns = doc["dns"].as_mapping().expect("dns mapping");
+        assert_eq!(dns["listen"].as_str(), Some("127.0.0.1:1053"));
+        let list = |key: &str| -> Vec<String> {
+            dns[key]
+                .as_sequence()
+                .expect(key)
+                .iter()
+                .map(|v| v.as_str().expect("string entry").to_string())
+                .collect()
+        };
+        assert_eq!(
+            list("proxy-server-nameserver"),
+            vec!["udp://127.0.0.1:1053", "tcp://127.0.0.1:1053#Proxies"]
+        );
+        assert_eq!(list("default-nameserver"), vec!["223.5.5.5"]);
+        assert_eq!(
+            list("nameserver"),
+            vec![
+                "https://kfzzxcx.com:44443/dns-query/f2c7731d",
+                "127.0.0.1:1053",
+                "127.0.0.1:7875",
+                "udp://10.0.0.1:7874",
+                "https://127.0.0.1:7874/dns-query",
+                "119.29.29.29",
+                "223.5.5.5",
+            ]
+        );
+        assert_eq!(list("fallback"), vec!["127.0.0.1:1053"]);
+        let policy = dns["nameserver-policy"].as_mapping().expect("policy");
+        assert_eq!(policy["geosite:cn"].as_str(), Some("udp://127.0.0.1:1053"));
+        assert_eq!(
+            policy["+.example.com"]
+                .as_sequence()
+                .expect("list")
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["127.0.0.1:1053", "1.1.1.1"]
+        );
+    }
+
+    #[test]
+    fn patch_config_leaves_nameservers_alone_without_user_listen() {
+        let patched = patch_config(
+            r#"
+dns:
+  enable: true
+  proxy-server-nameserver:
+    - udp://127.0.0.1:7874
+rules:
+  - MATCH,DIRECT
+"#,
+            7890,
+            0,
+            1053,
+        );
+        let doc: serde_yaml::Value = serde_yaml::from_str(&patched).expect("patched yaml");
+        assert_eq!(
+            doc["dns"]["proxy-server-nameserver"][0].as_str(),
+            Some("udp://127.0.0.1:7874")
+        );
+    }
+
+    #[test]
+    fn parse_listen_port_accepts_common_forms() {
+        assert_eq!(parse_listen_port("127.0.0.1:7874"), Some(7874));
+        assert_eq!(parse_listen_port("0.0.0.0:53"), Some(53));
+        assert_eq!(parse_listen_port("[::]:1053"), Some(1053));
+        assert_eq!(parse_listen_port(":7874"), Some(7874));
+        assert_eq!(parse_listen_port("7874"), Some(7874));
+        assert_eq!(parse_listen_port(""), None);
+        assert_eq!(parse_listen_port("127.0.0.1"), None);
+    }
+
+    #[test]
+    fn patch_config_pins_lan_mixed_and_dns_listener() {
+        let patched = patch_config(
+            r#"
+mixed-port: 1
+allow-lan: false
+bind-address: 127.0.0.1
+dns:
+  enable: false
+sniffer:
+  enable: false
+  sniff:
+    HTTP:
+      ports: [80]
+subscriptions:
+  old: {}
+rules:
+  - MATCH,DIRECT
+"#,
+            7899,
+            1,
+            1054,
+        );
+        assert!(patched.contains("mixed-port: 7899"));
+        assert!(patched.contains("allow-lan: true"));
+        assert!(patched.contains("bind-address: 0.0.0.0"));
+        assert!(patched.contains("listen: 0.0.0.0:1054"));
+        assert!(patched.contains("enhanced-mode: fake-ip"));
+        assert!(patched.contains("fake-ip-range: 28.0.0.0/8"));
+        assert!(!patched.contains("subscriptions:"));
+
+        let doc: serde_yaml::Value = serde_yaml::from_str(&patched).expect("patched yaml");
+        let root = doc.as_mapping().expect("mapping root");
+        let dns = root
+            .get("dns")
+            .and_then(serde_yaml::Value::as_mapping)
+            .expect("forced dns mapping");
+        assert_eq!(
+            dns.get("store-fake-ip")
+                .and_then(serde_yaml::Value::as_bool),
+            Some(true)
+        );
+        let sniffer = root
+            .get("sniffer")
+            .and_then(serde_yaml::Value::as_mapping)
+            .expect("forced sniffer mapping");
+        assert_eq!(
+            sniffer.get("enable").and_then(serde_yaml::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            sniffer
+                .get("parse-pure-ip")
+                .and_then(serde_yaml::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            sniffer
+                .get("override-destination")
+                .and_then(serde_yaml::Value::as_bool),
+            Some(false)
+        );
+        let sniff = sniffer
+            .get("sniff")
+            .and_then(serde_yaml::Value::as_mapping)
+            .expect("forced protocol map");
+        let ports: Vec<u64> = sniff
+            .get("TLS")
+            .and_then(serde_yaml::Value::as_mapping)
+            .and_then(|tls| tls.get("ports"))
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("forced TLS ports")
+            .iter()
+            .map(|value| value.as_u64().expect("numeric TLS port"))
+            .collect();
+        assert_eq!(ports, vec![443, 8443]);
+        assert!(
+            sniff.get("HTTP").is_none(),
+            "user HTTP sniffer was replaced"
+        );
+    }
+
+    #[test]
+    fn patch_config_respects_user_dns_but_pins_fake_ip() {
+        let patched = patch_config(
+            r#"
+dns:
+  enable: false
+  enhanced-mode: redir-host
+  listen: 0.0.0.0:53
+  fake-ip-range: 198.18.0.1/16
+  nameserver:
+    - 1.1.1.1
+    - https://dns.google/dns-query
+  fallback:
+    - 8.8.8.8
+  fake-ip-filter:
+    - '*.lan'
+rules:
+  - MATCH,DIRECT
+"#,
+            7890,
+            0,
+            1053,
+        );
+        let doc: serde_yaml::Value = serde_yaml::from_str(&patched).expect("patched yaml");
+        let dns = doc
+            .as_mapping()
+            .and_then(|root| root.get("dns"))
+            .and_then(serde_yaml::Value::as_mapping)
+            .expect("dns mapping");
+
+        // The tunnel-critical keys override whatever the user wrote.
+        assert_eq!(
+            dns.get("enable").and_then(serde_yaml::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            dns.get("enhanced-mode").and_then(serde_yaml::Value::as_str),
+            Some("fake-ip")
+        );
+        assert_eq!(
+            dns.get("fake-ip-range").and_then(serde_yaml::Value::as_str),
+            Some("28.0.0.0/8")
+        );
+        assert_eq!(
+            dns.get("listen").and_then(serde_yaml::Value::as_str),
+            Some("127.0.0.1:1053")
+        );
+
+        // The user's resolver choices survive the patch, ahead of the
+        // always-appended built-in defaults.
+        let nameservers: Vec<&str> = dns
+            .get("nameserver")
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("user nameservers kept")
+            .iter()
+            .filter_map(serde_yaml::Value::as_str)
+            .collect();
+        assert_eq!(
+            nameservers,
+            vec![
+                "1.1.1.1",
+                "https://dns.google/dns-query",
+                "119.29.29.29",
+                "223.5.5.5"
+            ]
+        );
+        assert!(dns.get("fallback").is_some(), "user fallback kept");
+        assert!(
+            dns.get("fake-ip-filter").is_some(),
+            "user fake-ip-filter kept"
+        );
+    }
+
+    #[test]
+    fn patch_config_normalizes_nameservers() {
+        fn nameservers(yaml: &str) -> Vec<String> {
+            let patched = patch_config(yaml, 7890, 0, 1053);
+            let doc: serde_yaml::Value = serde_yaml::from_str(&patched).expect("patched yaml");
+            doc.as_mapping()
+                .and_then(|root| root.get("dns"))
+                .and_then(serde_yaml::Value::as_mapping)
+                .and_then(|dns| dns.get("nameserver"))
+                .and_then(serde_yaml::Value::as_sequence)
+                .expect("nameserver list present")
+                .iter()
+                .filter_map(serde_yaml::Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        }
+
+        // Absent, null, or empty user lists get exactly the defaults.
+        for yaml in [
+            "rules:\n  - MATCH,DIRECT\n",
+            "dns:\n  nameserver: []\nrules:\n  - MATCH,DIRECT\n",
+            "dns:\n  nameserver:\nrules:\n  - MATCH,DIRECT\n",
+        ] {
+            assert_eq!(nameservers(yaml), ["119.29.29.29", "223.5.5.5"], "{yaml}");
+        }
+
+        // A default already listed by the user is not duplicated.
+        assert_eq!(
+            nameservers("dns:\n  nameserver:\n    - 223.5.5.5\nrules:\n  - MATCH,DIRECT\n"),
+            ["223.5.5.5", "119.29.29.29"]
+        );
+
+        // DHCP resolvers are unsupported on iOS regardless of their target.
+        assert_eq!(
+            nameservers("dns:\n  nameserver:\n    - dhcp://en0\nrules:\n  - MATCH,DIRECT\n"),
+            ["119.29.29.29", "223.5.5.5"]
+        );
+        assert_eq!(
+            nameservers(
+                r#"
+dns:
+  nameserver:
+    - dhcp://en0
+    - 1.1.1.1
+    - dhcp://system
+    - https://dns.google/dns-query
+rules:
+  - MATCH,DIRECT
+"#
+            ),
+            [
+                "1.1.1.1",
+                "https://dns.google/dns-query",
+                "119.29.29.29",
+                "223.5.5.5"
+            ]
+        );
+    }
+
+    #[test]
+    fn patch_config_drops_dhcp_from_every_dns_server_list() {
+        let patched = patch_config(
+            r#"
+dns:
+  default-nameserver:
+    - dhcp://en0
+    - 223.5.5.5
+  fallback:
+    - dhcp://system
+    - tls://1.1.1.1
+  proxy-server-nameserver:
+    - DHCP://en0
+  nameserver-policy:
+    corp.example: dhcp://en0
+    "+.lan":
+      - dhcp://en0
+    example.com:
+      - dhcp://en0
+      - 8.8.8.8
+rules:
+  - MATCH,DIRECT
+"#,
+            7890,
+            0,
+            1053,
+        );
+        let doc: serde_yaml::Value = serde_yaml::from_str(&patched).expect("patched yaml");
+        let dns = &doc["dns"];
+        let list = |key: &str| -> Vec<String> {
+            dns[key]
+                .as_sequence()
+                .map(|s| {
+                    s.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(list("default-nameserver"), ["223.5.5.5"]);
+        assert_eq!(list("fallback"), ["tls://1.1.1.1"]);
+        assert!(list("proxy-server-nameserver").is_empty());
+        let policy = dns["nameserver-policy"].as_mapping().expect("policy kept");
+        assert_eq!(policy.len(), 1, "domains left with no servers are dropped");
+        assert_eq!(
+            dns["nameserver-policy"]["example.com"][0].as_str(),
+            Some("8.8.8.8")
+        );
+    }
+
+    #[test]
+    fn patch_config_drops_dhcp_nameserver_and_loads_config() {
+        let tmp = tempfile::tempdir().expect("temp config dir");
+        let config_path = tmp.path().join("effective-config.yaml");
+        let patched = patch_config(
+            r#"
+dns:
+  nameserver:
+    - dhcp://en0
+  fallback:
+    - dhcp://system
+  nameserver-policy:
+    corp.example: dhcp://en0
+proxies:
+  - name: DIRECT
+    type: direct
+rules:
+  - MATCH,DIRECT
+"#,
+            7890,
+            0,
+            1053,
+        );
+        std::fs::write(&config_path, patched).expect("write effective config");
+        crate::get_engine_runtime()
+            .block_on(meow_config::load_config(
+                config_path.to_str().expect("utf-8 config path"),
+            ))
+            .expect("load DHCP-normalized config");
+    }
+
+    #[test]
+    fn patched_fake_ip_mapping_survives_config_reload() {
+        let tmp = tempfile::tempdir().expect("temp config dir");
+        let config_path = tmp.path().join("effective-config.yaml");
+        let patched = patch_config(
+            r#"
+proxies:
+  - name: DIRECT
+    type: direct
+rules:
+  - MATCH,DIRECT
+"#,
+            7890,
+            0,
+            1053,
+        );
+        std::fs::write(&config_path, patched).expect("write effective config");
+        let config_path = config_path.to_str().expect("utf-8 config path");
+
+        let first = crate::get_engine_runtime()
+            .block_on(meow_config::load_config(config_path))
+            .expect("load first config generation");
+        assert!(first.sniffer.enable);
+        assert_eq!(first.sniffer.tls_ports, vec![443, 8443]);
+        let fake_ip = crate::get_engine_runtime()
+            .block_on(first.dns.resolver.lookup_ipv4("wake.example"))
+            .expect("fake IP allocation");
+        assert_eq!(
+            first.dns.resolver.reverse_lookup(fake_ip).as_deref(),
+            Some("wake.example")
+        );
+        drop(first);
+
+        let second = crate::get_engine_runtime()
+            .block_on(meow_config::load_config(config_path))
+            .expect("reload config after engine restart");
+        assert!(second.dns.resolver.is_fake_ip(fake_ip));
+        assert_eq!(
+            second.dns.resolver.reverse_lookup(fake_ip).as_deref(),
+            Some("wake.example"),
+            "the reverse map used by stale post-wake destinations must survive restart"
+        );
+        let same_ip = crate::get_engine_runtime()
+            .block_on(second.dns.resolver.lookup_ipv4("wake.example"))
+            .expect("reloaded fake IP allocation");
+        assert_eq!(same_ip, fake_ip);
+    }
+
+    #[test]
+    fn patch_config_hardens_rest_api_with_random_port_and_secret() {
+        let patched = patch_config(
+            r#"
+external-controller: 127.0.0.1:9090
+secret: user-provided
+proxies: []
+"#,
+            7890,
+            0,
+            1053,
+        );
+        let doc: serde_yaml::Value = serde_yaml::from_str(&patched).expect("patched yaml");
+        let root = doc.as_mapping().expect("mapping root");
+        let controller = root
+            .get(serde_yaml::Value::String("external-controller".into()))
+            .and_then(serde_yaml::Value::as_str)
+            .expect("external-controller");
+        let port = controller
+            .strip_prefix("127.0.0.1:")
+            .expect("loopback controller")
+            .parse::<u16>()
+            .expect("controller port");
+        assert_ne!(port, 9090);
+        assert!(port > 0);
+
+        let secret = root
+            .get(serde_yaml::Value::String("secret".into()))
+            .and_then(serde_yaml::Value::as_str)
+            .expect("secret");
+        assert_ne!(secret, "user-provided");
+        assert_eq!(secret.len(), 64);
+        assert!(secret.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    /// Read the injected `GLOBAL` group's member list out of a patched config.
+    fn global_members(patched: &str) -> Vec<String> {
+        let doc: serde_yaml::Value = serde_yaml::from_str(patched).expect("patched yaml");
+        doc.as_mapping()
+            .and_then(|root| root.get("proxy-groups"))
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("proxy-groups")
+            .iter()
+            .find_map(|g| {
+                let g = g.as_mapping()?;
+                if g.get("name")?.as_str()? != "GLOBAL" {
+                    return None;
+                }
+                Some(
+                    g.get("proxies")?
+                        .as_sequence()?
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .expect("injected GLOBAL group")
+    }
+
+    /// The bug this guards: meow-config's auto-created `GLOBAL` sorts every
+    /// registry key, so the head of the list — the member a `select` group
+    /// dials when nothing is stored — lands on whatever sorts first. Here
+    /// that is the provider's quota pseudo-node, which routes nowhere, so
+    /// `mode: global` black-holed every connection.
+    #[test]
+    fn patch_config_heads_global_selector_with_the_match_target() {
+        let patched = patch_config(
+            r#"
+proxies:
+  - {name: "137.15 G | 500.00 G", type: ss, server: 1.1.1.1, port: 1, cipher: aes-128-gcm, password: p}
+  - {name: "HK 01", type: ss, server: 1.1.1.2, port: 1, cipher: aes-128-gcm, password: p}
+proxy-groups:
+  - {name: "AutoSelect", type: url-test, proxies: ["HK 01"]}
+  - {name: "Proxies", type: select, proxies: ["AutoSelect", "HK 01"]}
+rules:
+  - DOMAIN,example.com,DIRECT
+  - MATCH,Proxies
+"#,
+            7890,
+            0,
+            1053,
+        );
+        let members = global_members(&patched);
+        assert_eq!(
+            members.first().map(String::as_str),
+            Some("Proxies"),
+            "global mode must dispatch through the config's MATCH target, not \
+             the alphabetically-first registry key",
+        );
+        // mihomo's "GLOBAL lists everything" contract, minus the duplicate head.
+        assert!(members.contains(&"AutoSelect".to_string()));
+        assert!(members.contains(&"HK 01".to_string()));
+        assert!(members.contains(&"137.15 G | 500.00 G".to_string()));
+        assert!(members.contains(&"DIRECT".to_string()));
+        assert_eq!(
+            members.iter().filter(|n| *n == "Proxies").count(),
+            1,
+            "head must not be duplicated further down the list",
+        );
+    }
+
+    /// No `MATCH` target to follow (or one naming a built-in): fall back to the
+    /// first declared group, then the first proxy — never to `DIRECT`, which
+    /// would make global mode a no-op.
+    #[test]
+    fn patch_config_global_selector_falls_back_to_first_declared_outbound() {
+        let group_first = patch_config(
+            r#"
+proxies:
+  - {name: "HK 01", type: ss, server: 1.1.1.2, port: 1, cipher: aes-128-gcm, password: p}
+proxy-groups:
+  - {name: "Proxies", type: select, proxies: ["HK 01"]}
+rules:
+  - MATCH,DIRECT
+"#,
+            7890,
+            0,
+            1053,
+        );
+        assert_eq!(
+            global_members(&group_first).first().map(String::as_str),
+            Some("Proxies"),
+        );
+
+        let proxy_only = patch_config(
+            r#"
+proxies:
+  - {name: "HK 01", type: ss, server: 1.1.1.2, port: 1, cipher: aes-128-gcm, password: p}
+rules:
+  - MATCH,DIRECT
+"#,
+            7890,
+            0,
+            1053,
+        );
+        assert_eq!(
+            global_members(&proxy_only).first().map(String::as_str),
+            Some("HK 01"),
+        );
+    }
+
+    /// A config that declares its own `GLOBAL` owns it — and one with nothing
+    /// but built-ins to route to gets no injected group at all (meow-config's
+    /// auto-created selector is then the only sensible answer).
+    #[test]
+    fn patch_config_leaves_user_global_and_outbound_less_configs_alone() {
+        let user_global = patch_config(
+            r#"
+proxies:
+  - {name: "HK 01", type: ss, server: 1.1.1.2, port: 1, cipher: aes-128-gcm, password: p}
+proxy-groups:
+  - {name: "GLOBAL", type: select, proxies: ["DIRECT", "HK 01"]}
+rules:
+  - MATCH,HK 01
+"#,
+            7890,
+            0,
+            1053,
+        );
+        assert_eq!(
+            global_members(&user_global),
+            vec!["DIRECT".to_string(), "HK 01".to_string()],
+        );
+
+        let no_outbound = patch_config(
+            r#"
+proxies: []
+rules:
+  - MATCH,DIRECT
+"#,
+            7890,
+            0,
+            1053,
+        );
+        let doc: serde_yaml::Value = serde_yaml::from_str(&no_outbound).expect("patched yaml");
+        assert!(doc
+            .as_mapping()
+            .and_then(|root| root.get("proxy-groups"))
+            .is_none());
+    }
+
+    /// End-to-end over the real parser: what `Tunnel::resolve_proxy` reaches
+    /// for in `global` mode is `proxies["GLOBAL"]`, and an unselected
+    /// `SelectorGroup` dials its first member. Assert against the built
+    /// registry rather than the YAML so a change in meow-config's group
+    /// construction can't quietly re-break global mode.
+    #[test]
+    fn global_selector_resolves_to_the_primary_group_in_the_built_registry() {
+        let patched = patch_config(
+            r#"
+proxies:
+  - {name: "137.15 G | 500.00 G", type: ss, server: 1.1.1.1, port: 1, cipher: aes-128-gcm, password: p}
+  - {name: "HK 01", type: ss, server: 1.1.1.2, port: 1, cipher: aes-128-gcm, password: p}
+proxy-groups:
+  - {name: "Proxies", type: select, proxies: ["HK 01"]}
+rules:
+  - MATCH,Proxies
+"#,
+            7890,
+            0,
+            1053,
+        );
+        let rt = tokio::runtime::Runtime::new().expect("tokio rt");
+        let cfg = rt
+            .block_on(meow_config::load_config_from_str(&patched))
+            .expect("patched config loads");
+        let global = cfg.proxies.get("GLOBAL").expect("GLOBAL in registry");
+        // `current()` names the immediate member, not the recursive leaf —
+        // the group itself is the point: it keeps tracking whichever node the
+        // user picks in `Proxies`, which a frozen leaf reference would not.
+        assert_eq!(
+            global.current().as_deref(),
+            Some("Proxies"),
+            "global mode must dispatch through the config's own top selector",
+        );
+        assert_eq!(
+            cfg.proxies
+                .get("Proxies")
+                .and_then(|g| g.current())
+                .as_deref(),
+            Some("HK 01"),
+            "…which in turn resolves to its selected node",
+        );
+    }
+}

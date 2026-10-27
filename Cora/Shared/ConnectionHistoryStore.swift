@@ -1,7 +1,7 @@
 import Foundation
 import SQLite3
 
-/// A compact, cross-process representation of one Mihomo connection.  It is
+/// A compact, cross-process representation of one core connection. It is
 /// deliberately independent from the App UI models so the packet tunnel can
 /// persist it without loading SwiftUI or retaining a REST-sized snapshot.
 struct ConnectionHistoryRecord: Identifiable, Sendable {
@@ -97,8 +97,9 @@ struct ConnectionHistoryRecord: Identifiable, Sendable {
 
         id = identifier
         startedAt = Self.parseDate(start) ?? capturedAt
-        endedAt = nil
-        isActive = true
+        let closed = object["closed"] as? Bool ?? false
+        endedAt = closed ? (Self.parseDate(Self.string(object["end"])) ?? capturedAt) : nil
+        isActive = !closed
         upload = max(0, Self.int64(object["upload"]))
         download = max(0, Self.int64(object["download"]))
         network = Self.limit(Self.string(metadata["network"]), to: 24)

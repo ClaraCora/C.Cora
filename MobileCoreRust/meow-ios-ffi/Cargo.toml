@@ -1,0 +1,362 @@
+[package]
+name = "meow-ios-ffi"
+version = "0.1.0"
+edition = "2021"
+description = "meow-rs engine + tun2socks for meow-ios — C ABI, no Go, no JNI. TCP/UDP dispatch through local meow listeners."
+
+[lib]
+# `staticlib` is the iOS xcframework consumer; `rlib` exists so the
+# `macos-utun-harness` sibling crate (a developer-only end-to-end test
+# binary that runs the FFI against a real `utun` device on macOS) can
+# depend on us as a normal Rust dependency instead of going through
+# C-ABI relinking. Adds zero cost to the iOS build.
+crate-type = ["staticlib", "rlib"]
+
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+needless_return = "allow"
+
+[dependencies]
+cora-config = { path = '../cora-config' }
+meow-rules = { git = 'https://github.com/meow-rs/meow-rs', rev = 'fa7a7d6dc94e886ae0bc43eeb0227082ae5bf2e6' }
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time", "signal"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+parking_lot = "0.12"
+futures = "0.3"
+# Explicit pin — transitive through meow-tunnel, but engine.rs builds
+# `DashMap<String, Arc<ProxyProvider>>` for ApiServer::new and tun2socks.rs
+# uses the same NAT-key concrete type as meow-tunnel. Match upstream's 6.x.
+dashmap = "6"
+
+# Logging
+tracing = "0.1"
+# `fmt` powers the App Group file-log layer (file_log.rs); `env-filter` is the
+# pre-existing broadcast/oslog filter surface.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# Off-hot-path, bounded, lossy file writer for the always-on debug ring. The
+# worker thread keeps the wedge-prone tokio workers off disk I/O so a livelock
+# never blocks on logging (see project_lwip_timer_livelock).
+tracing-appender = "0.2"
+log = "0.4"
+
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+
+# Proxy detail probes (src/probe): HTTP heads and random payloads/ids. Both
+# already in the engine's dependency graph.
+httparse = "1"
+rand = "0.9"
+# Connection detail IP lookups (src/ip_info.rs) read the staged GeoX
+# databases from the app process. Already in the engine's graph (meow-rules'
+# GEOIP / IP-ASN rules) with `mmap` on, so this adds no code.
+maxminddb = { version = "0.27", features = ["mmap"] }
+
+# Low-level
+# Cargo.lock holds libc at 0.2.189 on purpose: 0.2.190 dropped
+# `RTM_IFINFO2` from its iOS/tvOS bindings, and sysinfo 0.32 (pulled by
+# meow-api for the host-metrics routes) still imports it, so a newer libc
+# fails `cargo build --target aarch64-apple-ios` inside sysinfo. Re-check
+# after a `cargo update` by building one Apple slice; lift the pin once
+# meow-rs moves to a sysinfo release that no longer needs the constant.
+libc = "0.2"
+anyhow = "1"
+
+# Subscription parsing (v2rayN URI list → Clash YAML)
+base64 = "0.22"
+url = "2"
+urlencoding = "2"
+
+# tun2socks: the madeye lwip fork, consumed as `meow-lwip` from the meow-rs
+# tree at the same tag as the engine crates below (upstream vendored it in
+# #411 because crates.io forbids git deps in published manifests). The
+# library name is still `lwip`, so `use lwip::...` is unchanged, and the
+# former `[patch.crates-io]` git pin on madeye/lwip 5f6f0dfe is gone.
+#
+# The fork replaces upstream ssrlive/lwip's shared-state-plus-LWIP_MUTEX
+# design with a single-owner core: one task (spawned by
+# NetStack::with_buffer_size, so it lands on the tun2socks runtime) makes
+# every lwIP C call, and TcpStream/TcpListener/UdpSocket/NetStack are pure
+# channel endpoints. There is no lock, which structurally removes the
+# 0.3.15 poll_next UAF under flow churn (handles never touch C state), the
+# spin-lock livelock family (project_lwip_timer_livelock), the
+# guard-held-across-Pending deadlock, and the hand-rolled waker bugs
+# (poll_flush Pending-without-waker). Frames are dropped (not deadlocked)
+# on pbuf_alloc failure; close-after-tx-shutdown sets TF_RXCLOSED so
+# FIN_WAIT_2 pcbs reap in 20 s instead of leaking; and, new in-tree since
+# the fork rev (meow-rs #696), tcp_recv_cb hands a fully closed pcb back to
+# lwIP on peer FIN, because lwIP frees TIME_WAIT pcbs without calling errf
+# and a later handle drop would touch a recycled memp slot. Consumer
+# contract: one live stack generation per process; run_tun2socks awaits
+# NetStack::core_done() at teardown to enforce it. crates.io `lwip` 0.4.0
+# has none of this.
+lwip = { package = "meow-lwip", git = "https://github.com/meow-rs/meow-rs", rev = "fa7a7d6dc94e886ae0bc43eeb0227082ae5bf2e6" }
+
+# Embedded meow-rs engine (formerly mihomo-rust, renamed upstream). Pinned
+# to a release tag normally; bump deliberately rather than tracking main.
+# Each crate is a workspace member of meow-rs/meow-rs.
+#
+# Rev fa7a7d6d (meow-rs main, 2026-10-22) = tag v0.26.1 plus #788, for the
+# Paw Print page. v0.26.1 only re-resolved meow-rs's own Cargo.lock, which
+# a git dependency does not use, so for this crate the change is #788
+# alone. Back to a tag at the next meow-rs release.
+# - Logbook (#769, ADR-0014): meow-common is built with `logbook`.
+#   engine.rs opens it (`logbook::apply`), records `engine_started` and
+#   `engine_stopped`, and calls `dropped_providers.record()` after each
+#   commit (`start` and `reload`), as meow-app and the Android FFI do.
+# - #788: on iOS and tvOS that SQLite is the system libsqlite3 (rusqlite's
+#   `bundled` is left off there), so every target that links MeowCore
+#   passes `-lsqlite3` (project.yml) and the PacketTunnel does not carry
+#   its own copy (about 1 MiB).
+#
+# Tag v0.26.0 (3e123030, 2026-10-21). iOS skipped v0.25.0, so this covers
+# v0.24.0 → v0.26.0. No embedder API change; engine.rs is untouched.
+# - TLS trust (#785, the eMudhra intermediate-key compromise): the engine
+#   verifies with its own built-in Mozilla roots (`webpki-root-certs`),
+#   never the iOS system store, so Apple's trust-store updates do not reach
+#   it. 1.0.10 drops "emSign ECC Root CA - G3"; 1.0.7 still trusted the
+#   compromised chain.
+# - `dialer-proxy` chains (#768, #773, #775, #777, #778): a front group
+#   skips members that cannot reach the chained server, keeps an outbound's
+#   chains on the member that carries them, checks a failing outbound
+#   through up to 3 other members before taking it down, and brings it back
+#   as soon as a chain probe reaches its server.
+# - Another resolver's fake IP (#770): a 198.18.0.0/15 literal outside our
+#   own pool, with no snooped name, dials the name the mixed listener's
+#   sniffer saw (iOS pins the TLS sniffer on), instead of black-holing.
+# - API (#780-#783): proxy providers report `subscriptionInfo`; every proxy
+#   reports `provider-name`, and `/proxies/{name}` (and its `/delay`) now
+#   resolve provider nodes; groups report `hidden` and `icon`; connection
+#   `dscp` is always a number; rule-provider `format` is `YamlRule` /
+#   `TextRule` / `MrsRule`; `GET /group/{name}/delay` answers with the
+#   members that passed and is a 504 only when none did. `PATCH /configs`
+#   also takes `tun` (#782); the NE has no TUN listener, and the app only
+#   patches `mode`.
+# - Windows TUN (#742) and a GUI's GeoIP/ASN file names (#784) do not
+#   apply.
+#
+# Tag v0.24.0 (b63ec4b5, 2026-10-18). What v0.23.1 → v0.24.0 changed for
+# this crate, all additive (no embedder API change):
+# - `GET /statistics` (#764): the upload and download each proxy carried
+#   since the engine started, TCP and UDP, with a group's traffic at the
+#   member that carried it and a `dialer-proxy` front hop also at the
+#   dialer group's member (#766). The totals count each connection once.
+# - UDP counts toward the totals (#764): the mixed listener's SOCKS5 UDP
+#   relay, which tun2socks's UDP sessions go through, now dials via the
+#   tunnel's counting helper, so `meow_engine_traffic` and `/traffic`
+#   include QUIC and other UDP flows.
+# - Connection notes name the `dialer-proxy` hop (#765).
+#
+# Tag v0.23.1 (9bf2445a, 2026-10-17) was v0.23.0 plus the iOS/tvOS build
+# fix (meow-rs#759: kcptun's `set_tclass_v6` is not in socket2 on Apple
+# mobile targets, so 0.22.0 and 0.23.0 do not compile for them) and zip 9
+# for the `external-ui-download` feature (#761), which this crate does not
+# enable. What the a663364 → v0.23.1 range changed for this crate:
+# - Embedder API (engine.rs): a routing install is one `update_routing`
+#   that also takes the build's `dialer_registry` (#533), the tunnel shares
+#   the config's resolver slot (`Tunnel::new_with_slot`, #514), and it is
+#   handed the process-lifetime provider dialer registry once, before the
+#   first install (`set_dialer_registry`, #489). `ApiServer::new` also takes
+#   the provider refresh supervisors, a DNS server handle and that registry.
+#   `engine::reload` now rebuilds against the live providers and commits
+#   them like `PUT /configs`, under the shared `CONFIG_MUTATION` lane.
+# - Providers are cache-first (#748/#750): a load serves the on-disk copy
+#   and leaves the remote fetch owed, which `engine::start` settles via the
+#   supervisors' `reconcile` and `spawn_deferred_initial_fetches`. Those
+#   supervisors also run `interval:` refresh for rule and proxy providers
+#   (#543/#625); nothing on iOS refreshed providers before. No
+#   `set_provider_fetch_deadline`: an uncached HTTP provider still holds
+#   `meow_engine_start` until its fetch finishes, as before.
+# - TLS: boring/tokio-boring 5.2 + quiche 0.30. quiche accepts boring
+#   >=4.19,<6, so one BoringSSL copy is shared, and boring-sys 5's native
+#   tvOS support retired the build-rust.sh / cmake toolchain workarounds.
+#   rustls left the engine in #500; the FFI's own rustls/ring provider
+#   install had no consumer left and is gone too.
+# - New built-ins COMPATIBLE, PASS and PASS-RULE with mihomo semantics;
+#   opt-in `connection-notes:` per-flow notes behind `GET /connections/{id}`
+#   (#754); `/connections` reports the node a group actually used.
+# - Fixes on paths the NE runs: simple-obfs empty Host for hosts Go would
+#   reject (#755), bare IPv6 nameserver literals (#738), bracketed IPv6
+#   `server:` (#701), REALITY honours `client-fingerprint` (#712),
+#   server-first protocols through SS outbounds (#695), and WebSocket write
+#   backpressure, mux stream cleanup and muxcool UDP size checks (#745).
+# - Size: meow-proxy's `ss` feature now carries in-process shadow-tls,
+#   restls and jls, and `kcptun` joined the defaults (KCP + smux + snappy +
+#   FEC). They run only when a profile uses them but ship in the NE binary;
+#   the archive job's PacketTunnel size gate is the check.
+#
+# Previous pin a663364 — meow-rs main 2026-09-07 (workspace version 0.21.2;
+# the v0.21.2 tag itself is a docs/version bump directly on 0.21.1, so
+# everything below is post-tag main). Bumped deliberately for the iOS
+# 1.7.0 TestFlight cut.
+#
+# What the 0.21.1 → a663364 range changes for this crate:
+# - TLS: BoringSSL is now the ONLY crypto library (#500). rustls, quinn,
+#   reqwest and the rcgen/x509-parser test stack are gone from the NE
+#   binary; hysteria2 moved onto quiche (BoringSSL-native QUIC + HTTP/3).
+#   `boring-tls` survives as a no-op alias for `tls` + `reality`, so the
+#   feature list below is unchanged. tokio-boring pinned back to 4.x.
+# - DNS: loopback upstreams are dialed from a loopback-bound socket
+#   (a7836e7) — the engine-side half of the self-referential
+#   `dns.listen` fix in lib.rs (`rewrite_self_referential_nameservers`);
+#   a wildcard-bound UDP socket cannot reach 127.0.0.1 inside the NE.
+#   Also prefer-IPv4 lookup + per-family cache + single-flight (#463),
+#   pooled plain `tcp://` exchanges (#462), `rule-set:` patterns in
+#   nameserver-policy (#465).
+# - Tunnel/proxy: every outbound dial bounded by a global timeout (#504),
+#   failing group members marked dead like mihomo onDialFailed (#488),
+#   dialer-proxy chaining via pluggable TcpDialer (Phase 1, #490),
+#   primary outbound chosen for GLOBAL (#501 — same problem
+#   meow_patch_config's GLOBAL head fix works around), live TCP streams
+#   cancelled on /connections deletion and reload (#509), UDP port-53
+#   traffic honours routing policy (#507), SOCKS5 UDP associations keep
+#   the authenticated identity (#508), idle control-plane work suspended
+#   (#483).
+# - Protocol fixes: AnyTLS server-pushed padding schemes + cancellation-
+#   safe session writes (#502/#503), Snell reuse lifecycle (#496),
+#   hysteria2 fingerprint pinning + transport hardening (#505).
+# - New: XHTTP transport with safe H2 shutdown (#512).
+# - Config API: `NamedListener.listener_type: ListenerType` became
+#   `spec: ListenerSpec` (#480); engine.rs matches on the enum and skips
+#   the new server-only `Shadowsocks` inbound (needs
+#   `listener-shadowsocks`, which the NE does not enable).
+#
+# v0.21.1 (bc38424b) added the AnyTLS handshake fix (#469): auth used to
+# go out as three TLS records; anytls-go / sing-box / sing-anytls read it
+# in one shot, saw only the 32-byte password hash, and EOF'd on padding
+# length. 0.21.1 coalesces the record.
+#
+# v0.21.0 retired the `ios/connect-timeout-0.20.1` side branch: its one
+# commit (the global `tcp-connect-timeout:` field wired into
+# DirectAdapter::with_connect_timeout, which `prepare_ios_config` injects
+# at 10 s) merged to main before 0.21.0.
+#
+# What the 0.20.1 → 0.21.0 range adds that this crate actually runs:
+# - sing-mux multiplexing (#412 series, #414–#418) plus Xray Mux.Cool,
+#   yamux, and h2mux. NOTE: `mux` is now in meow-proxy's *default*
+#   feature list, so it ships in the NE whether or not a profile uses it
+#   (h2 + yamux + tokio-util). Watch the 50 MB NE budget.
+# - Correctness fixes on paths this crate leans on: fake-IP lookup
+#   serialisation against a check-then-act double-allocate (#434/#436),
+#   fake-ip store compare-and-delete symmetry (#454), atomic UDP NAT-key
+#   claim with eviction gated on session identity (#432/#438 — same family
+#   as the project_udp_nat_dashmap_deadlock freeze), and h2 write-path
+#   partial-write / cancelled-datagram recovery (#423, #428, #441, #452).
+# - Hardening: REALITY pre-auth transcript cap + ordering (#430/#439),
+#   rule / proxy-provider path containment inside the cache dir
+#   (#429/#444, polish #458), direct HTTP fetch body caps for
+#   rule-provider and geodata (#431/#437), h2 bump to 0.4.16
+#   (RUSTSEC-2026-0258).
+#
+# BREAKING, and handled on our side: #429/#444/#458 turn an absolute or
+# `..`-escaping `rule-providers[*].path` / `proxy-providers[*].path` into a
+# hard `load_config` error — i.e. the tunnel would refuse to start on any
+# profile exported from a desktop client. `prepare_ios_config`
+# (engine.rs::contain_provider_paths) now rewrites those to `./<basename>`
+# inside the App Group container before the engine ever sees them; see
+# `escaping_provider_paths_are_contained` and
+# `prepared_escaping_provider_config_actually_loads`. We do not set
+# `SKIP_SAFE_PATH_CHECK` (the #458 mihomo-compat hatch) — rewriting keeps
+# the containment guarantee.
+# - DNS: proxy server hostnames now resolve through the configured DNS
+#   (#420). `engine::start` hands `dns.proxy_resolver` to
+#   `ResolverHostHook::new_with_proxy_resolver` so a
+#   `dns.proxy-server-nameserver` block is honoured instead of always
+#   going through the main resolver. Hosts-file domain aliases (#410).
+# - Interop: unquoted numeric `reality-opts.short-id` (#408/#446), XTLS
+#   Vision + mux gate narrowed to sing-mux so Mux.Cool is allowed
+#   (#424/#445).
+# - meow-rs vendored the madeye/lwip fork in-tree as `meow-lwip` (#409,
+#   #411), behind `listener-tun`, which this crate does not enable; this
+#   crate now consumes that vendored copy directly (see `lwip` above).
+#
+# Base 0.20.1 (c5557577) picked up the AnyTLS outbound + REALITY
+# rework (#377: REALITY moved in-tree onto rustls primitives so it no longer
+# needs boring-tls; VLESS over grpc/h2 unblocked, ALPN defaults to h2 for
+# those transports), DNS hardening (#368 upstream response validation, #362
+# eager-bind + panic-guarded workers, #351 real answer TTLs + reverse-cache
+# snapshot/restore, #350 #PROXY nameserver-policy fragments), listener HTTP
+# hardening (#369 strict byte header parsing, #372 Content-Length
+# normalization / TE rejection on HTTP/1.0, #370 close plain HTTP after one
+# request), delta-based traffic sampling (#357), /connections push-interval
+# 100ms floor (#359), group-level filter/exclude on provider members, and
+# the event-listener RUSTSEC-2026-0221 bump. Windows TUN-listener and
+# macOS pf/tproxy work in 0.19–0.20 doesn't affect this crate. Previous
+# pin 74e8083a (0.18.0) brought the rule-IR compilation series and the
+# VMess AEAD interop fix. meow-dns runs in fake-ip mode: the FFI config
+# parser pins `enhanced-mode: fake-ip` with `fake-ip-range: 28.0.0.0/8`
+# (the 2026-07-17 redir-host/DoT switch was reverted in PR #321).
+meow-common = { git = "https://github.com/meow-rs/meow-rs", rev = "fa7a7d6dc94e886ae0bc43eeb0227082ae5bf2e6", features = ["logbook"] }
+# `boring-tls` activates BoringSSL-backed TLS in meow-transport so ECH
+# (RFC 9460 SVCB / HTTPS ECHConfigList) and uTLS fingerprinting work for
+# proxy outbound. Without it, any proxy entry with `ech-opts:` set is
+# rejected at `TlsLayer::new` with `TransportError::Config` and the
+# fingerprint field falls back to a stub-warn. Cost: boring-sys vendors
+# BoringSSL, adding ~several MB to the stripped extension binary —
+# watch the 50 MB NE budget after a release archive.
+#
+# `anytls` opts into the AnyTLS outbound (off by default upstream, but part
+# of the meow-app `full` release bundle). Together with the defaults this
+# matches upstream's full protocol set: ss, trojan, vless (+vision,
+# +encryption, REALITY), vmess, snell, hysteria2, anytls, ech-tls-tunnel.
+# Deliberately NOT enabled: `listener-tun` (Windows TUN inbound — iOS uses
+# the lwip tun2socks path; would drag netstack-smoltcp/tun-rs dead weight
+# into the NE binary) and `external-ui-download` (force-disabled at compile
+# time on iOS; would only add the zip crate).
+#
+# meow-proxy's default `ss` feature pulls shadowsocks-rust, whose
+# `net/sys/unix/bsd/mod.rs` routes tvos/watchos to the macOS impl — but that
+# impl unconditionally imports `BatchRecvMessage` / `BatchSendMessage`, which
+# `net/udp.rs` cfg-gates to a narrower OS list. The two lists disagree, so
+# the crate doesn't compile for tvOS at all. Fixed upstream in
+# shadowsocks/shadowsocks-rust#2162, shipped in shadowsocks 1.25.0
+# (2026-08-26), which meow-proxy's `^1.21` resolves from the registry — the
+# git pin on the merge commit is gone. The registry release requires
+# shadowsocks-crypto ^0.8 (the pinned merge commit was on 0.7), so the AEAD
+# stack moved again; re-test Shadowsocks throughput and all three cipher
+# families on device after touching this.
+meow-config = { git = "https://github.com/meow-rs/meow-rs", rev = "fa7a7d6dc94e886ae0bc43eeb0227082ae5bf2e6", features = ["boring-tls", "anytls"] }
+meow-dns = { git = "https://github.com/meow-rs/meow-rs", rev = "fa7a7d6dc94e886ae0bc43eeb0227082ae5bf2e6" }
+meow-tunnel = { git = "https://github.com/meow-rs/meow-rs", rev = "fa7a7d6dc94e886ae0bc43eeb0227082ae5bf2e6" }
+meow-listener = { git = "https://github.com/meow-rs/meow-rs", rev = "fa7a7d6dc94e886ae0bc43eeb0227082ae5bf2e6", default-features = false, features = ["listener-mixed"] }
+meow-api = { git = "https://github.com/meow-rs/meow-rs", rev = "fa7a7d6dc94e886ae0bc43eeb0227082ae5bf2e6" }
+meow-proxy = { git = "https://github.com/meow-rs/meow-rs", rev = "fa7a7d6dc94e886ae0bc43eeb0227082ae5bf2e6" }
+# The probes' `https` requests (src/probe/http.rs) go through the engine's
+# own `TlsLayer`, as its latency test does. Already built for the outbounds
+# via meow-config's `boring-tls`; listed for the direct `use`.
+meow-transport = { git = "https://github.com/meow-rs/meow-rs", rev = "fa7a7d6dc94e886ae0bc43eeb0227082ae5bf2e6", default-features = false, features = ["tls"] }
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+oslog = { version = "0.2", default-features = false, features = ["logger"] }
+
+[build-dependencies]
+cbindgen = "0.29"
+
+[dev-dependencies]
+# `xdg_home_dir_tests` probes the env-var wire-up via meow-config's GeoIP
+# load path, and also opens the fixture MMDB directly (with `maxminddb`,
+# now a regular dependency for `ip_info`) to prove the env-derived path
+# resolves correctly.
+tempfile = "3"
+# The probe tests' fake UDP relays implement meow-common's async-trait
+# `ProxyPacketConn`.
+async-trait = "0.1"
+# `test-util` enables `#[tokio::test(start_paused = true)]`, which gives
+# the dial-watchdog regression tests virtual time. Without it the tests
+# would either block on real wall-clock sleeps (slow CI) or shrink their
+# budgets so far they'd flake under load. Dev-only — production builds
+# don't pull `test-util` so the time skew never reaches a real device.
+tokio = { version = "1", features = ["test-util", "macros", "rt", "rt-multi-thread", "sync", "time"] }
+
+[profile.release]
+# Reduce on-disk code size with LTO and size-optimized codegen. This does not
+# establish a resident-memory bound; phys_footprint still needs device testing.
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
