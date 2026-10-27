@@ -70,11 +70,6 @@ struct SubscriptionDetailView: View {
 
     @ViewBuilder private func configurationSection(_ sub: Subscription) -> some View {
         Section("配置行为") {
-            NavigationLink {
-                ProxyChainSettingsView(subscriptionID: sub.id)
-            } label: {
-                Label("节点前置代理", systemImage: "point.3.connected.trianglepath.dotted")
-            }
             Button {
                 if sub.isLocal {
                     showEditor = true

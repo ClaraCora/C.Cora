@@ -313,9 +313,7 @@ final class SettingsStore: ObservableObject {
     /// 序列化为下发给 NE 的 JSON。
     func asJSON(geoAvailable: Bool = true,
                 applyOverrides: Bool = true,
-                proxySelections: [String: String] = [:],
-                proxyChain: ProxyChainConfiguration = .init(),
-                subscriptionID: UUID? = nil) -> String {
+                proxySelections: [String: String] = [:]) -> String {
         let dict: [String: Any] = [
             "stack": Self.fixedStack,
             "ipv6": ipv6,
@@ -336,8 +334,6 @@ final class SettingsStore: ObservableObject {
             "mixedPort": mixedPort,
             "blockDirectSTUN": blockDirectSTUN,
             "proxySelections": proxySelections,
-            "proxyChain": proxyChain.dictionary,
-            "subscriptionID": subscriptionID?.uuidString ?? "",
             "applyOverrides": applyOverrides,
             "overrides": ConfigOverrideStore.shared.asDictionary(),
         ]

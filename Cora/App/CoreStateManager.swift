@@ -217,19 +217,14 @@ final class CoreStateManager: ObservableObject {
     /// 使用当前订阅和设置构造一次完整的 NE 启动请求。
     /// `configYAML` 仅用于失败回滚；正常连接和重载都明确传入当前订阅内容。
     private func startCurrentConfiguration(configYAML: String? = nil,
-                                           useCurrentConfiguration: Bool = true,
-                                           rollbackSettingsJSON: String? = nil) async throws {
+                                           useCurrentConfiguration: Bool = true) async throws {
         let yaml = useCurrentConfiguration ? SubscriptionStore.shared.activeYAML : configYAML
         // GEO 首次下载与定时更新在主 App 完成，避免 NE 启动阶段联网和冲高内存。
-        if useCurrentConfiguration {
-            try await GeoDatabaseManager.shared.prepareForConnection(configYAML: yaml)
-        }
-        let settings = rollbackSettingsJSON ?? SettingsStore.shared.asJSON(
+        try await GeoDatabaseManager.shared.prepareForConnection(configYAML: yaml)
+        let settings = SettingsStore.shared.asJSON(
             geoAvailable: AppGroup.containerURL != nil,
             applyOverrides: SubscriptionStore.shared.activeOverridesEnabled,
-            proxySelections: SubscriptionStore.shared.activeProxySelections,
-            proxyChain: useCurrentConfiguration ? SubscriptionStore.shared.activeProxyChain : .init(),
-            subscriptionID: SubscriptionStore.shared.selectedID)
+            proxySelections: SubscriptionStore.shared.activeProxySelections)
         let s = SettingsStore.shared
         let opts = TunnelManager.ProtocolOptions(
             includeAllNetworks: s.includeAllNetworks,
@@ -238,18 +233,8 @@ final class CoreStateManager: ObservableObject {
             excludeDeviceCommunication: s.excludeDeviceCommunication,
             enforceRoutes: s.enforceRoutes)
         try await tunnel.start(configYAML: yaml, settingsJSON: settings, protocolOptions: opts)
-        // Without an App Group, NE has its own successful snapshot for system
-        // reconnects; keep an App-side copy for explicit rollback as well.
-        if AppGroup.containerURL == nil {
-            try? RuntimeConfigurationSnapshotStorage.save(
-                RuntimeConfigurationSnapshot(configYAML: yaml ?? "", settingsJSON: settings),
-                in: RuntimeConfigurationSnapshotStorage.appDirectory)
-        }
-        if useCurrentConfiguration {
-            SettingsStore.shared.markConnectionSettingsApplied()
-            ConfigOverrideStore.shared.markConnectionSettingsApplied()
-        }
-        SubscriptionStore.shared.reconcileProxyChainApply()
+        SettingsStore.shared.markConnectionSettingsApplied()
+        ConfigOverrideStore.shared.markConnectionSettingsApplied()
     }
 
     /// 在运行中的 VPN 上应用刚刚成功下载的当前订阅。
@@ -318,9 +303,6 @@ final class CoreStateManager: ObservableObject {
     private func performConfigurationReload(previousYAML: String?) async -> Bool {
         guard status == .connected || status == .reasserting else { return true }
 
-        let lastSuccessful = RuntimeConfigurationSnapshotStorage.load(
-            in: RuntimeConfigurationSnapshotStorage.appDirectory)
-
         let alwaysOn = SettingsStore.shared.alwaysOnVPN
         var stopped = false
         lastError = nil
@@ -366,9 +348,8 @@ final class CoreStateManager: ObservableObject {
 
             // 新配置失败时，旧配置仍在内存中的副本只保留这一份；新 NE 已确认退出后才回滚。
             do {
-                try await startCurrentConfiguration(configYAML: lastSuccessful?.configYAML ?? previousYAML,
-                                                    useCurrentConfiguration: false,
-                                                    rollbackSettingsJSON: lastSuccessful?.settingsJSON)
+                try await startCurrentConfiguration(configYAML: previousYAML,
+                                                    useCurrentConfiguration: false)
                 guard await tunnel.waitUntilConnected() else {
                     throw NSError(domain: "Cora.CoreStateManager", code: -21,
                                   userInfo: [NSLocalizedDescriptionKey: "旧配置恢复后未进入已连接状态"])

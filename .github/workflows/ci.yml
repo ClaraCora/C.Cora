@@ -50,9 +50,6 @@ jobs:
       - name: Test single-node delay feedback
         run: bash scripts/test-proxy-controller.sh
 
-      - name: Test proxy chain settings and reconnect snapshots
-        run: bash scripts/test-proxy-chain.sh
-
       - name: Test PO0 whitelist settings
         run: bash scripts/test-po0-whitelist.sh
 

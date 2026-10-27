@@ -43,7 +43,6 @@ struct Subscription: Identifiable, Codable, Equatable, Sendable {
     var autoNamed: Bool       // 名称是否自动获取（用户没手填时才自动覆盖）
     var overrideEnabled: Bool // 是否应用全局固定覆写设置
     var proxySelections: [String: String] // 离线选择，下次连接时恢复
-    var proxyChain: ProxyChainConfiguration // App 元数据，不写入订阅 YAML
     /// 远程资源按「类型 + 名称」保存的准确刷新时间。旧订阅没有该字段时自动兼容。
     var resourceUpdatedAt: [String: Date]
 
@@ -53,7 +52,6 @@ struct Subscription: Identifiable, Codable, Equatable, Sendable {
          expire: Date? = nil, autoNamed: Bool = false,
          overrideEnabled: Bool = false,
          proxySelections: [String: String] = [:],
-         proxyChain: ProxyChainConfiguration = .init(),
          resourceUpdatedAt: [String: Date] = [:]) {
         self.id = id
         self.name = name
@@ -68,7 +66,6 @@ struct Subscription: Identifiable, Codable, Equatable, Sendable {
         self.autoNamed = autoNamed
         self.overrideEnabled = overrideEnabled
         self.proxySelections = proxySelections
-        self.proxyChain = proxyChain
         self.resourceUpdatedAt = resourceUpdatedAt
     }
 
@@ -97,7 +94,7 @@ struct Subscription: Identifiable, Codable, Equatable, Sendable {
     // 容错解码：旧版 subscriptions.json 没有新字段，缺失时给默认值，避免整体解码失败丢订阅。
     enum CodingKeys: String, CodingKey {
         case id, name, url, yaml, updatedAt, nodeCount, upload, download, total, expire, autoNamed
-        case overrideEnabled, proxySelections, proxyChain, resourceUpdatedAt
+        case overrideEnabled, proxySelections, resourceUpdatedAt
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -115,7 +112,6 @@ struct Subscription: Identifiable, Codable, Equatable, Sendable {
         overrideEnabled = try c.decodeIfPresent(Bool.self, forKey: .overrideEnabled) ?? false
         proxySelections = try c.decodeIfPresent([String: String].self,
                                                 forKey: .proxySelections) ?? [:]
-        proxyChain = try c.decodeIfPresent(ProxyChainConfiguration.self, forKey: .proxyChain) ?? .init()
         resourceUpdatedAt = try c.decodeIfPresent([String: Date].self,
                                                    forKey: .resourceUpdatedAt) ?? [:]
     }
@@ -138,7 +134,6 @@ final class SubscriptionStore: ObservableObject {
     @Published private(set) var refreshingResourceIDs: Set<String> = []
     @Published private(set) var providerCacheRevision = 0
     @Published private(set) var resourceUpdateRevision = 0
-    @Published private(set) var pendingProxyChainApply = false
 
     private struct RemoteResourceCacheKey: Equatable {
         let persistenceRevision: Int
@@ -191,22 +186,6 @@ final class SubscriptionStore: ObservableObject {
         selected?.proxySelections ?? [:]
     }
 
-    var activeProxyChain: ProxyChainConfiguration { selected?.proxyChain ?? .init() }
-
-    func setProxyChain(_ id: UUID, configuration: ProxyChainConfiguration) {
-        guard let index = subscriptions.firstIndex(where: { $0.id == id }),
-              subscriptions[index].proxyChain != configuration else { return }
-        lastError = nil
-        subscriptions[index].proxyChain = configuration
-        save()
-        reconcileProxyChainApply()
-    }
-
-    func reconcileProxyChainApply() {
-        let json = RuntimeConfigurationSnapshotStorage.settings(in: RuntimeConfigurationSnapshotStorage.appDirectory)
-        pendingProxyChainApply = activeProxyChain.requiresApply(settingsJSON: json, subscriptionID: selectedID)
-    }
-
     var hasRemoteSubscriptions: Bool {
         subscriptions.contains { !$0.isLocal }
     }
@@ -227,7 +206,6 @@ final class SubscriptionStore: ObservableObject {
         let sub = Subscription(name: auto ? "拉取中…" : trimmedName, url: trimmedURL, autoNamed: auto)
         subscriptions.append(sub)
         if selectedID == nil { selectedID = sub.id }
-        reconcileProxyChainApply()
         save()
         await refresh(sub.id)
     }
@@ -240,7 +218,6 @@ final class SubscriptionStore: ObservableObject {
         sub.updatedAt = Date()
         subscriptions.append(sub)
         if selectedID == nil { selectedID = sub.id }
-        reconcileProxyChainApply()
         lastError = Self.looksLikeClashYAML(yaml) ? nil
             : "已保存，但内容里没找到 proxies/proxy-groups，连接时可能无效"
         save()
@@ -334,14 +311,12 @@ final class SubscriptionStore: ObservableObject {
         remoteResourceCache.removeValue(forKey: id)
         subscriptions.removeAll { $0.id == id }
         if selectedID == id { selectedID = subscriptions.first?.id }
-        reconcileProxyChainApply()
         save()
     }
 
     func select(_ id: UUID) {
         selectedID = id
         save()
-        reconcileProxyChainApply()
     }
 
     func selectProxyOffline(subscriptionID: UUID, group: String, name: String) {
@@ -505,7 +480,9 @@ final class SubscriptionStore: ObservableObject {
             guard !providers.isEmpty else {
                 throw ProxyProviderRefreshError.noRemoteProviders
             }
-            var downloadedPayloads: [String: String] = [:]
+            var cached = Self.loadProviderCache(id)
+            var downloaded = 0
+            var refreshedProviderNames: [String] = []
             for provider in providers {
                 do {
                     guard let url = Self.remoteURL(provider.url) else {
@@ -528,42 +505,14 @@ final class SubscriptionStore: ObservableObject {
                     if let validationError = MihomoCore.validateProxyProviderPayload(payload) {
                         throw ProxyProviderRefreshError.invalidPayload(provider.name, validationError)
                     }
-                    guard let latestSubscription = subscriptions.first(where: { $0.id == id }),
-                          latestSubscription.yaml == subscription.yaml else {
-                        throw ProxyProviderRefreshError.configurationChanged(provider.name)
-                    }
-                    downloadedPayloads[provider.name] = payload
+                    cached[provider.name] = payload
+                    downloaded += 1
+                    refreshedProviderNames.append(provider.name)
                 } catch {
                     failures.append("\(provider.name)：\(error.localizedDescription)")
                 }
             }
-            if !downloadedPayloads.isEmpty {
-                guard let latestSubscription = subscriptions.first(where: { $0.id == id }),
-                      latestSubscription.yaml == subscription.yaml else {
-                    throw ProxyProviderRefreshError.configurationChanged("全部")
-                }
-                // Reload after the network awaits so concurrent per-Provider
-                // refreshes cannot be overwritten by this batch's stale copy.
-                var cached = Self.loadProviderCache(id)
-                var refreshedProviderNames: [String] = []
-                for name in downloadedPayloads.keys.sorted() {
-                    guard let payload = downloadedPayloads[name] else { continue }
-                    var candidate = cached
-                    candidate[name] = payload
-                    do {
-                        try validateProxyChainProviderUpdate(candidate,
-                                                             subscription: latestSubscription,
-                                                             providerName: name)
-                        cached = candidate
-                        refreshedProviderNames.append(name)
-                    } catch {
-                        failures.append("\(name)：\(error.localizedDescription)")
-                    }
-                }
-                guard !refreshedProviderNames.isEmpty else {
-                    lastError = failures.isEmpty ? nil : "Provider 刷新未全部完成：\n" + failures.joined(separator: "\n")
-                    return
-                }
+            if downloaded > 0 {
                 try Self.saveProviderCache(cached, id: id)
                 updateNodeCount(id, providerPayloads: cached)
                 recordResourceUpdates(subscriptionID: id,
@@ -721,16 +670,7 @@ final class SubscriptionStore: ObservableObject {
             }
             let payload = try await downloadProxyProvider(provider)
             var cached = Self.loadProviderCache(resource.subscriptionID)
-            guard let latestSubscription = subscriptions.first(where: { $0.id == resource.subscriptionID }),
-                  latestSubscription.yaml == subscription.yaml else {
-                throw ProxyProviderRefreshError.configurationChanged(provider.name)
-            }
-            var candidate = cached
-            candidate[provider.name] = payload
-            try validateProxyChainProviderUpdate(candidate,
-                                                 subscription: latestSubscription,
-                                                 providerName: provider.name)
-            cached = candidate
+            cached[provider.name] = payload
             try Self.saveProviderCache(cached, id: resource.subscriptionID)
             updateNodeCount(resource.subscriptionID, providerPayloads: cached)
             didRefreshPayload = true
@@ -764,28 +704,6 @@ final class SubscriptionStore: ObservableObject {
             }
         }
         lastError = failures.isEmpty ? nil : "部分 Proxy Provider 刷新失败：\n" + failures.joined(separator: "\n")
-    }
-
-    /// Reject a newly downloaded Provider payload before replacing the last
-    /// locally usable copy if it conflicts with this subscription's saved chain.
-    private func validateProxyChainProviderUpdate(_ payloads: [String: String],
-                                                  subscription: Subscription,
-                                                  providerName: String) throws {
-        guard subscription.proxyChain.enabled else { return }
-        let encoder = JSONEncoder()
-        guard let data = try? encoder.encode(payloads),
-              let payloadsJSON = String(data: data, encoding: .utf8) else {
-            throw ProxyProviderRefreshError.proxyChain(providerName, "Provider 缓存无法编码")
-        }
-        let response = MihomoCore.validateProxyChain(configYAML: subscription.yaml,
-                                                     providerPayloadsJSON: payloadsJSON,
-                                                     chainJSON: subscription.proxyChain.json)
-        guard let validation = try? JSONDecoder().decode(ProxyChainValidation.self, from: response) else {
-            throw ProxyProviderRefreshError.proxyChain(providerName, "前置设置校验失败")
-        }
-        if let error = validation.error {
-            throw ProxyProviderRefreshError.proxyChain(providerName, error)
-        }
     }
 
     func refreshRuleProvider(_ resource: RemoteResource) async {
@@ -1179,7 +1097,6 @@ final class SubscriptionStore: ObservableObject {
         if let decoded = try? JSONDecoder().decode(PersistedSubscriptions.self, from: data) {
             subscriptions = decoded.subscriptions
             selectedID = decoded.selectedID
-            reconcileProxyChainApply()
         }
     }
 
@@ -1313,8 +1230,6 @@ private enum ProxyProviderRefreshError: LocalizedError {
     case notFound(String)
     case invalidURL(String)
     case invalidPayload(String, String)
-    case configurationChanged(String)
-    case proxyChain(String, String)
     case manifest(String)
 
     var errorDescription: String? {
@@ -1327,10 +1242,6 @@ private enum ProxyProviderRefreshError: LocalizedError {
             return "Provider \(name) 的链接无效"
         case .invalidPayload(let name, let reason):
             return "Provider \(name) 内容无效：\(reason)"
-        case .configurationChanged(let name):
-            return "Provider \(name) 刷新期间配置已变化，请重试"
-        case .proxyChain(let name, let reason):
-            return "Provider \(name) 与节点前置设置冲突：\(reason)"
         case .manifest(let reason):
             return "解析 Provider 配置失败：\(reason)"
         }
