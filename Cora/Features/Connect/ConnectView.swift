@@ -5,7 +5,6 @@ import UIKit
 /// 总览：以连接控制为中心，运行状态与流量指标围绕主操作展开。
 struct ConnectView: View {
     @EnvironmentObject private var core: CoreStateManager
-    @EnvironmentObject private var geoDatabase: GeoDatabaseManager
     @ObservedObject var connections: ConnectionsController
     @State private var memoryReleaseFeedback: String?
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
@@ -144,6 +143,7 @@ private struct OverviewConnectionCard: View {
 private struct ConnectionHero: View {
     let onMemoryRelease: (String) -> Void
     @EnvironmentObject private var core: CoreStateManager
+    @EnvironmentObject private var geoDatabase: GeoDatabaseManager
     @EnvironmentObject private var kernel: KernelController
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var ripple = false

@@ -102,7 +102,11 @@ class MigrationTests(unittest.TestCase):
         bridge = (ROOT / "Cora/Core/CoraCoreBridge.swift").read_text(encoding="utf-8")
         self.assertIn('settings["systemDNS"] = ["192.0.2.1"]', bridge)
         connect = (ROOT / "Cora/Features/Connect/ConnectView.swift").read_text(encoding="utf-8")
-        self.assertIn("geoDatabase.isUpdating", connect)
+        hero = connect.split("private struct ConnectionHero", 1)[1].split(
+            "private func releaseMemory", 1
+        )[0]
+        self.assertIn("@EnvironmentObject private var geoDatabase: GeoDatabaseManager", hero)
+        self.assertIn("geoDatabase.isUpdating", hero)
 
     def test_windows_tool_stays_untracked(self):
         files = subprocess.check_output(["git", "ls-files", "--", "WindowsConfigTool/"], cwd=ROOT)
