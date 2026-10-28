@@ -795,15 +795,58 @@ mod tests {
     fn prepared_runtime_starts_with_internal_socks_and_packet_callbacks() {
         use std::io::{Read, Write};
         use std::net::{TcpListener, TcpStream};
+        use std::process::{Command, Stdio};
         use std::time::Duration;
         unsafe extern "C" fn discard(_: *mut std::ffi::c_void, _: *const u8, _: usize) {}
         struct Stop;
         impl Drop for Stop {
             fn drop(&mut self) {
+                eprintln!("lifecycle-test: stopping tun2socks");
                 crate::meow_tun_stop_blocking();
+                eprintln!("lifecycle-test: stopping engine");
                 crate::meow_engine_stop();
+                eprintln!("lifecycle-test: cleanup complete");
             }
         }
+
+        // Engine, logbook and tun2socks all own process-wide OnceLock state.
+        // Keep this end-to-end test out of the parent test process so an
+        // earlier runtime/provider test cannot contaminate it. The child also
+        // gives CI live stage markers and a hard deadline for native hangs.
+        const CHILD: &str = "CORA_LIFECYCLE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let executable = std::env::current_exe().expect("test executable path");
+            let mut child = Command::new(executable)
+                .args([
+                    "--exact",
+                    "cora::tests::prepared_runtime_starts_with_internal_socks_and_packet_callbacks",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .expect("spawn isolated lifecycle test process");
+            let deadline = Instant::now() + Duration::from_secs(120);
+            loop {
+                if let Some(status) = child.try_wait().expect("poll lifecycle test child") {
+                    assert!(
+                        status.success(),
+                        "isolated lifecycle test exited with {status}"
+                    );
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("isolated lifecycle test exceeded 120s; inspect stage markers above");
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+
+        eprintln!("lifecycle-test: creating isolated home");
         let home = tempfile::tempdir().unwrap();
         let dir = CString::new(home.path().to_str().unwrap()).unwrap();
         unsafe { crate::meow_core_set_home_dir(dir.as_ptr()) };
@@ -817,13 +860,16 @@ mod tests {
         );
         input["mixedPort"] = json!(mixed_port);
         input["dnsPort"] = json!(dns.local_addr().unwrap().port());
+        eprintln!("lifecycle-test: preparing runtime config");
         let prepared = prepare(&input).unwrap();
         let config = home.path().join("runtime.yaml");
         std::fs::write(&config, text(&prepared, "yaml")).unwrap();
         let path = CString::new(config.to_str().unwrap()).unwrap();
         drop((mixed, dns));
         let _stop = Stop;
+        eprintln!("lifecycle-test: engine start begin");
         assert_eq!(unsafe { crate::meow_engine_start(path.as_ptr()) }, 0);
+        eprintln!("lifecycle-test: engine start complete");
         // Check actual loopback SOCKS negotiation, including an authenticated
         // source config, before feeding packets into the native generation.
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -836,6 +882,7 @@ mod tests {
                 }
             }
         };
+        eprintln!("lifecycle-test: mixed listener accepting");
         socket
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
@@ -843,17 +890,22 @@ mod tests {
         let mut reply = [0; 2];
         socket.read_exact(&mut reply).unwrap();
         assert_eq!(reply, [5, 0]);
+        eprintln!("lifecycle-test: SOCKS handshake complete");
         drop(socket);
+        eprintln!("lifecycle-test: tun2socks start begin");
         assert_eq!(
             unsafe { crate::meow_tun_start(std::ptr::null_mut(), discard) },
             0
         );
+        eprintln!("lifecycle-test: tun2socks start complete");
         let src = CString::new("198.18.0.1").unwrap();
         let dst = CString::new("198.18.0.2").unwrap();
+        eprintln!("lifecycle-test: health probe begin");
         assert_eq!(
             unsafe { crate::meow_tun_health_probe(src.as_ptr(), dst.as_ptr(), 3000) },
             0
         );
+        eprintln!("lifecycle-test: health probe complete");
     }
     #[test]
     fn provider_download_headers_and_failed_refresh_keep_last_good_bytes() {

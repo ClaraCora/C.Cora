@@ -52,10 +52,11 @@ jobs:
           python3 scripts/test-meow-migration.py
           python3 scripts/test-ipa-release.py
       - name: Test FFI lifecycle, packets and traffic
+        timeout-minutes: 10
         run: |
           cd MobileCoreRust/meow-ios-ffi
-          # Tests share process-wide engine/home/runtime state.
-          cargo test --locked --lib -- --test-threads=1
+          # Some tests touch process-wide engine/home/runtime state; keep them serial.
+          cargo test --locked --lib -- --nocapture --test-threads=1
       - name: Test Swift persistence and control protocol
         run: |
           bash scripts/test-connection-history.sh

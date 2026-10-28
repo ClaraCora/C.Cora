@@ -63,6 +63,27 @@ class MigrationTests(unittest.TestCase):
         for script in ["test-core-compatibility.sh", "verify-meow-app.sh"]:
             self.assertTrue((ROOT / "scripts" / script).is_file())
 
+    def test_ffi_ci_lifecycle_test_is_isolated_and_bounded(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        marker = "- name: Test FFI lifecycle, packets and traffic"
+        self.assertIn(marker, workflow)
+        ffi_step = workflow.split(marker, 1)[1].split("- name:", 1)[0]
+        self.assertIn("timeout-minutes: 10", ffi_step)
+        self.assertIn("--nocapture --test-threads=1", ffi_step)
+
+        source = (ROOT / "MobileCoreRust/meow-ios-ffi/src/cora.rs").read_text(encoding="utf-8")
+        self.assertIn('const CHILD: &str = "CORA_LIFECYCLE_TEST_CHILD";', source)
+        self.assertIn("Duration::from_secs(120)", source)
+        for stage in [
+            "engine start begin",
+            "SOCKS handshake complete",
+            "tun2socks start begin",
+            "health probe begin",
+            "stopping tun2socks",
+            "stopping engine",
+        ]:
+            self.assertIn(f"lifecycle-test: {stage}", source)
+
     def test_windows_tool_stays_untracked(self):
         files = subprocess.check_output(["git", "ls-files", "--", "WindowsConfigTool/"], cwd=ROOT)
         self.assertEqual(files.strip(), b"", "WindowsConfigTool must not enter this migration")

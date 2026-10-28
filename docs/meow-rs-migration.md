@@ -62,7 +62,7 @@ python scripts/test-ipa-release.py
 
 完整 FFI 主机测试需要本机 C/C++ 工具链、CMake、libclang；Windows 还需 NASM。
 测试没有外部代理账号，仅验证主机可覆盖的配置、生命周期、队列、回调和本机数据路径。
-FFI 测试共享进程级运行时和 home 状态，必须串行。
+FFI 测试中涉及进程级运行时和 home 状态的端到端生命周期用例会在独立子进程运行，避免被其他测试污染；子进程 120 秒无响应会被终止，并输出最后到达的阶段标记。CI 的 FFI 步骤另有 10 分钟总超时，并用 `--nocapture` 保留诊断输出。
 
 macOS 再执行 README 中全部 Swift 回归脚本、XcodeGen、两个 Apple Rust slices 和标准 App 构建。
 `scripts/verify-meow-app.sh` 检查三个 bundle 的 iOS 18 下限、纯 arm64、两个扩展、系统 SQLite、旧 Go 框架/符号及 Tunnel 50 MiB 磁盘大小上限。
