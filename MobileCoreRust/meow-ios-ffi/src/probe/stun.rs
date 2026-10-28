@@ -516,7 +516,7 @@ mod tests {
     // An RFC 5780 server on loopback: 127.0.0.1 and 127.0.0.2, two ports each
     // -----------------------------------------------------------------------
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug)]
     enum ServerMode {
         Full,
         /// Answers without OTHER-ADDRESS, as a plain server does.
@@ -525,78 +525,110 @@ mod tests {
         RefusesChange,
     }
 
-    async fn stun_server(mode: ServerMode) -> SocketAddr {
+    async fn stun_server(mode: ServerMode) -> Option<SocketAddr> {
+        eprintln!("STUN test server setup: mode={mode:?}");
         let (a1, a2): (IpAddr, IpAddr) =
             ("127.0.0.1".parse().unwrap(), "127.0.0.2".parse().unwrap());
-        let (sockets, p1, p2) = loop {
-            let first = UdpSocket::bind((a1, 0)).await.unwrap();
+        const MAX_BIND_ATTEMPTS: usize = 16;
+        let mut last_error = None;
+        for _ in 0..MAX_BIND_ATTEMPTS {
+            let first = UdpSocket::bind((a1, 0))
+                .await
+                .unwrap_or_else(|error| panic!("cannot bind STUN test loopback {a1}: {error}"));
             let p1 = first.local_addr().unwrap().port();
-            let second = UdpSocket::bind((a1, 0)).await.unwrap();
-            let p2 = second.local_addr().unwrap().port();
-            let (Ok(third), Ok(fourth)) = (
-                UdpSocket::bind((a2, p1)).await,
-                UdpSocket::bind((a2, p2)).await,
-            ) else {
-                continue;
-            };
-            break ([first, second, third, fourth].map(Arc::new), p1, p2);
-        };
-        let by_addr: HashMap<SocketAddr, Arc<UdpSocket>> = sockets
-            .iter()
-            .map(|s| (s.local_addr().unwrap(), Arc::clone(s)))
-            .collect();
-        for socket in sockets {
-            let by_addr = by_addr.clone();
-            tokio::spawn(async move {
-                let me = socket.local_addr().unwrap();
-                let mut buf = [0u8; 512];
-                while let Ok((n, from)) = socket.recv_from(&mut buf).await {
-                    let request = &buf[..n];
-                    let tid: [u8; 12] = request[8..20].try_into().unwrap();
-                    let change = if n >= 28 {
-                        u32::from_be_bytes(request[24..28].try_into().unwrap())
-                    } else {
-                        0
-                    };
-                    let flip_ip = |ip: IpAddr| if ip == a1 { a2 } else { a1 };
-                    let flip_port = |p: u16| if p == p1 { p2 } else { p1 };
-                    if change != 0 && matches!(mode, ServerMode::RefusesChange) {
-                        let mut error = Vec::new();
-                        error.extend_from_slice(&BINDING_ERROR.to_be_bytes());
-                        error.extend_from_slice(&0u16.to_be_bytes());
-                        error.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
-                        error.extend_from_slice(&tid);
-                        let _ = socket.send_to(&error, from).await;
-                        continue;
-                    }
-                    let reply_from = SocketAddr::new(
-                        if change & CHANGE_IP != 0 {
-                            flip_ip(me.ip())
-                        } else {
-                            me.ip()
-                        },
-                        if change & CHANGE_PORT != 0 {
-                            flip_port(me.port())
-                        } else {
-                            me.port()
-                        },
-                    );
-                    let other = SocketAddr::new(flip_ip(me.ip()), flip_port(me.port()));
-                    let mut attrs = xor_address_attr(from);
-                    if !matches!(mode, ServerMode::Plain) {
-                        attrs.extend_from_slice(&address_attr(ATTR_OTHER_ADDRESS, other));
-                    }
-                    let mut reply = Vec::new();
-                    reply.extend_from_slice(&BINDING_SUCCESS.to_be_bytes());
-                    reply.extend_from_slice(&(attrs.len() as u16).to_be_bytes());
-                    reply.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
-                    reply.extend_from_slice(&tid);
-                    reply.extend_from_slice(&attrs);
-                    let _ = by_addr[&reply_from].send_to(&reply, from).await;
-                }
+            let second = UdpSocket::bind((a1, 0)).await.unwrap_or_else(|error| {
+                panic!("cannot bind second STUN test port on {a1}: {error}")
             });
+            let p2 = second.local_addr().unwrap().port();
+            let third = match UdpSocket::bind((a2, p1)).await {
+                Ok(socket) => socket,
+                Err(error) if error.kind() == std::io::ErrorKind::AddrNotAvailable => {
+                    eprintln!(
+                        "STUN tests requiring a second loopback address are skipped: {a2} is unavailable ({error})"
+                    );
+                    return None;
+                }
+                Err(error) => {
+                    last_error = Some(error.to_string());
+                    continue;
+                }
+            };
+            let fourth = match UdpSocket::bind((a2, p2)).await {
+                Ok(socket) => socket,
+                Err(error) if error.kind() == std::io::ErrorKind::AddrNotAvailable => {
+                    eprintln!(
+                        "STUN tests requiring a second loopback address are skipped: {a2} is unavailable ({error})"
+                    );
+                    return None;
+                }
+                Err(error) => {
+                    last_error = Some(error.to_string());
+                    continue;
+                }
+            };
+            let sockets = [first, second, third, fourth].map(Arc::new);
+            let by_addr: HashMap<SocketAddr, Arc<UdpSocket>> = sockets
+                .iter()
+                .map(|s| (s.local_addr().unwrap(), Arc::clone(s)))
+                .collect();
+            for socket in sockets {
+                let by_addr = by_addr.clone();
+                tokio::spawn(async move {
+                    let me = socket.local_addr().unwrap();
+                    let mut buf = [0u8; 512];
+                    while let Ok((n, from)) = socket.recv_from(&mut buf).await {
+                        let request = &buf[..n];
+                        let tid: [u8; 12] = request[8..20].try_into().unwrap();
+                        let change = if n >= 28 {
+                            u32::from_be_bytes(request[24..28].try_into().unwrap())
+                        } else {
+                            0
+                        };
+                        let flip_ip = |ip: IpAddr| if ip == a1 { a2 } else { a1 };
+                        let flip_port = |p: u16| if p == p1 { p2 } else { p1 };
+                        if change != 0 && matches!(mode, ServerMode::RefusesChange) {
+                            let mut error = Vec::new();
+                            error.extend_from_slice(&BINDING_ERROR.to_be_bytes());
+                            error.extend_from_slice(&0u16.to_be_bytes());
+                            error.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
+                            error.extend_from_slice(&tid);
+                            let _ = socket.send_to(&error, from).await;
+                            continue;
+                        }
+                        let reply_from = SocketAddr::new(
+                            if change & CHANGE_IP != 0 {
+                                flip_ip(me.ip())
+                            } else {
+                                me.ip()
+                            },
+                            if change & CHANGE_PORT != 0 {
+                                flip_port(me.port())
+                            } else {
+                                me.port()
+                            },
+                        );
+                        let other = SocketAddr::new(flip_ip(me.ip()), flip_port(me.port()));
+                        let mut attrs = xor_address_attr(from);
+                        if !matches!(mode, ServerMode::Plain) {
+                            attrs.extend_from_slice(&address_attr(ATTR_OTHER_ADDRESS, other));
+                        }
+                        let mut reply = Vec::new();
+                        reply.extend_from_slice(&BINDING_SUCCESS.to_be_bytes());
+                        reply.extend_from_slice(&(attrs.len() as u16).to_be_bytes());
+                        reply.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
+                        reply.extend_from_slice(&tid);
+                        reply.extend_from_slice(&attrs);
+                        let _ = by_addr[&reply_from].send_to(&reply, from).await;
+                    }
+                });
+            }
+            return Some(SocketAddr::new(a1, p1));
         }
-        SocketAddr::new(a1, p1)
+        eprintln!(
+            "STUN test server setup failed: could not reserve matching loopback ports after {MAX_BIND_ATTEMPTS} attempts; last error: {}",
+            last_error.as_deref().unwrap_or("unknown bind error")
+        );
+        panic!("STUN test server setup failed after bounded retries")
     }
 
     fn address_attr(kind: u16, addr: SocketAddr) -> Vec<u8> {
@@ -752,11 +784,13 @@ mod tests {
         classify(&mut relay, server, TEST_SCHEDULE).await
     }
 
-    async fn behaviour(mapping: Behavior, filtering: Behavior) -> (Behavior, Behavior) {
-        let server = stun_server(ServerMode::Full).await;
+    async fn behaviour(mapping: Behavior, filtering: Behavior) -> Option<(Behavior, Behavior)> {
+        let Some(server) = stun_server(ServerMode::Full).await else {
+            return None;
+        };
         let report = run(SimNat::new(mapping, filtering), server).await.unwrap();
         assert!(report.mapped.is_some());
-        (report.mapping, report.filtering)
+        Some((report.mapping, report.filtering))
     }
 
     use Behavior::{
@@ -765,32 +799,49 @@ mod tests {
 
     #[tokio::test]
     async fn full_cone() {
-        assert_eq!(behaviour(Ei, Ei).await, (Ei, Ei));
+        let Some(actual) = behaviour(Ei, Ei).await else {
+            return;
+        };
+        assert_eq!(actual, (Ei, Ei));
     }
 
     #[tokio::test]
     async fn restricted_cone() {
-        assert_eq!(behaviour(Ei, Ad).await, (Ei, Ad));
+        let Some(actual) = behaviour(Ei, Ad).await else {
+            return;
+        };
+        assert_eq!(actual, (Ei, Ad));
     }
 
     #[tokio::test]
     async fn port_restricted_cone() {
-        assert_eq!(behaviour(Ei, Apd).await, (Ei, Apd));
+        let Some(actual) = behaviour(Ei, Apd).await else {
+            return;
+        };
+        assert_eq!(actual, (Ei, Apd));
     }
 
     #[tokio::test]
     async fn address_dependent_mapping() {
-        assert_eq!(behaviour(Ad, Apd).await, (Ad, Apd));
+        let Some(actual) = behaviour(Ad, Apd).await else {
+            return;
+        };
+        assert_eq!(actual, (Ad, Apd));
     }
 
     #[tokio::test]
     async fn symmetric() {
-        assert_eq!(behaviour(Apd, Apd).await, (Apd, Apd));
+        let Some(actual) = behaviour(Apd, Apd).await else {
+            return;
+        };
+        assert_eq!(actual, (Apd, Apd));
     }
 
     #[tokio::test]
     async fn a_relay_bound_to_one_destination_is_not_misread() {
-        let server = stun_server(ServerMode::Full).await;
+        let Some(server) = stun_server(ServerMode::Full).await else {
+            return;
+        };
         let relay = BoundRelay {
             socket: UdpSocket::bind("127.0.0.1:0").await.unwrap(),
             remote: server,
@@ -804,7 +855,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_relay_without_sources_is_not_misread() {
-        let server = stun_server(ServerMode::Full).await;
+        let Some(server) = stun_server(ServerMode::Full).await else {
+            return;
+        };
         let mut nat = SimNat::new(Ei, Ei);
         nat.reported_source = Some("0.0.0.0:0".parse().unwrap());
         let report = run(nat, server).await.unwrap();
@@ -816,14 +869,18 @@ mod tests {
 
     #[tokio::test]
     async fn a_refused_change_request_leaves_filtering_unknown() {
-        let server = stun_server(ServerMode::RefusesChange).await;
+        let Some(server) = stun_server(ServerMode::RefusesChange).await else {
+            return;
+        };
         let report = run(SimNat::new(Ei, Apd), server).await.unwrap();
         assert_eq!((report.mapping, report.filtering), (Ei, Unknown));
     }
 
     #[tokio::test]
     async fn a_plain_server_is_passed_over() {
-        let server = stun_server(ServerMode::Plain).await;
+        let Some(server) = stun_server(ServerMode::Plain).await else {
+            return;
+        };
         assert_eq!(run(SimNat::new(Ei, Ei), server).await, None);
     }
 
@@ -838,10 +895,12 @@ mod tests {
 
     #[tokio::test]
     async fn two_plain_servers_tell_the_mapping_only() {
-        let (first, second) = (
-            stun_server(ServerMode::Plain).await,
-            stun_server(ServerMode::Plain).await,
-        );
+        let Some(first) = stun_server(ServerMode::Plain).await else {
+            return;
+        };
+        let Some(second) = stun_server(ServerMode::Plain).await else {
+            return;
+        };
         for (nat, expected) in [(Ei, Ei), (Apd, Behavior::Dependent)] {
             let mut relay = Relay::new(Arc::new(SimNat::new(nat, Apd)));
             let report = mapping_only(&mut relay, first, second, TEST_SCHEDULE)

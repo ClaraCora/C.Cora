@@ -84,6 +84,13 @@ class MigrationTests(unittest.TestCase):
         ]:
             self.assertIn(f"lifecycle-test: {stage}", source)
 
+        stun = (ROOT / "MobileCoreRust/meow-ios-ffi/src/probe/stun.rs").read_text(encoding="utf-8")
+        test_server = stun.split("async fn stun_server", 1)[1].split("fn address_attr", 1)[0]
+        self.assertIn("0..MAX_BIND_ATTEMPTS", test_server)
+        self.assertIn("could not reserve matching loopback ports", test_server)
+        self.assertIn("STUN test server setup: mode={mode:?}", test_server)
+        self.assertNotIn("loop {", test_server)
+
     def test_windows_tool_stays_untracked(self):
         files = subprocess.check_output(["git", "ls-files", "--", "WindowsConfigTool/"], cwd=ROOT)
         self.assertEqual(files.strip(), b"", "WindowsConfigTool must not enter this migration")
