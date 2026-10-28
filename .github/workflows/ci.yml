@@ -206,11 +206,10 @@ jobs:
             Tests/MemoryDiagnosticAnalyzerTests.swift -o "$RUNNER_TEMP/memory-diagnostic-analyzer-tests"
           "$RUNNER_TEMP/memory-diagnostic-analyzer-tests"
 
-      - name: Build standard and Legacy Mihomo.xcframeworks (gomobile bind)
+      - name: Build standard Mihomo.xcframework (gomobile bind)
         run: |
           set -euxo pipefail
           bash MobileCore/scripts/build-ios-xcframework.sh
-          bash MobileCore/scripts/build-ios-xcframework.sh --legacy
 
       # ───────────── 生成工程并构建 App ─────────────
       - name: Install XcodeGen
@@ -219,10 +218,10 @@ jobs:
       - name: Generate Xcode project
         run: xcodegen generate
 
-      - name: Build standard and Legacy apps (unsigned)
+      - name: Build standard app (unsigned)
         run: |
           set -euo pipefail
-          # 两个 App、Tunnel 产物都必须随每次构建递增 build 号；否则覆盖安装时
+          # App 与 Tunnel 产物都必须随每次构建递增 build 号；否则覆盖安装时
           # iOS 可能继续使用旧的 Network Extension 注册，表现为连接后立即断开。
           BUILD_NUMBER="${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
           echo "CFBundleVersion: ${BUILD_NUMBER}"
@@ -252,7 +251,6 @@ jobs:
             fi
           }
           build_scheme Cora build
-          build_scheme CoraLegacy build-legacy
 
       - name: Package into .ipa (unsigned)
         run: |
@@ -266,91 +264,6 @@ jobs:
           cp -R "$APP_PATH" Payload/
           zip -qr Cora-unsigned.ipa Payload
           echo "已生成 Cora-unsigned.ipa"
-
-      - name: Package Legacy into .ipa (unsigned)
-        run: |
-          set -euo pipefail
-          APP_PATH="build-legacy/Build/Products/Release-iphoneos/Cora.app"
-          if [ ! -d "$APP_PATH" ]; then
-            echo "未找到 $APP_PATH"; exit 1
-          fi
-          rm -rf Payload
-          mkdir -p Payload
-          cp -R "$APP_PATH" Payload/
-          zip -qr CoraLegacy-unsigned.ipa Payload
-          echo "已生成 CoraLegacy-unsigned.ipa"
-
-      - name: Package TrollStore IPAs
-        run: |
-          set -euo pipefail
-          package_trollstore() {
-            local source_app="$1"
-            local package_root="$2"
-            local output_ipa="$3"
-            local main_entitlements="$RUNNER_TEMP/$(basename "$output_ipa" .ipa)-main-entitlements.plist"
-            local tunnel_entitlements="$RUNNER_TEMP/$(basename "$output_ipa" .ipa)-tunnel-entitlements.plist"
-            local ts_app="$package_root/Payload/Cora.app"
-
-            test -d "$source_app"
-            rm -rf "$package_root"
-            mkdir -p "$package_root/Payload"
-            ditto "$source_app" "$ts_app"
-
-            # 标准包含有 iOS 18 ControlWidget；Legacy 本身不含。对两者执行删除是安全的。
-            rm -rf "$ts_app/PlugIns/CoraControl.appex"
-
-            /usr/libexec/PlistBuddy -c \
-              'Add :CoraTrollStoreBuild bool true' "$ts_app/Info.plist"
-            /usr/libexec/PlistBuddy -c \
-              'Add :CoraTrollStoreBuild bool true' \
-              "$ts_app/PlugIns/CoraTunnel.appex/Info.plist"
-
-            codesign --force --sign - --generate-entitlement-der \
-              --entitlements CoraTunnel/CoraTunnel-TrollStore.entitlements \
-              "$ts_app/PlugIns/CoraTunnel.appex"
-            codesign --force --sign - --generate-entitlement-der \
-              --entitlements Cora/Cora-TrollStore.entitlements \
-              "$ts_app"
-
-            codesign -d --entitlements :- "$ts_app" > "$main_entitlements" 2>/dev/null
-            codesign -d --entitlements :- \
-              "$ts_app/PlugIns/CoraTunnel.appex" > "$tunnel_entitlements" 2>/dev/null
-            test "$(/usr/libexec/PlistBuddy -c \
-              'Print :CoraTrollStoreBuild' "$ts_app/Info.plist")" = "true"
-            test "$(/usr/libexec/PlistBuddy -c \
-              'Print :CoraTrollStoreBuild' \
-              "$ts_app/PlugIns/CoraTunnel.appex/Info.plist")" = "true"
-            test "$(/usr/libexec/PlistBuddy -c \
-              'Print :application-identifier' "$main_entitlements")" \
-              = "TROLLTROLL.com.miclash.app"
-            test "$(/usr/libexec/PlistBuddy -c \
-              'Print :application-identifier' "$tunnel_entitlements")" \
-              = "TROLLTROLL.com.miclash.app.tunnel"
-            test "$(/usr/libexec/PlistBuddy -c \
-              'Print :com.apple.private.security.no-sandbox' "$main_entitlements")" = "true"
-            test "$(/usr/libexec/PlistBuddy -c \
-              'Print :com.apple.private.security.no-sandbox' "$tunnel_entitlements")" = "true"
-            for entitlements in "$main_entitlements" "$tunnel_entitlements"; do
-              test "$(/usr/libexec/PlistBuddy -c \
-                'Print :platform-application' "$entitlements")" = "true"
-              test "$(/usr/libexec/PlistBuddy -c \
-                'Print :com.apple.private.security.storage.AppDataContainers' \
-                "$entitlements")" = "true"
-              test "$(/usr/libexec/PlistBuddy -c \
-                'Print :com.apple.developer.team-identifier' "$entitlements")" \
-                = "TROLLTROLL"
-              test "$(/usr/libexec/PlistBuddy -c \
-                'Print :com.apple.developer.networking.networkextension:0' \
-                "$entitlements")" = "packet-tunnel-provider"
-            done
-            (cd "$package_root" && zip -qr "$GITHUB_WORKSPACE/$output_ipa" Payload)
-          }
-
-          package_trollstore "build/Build/Products/Release-iphoneos/Cora.app" \
-            "$RUNNER_TEMP/cora-trollstore" Cora-TrollStore.ipa
-          package_trollstore "build-legacy/Build/Products/Release-iphoneos/Cora.app" \
-            "$RUNNER_TEMP/cora-legacy-trollstore" CoraLegacy-TrollStore.ipa
-          echo "已生成 Cora-TrollStore.ipa 与 CoraLegacy-TrollStore.ipa"
 
       - name: Publish IPAs to GitHub Releases
         env:

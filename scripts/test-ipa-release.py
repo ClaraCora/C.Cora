@@ -9,8 +9,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-FILES = ["Cora-unsigned.ipa", "Cora-TrollStore.ipa",
-         "CoraLegacy-unsigned.ipa", "CoraLegacy-TrollStore.ipa"]
+FILES = ["Cora-unsigned.ipa"]
 BASH = (r"C:\Program Files\Git\bin\bash.exe" if os.name == "nt" else shutil.which("bash"))
 
 
