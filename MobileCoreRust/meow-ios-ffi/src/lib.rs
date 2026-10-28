@@ -1375,11 +1375,18 @@ pub unsafe extern "C" fn meow_patch_config(
 // ---------------------------------------------------------------------------
 
 /// C-compatible egress callback. Called from the tun2socks tokio runtime
-/// whenever tun2socks produces a packet bound for Swift's `NEPacketTunnelFlow`.
+/// whenever tun2socks produces packets bound for Swift's `NEPacketTunnelFlow`.
+/// One call carries a whole batch: `packets[i]` is `lens[i]` bytes long and
+/// `count >= 1`, so Swift can hand the batch to one `writePackets` call —
+/// per-packet flow writes could not keep up with speedtest-rate egress.
 /// Swift guarantees `ctx` remains live between `meow_tun_start` and
-/// `meow_tun_stop`.
-pub type MeowWritePacket =
-    unsafe extern "C" fn(ctx: *mut std::os::raw::c_void, data: *const u8, len: usize);
+/// `meow_tun_stop`, and the packet pointers stay valid until the call returns.
+pub type MeowWriteBatch = unsafe extern "C" fn(
+    ctx: *mut std::os::raw::c_void,
+    packets: *const *const u8,
+    lens: *const usize,
+    count: usize,
+);
 
 /// Start tun2socks with a Swift-owned egress callback. The ingest side is
 /// driven by `meow_tun_ingest`; the tunnel uses an internal mpsc queue so
@@ -1394,7 +1401,7 @@ pub type MeowWritePacket =
 #[no_mangle]
 pub unsafe extern "C" fn meow_tun_start(
     ctx: *mut std::os::raw::c_void,
-    write_cb: MeowWritePacket,
+    write_cb: MeowWriteBatch,
 ) -> c_int {
     logging::bridge_log("meow_tun_start (direct callback)");
     match tun2socks::start(ctx, write_cb) {

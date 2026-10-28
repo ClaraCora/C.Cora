@@ -70,7 +70,22 @@ type UdpSessionKey = SocketAddr;
 
 /// Matches the cbindgen-emitted typedef in `meow_core.h`: Rust calls this
 /// whenever netstack or DNS produces an egress packet bound for the utun.
-pub type WritePacketFn = unsafe extern "C" fn(ctx: *mut c_void, data: *const u8, len: usize);
+/// One callback delivers a whole egress batch: `packets[i]` is `lens[i]`
+/// bytes long and `count >= 1`. Swift forwards the batch to
+/// `NEPacketTunnelFlow.writePackets` in ONE call — per-packet calls could not
+/// keep up with speedtest-rate flows and forced the egress queue to drop
+/// (see EGRESS_DROP_LOG_LAST_MS).
+pub type WriteBatchFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    packets: *const *const u8,
+    lens: *const usize,
+    count: usize,
+);
+
+/// Upper bound of one coalesced egress batch. Matches the burst sizes
+/// `readPackets` delivers in the other direction; larger batches only add
+/// latency under backpressure without helping throughput.
+pub const EGRESS_BATCH_MAX: usize = 64;
 
 /// Wraps the raw context pointer so it's `Send` across the tokio runtime. The
 /// contract is that Swift keeps the referent alive between `meow_tun_start`
@@ -83,7 +98,7 @@ unsafe impl Sync for EmitCtx {}
 
 struct EgressTarget {
     ctx: EmitCtx,
-    cb: WritePacketFn,
+    cb: WriteBatchFn,
 }
 type EgressGate = Arc<Mutex<Option<EgressTarget>>>;
 struct EgressEmitter {
@@ -96,11 +111,18 @@ fn egress_gate_slot() -> &'static Mutex<Option<std::sync::Weak<Mutex<Option<Egre
 }
 
 impl EgressEmitter {
-    fn emit(&self, packet: &[u8]) {
+    fn emit(&self, packets: &[Vec<u8>]) {
         // Hold the gate through the callback. Closing it waits for an in-flight
         // write; after close, even a wedged teardown cannot touch Swift's ctx.
+        if packets.is_empty() {
+            return;
+        }
+        let ptrs: Vec<*const u8> = packets.iter().map(|p| p.as_ptr()).collect();
+        let lens: Vec<usize> = packets.iter().map(Vec::len).collect();
         if let Some(target) = self.gate.lock().as_ref() {
-            unsafe { (target.cb)(target.ctx.0, packet.as_ptr(), packet.len()) };
+            unsafe {
+                (target.cb)(target.ctx.0, ptrs.as_ptr(), lens.as_ptr(), packets.len())
+            };
         }
     }
 }
@@ -549,7 +571,7 @@ pub fn debug_counts() -> DebugCounts {
     }
 }
 
-pub fn start(ctx: *mut c_void, cb: WritePacketFn) -> Result<(), String> {
+pub fn start(ctx: *mut c_void, cb: WriteBatchFn) -> Result<(), String> {
     if TUN2SOCKS_RUNNING.swap(true, Ordering::SeqCst) {
         return Err("tun2socks already running".into());
     }
@@ -1026,14 +1048,23 @@ async fn run_tun2socks(
     });
 
     let egress_handle = tokio::spawn(async move {
-        while let Some(pkt) = egress_rx.recv().await {
+        while let Some(first) = egress_rx.recv().await {
+            // Coalesce everything already queued into one writePackets call.
+            // Under download bursts this cuts per-packet FFI + Data + flow
+            // overhead to ~1/EGRESS_BATCH_MAX — the old per-packet path
+            // saturated this queue and dropped outbound frames mid-speedtest.
+            let mut batch = vec![first];
+            while batch.len() < EGRESS_BATCH_MAX {
+                match egress_rx.try_recv() {
+                    Ok(pkt) => batch.push(pkt),
+                    Err(_) => break,
+                }
+            }
             // Health-probe replies are consumed here instead of being handed
             // to Swift: the probe's synthetic client doesn't exist on the
             // device side. Single atomic load when no probe is armed.
-            if probe_reply_intercept(&pkt) {
-                continue;
-            }
-            emitter.emit(&pkt);
+            batch.retain(|pkt| !probe_reply_intercept(pkt));
+            emitter.emit(&batch);
         }
     });
 
@@ -2928,8 +2959,9 @@ mod tests {
 
         unsafe extern "C" fn noop_write(
             _ctx: *mut std::os::raw::c_void,
-            _data: *const u8,
-            _len: usize,
+            _packets: *const *const u8,
+            _lens: *const usize,
+            _count: usize,
         ) {
         }
 
@@ -2973,8 +3005,9 @@ mod tests {
 
         unsafe extern "C" fn noop_write(
             _ctx: *mut std::os::raw::c_void,
-            _data: *const u8,
-            _len: usize,
+            _packets: *const *const u8,
+            _lens: *const usize,
+            _count: usize,
         ) {
         }
 
@@ -3151,8 +3184,9 @@ mod tests {
 
         unsafe extern "C" fn noop_write(
             _ctx: *mut std::os::raw::c_void,
-            _data: *const u8,
-            _len: usize,
+            _packets: *const *const u8,
+            _lens: *const usize,
+            _count: usize,
         ) {
         }
         start(std::ptr::null_mut(), noop_write).expect("start");

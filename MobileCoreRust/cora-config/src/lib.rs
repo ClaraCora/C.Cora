@@ -3,6 +3,8 @@ use serde_json::{json, Value as J};
 use serde_yaml::{Mapping, Value as Y};
 use std::collections::HashSet;
 
+pub mod script;
+
 type Result<T> = std::result::Result<T, String>;
 fn key(s: &str) -> Y {
     Y::String(s.into())

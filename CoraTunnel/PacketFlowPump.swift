@@ -38,16 +38,28 @@ final class PacketFlowPump {
 final class PacketFlowWriter {
     private let flow: NEPacketTunnelFlow
     init(flow: NEPacketTunnelFlow) { self.flow = flow }
-    func write(_ bytes: UnsafePointer<UInt8>, count: Int) {
-        guard count > 0, count <= 65535 else { return }
-        let version = bytes.pointee >> 4
-        guard version == 4 || version == 6 else { return }
-        let packet = Data(bytes: bytes, count: count)
-        _ = flow.writePackets([packet], withProtocols: [NSNumber(value: version == 6 ? AF_INET6 : AF_INET)])
+    /// Rust 按批交付出口包：整批合并成一次 writePackets，避免按包调用在高吞吐下堆积出口队列。
+    func writeBatch(packets: UnsafePointer<UnsafePointer<UInt8>?>, lens: UnsafePointer<UInt>, count: Int) {
+        guard count > 0, count <= 256 else { return }
+        var datas: [Data] = []
+        var protocols: [NSNumber] = []
+        datas.reserveCapacity(count)
+        protocols.reserveCapacity(count)
+        for index in 0..<count {
+            let length = Int(lens[index])
+            guard let base = packets[index], length > 0, length <= 65535 else { continue }
+            let version = base.pointee >> 4
+            guard version == 4 || version == 6 else { continue }
+            datas.append(Data(bytes: base, count: length))
+            protocols.append(NSNumber(value: version == 6 ? AF_INET6 : AF_INET))
+        }
+        guard !datas.isEmpty else { return }
+        _ = flow.writePackets(datas, withProtocols: protocols)
     }
 }
 
-let coraWritePacket: @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<UInt8>?, UInt) -> Void = { context, bytes, length in
-    guard let context, let bytes else { return }
-    Unmanaged<PacketFlowWriter>.fromOpaque(context).takeUnretainedValue().write(bytes, count: Int(length))
+let coraWritePacket: @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<UnsafePointer<UInt8>?>?, UnsafePointer<UInt>?, UInt) -> Void = { context, packets, lens, count in
+    guard let context, let packets, let lens, count > 0 else { return }
+    Unmanaged<PacketFlowWriter>.fromOpaque(context).takeUnretainedValue()
+        .writeBatch(packets: packets, lens: lens, count: Int(count))
 }

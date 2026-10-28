@@ -37,11 +37,17 @@ typedef struct MeowInterfaceTraffic {
 
 /**
  * C-compatible egress callback. Called from the tun2socks tokio runtime
- * whenever tun2socks produces a packet bound for Swift's `NEPacketTunnelFlow`.
+ * whenever tun2socks produces packets bound for Swift's `NEPacketTunnelFlow`.
+ * One call carries a whole batch: `packets[i]` is `lens[i]` bytes long and
+ * `count >= 1`, so Swift can hand the batch to one `writePackets` call —
+ * per-packet flow writes could not keep up with speedtest-rate egress.
  * Swift guarantees `ctx` remains live between `meow_tun_start` and
- * `meow_tun_stop`.
+ * `meow_tun_stop`, and the packet pointers stay valid until the call returns.
  */
-typedef void (*MeowWritePacket)(void *ctx, const uint8_t *data, uintptr_t len);
+typedef void (*MeowWriteBatch)(void *ctx,
+                               const uint8_t *const *packets,
+                               const uintptr_t *lens,
+                               uintptr_t count);
 
 /**
  * Initialize logging. Safe to call more than once.
@@ -338,7 +344,7 @@ int meow_patch_config(const char *source_yaml,
  * between this call and `meow_tun_stop`. `write_cb` must be a non-null C
  * function pointer that stays valid for the lifetime of the tunnel.
  */
-int meow_tun_start(void *ctx, MeowWritePacket write_cb);
+int meow_tun_start(void *ctx, MeowWriteBatch write_cb);
 
 /**
  * Feed a raw IP packet from `NEPacketTunnelFlow.readPackets` into the
