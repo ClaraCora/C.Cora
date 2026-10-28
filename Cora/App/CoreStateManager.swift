@@ -226,12 +226,17 @@ final class CoreStateManager: ObservableObject {
             return
         }
         let yaml = useCurrentConfiguration ? SubscriptionStore.shared.activeYAML : configYAML
-        // GEO 首次下载与定时更新在主 App 完成，避免 NE 启动阶段联网和冲高内存。
-        try await GeoDatabaseManager.shared.prepareForConnection(configYAML: yaml)
         let settings = SettingsStore.shared.asJSON(
             geoAvailable: AppGroup.containerURL != nil,
             applyOverrides: SubscriptionStore.shared.activeOverridesEnabled,
             proxySelections: SubscriptionStore.shared.activeProxySelections)
+        let validationYAML = yaml.flatMap { $0.isEmpty ? nil : $0 } ?? "rules: ['MATCH,DIRECT']"
+        if let validationError = CoraCore.validateConfiguration(validationYAML, settingsJSON: settings) {
+            throw CoraNativeCore.failure(validationError)
+        }
+        // Reject incompatible configs before waiting for large GEO/ASN downloads.
+        // Database updates stay in the main app; the NE only reads installed files.
+        try await GeoDatabaseManager.shared.prepareForConnection(configYAML: yaml)
         let s = SettingsStore.shared
         let opts = TunnelManager.ProtocolOptions(
             includeAllNetworks: s.includeAllNetworks,

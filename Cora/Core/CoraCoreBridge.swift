@@ -6,8 +6,16 @@ import CryptoKit
 enum CoraCore {
     static func validateConfiguration(_ yaml: String, settingsJSON: String = "{}") -> String? {
         do {
+            var settings = CoraNativeCore.dictionary(settingsJSON)
+            // Validation only checks config shape and runtime compatibility. A
+            // TEST-NET address lets it validate `system` DNS entries before
+            // the Network Extension samples the real physical DNS servers.
+            // This value is never used to start an engine or persisted.
+            if !((settings["systemDNS"] as? [String])?.isEmpty == false) {
+                settings["systemDNS"] = ["192.0.2.1"]
+            }
             _ = try CoraNativeCore.object("validate", ["yaml": yaml,
-                "settings": CoraNativeCore.dictionary(settingsJSON), "home": AppGroup.containerURL?.path ?? ""])
+                "settings": settings, "home": AppGroup.containerURL?.path ?? ""])
             return nil
         } catch { return error.localizedDescription }
     }

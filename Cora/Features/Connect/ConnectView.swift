@@ -5,6 +5,7 @@ import UIKit
 /// 总览：以连接控制为中心，运行状态与流量指标围绕主操作展开。
 struct ConnectView: View {
     @EnvironmentObject private var core: CoreStateManager
+    @EnvironmentObject private var geoDatabase: GeoDatabaseManager
     @ObservedObject var connections: ConnectionsController
     @State private var memoryReleaseFeedback: String?
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
@@ -252,6 +253,13 @@ private struct ConnectionHero: View {
                 Label(error, systemImage: "exclamationmark.circle.fill")
                     .font(.footnote)
                     .foregroundStyle(.red)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity)
+            }
+            if core.isBusy, geoDatabase.isUpdating, let status = geoDatabase.statusText {
+                Label(status, systemImage: "globe")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: .infinity)
             }

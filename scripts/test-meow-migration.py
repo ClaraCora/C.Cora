@@ -91,6 +91,19 @@ class MigrationTests(unittest.TestCase):
         self.assertIn("STUN test server setup: mode={mode:?}", test_server)
         self.assertNotIn("loop {", test_server)
 
+    def test_app_rejects_unsupported_configs_before_geo_download(self):
+        source = (ROOT / "Cora/App/CoreStateManager.swift").read_text(encoding="utf-8")
+        start = source.split("private func startCurrentConfiguration", 1)[1].split(
+            "/// 在运行中的 VPN 上应用", 1
+        )[0]
+        self.assertLess(start.index("validateConfiguration"), start.index("prepareForConnection"))
+        self.assertIn("CoraNativeCore.failure(validationError)", start)
+
+        bridge = (ROOT / "Cora/Core/CoraCoreBridge.swift").read_text(encoding="utf-8")
+        self.assertIn('settings["systemDNS"] = ["192.0.2.1"]', bridge)
+        connect = (ROOT / "Cora/Features/Connect/ConnectView.swift").read_text(encoding="utf-8")
+        self.assertIn("geoDatabase.isUpdating", connect)
+
     def test_windows_tool_stays_untracked(self):
         files = subprocess.check_output(["git", "ls-files", "--", "WindowsConfigTool/"], cwd=ROOT)
         self.assertEqual(files.strip(), b"", "WindowsConfigTool must not enter this migration")
