@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 private let subscriptionMaximumDownloadBytes: Int64 = 10 * 1_024 * 1_024
 private let proxyProviderMaximumDownloadBytes: Int64 = 10 * 1_024 * 1_024
@@ -452,6 +453,8 @@ final class SubscriptionStore: ObservableObject {
 
     /// 刷新订阅声明的 HTTP proxy-providers。连接中时先让运行内核原地更新，
     /// 同时由主 App 保存一份订阅隔离缓存，供断开状态下浏览节点。
+    /// 内核直连拉取被订阅端拒绝（如 HTTP 403）时，以主 App 下载结果预置
+    /// 内核缓存，并经一次重连使其生效。
     func refreshProxyProviders(_ id: UUID, updateRuntime: Bool = true) async {
         guard !refreshingProviderIDs.contains(id),
               let subscription = subscriptions.first(where: { $0.id == id }) else { return }
@@ -460,16 +463,17 @@ final class SubscriptionStore: ObservableObject {
         defer { refreshingProviderIDs.remove(id) }
 
         var failures: [String] = []
+        var runtimeFailures: [String] = []
         let runtimeStatus = CoreStateManager.shared.status
-        if updateRuntime && selectedID == id &&
-            (runtimeStatus == .connected || runtimeStatus == .reasserting) {
+        let runtimeWasActive = runtimeStatus == .connected || runtimeStatus == .reasserting
+        if updateRuntime && selectedID == id && runtimeWasActive {
             switch await CoreStateManager.shared.sendMessage(["cmd": "updateProxyProviders"]) {
             case .failure(let reason):
-                failures.append("运行内核：\(reason)")
+                runtimeFailures.append("运行内核：\(reason)")
             case .ok(let data):
                 if let response = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
                    let providerFailures = response["failures"] as? [String: String] {
-                    failures.append(contentsOf: providerFailures.sorted(by: { $0.key < $1.key })
+                    runtimeFailures.append(contentsOf: providerFailures.sorted(by: { $0.key < $1.key })
                         .map { "\($0.key)：\($0.value)" })
                 }
             }
@@ -514,16 +518,27 @@ final class SubscriptionStore: ObservableObject {
             }
             if downloaded > 0 {
                 try Self.saveProviderCache(cached, id: id)
+                if let latest = subscriptions.first(where: { $0.id == id }) {
+                    seedEngineProviderCaches(subscriptionID: id, yaml: latest.yaml)
+                }
                 updateNodeCount(id, providerPayloads: cached)
                 recordResourceUpdates(subscriptionID: id,
                                       kind: .proxyProvider,
                                       names: refreshedProviderNames)
                 providerCacheRevision &+= 1
+                // 内核原地更新失败时，刚写入的内核缓存需要一次重连才会被加载。
+                if runtimeWasActive, !runtimeFailures.isEmpty,
+                   await CoreStateManager.shared.reloadActiveConfigurationIfNeeded(
+                       changedSubscriptionID: id,
+                       previousYAML: subscriptions.first(where: { $0.id == id })?.yaml) {
+                    runtimeFailures = []
+                }
             }
         } catch {
             failures.append(error.localizedDescription)
         }
-        lastError = failures.isEmpty ? nil : "Provider 刷新未全部完成：\n" + failures.joined(separator: "\n")
+        let combinedFailures = failures + runtimeFailures
+        lastError = combinedFailures.isEmpty ? nil : "Provider 刷新未全部完成：\n" + combinedFailures.joined(separator: "\n")
     }
 
     /// 返回所有配置中的远程资源。保留该入口供需要跨配置汇总的调用使用。
@@ -646,20 +661,23 @@ final class SubscriptionStore: ObservableObject {
         save()
     }
 
-    func refreshProxyProvider(_ resource: RemoteResource) async {
+    /// allowRuntimeReload=false 供批量刷新使用：此时不做单个重连，返回是否仍需要一次重连。
+    @discardableResult
+    func refreshProxyProvider(_ resource: RemoteResource, allowRuntimeReload: Bool = true) async -> Bool {
         guard resource.kind == .proxyProvider,
               !refreshingResourceIDs.contains(resource.id),
-              let subscription = subscriptions.first(where: { $0.id == resource.subscriptionID }) else { return }
+              let subscription = subscriptions.first(where: { $0.id == resource.subscriptionID }) else { return false }
         refreshingResourceIDs.insert(resource.id)
         lastError = nil
         defer { refreshingResourceIDs.remove(resource.id) }
 
         var failures: [String] = []
+        var runtimeFailures: [String] = []
         var didRefreshPayload = false
         let runtimeStatus = CoreStateManager.shared.status
-        if selectedID == resource.subscriptionID &&
-            (runtimeStatus == .connected || runtimeStatus == .reasserting) {
-            failures.append(contentsOf: await Self.runtimeProviderFailures(
+        let runtimeWasActive = runtimeStatus == .connected || runtimeStatus == .reasserting
+        if selectedID == resource.subscriptionID && runtimeWasActive {
+            runtimeFailures.append(contentsOf: await Self.runtimeProviderFailures(
                 command: ["cmd": "updateProxyProvider", "name": resource.name]))
         }
 
@@ -672,9 +690,18 @@ final class SubscriptionStore: ObservableObject {
             var cached = Self.loadProviderCache(resource.subscriptionID)
             cached[provider.name] = payload
             try Self.saveProviderCache(cached, id: resource.subscriptionID)
+            if let latest = subscriptions.first(where: { $0.id == resource.subscriptionID }) {
+                seedEngineProviderCaches(subscriptionID: resource.subscriptionID, yaml: latest.yaml)
+            }
             updateNodeCount(resource.subscriptionID, providerPayloads: cached)
             didRefreshPayload = true
             providerCacheRevision &+= 1
+            if runtimeWasActive, !runtimeFailures.isEmpty, allowRuntimeReload,
+               await CoreStateManager.shared.reloadActiveConfigurationIfNeeded(
+                   changedSubscriptionID: resource.subscriptionID,
+                   previousYAML: subscriptions.first(where: { $0.id == resource.subscriptionID })?.yaml) {
+                runtimeFailures = []
+            }
         } catch {
             failures.append(error.localizedDescription)
         }
@@ -683,7 +710,10 @@ final class SubscriptionStore: ObservableObject {
                                   kind: .proxyProvider,
                                   names: [resource.name])
         }
-        lastError = failures.isEmpty ? nil : failures.joined(separator: "\n")
+        // 批量刷新由调用方统一重连，内核侧失败明细不进单条错误。
+        let combinedFailures = allowRuntimeReload ? failures + runtimeFailures : failures
+        lastError = combinedFailures.isEmpty ? nil : combinedFailures.joined(separator: "\n")
+        return !allowRuntimeReload && didRefreshPayload && runtimeWasActive && !runtimeFailures.isEmpty
     }
 
     func refreshAllProxyProviders() async {
@@ -697,10 +727,21 @@ final class SubscriptionStore: ObservableObject {
             return
         }
         var failures: [String] = []
+        var needsRuntimeReload = false
         for resource in resources {
-            await refreshProxyProvider(resource)
+            let pending = await refreshProxyProvider(resource, allowRuntimeReload: false)
+            needsRuntimeReload = needsRuntimeReload || pending
             if let error = lastError {
                 failures.append("\(resource.subscriptionName) / \(resource.name)：\(error)")
+            }
+        }
+        // 内核原地更新被拒的 Provider 已通过预置缓存就绪，统一做一次重连加载。
+        if needsRuntimeReload {
+            let reloaded = await CoreStateManager.shared.reloadActiveConfigurationIfNeeded(
+                changedSubscriptionID: selectedID,
+                previousYAML: subscriptions.first(where: { $0.id == selectedID })?.yaml)
+            if !reloaded {
+                failures.append("运行内核重载未完成，新节点将在下次连接后生效")
             }
         }
         lastError = failures.isEmpty ? nil : "部分 Proxy Provider 刷新失败：\n" + failures.joined(separator: "\n")
@@ -946,6 +987,31 @@ final class SubscriptionStore: ObservableObject {
                                                 withIntermediateDirectories: true)
         let data = try JSONEncoder().encode(cache)
         try data.write(to: providerCacheURL(id), options: .atomic)
+    }
+
+    /// 把主 App 已成功下载的 Proxy Provider 载荷预置到运行内核的隔离缓存目录
+    ///（App Group 内 meow-cache/<namespace>/proxy-providers-<hex>.yaml）。内核启动
+    /// 时先网络拉取、失败回落到该缓存；部分订阅后端会拒绝内核自带的 HTTP 栈
+    ///（HTTP 403），预置缓存保证连接后节点仍可用。namespace 与 CoraCoreAdapter
+    /// 的 cacheNamespace 算法一致：SHA256(profileID + "\u{0}" + YAML)。
+    func seedEngineProviderCaches(subscriptionID: UUID, yaml: String) {
+        guard let home = AppGroup.containerURL,
+              let providers = try? Self.providerManifest(yaml), !providers.isEmpty else { return }
+        let cached = Self.loadProviderCache(subscriptionID)
+        guard !cached.isEmpty else { return }
+        let namespace = SHA256.hash(data: Data((subscriptionID.uuidString + "\u{0}" + yaml).utf8))
+            .map { String(format: "%02x", $0) }.joined()
+        let directory = home.appendingPathComponent("meow-cache/\(namespace)", isDirectory: true)
+        guard (try? FileManager.default.createDirectory(at: directory,
+                                                        withIntermediateDirectories: true)) != nil else { return }
+        for provider in providers {
+            guard let payload = cached[provider.name], !payload.isEmpty else { continue }
+            let hexName = Data(provider.name.utf8).map { String(format: "%02x", $0) }.joined()
+            let file = directory.appendingPathComponent("proxy-providers-\(hexName).yaml")
+            // 内容未变时不重写，保留既有缓存文件时间。
+            if let existing = try? String(contentsOf: file, encoding: .utf8), existing == payload { continue }
+            try? Data(payload.utf8).write(to: file, options: .atomic)
+        }
     }
 
     private func removeProviderCache(_ id: UUID) {

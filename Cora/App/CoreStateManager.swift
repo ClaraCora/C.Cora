@@ -244,6 +244,11 @@ final class CoreStateManager: ObservableObject {
             excludeAPNs: s.excludeAPNs,
             excludeDeviceCommunication: s.excludeDeviceCommunication,
             enforceRoutes: s.enforceRoutes)
+        // 预置内核 Provider 缓存：部分订阅后端拒绝内核自带的 HTTP 栈（如 403），
+        // 预置后启动时内核可直接从缓存加载主 App 已下载的节点。
+        if let id = SubscriptionStore.shared.selectedID, let yaml {
+            SubscriptionStore.shared.seedEngineProviderCaches(subscriptionID: id, yaml: yaml)
+        }
         try await tunnel.start(configYAML: yaml, settingsJSON: settings, protocolOptions: opts)
         SettingsStore.shared.markConnectionSettingsApplied()
         ConfigOverrideStore.shared.markConnectionSettingsApplied()

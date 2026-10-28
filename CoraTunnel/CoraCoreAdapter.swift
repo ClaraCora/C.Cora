@@ -77,8 +77,23 @@ final class CoraCoreAdapter {
             }
         }
         let settings = CoraNativeCore.dictionary(settingsJSON)
-        for (group, member) in settings["proxySelections"] as? [String: String] ?? [:] {
-            try select(group, member)
+        let savedSelections = settings["proxySelections"] as? [String: String] ?? [:]
+        if !savedSelections.isEmpty {
+            let proxies = try api("GET", ["proxies"])["proxies"] as? [String: [String: Any]] ?? [:]
+            for (group, member) in savedSelections.sorted(by: { $0.key < $1.key }) {
+                guard let groupSnapshot = proxies[group] else {
+                    FileLog.write("忽略已失效的离线节点选择：策略组「\(group)」已不存在")
+                    continue
+                }
+                let members = groupSnapshot["all"] as? [String] ?? []
+                guard members.contains(member) else {
+                    let current = groupSnapshot["now"] as? String
+                    let fallback = current.map { "；使用当前选择「\($0)」" } ?? "；使用内核默认选择"
+                    FileLog.write("忽略已失效的离线节点选择：策略组「\(group)」中不存在节点「\(member)」\(fallback)")
+                    continue
+                }
+                try select(group, member)
+            }
         }
     }
 
